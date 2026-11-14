@@ -2794,3 +2794,343 @@ def test_gqa_dcp_keeps_native_head_and_simulator_scope_checks(
 ):
     with pytest.raises(ValueError, match=reason):
         _gqa_dcp_config(tmp_path, tp=tp, dcp=dcp, **overrides)
+
+
+def _mtp_dcp_engine_config(tmp_path, *, tp=2, dcp=2, target=V3, spec=None, **opts):
+    from pathlib import Path
+
+    from vllm.engine.arg_utils import EngineArgs
+
+    # The evidence run uses the exact published snapshot read-only; CPU CI can
+    # use the same published architecture bundled with AISimulate.
+    published = os.environ.get("ROUND22_PUBLISHED_V3")
+    raw = (
+        json.loads(Path(published).read_text())
+        if target == V3 and published
+        else bundled_config(target)
+    )
+    path = model_dir(tmp_path, target.replace("/", "--"), raw)
+    speculative = {"method": "mtp", "num_speculative_tokens": 1} | (spec or {})
+    kwargs = dict(
+        model=path,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        tensor_parallel_size=tp,
+        decode_context_parallel_size=dcp,
+        max_model_len=2048,
+        block_size=16,
+        kv_cache_memory_bytes=1 << 29,
+        enable_prefix_caching=False,
+        speculative_config=speculative,
+        simulation_config={"simulate_forward": True, "timing": "aisimulate"},
+    )
+    return EngineArgs(**(kwargs | opts)).create_engine_config()
+
+
+requires_mtp_dcp = pytest.mark.skipif(
+    not REAL or not current_platform.is_cpu(),
+    reason="Requires AISimulate and the CPU platform.",
+)
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize(
+    "target_kv,draft_kv", [("auto", None), ("auto", "bfloat16"), ("bfloat16", "auto")]
+)
+def test_admits_native_mtp_dcp_and_equivalent_bf16(tmp_path, tp, target_kv, draft_kv):
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import dcp_scope_problems
+
+    config = _mtp_dcp_engine_config(
+        tmp_path, tp=tp, dcp=tp, kv_cache_dtype=target_kv,
+        spec={"kv_cache_dtype": draft_kv},
+    )
+    assert dcp_scope_problems(config, transfers=False) == []
+    assert dcp_scope_problems(config, transfers=True) == ["speculative decoding"]
+    assert config.speculative_config.draft_model_config.architectures == [
+        "DeepSeekMTPModel"
+    ]
+    assert config.model_config.quantization == "fp8"
+    assert config.num_lookahead_tokens == 1
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize(
+    "options,spec,reason",
+    [
+        (
+            {"enable_prefix_caching": True},
+            {},
+            "prefix caching with speculative decoding",
+        ),
+        ({"tp": 4, "dcp": 2}, {}, "requires TP2/DCP2 or TP4/DCP4"),
+        ({"block_size": 32}, {}, "requires interleave 1 and 16-token pages"),
+        ({"cp_kv_cache_interleave_size": 2}, {}, "requires interleave 1"),
+        ({"dcp_kv_cache_interleave_size": 2}, {}, "requires interleave 1"),
+        (
+            {"kv_offloading_size": 1},
+            {},
+            "KV offloading with speculative decoding and DCP",
+        ),
+        ({"kv_cache_dtype": "fp8"}, {}, "requires published FP8 weights and BF16"),
+        ({"dtype": "float16"}, {}, "requires published FP8 weights and BF16"),
+        ({}, {"kv_cache_dtype": "fp8"}, "requires published FP8 weights and BF16"),
+        ({}, {"draft_tensor_parallel_size": 1}, "draft tensor parallelism 1"),
+        ({}, {"num_speculative_tokens": 2}, "2 speculative tokens with DCP"),
+        (
+            {"simulation_config": {"simulate_forward": True, "timing": "linear"}},
+            {},
+            "speculative decoding with DCP requires timing aisimulate",
+        ),
+        ({"target": "deepseek-ai/DeepSeek-V3.2"}, {}, "requires dense DeepSeek-V3"),
+        (
+            {"target": "Qwen/Qwen3.5-27B", "language_model_only": True},
+            {},
+            "requires dense DeepSeek-V3",
+        ),
+        ({}, {"method": "ngram", "prompt_lookup_max": 3}, "speculative method ngram"),
+    ],
+)
+def test_mtp_dcp_scope_refusals(tmp_path, options, spec, reason):
+    with pytest.raises(ValueError, match=reason):
+        _mtp_dcp_engine_config(tmp_path, spec=spec, **options)
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize(
+    "method,target,reason",
+    [
+        ("eagle3", V3, "speculative method eagle3"),
+        ("draft_model", "Qwen/Qwen3-30B-A3B", "requires dense DeepSeek-V3"),
+        ("mtp", V3, "requires the target checkpoint"),
+        ("mtp", "Qwen/Qwen3-30B-A3B", "requires dense DeepSeek-V3"),
+    ],
+)
+def test_mtp_dcp_drafter_source_and_method(tmp_path, method, target, reason):
+    draft_target = "Qwen/Qwen3-8B" if method in ("eagle3", "draft_model") else V3
+    raw = bundled_config(draft_target)
+    external = model_dir(tmp_path, "external-draft", raw)
+    with pytest.raises(ValueError, match=reason):
+        _mtp_dcp_engine_config(
+            tmp_path,
+            target=target,
+            tp=8 if target != V3 else 2,
+            spec={"method": method, "model": external},
+        )
+
+
+@requires_mtp_dcp
+def test_mtp_dcp_requires_one_native_layer(tmp_path):
+    reason = "target and draft to have one native MTP layer"
+    with pytest.raises(ValueError, match=reason):
+        _mtp_dcp_engine_config(tmp_path, hf_overrides={"num_nextn_predict_layers": 2})
+
+
+@requires_mtp_dcp
+def test_mtp_dcp_refuses_transfer_in_config_and_both_handshake_directions(tmp_path):
+    import msgspec
+
+    from tests.v1.worker.simulated.test_real_kv_transfer import agent_metadata
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        dcp_scope_problems,
+        simulated_dcp_scope,
+        simulated_tp_mismatch,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import dcp_peer_refusal
+
+    def real(role):
+        return {
+            "kv_transfer_config": {
+                "kv_connector": "NixlConnector", "kv_role": role,
+                "kv_buffer_device": "cpu",
+            },
+            "simulation_config": {
+                "simulate_forward": True, "timing": "aisimulate",
+            },
+        }
+
+    with pytest.raises(ValueError, match="not with speculative decoding"):
+        _mtp_dcp_engine_config(tmp_path / "refused", **real("kv_consumer"))
+    source = _mtp_dcp_engine_config(tmp_path / "source", dcp=1, **real("kv_producer"))
+    consumer = _mtp_dcp_engine_config(
+        tmp_path / "consumer", dcp=1, **real("kv_consumer")
+    )
+    assert dcp_scope_problems(source, transfers=True) == ["speculative decoding"]
+    assert simulated_dcp_scope(source) == ["speculative decoding"]
+    assert simulated_tp_mismatch(
+        consumer, 2, 2, nixl_consumer=True, remote_dcp_size=2
+    ) == (
+        "Simulated real KV transfers pair decode context parallelism (local DCP 1, "
+        "remote DCP 2) for a dense MLA model over tensor parallelism alone on both "
+        "sides, TP sizes one dividing the other, without speculative decoding, "
+        "not with speculative decoding."
+    )
+    metadata = agent_metadata(simulated_scope=simulated_dcp_scope(source))
+    metadata = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(metadata), type=type(metadata)
+    )
+    replica = _mtp_dcp_engine_config(
+        tmp_path / "replica", speculative_config=None, **real("kv_consumer")
+    )
+    assert dcp_peer_refusal(replica, 2, (16, 1), 1, metadata) == (
+        "Simulated real KV transfers pair decode context parallelism (local DCP 2, "
+        "remote DCP 1) for a dense MLA model over tensor parallelism alone on both "
+        "sides, TP sizes one dividing the other, without speculative decoding, "
+        "not with the peer's speculative decoding."
+    )
+    assert dcp_peer_refusal(consumer, 1, (16, 1), 1, metadata) is None
+
+    # The real-KV wrapper still compares raw cache settings at DCP1.
+    with pytest.raises(ValueError, match="draft KV cache dtype bfloat16"):
+        _mtp_dcp_engine_config(
+            tmp_path / "raw-dtype", dcp=1,
+            spec={"kv_cache_dtype": "bfloat16"}, **real("kv_producer"),
+        )
+    for prefix in (True, False):
+        no_spec = _mtp_dcp_engine_config(
+            tmp_path / f"prefix-{prefix}", speculative_config=None,
+            enable_prefix_caching=prefix, **real("kv_consumer"),
+        )
+        assert simulated_dcp_scope(no_spec) == []
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize(
+    "opts,timing_opts,env,reason",
+    [
+        ({}, {"gpu": "h100"}, None, "requires the published DeepSeek-V3 H200 profile"),
+        ({}, {"backend_version": "0.23.0"}, None, "requires vLLM 0.24.0 timing tables"),
+        (
+            {},
+            {"quant_modes": {"gemm_quant_mode": "bfloat16"}},
+            None,
+            "block-FP8 timing",
+        ),
+        (
+            {"hf_overrides": {"num_experts_per_tok": 4}},
+            {}, None, "published DeepSeek-V3 compute and weight geometry",
+        ),
+        (
+            {"attention_config": {"backend": "TRITON_MLA"}},
+            {}, None, "requires the default attention and MoE selection",
+        ),
+        ({"dcp_comm_backend": "a2a"}, {}, None, "dcp_comm_backend a2a"),
+        ({"dcp_q_replicate": True}, {}, None, "dcp_q_replicate"),
+        (
+            {"dcp_q_replicate": False}, {}, "1",
+            "dcp_q_replicate from VLLM_DCP_Q_REPLICATE",
+        ),
+    ],
+)
+def test_mtp_dcp_refuses_other_timing_profiles(
+    tmp_path, monkeypatch, opts, timing_opts, env, reason
+):
+    monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
+    if env is not None:
+        monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", env)
+    config = _mtp_dcp_engine_config(tmp_path, **opts)
+    with pytest.raises(ValueError, match=reason):
+        provider(config, **({"gpu": "h200", "target_model": V3} | timing_opts))
+
+
+def _mtp_dcp_direct_sdk(tp, dcp):
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    return RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model="deepseek-ai/DeepSeek-V3",
+            system="h200_sxm",
+            backend="vllm",
+            backend_version="0.24.0",
+            worker_type="aggregated",
+            tp=tp,
+            pp=1,
+            attention_dp=1,
+            dcp=None if dcp == 1 else dcp,
+            cp_size=1,
+            moe_tp_size=tp,
+            moe_ep_size=1,
+            nextn=1,
+            gemm_quant_mode="fp8_block",
+            moe_quant_mode="fp8_block",
+            fmha_quant_mode="bfloat16",
+            kvcache_quant_mode="bfloat16",
+            comm_quant_mode="half",
+            estimation_mode="op_level",
+            database_mode="SILICON",
+            fallback_policy="deny",
+        )
+    )
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize("tp,dcp", [(2, 1), (2, 2), (4, 1), (4, 4)])
+def test_mtp_dcp_passes_global_full_width_metrics_to_sdk(
+    tmp_path, monkeypatch, tp, dcp
+):
+    monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", "0")
+    config = _mtp_dcp_engine_config(
+        tmp_path, tp=tp, dcp=dcp, dcp_q_replicate=dcp > 1,
+        spec={"kv_cache_dtype": "bfloat16"} if dcp > 1 else {},
+    )
+    timed = provider(config, gpu="h200", target_model=V3)
+    record = timed.assumptions()["aisimulate"]
+    resolved = record["resolved_config"]
+    assert (record["source"], record["readiness"]) == ("aic", "ready")
+    assert record["target_quantization"] == "fp8_block"
+    assert (resolved["tp"], resolved["dcp"], resolved["nextn"]) == (
+        tp, dcp if dcp > 1 else None, 1
+    )
+    assert resolved["backend_version"] == "0.24.0"
+    assert resolved["estimation_mode"] == "op_level"
+    assert record["speculation"] == {
+        "method": "mtp", "num_speculative_tokens": 1, "verify_width": 2,
+        "draft_architectures": ["DeepSeekMTPModel"],
+    }
+    if dcp > 1:
+        assert record["decode_context_parallel"] == {
+            "size": dcp, "comm_backend": "ag_rs", "q_replicate": False,
+            "kv_cache_format": "bfloat16", "interleave": 1,
+            "sdk_backend_version": "0.24.0",
+        }
+        probe = next(p for p in record["startup_probes"] if p["kind"] == "decode")
+        assert probe["metrics"]["scheduled_requests"]["extend_lengths"] == [2] * 4
+    else:
+        assert record["decode_context_parallel"] is None
+    assert "acceptance does not enter the cost" in record["approximations"]
+
+    # Independently specify global lengths, including the cached prefill.
+    sdk = _mtp_dcp_direct_sdk(tp, dcp)
+    requests = [
+        dataclasses.replace(sim_req("d1", 2, 1025, 1025), num_spec_tokens=1),
+        dataclasses.replace(sim_req("d2", 2, 1041, 1041), num_spec_tokens=1),
+    ]
+    metrics = {
+        "num_prefill_requests": 0, "sum_prefill_tokens": 0, "var_prefill_length": 0,
+        "sum_prefill_kv_tokens": 0, "num_decode_requests": 2,
+        "sum_decode_kv_tokens": 2066, "var_decode_kv_tokens": 64,
+        "extend_lengths": [2, 2], "past_kv_lengths": [1025, 1041],
+    }
+    for has_prefill in (False, True):
+        step = sim_step(0, *requests)
+        if has_prefill:
+            step = sim_step(1, sim_req("p", 256, 513, 1024), *requests)
+            metrics = metrics | {
+                "num_prefill_requests": 1, "sum_prefill_tokens": 256,
+                "sum_prefill_kv_tokens": 513,
+                "extend_lengths": [256, 2, 2], "past_kv_lengths": [513, 1025, 1041],
+            }
+        ms = sdk.estimate_forward_pass_time_ms({"scheduled_requests": metrics})
+        assert ms > 0
+        cost = timed.estimate(step)
+        assert cost.device_s * 1000 == pytest.approx(ms, rel=1e-9)
+        assert cost.breakdown["spec_draft_tokens"] == 2
+        assert cost.breakdown["spec_requests_below_width"] == 0
+
+
+@requires_mtp_dcp
+def test_mtp_dcp_refuses_another_sdk_target(tmp_path):
+    config = _mtp_dcp_engine_config(tmp_path)
+    reason = "requires the published DeepSeek-V3 H200 profile"
+    with pytest.raises(ValueError, match=reason):
+        provider(config, gpu="h200", target_model="deepseek-ai/DeepSeek-V3.2")

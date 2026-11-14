@@ -172,8 +172,9 @@ class SimulationConfig:
         """Decode context parallelism on CPU over tensor parallelism alone.
         Dense MLA can run in one instance or with real NIXL pull transfers,
         prefix caching on or off; the handshake checks the peer's DCP. Sparse MLA
-        and qualified GQA require AISimulate and one instance. A simulated
-        forward does not run attention kernels."""
+        and qualified GQA require AISimulate and one instance. The same
+        restriction applies to qualified DeepSeek-V3 MTP at depth 1.
+        A simulated forward does not run attention kernels."""
         from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
             dcp_scope_problems,
         )
@@ -190,21 +191,22 @@ class SimulationConfig:
                 f"{parallel.decode_context_parallel_size}) over tensor parallelism "
                 "alone: dense MLA in one instance or with real NixlConnector "
                 "pull transfers; sparse MLA and qualified GQA only in one "
-                f"instance with AISimulate, not with {', '.join(problems)}."
+                "instance with AISimulate; with speculative decoding, only "
+                "standalone DeepSeek-V3 MTP at depth 1, not with "
+                f"{', '.join(problems)}."
             )
 
     @staticmethod
-    def _real_kv_mtp_problems(vllm_config: "VllmConfig") -> list[str]:
-        """Speculative decoding moves its draft's KV with the target's only as
-        a model's native single-module MTP (`REAL_KV_MTP_DRAFTS`): the
-        checkpoint's one MTP layer, at the target's parallelism and
-        precision; over NIXL, whose handshake checks the instances' transfer
-        compatibility, the draft among it, or over Mooncake for
-        `REAL_KV_MTP_MOONCAKE` (no such check: the instances' configs must
-        match)."""
+    def _native_mtp_mismatches(
+        vllm_config: "VllmConfig", *, effective_kv: bool = False
+    ) -> list[str]:
+        """Check native single-module MTP before connector-specific checks.
+
+        Standalone DCP checks effective KV precision separately; real KV
+        transfers retain their exact cache dtype setting checks.
+        """
         spec = vllm_config.speculative_config
         model = vllm_config.model_config
-        kv_transfer = vllm_config.kv_transfer_config
         k = spec.num_speculative_tokens
         draft = REAL_KV_MTP_DRAFTS.get(getattr(model.hf_config, "model_type", None))
         architectures = list(
@@ -235,12 +237,28 @@ class SimulationConfig:
             )
         if spec.quantization not in (None, model.quantization):
             mismatches.append(f"draft quantization {spec.quantization}")
-        if spec.kv_cache_dtype not in (None, vllm_config.cache_config.cache_dtype):
+        if not effective_kv and spec.kv_cache_dtype not in (
+            None, vllm_config.cache_config.cache_dtype
+        ):
             mismatches.append(f"draft KV cache dtype {spec.kv_cache_dtype}")
         if getattr(spec, "draft_lm_head_quantization", None) is not None:
             mismatches.append(
                 f"draft LM head quantization {spec.draft_lm_head_quantization}"
             )
+        return mismatches
+
+    @staticmethod
+    def _real_kv_mtp_problems(vllm_config: "VllmConfig") -> list[str]:
+        """Speculative decoding moves its draft's KV with the target's only as
+        a model's native single-module MTP (`REAL_KV_MTP_DRAFTS`): the
+        checkpoint's one MTP layer, at the target's parallelism and
+        precision; over NIXL, whose handshake checks the instances' transfer
+        compatibility, the draft among it, or over Mooncake for
+        `REAL_KV_MTP_MOONCAKE` (no such check: the instances' configs must
+        match)."""
+        model = vllm_config.model_config
+        kv_transfer = vllm_config.kv_transfer_config
+        mismatches = SimulationConfig._native_mtp_mismatches(vllm_config)
         model_type = getattr(model.hf_config, "model_type", None)
         if kv_transfer.kv_connector not in NIXL_CONNECTORS and not (
             kv_transfer.kv_connector == "MooncakeConnector"

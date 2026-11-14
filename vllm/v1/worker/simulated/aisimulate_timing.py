@@ -51,6 +51,8 @@ TENSOR_PARALLEL_SIZES = (1, 2, 4, 8)
 MAX_LOCAL_GPUS = 8
 GQA_DCP_TARGET = "Qwen/Qwen3-30B-A3B"
 GQA_DCP_TABLE_VERSION = "0.24.0"
+MTP_DCP_TARGET = "deepseek-ai/DeepSeek-V3"
+MTP_DCP_TABLE_VERSION = "0.24.0"
 GQA_DCP_PREFIX_APPROXIMATION = (
     "AISimulate models cached-context prefill with a KV gather; native "
     "FlashAttention gathers Q and merges partial cached attention outputs"
@@ -463,7 +465,7 @@ def _compress_ratios(config: Any) -> list[int]:
 
 
 def _probe_request(
-    scheduled: int, computed: int, prompt: int, prefill: bool
+    scheduled: int, computed: int, prompt: int, prefill: bool, *, drafts: int = 0
 ) -> SimRequestStep:
     return SimRequestStep(
         req_id="probe",
@@ -471,7 +473,7 @@ def _probe_request(
         num_computed_tokens=computed,
         num_prompt_tokens=prompt,
         num_cached_tokens=0,
-        num_spec_tokens=0,
+        num_spec_tokens=drafts,
         is_prefill=prefill,
     )
 
@@ -584,6 +586,15 @@ class AisimulateTimingProvider:
             )
         with open(bundled) as f:
             target_config = json.load(f)
+        mtp_dcp = (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+            and vllm_config.speculative_config is not None
+        )
+
+        if mtp_dcp and (target != MTP_DCP_TARGET or system != "h200_sxm"):
+            raise ValueError(
+                "MTP with DCP requires the published DeepSeek-V3 H200 profile."
+            )
         geometry = self._check_geometry(vllm_config, target_config, target)
 
         # One snapshot for the provider's lifetime: quant inference and the
@@ -667,11 +678,28 @@ class AisimulateTimingProvider:
             backend_version=backend_version,
             quant_overridden=bool(quant_modes) or quant is not None,
         )
+        if mtp_dcp:
+            self._qualify_mtp_dcp(
+                vllm_config,
+                target_config,
+                backend_version=backend_version,
+                quant=quant,
+                quant_overridden=bool(quant_modes) or online is not None,
+            )
+            backend_version = MTP_DCP_TABLE_VERSION
+            assert dcp is not None
+            dcp.update(
+                kv_cache_format=kv_format,
+                interleave=vllm_config.parallel_config.cp_kv_cache_interleave_size,
+                sdk_backend_version=backend_version,
+            )
         gqa_dcp = dcp is not None and "native_attention_backend" in dcp
         if gqa_dcp:
             backend_version = GQA_DCP_TABLE_VERSION
 
-        nextn, speculation = self._speculation(vllm_config, target_config, topology)
+        nextn, speculation = self._speculation(
+            vllm_config, target_config, topology, qualified_mtp_dcp=mtp_dcp
+        )
 
         kv_role = getattr(vllm_config.kv_transfer_config, "kv_role", None)
         worker_type = {"kv_producer": "prefill", "kv_consumer": "decode"}.get(
@@ -728,7 +756,33 @@ class AisimulateTimingProvider:
                 "GQA DCP requires the default AISimulate attention selector "
                 f"with vLLM {GQA_DCP_TABLE_VERSION} timing tables."
             )
-        probes = self._startup_probes(target, system, topology)
+        if mtp_dcp:
+            fields = (
+                "system",
+                "backend",
+                "backend_version",
+                "worker_type",
+                "tp",
+                "moe_tp_size",
+                "moe_ep_size",
+                "dcp",
+                "nextn",
+                "gemm_quant_mode",
+                "moe_quant_mode",
+                "fmha_quant_mode",
+                "kvcache_quant_mode",
+            )
+            if resolved.get("attention_backend") not in (None, "default") or any(
+                resolved.get(name) != self.config[name] for name in fields
+            ):
+                raise ValueError(
+                    "MTP with DCP requires the qualified AISimulate precision, "
+                    "DCP and depth with the default attention selector and "
+                    f"vLLM {MTP_DCP_TABLE_VERSION} timing tables."
+                )
+        probes = self._startup_probes(
+            target, system, topology, decode_width=nextn + 1 if mtp_dcp else 1
+        )
         try:
             version = importlib.metadata.version("aisimulate")
         except importlib.metadata.PackageNotFoundError:
@@ -824,6 +878,86 @@ class AisimulateTimingProvider:
             "vLLM resolves it alone, not with a quantization_config of its own "
             f"(ignored layers, targets or other precisions): {resolved}."
         )
+
+    @staticmethod
+    def _qualify_mtp_dcp(
+        vllm_config: "VllmConfig",
+        target_config: dict[str, Any],
+        *,
+        backend_version: str | None,
+        quant: str | None,
+        quant_overridden: bool,
+    ) -> None:
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+            dcp_scope_problems,
+        )
+        from vllm.platforms import current_platform
+
+        if not (
+            current_platform.is_cpu() and vllm_config.simulation_config.simulate_forward
+        ):
+            raise ValueError("MTP with DCP requires standalone CPU simulation.")
+        if problems := dcp_scope_problems(
+            vllm_config, transfers=vllm_config.kv_transfer_config is not None
+        ):
+            raise ValueError(f"MTP with DCP does not time {', '.join(problems)}.")
+        if backend_version not in (None, MTP_DCP_TABLE_VERSION):
+            raise ValueError(
+                f"MTP with DCP requires vLLM {MTP_DCP_TABLE_VERSION} timing tables."
+            )
+        if quant_overridden or quant != "fp8_block":
+            raise ValueError("MTP with DCP requires published block-FP8 timing modes.")
+        ac = vllm_config.attention_config
+        if (
+            ac.backend is not None
+            or ac.backend_per_kind
+            or ac.mla_prefill_backend is not None
+            or ac.flash_attn_version is not None
+            or ac.use_non_causal
+            or ac.use_prefill_query_quantization
+            or vllm_config.kernel_config.moe_backend != "auto"
+        ):
+            raise ValueError(
+                "MTP with DCP requires the default attention and MoE selection."
+            )
+
+        model = vllm_config.model_config
+        spec = vllm_config.speculative_config
+        assert spec is not None and spec.draft_model_config is not None
+        fields = MLA_FIELDS + (
+            "hidden_size",
+            "intermediate_size",
+            "moe_intermediate_size",
+            "n_routed_experts",
+            "n_shared_experts",
+            "num_experts_per_tok",
+            "first_k_dense_replace",
+            "moe_layer_freq",
+            "q_lora_rank",
+            "vocab_size",
+            "tie_word_embeddings",
+            "n_group",
+            "topk_group",
+            "topk_method",
+            "scoring_func",
+            "norm_topk_prob",
+            "num_nextn_predict_layers",
+            "quantization_config",
+        )
+        local = model.hf_text_config
+        draft = spec.draft_model_config.hf_text_config
+        published = type(local).from_dict(target_config)
+        changes = [
+            name
+            for name in fields
+            if _resolved(local, name) != _resolved(published, name)
+            or _resolved(draft, name) != _resolved(published, name)
+        ]
+        if changes:
+            raise ValueError(
+                "MTP with DCP requires the published DeepSeek-V3 compute and "
+                f"weight geometry; local target or draft changes {', '.join(changes)}."
+            )
 
     @staticmethod
     def _decode_context_parallel(
@@ -1033,7 +1167,11 @@ class AisimulateTimingProvider:
 
     @staticmethod
     def _speculation(
-        vllm_config: "VllmConfig", target_config: dict[str, Any], topology: dict
+        vllm_config: "VllmConfig",
+        target_config: dict[str, Any],
+        topology: dict,
+        *,
+        qualified_mtp_dcp: bool = False,
     ) -> tuple[int, dict[str, Any] | None]:
         """AISimulate's MTP depth for the speculative configuration: DeepSeek-V3's,
         DeepSeek-V4's or Qwen3.5's native single-module MTP (its own
@@ -1091,7 +1229,11 @@ class AisimulateTimingProvider:
             problems.append(f"draft quantization {spec.quantization}")
         # The draft's own precision choices: its KV cache (None inherits the
         # target's) and its copy of the target's LM head.
-        if spec.kv_cache_dtype not in (None, vllm_config.cache_config.cache_dtype):
+        # The standalone DCP qualifier has already checked effective BF16.
+        if (
+            not qualified_mtp_dcp
+            and spec.kv_cache_dtype not in (None, vllm_config.cache_config.cache_dtype)
+        ):
             problems.append(f"draft KV cache dtype {spec.kv_cache_dtype}")
         if getattr(spec, "draft_lm_head_quantization", None) is not None:
             problems.append(
@@ -1263,7 +1405,7 @@ class AisimulateTimingProvider:
         return dtype, mode
 
     def _startup_probes(
-        self, target: str, system: str, topology: dict[str, Any]
+        self, target: str, system: str, topology: dict[str, Any], *, decode_width: int
     ) -> list[dict[str, Any]]:
         """A prefill and a decode step at startup, on rank 0 (the others
         idle): readiness alone does not show the estimator has data for the
@@ -1271,7 +1413,14 @@ class AisimulateTimingProvider:
         probes = []
         for kind, requests in (
             ("prefill", [_probe_request(1024, 0, 1024, True)]),
-            ("decode", [_probe_request(1, 1024, 1024, False)] * 4),
+            (
+                "decode",
+                [
+                    _probe_request(
+                        decode_width, 1024, 1024, False, drafts=decode_width - 1
+                    )
+                ] * 4,
+            ),
         ):
             metrics = [rank_metrics(requests)] + [
                 rank_metrics([]) for _ in range(self.num_ranks - 1)

@@ -161,6 +161,16 @@ estimates in the qualified queries. GQA DCP with KV transfers, compressed
 MLA, hybrids, and pipeline, prefill context, data and expert parallelism
 are outside this scope.
 
+With DCP greater than one, speculative decoding is limited to standalone
+CPU simulation of the published DeepSeek-V3 with native single-module MTP
+at depth 1, TP2/DCP2 or TP4/DCP4, 16-token pages and interleave 1. This
+profile uses H200 AISimulate vLLM 0.24.0 tables, the published block-FP8
+weights, BF16 model and KV, and the same merge and Q replication settings.
+Prefix caching, KV offloading, and KV transfers are outside this combined
+scope. The single draft layer's sharded KV belongs to the target's cache
+group and shares its scheduler block span. Its cache contributes to the
+engine's virtual memory plan even though the timing model omits draft KV.
+
 Speculative decoding is timed for the native single-module MTP of
 DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 only (`method: mtp`, the checkpoint's one MTP layer,
 1 to 5 tokens, the draft at the target's parallelism and precision), as

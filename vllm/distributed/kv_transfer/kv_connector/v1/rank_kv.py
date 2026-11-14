@@ -177,15 +177,109 @@ def gqa_dcp_model(model) -> bool:
     )
 
 
+def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
+    """Qualify the local model and layout before building an AISimulate profile."""
+    from vllm.config.simulation import SimulationConfig
+
+    sim = vllm_config.simulation_config
+    cache = vllm_config.cache_config
+    parallel = vllm_config.parallel_config
+    model = vllm_config.model_config
+    spec = vllm_config.speculative_config
+    assert spec is not None
+    problems = []
+    if vllm_config.kv_transfer_config is not None:
+        problems.append("KV transfers with speculative decoding and DCP")
+    if cache.kv_offloading_size is not None:
+        problems.append("KV offloading with speculative decoding and DCP")
+    if cache.enable_prefix_caching:
+        problems.append("prefix caching with speculative decoding")
+    if sim.timing != "aisimulate":
+        problems.append("speculative decoding with DCP requires timing aisimulate")
+    if (
+        parallel.tensor_parallel_size,
+        parallel.decode_context_parallel_size,
+    ) not in ((2, 2), (4, 4)):
+        problems.append("MTP with DCP requires TP2/DCP2 or TP4/DCP4")
+    if parallel.nnodes != 1:
+        problems.append("MTP with DCP requires one node")
+    if (
+        parallel.cp_kv_cache_interleave_size != 1
+        or parallel.dcp_kv_cache_interleave_size != 1
+        or cache.block_size != 16
+    ):
+        problems.append("MTP with DCP requires interleave 1 and 16-token pages")
+    if (
+        model.hf_config.model_type != "deepseek_v3"
+        or model.architectures != ["DeepseekV3ForCausalLM"]
+        or not plain_mla(model)
+    ):
+        return problems + ["speculative decoding with DCP requires dense DeepSeek-V3"]
+    if spec.method != "mtp":
+        return problems + [f"speculative method {spec.method} (requires mtp)"]
+    if spec.num_speculative_tokens != 1:
+        problems.append(
+            f"{spec.num_speculative_tokens} speculative tokens with DCP (requires 1)"
+        )
+    if spec.uses_dynamic_speculative_decoding() or spec.enable_adaptive_verification:
+        problems.append("dynamic or adaptive speculative decoding with DCP")
+    if spec.model != model.model:
+        problems.append(
+            f"draft checkpoint {spec.model} (requires the target checkpoint)"
+        )
+    draft = spec.draft_model_config
+    draft_text = getattr(draft, "hf_text_config", None)
+    if (
+        getattr(model.hf_text_config, "num_nextn_predict_layers", None) != 1
+        or getattr(draft_text, "num_nextn_predict_layers", None) != 1
+    ):
+        problems.append(
+            "DCP requires the target and draft to have one native MTP layer"
+        )
+
+    problems.extend(
+        SimulationConfig._native_mtp_mismatches(vllm_config, effective_kv=True)
+    )
+    draft_tp = getattr(spec.draft_parallel_config, "tensor_parallel_size", None)
+    if (
+        getattr(getattr(draft, "hf_config", None), "model_type", None) != "deepseek_mtp"
+        or draft_tp != parallel.tensor_parallel_size
+    ):
+        problems.append("MTP with DCP requires DeepSeekMTPModel at the target's TP")
+    if (
+        spec.kv_cache_dtype not in (None, "auto", "bfloat16")
+        or cache.cache_dtype not in ("auto", "bfloat16")
+        or str(model.dtype) != "torch.bfloat16"
+        or str(getattr(draft, "dtype", None)) != "torch.bfloat16"
+        or model.quantization != "fp8"
+        or getattr(draft, "quantization", None) != "fp8"
+        or model.quantization_config is not None
+        or getattr(draft, "quantization_config", None) is not None
+    ):
+        problems.append(
+            "MTP with DCP requires published FP8 weights and BF16 model and KV dtype"
+        )
+    if (
+        spec.attention_backend is not None
+        or spec.moe_backend not in (None, "auto")
+        or spec.parallel_drafting
+        or spec.revision not in (None, model.revision)
+        or spec.code_revision not in (None, model.code_revision)
+    ):
+        problems.append("draft kernel, parallel drafting or revision override with DCP")
+    return problems
+
+
 def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]:
     """What of an instance's configuration falls outside the scope of decode
     context parallelism under simulated compute, either endpoint's when its
     KV moves (`transfers`): dense MLA, or sparse MLA or GQA with AISimulate in
     one instance. All use tensor parallelism alone (no pipeline, prefill
-    context or data parallelism, no expert parallelism) and no speculative
-    decoding. Prefix caching is admitted with transfers too (its byte checks
-    need the same setting on both endpoints: their pages' patterns are
-    content-seeded exactly when it is on)."""
+    context or data parallelism, no expert parallelism). Speculation is
+    limited to qualified standalone DeepSeek-V3 MTP. Prefix caching is
+    admitted with transfers too (its byte checks need the same setting on
+    both endpoints: their pages' patterns are content-seeded exactly when
+    it is on)."""
     parallel = vllm_config.parallel_config
     problems = []
     model = vllm_config.model_config
@@ -218,7 +312,10 @@ def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]
     if parallel.enable_expert_parallel:
         problems.append("expert parallelism")
     if vllm_config.speculative_config is not None:
-        problems.append("speculative decoding")
+        if transfers or vllm_config.kv_transfer_config is not None:
+            problems.append("speculative decoding")
+        else:
+            problems.extend(standalone_mtp_dcp_problems(vllm_config))
     return problems
 
 
