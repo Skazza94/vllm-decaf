@@ -68,6 +68,10 @@ class CPUAttentionBackend(AttentionBackend):
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         config = get_current_vllm_config_or_none()
         if config is not None and config.simulation_config.simulate_forward:
+            from vllm.v1.worker.simulated.kernel_geometry import declared_rule
+
+            if (rule := declared_rule(config, kv_cache_spec)) is not None:
+                return list(rule.sizes)
             # Simulated steps never run these kernels: the KV cache only holds
             # blocks, as large as a GPU's (FlashAttention: multiples of 16).
             return [MultipleOf(_SIMULATED_BLOCK_MULTIPLE)]

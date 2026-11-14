@@ -212,6 +212,91 @@ class CheckTests(unittest.TestCase):
         unset = pd.Run(**{**RUN.__dict__, "server": pd.Server(block_size=None)})
         self.assertNotIn("--block-size", pd.server_command(unset, "prefill", ["10.100.0.1"]))
 
+    def test_a_side_may_ask_its_own_block_size_over_nixl(self) -> None:
+        def load(server: dict, **sides) -> pd.Run:
+            base = {"name": "t", "topology": "t", "model": "org/name", "client": "c",
+                    "control_network": "control", "router": {"gateway": "gw"},
+                    "prefill": {"node": "p", "kv_network": "data0"},
+                    "decode": {"node": "d", "kv_network": "data0"}}
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "run.yaml"
+                path.write_text(json.dumps({**base, **sides, "server": {"timing": "zero", **server}}))
+                return pd.load(path)
+
+        def block(run: pd.Run, role: str) -> str | None:
+            command = pd.server_command(run, role, ["10.100.0.1"])
+            return command[command.index("--block-size") + 1] if "--block-size" in command else None
+
+        # Each side's own, as the hybrid pair whose sizes resolve to another
+        # ratio needs them; a side without one inherits the server's.
+        nixl = {"connector": "nixl", "block_size": 16}
+        own = load(nixl, prefill={"node": "p", "kv_network": "data0", "block_size": 800},
+                   decode={"node": "d", "kv_network": "data0", "block_size": 1600})
+        self.assertEqual((block(own, "prefill"), block(own, "decode")), ("800", "1600"))
+        inherit = load({"connector": "nixl", "block_size": 544},
+                       prefill={"node": "p", "kv_network": "data0", "block_size": 544})
+        self.assertEqual((block(inherit, "prefill"), block(inherit, "decode")), ("544", "544"))
+        platform = load({"connector": "nixl", "block_size": None})
+        self.assertEqual((block(platform, "prefill"), block(platform, "decode")), (None, None))
+
+    def test_a_side_block_size_is_bounded(self) -> None:
+        def load(server: dict, prefill: dict, decode: dict, router: dict | None = None) -> pd.Run:
+            base = {"name": "t", "topology": "t", "model": "org/name", "client": "c",
+                    "control_network": "control", "router": {"gateway": "gw", **(router or {})},
+                    "prefill": {"node": "p", "kv_network": "data0", **prefill},
+                    "decode": {"node": "d", "kv_network": "data0", **decode},
+                    "server": {"timing": "zero", **server}}
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "run.yaml"
+                path.write_text(json.dumps(base))
+                return pd.load(path)
+
+        nixl = {"connector": "nixl", "block_size": 544}
+        for bad in (0, -1, True, "544"):
+            with self.assertRaisesRegex(ValueError, "block_size is a positive integer"):
+                load(nixl, {"block_size": bad}, {})
+        # Mooncake's write-task estimate uses the server's size: a side may
+        # not change it, alone or with both sides equal to another value.
+        for sides in ({"block_size": 1088}, {}):
+            with self.assertRaisesRegex(ValueError, "per-side sizes need server.connector: nixl"):
+                load({"block_size": 544}, {"block_size": 1088}, sides)
+        load({"block_size": 544}, {"block_size": 544}, {"block_size": 544})
+        load(nixl, {"block_size": 1088}, {"block_size": 1088})
+        # The precise prefix index is built from server.block_size: sides
+        # must equal it, and it must be set.
+        router = {"prefix_index": "precise", "epp_verbosity": 5}
+        precise = {"connector": "nixl", "enable_prefix_caching": True}
+        with self.assertRaisesRegex(ValueError, "precise builds the index from server.block_size"):
+            load({**precise, "block_size": 16}, {"block_size": 64}, {"block_size": 64}, router)
+        with self.assertRaisesRegex(ValueError, "precise needs server.block_size"):
+            load({**precise, "block_size": None}, {"block_size": 16}, {"block_size": 16}, router)
+        load({**precise, "block_size": 64}, {}, {}, router)
+
+    def test_a_side_may_declare_its_kernel_backend(self) -> None:
+        def load(server: dict, prefill: dict) -> pd.Run:
+            base = {"name": "t", "topology": "t", "model": "org/name", "client": "c",
+                    "control_network": "control", "router": {"gateway": "gw"},
+                    "prefill": {"node": "p", "kv_network": "data0", **prefill},
+                    "decode": {"node": "d", "kv_network": "data0"},
+                    "server": {"timing": "aisimulate", "gpu": "h100", **server}}
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "run.yaml"
+                path.write_text(json.dumps(base))
+                return pd.load(path)
+
+        def simulation(run: pd.Run, role: str) -> dict:
+            command = pd.server_command(run, role, ["10.100.0.1"])
+            return json.loads(command[command.index("--simulation-config") + 1])
+
+        run = load({"connector": "nixl"}, {"kv_kernel_backend": "FLASHINFER"})
+        self.assertEqual(simulation(run, "prefill")["kv_kernel_backend"], "FLASHINFER")
+        self.assertNotIn("kv_kernel_backend", simulation(run, "decode"))
+        for server, backend in (({"connector": "mooncake"}, "FLASHINFER"),
+                                ({"connector": "nixl", "timing": "zero"}, "FLASHINFER"),
+                                ({"connector": "nixl"}, 1)):
+            with self.assertRaisesRegex(ValueError, "kv_kernel_backend needs a backend name, NIXL and AISimulate"):
+                load(server, {"kv_kernel_backend": backend})
+
     def test_prefix_caching_is_off_for_byte_checks_and_settable(self) -> None:
         def flags(kv_check: bool, enabled: bool | None) -> list[str]:
             run = pd.Run(**{**RUN.__dict__, "kv_check": kv_check,

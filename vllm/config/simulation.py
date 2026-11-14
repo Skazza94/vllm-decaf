@@ -65,6 +65,9 @@ class SimulationConfig:
     timing_args: dict[str, Any] = Field(default_factory=dict)
     """Keyword arguments of the timing provider."""
 
+    kv_kernel_backend: str | None = None
+    """A built-in GPU attention backend whose kernel block sizes to model on CPU."""
+
     clock: Literal["real", "virtual", "fast_forward"] = "real"
     """`real`: steps take their time on the wall clock. `fast_forward`: waits
     are skipped. `virtual`: waits are skipped and only predicted host time
@@ -134,6 +137,22 @@ class SimulationConfig:
                 "kv_pattern_fill and kv_pattern_check need simulate_forward and a "
                 "kv_transfer_config: they check real KV transfers."
             )
+        if self.kv_kernel_backend is not None:
+            transfer = vllm_config.kv_transfer_config
+            if (
+                not self.simulate_forward
+                or not current_platform.is_cpu()
+                or transfer is None
+                or transfer.kv_connector != "NixlConnector"
+                or self.timing != "aisimulate"
+            ):
+                raise ValueError(
+                    "kv_kernel_backend needs CPU simulated forward, "
+                    "NixlConnector (pull) and timing aisimulate."
+                )
+            from vllm.v1.worker.simulated.kernel_geometry import declared_rule
+
+            declared_rule(vllm_config)
         if not self.simulate_forward:
             return
 

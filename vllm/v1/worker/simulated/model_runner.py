@@ -64,6 +64,7 @@ from vllm.v1.worker.simulated.kv_transfer import (
     kv_layout,
     layer_specs,
     packed_pages,
+    observe_nixl_registration,
     prefill_backoff,
     refuse_foreign_state_geometry,
     validate_state_peer,
@@ -330,7 +331,9 @@ class SimulatedModelRunner(GPUModelRunner):
         # a group's layers, moved with it): what the native worker selects,
         # read once it registered the caches (below).
         native = (
-            self.model_config.is_hybrid or len(groups) > 1
+            self.model_config.is_hybrid
+            or len(groups) > 1
+            or (sim.kv_kernel_backend is not None and not self.model_config.use_mla)
         ) and self.vllm_config.kv_transfer_config.kv_connector in NIXL_CONNECTORS
         # With prefix caching, a block may hold another request's KV: its
         # pattern is its content's (each group's block size keys it).
@@ -362,9 +365,18 @@ class SimulatedModelRunner(GPUModelRunner):
             heads = layer_heads
             # A block's bytes are each layer's page, as the connector moves
             # it (in a packed layout, its real page).
-            pages = packed_pages(kv_caches_dict, layer_specs(groups))
-            views = block_views(kv_caches_dict, self.kv_cache_config.num_blocks, pages)
             if not native:
+                from vllm.v1.kv_cache_interface import group_kernel_blocks
+
+                blocks = self.kv_cache_config.num_blocks
+                pattern_caches = {
+                    name: group_kernel_blocks(cache, blocks)
+                    if cache.shape[0] != blocks and cache.ndim > 1
+                    else cache
+                    for name, cache in kv_caches_dict.items()
+                }
+                pages = packed_pages(pattern_caches, layer_specs(groups))
+                views = block_views(pattern_caches, blocks, pages)
                 if sim.kv_pattern_fill:
                     self._kv_filler = PatternFiller(
                         views,
@@ -403,7 +415,15 @@ class SimulatedModelRunner(GPUModelRunner):
             )
         if native and native_heads is None:
             heads = None
-        connector = super()._make_kv_connector(kv_caches_dict)
+        nixl_worker = getattr(get_kv_transfer_group(), "connector_worker", None)
+        if sim.kv_kernel_backend is not None:
+            registrations, original = observe_nixl_registration(nixl_worker)
+            try:
+                connector = super()._make_kv_connector(kv_caches_dict)
+            finally:
+                nixl_worker.nixl_wrapper.get_reg_descs = original
+        else:
+            connector = super()._make_kv_connector(kv_caches_dict)
         nixl_worker = getattr(get_kv_transfer_group(), "connector_worker", None)
         if (
             self.vllm_config.kv_transfer_config.kv_connector in NIXL_CONNECTORS
@@ -416,6 +436,8 @@ class SimulatedModelRunner(GPUModelRunner):
                 nixl_worker, "_read_blocks"
             ):
                 self._kv_checker.destinations = NixlReadDestinations(nixl_worker)
+                if self.model_config.use_mla and not sparse_mla(self.model_config):
+                    self._kv_checker.watch_prepared_reads(nixl_worker)
         selection = None
         if native:
             # A hybrid's peer must hold its states as this instance does;
@@ -432,6 +454,7 @@ class SimulatedModelRunner(GPUModelRunner):
                 [group.layer_names for group in groups],
                 self.kv_cache_config.transfer_group_ids,
                 state_layout,
+                layer_identity=(len(groups) == 1 and not self.model_config.is_hybrid),
             )
             if sim.kv_pattern_fill:
                 self._kv_filler = NativeFiller(
@@ -452,6 +475,9 @@ class SimulatedModelRunner(GPUModelRunner):
                 len(selection.rows),
             )
         if self.step_log is not None:
+            from vllm.v1.worker.simulated.kernel_geometry import declared_rule
+
+            rule = declared_rule(self.vllm_config)
             layout = kv_layout(
                 kv_caches_dict,
                 self.kv_cache_config.num_blocks,
@@ -460,6 +486,30 @@ class SimulatedModelRunner(GPUModelRunner):
                 groups,
                 registered_block_bytes(),
             )
+            if rule is not None:
+                kernel = nixl_worker.block_size
+                factor = nixl_worker._physical_blocks_per_logical_kv_block
+                layout["kernel_geometry"] = {
+                    "declared_backend": sim.kv_kernel_backend,
+                    "target": sim.timing_args.get("gpu", "h100"),
+                    "rule_source": rule.source,
+                    "rule_sha256": rule.source_sha256,
+                    "registered_backend": nixl_worker.backend_name,
+                    "runtime_backends": [
+                        backend.get_name() for backend in nixl_worker.attn_backends
+                    ],
+                    "logical_tokens": kernel * factor,
+                    "kernel_tokens": kernel,
+                    "kernel_blocks_per_logical": factor,
+                    "registered_region_block_lengths": nixl_worker.block_len_per_layer,
+                    "registered_region_block_counts": nixl_worker.region_num_blocks,
+                    "registered_region_strides": nixl_worker.block_stride_per_layer,
+                    "registered_physical_blocks": nixl_worker.num_blocks,
+                    "registered_logical_blocks": nixl_worker._logical_num_blocks,
+                    "kernel_blocks_by_group": self.kernel_block_sizes,
+                    "allocated_unique_bytes": layout["bytes"],
+                    "registered_bytes": sum(registrations.values()),
+                }
             if selection is not None:
                 # What NIXL moves of each group's block, beside its layers.
                 for entry, transfer in zip(layout["groups"], selection.describe()):

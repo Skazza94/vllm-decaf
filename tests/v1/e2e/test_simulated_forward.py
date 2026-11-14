@@ -1643,3 +1643,429 @@ def test_simulate_forward_cpu_mtp_dcp(tmp_path, monkeypatch, tp):
         print(f"MTP_DCP TP{tp}/DCP{dcp}: {capacity} tokens, {len(checks)} steps,"
               f" {accepted_drafts}/{scheduled_drafts} accepted")
     assert totals[tp] == tp * totals[1]
+
+
+def _round23_native_peer():
+    """Bounded subprocess with real workers; run as a standalone entry point."""
+    import sys
+    import time
+    from pathlib import Path
+
+    from vllm import LLM, SamplingParams
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    role, model, target, spec, dest = sys.argv[1:]
+    options = json.loads(spec)
+    prefill = role == "prefill"
+    directory = Path(dest)
+    output = directory / f"{role}.json"
+    pattern = options.pop("check", True)
+    prompt = options.pop("prompt")
+    name = options.pop("backend")
+    attest_state = options.pop("attest_state", False)
+    corrupt = options.pop("corrupt", False)
+    sim = {
+        "simulate_forward": True,
+        "timing": "aisimulate",
+        "timing_args": {
+            "gpu": "h200" if not target.startswith("nvidia/") else "h100",
+            "target_model": target,
+        },
+        "kv_kernel_backend": name,
+        "log_path": str(directory / f"{role}.steps"),
+    }
+    if pattern:
+        sim["kv_pattern_fill" if prefill else "kv_pattern_check"] = True
+    llm = LLM(
+        model=model,
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        enforce_eager=True,
+        max_model_len=2304 if attest_state or target.startswith("nvidia/") else 512,
+        max_num_batched_tokens=2304 if target.startswith("nvidia/") else 512,
+        max_num_seqs=4,
+        kv_cache_memory_bytes=128 << 20,
+        simulation_config=sim,
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_buffer_device": "cpu",
+            "kv_role": "kv_producer" if prefill else "kv_consumer",
+            "kv_connector_extra_config": {
+                "backends": ["Mooncake"],
+                "kv_lease_duration": 45,
+            },
+        },
+        **options,
+    )
+
+    if attest_state:
+        import dataclasses
+
+        import msgspec
+
+        def state_metadata(worker):
+            connector = get_kv_transfer_group().connector_worker
+            payload = connector.xfer_handshake_metadata
+            return payload.agent_metadata_bytes
+
+        def state_refusal(worker, packed, tp):
+            connector = get_kv_transfer_group().connector_worker
+            meta = msgspec.msgpack.decode(packed, type=NixlAgentMetadata)
+            regions = connector._ssm_region_indices
+            lens = list(meta.block_lens)
+            strides = list(meta.block_strides)
+            for region in regions:
+                lens[region] = strides[region] = 1
+            bad = dataclasses.replace(meta, block_lens=lens, block_strides=strides)
+            try:
+                connector.add_remote_agent(bad, remote_tp_size=tp)
+            except ValueError as exc:
+                return str(exc)
+            return None
+
+        if prefill:
+            data = llm.collective_rpc(state_metadata)
+            (directory / "peer-meta").write_bytes(data[0])
+        else:
+            reasons = llm.collective_rpc(
+                state_refusal, args=((directory / "peer-meta").read_bytes(), 4)
+            )
+            (directory / "state-refusal.json").write_text(json.dumps(reasons))
+
+    token_ids = [5] * prompt
+    if prefill:
+        handoff = {"do_remote_decode": True}
+    else:
+        handoff = json.loads((directory / "prefill.json").read_text())["handoff"]
+    params = SamplingParams(
+        max_tokens=1 if prefill else 2,
+        ignore_eos=True,
+        detokenize=False,
+        extra_args={"kv_transfer_params": handoff},
+    )
+    (response,) = llm.generate(
+        [{"prompt_token_ids": token_ids}], params, use_tqdm=False
+    )
+    value = {
+        "handoff": response.kv_transfer_params,
+        "tokens": list(response.outputs[0].token_ids),
+    }
+    if prefill and corrupt:
+
+        def flip_prefill_byte(worker, handoff):
+            cache = next(
+                iter(get_kv_transfer_group().connector_worker.device_kv_caches.values())
+            )
+            block = handoff["remote_block_ids"][0][0] * 2
+            raw = cache[block].view(-1).view(torch.uint8)
+            raw[0] ^= 1
+            return int(raw.numel())
+
+        import torch
+
+        assert all(llm.collective_rpc(flip_prefill_byte, args=(value["handoff"],)))
+
+    staging = output.with_suffix(".tmp")
+    staging.write_text(json.dumps(value))
+    staging.rename(output)
+    if prefill:
+        core = llm.llm_engine.engine_core.engine_core
+        end = time.monotonic() + 180
+        while not (directory / "stop").exists() and time.monotonic() < end:
+            core.step()
+            time.sleep(0.02)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "hybrid",
+        "hybrid-unchecked",
+        "hybrid-prefix",
+        "dcp",
+        "dcp-asymmetric",
+        "dcp-corrupt",
+        "gqa-declared-prefill",
+        "gqa-declared-decode",
+        "gqa-remote-only-split",
+        "gqa-split-both",
+        "gqa-split-decode-whole-producer",
+        "gqa-split-unequal",
+        "gqa-undeclared-split-producer",
+        "gqa-undeclared-split-producer-unchecked",
+        "mla-unequal-split",
+        "mla-unequal-split-unchecked",
+    ],
+)
+def test_declared_geometry_moves_real_kernel_rows(tmp_path, case):
+    import os
+    import socket
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    from tests.v1.worker.simulated.test_kernel_geometry import NANO, V3, published_path
+
+    pytest.importorskip("aisimulate_core")
+    pytest.importorskip("nixl")
+    hybrid = case.startswith("hybrid")
+    gqa = case.startswith("gqa")
+    unequal_mla = case.startswith("mla-unequal-split")
+    refusal = None
+    if case == "hybrid-prefix":
+        refusal = (
+            "Prefix caching with heterogeneous physical_blocks_per_logical"
+            " is not supported for Mamba hybrid models."
+        )
+    elif unequal_mla:
+        refusal = (
+            "Simulated NIXL with split MLA kernel blocks requires equal P/D "
+            "logical block sizes (local 256, remote 128)."
+        )
+    elif case.startswith("gqa-undeclared-split-producer"):
+        refusal = (
+            "Simulated NIXL from a peer whose blocks hold several kernel blocks "
+            "(2 of 64 tokens) needs this instance to declare its kernel geometry "
+            "too (simulation_config.kv_kernel_backend)."
+        )
+    target = NANO if hybrid else "Qwen/Qwen3-8B" if gqa else V3
+    model = published_path(target)
+    common = {
+        "prompt": 1089 if hybrid else 384,
+        "enable_prefix_caching": case == "hybrid-prefix",
+        "check": not case.endswith("unchecked"),
+        "attest_state": hybrid and case != "hybrid-prefix",
+        "corrupt": case == "dcp-corrupt",
+    }
+    p = {
+        **common,
+        "tensor_parallel_size": 4 if hybrid else 2,
+        "decode_context_parallel_size": 1,
+        "block_size": 1088 if hybrid else 128,
+        "backend": "FLASHINFER" if hybrid else "FLASHMLA",
+    }
+    d = {
+        **common,
+        "tensor_parallel_size": 2,
+        "decode_context_parallel_size": 1 if hybrid else 2,
+        "block_size": 2112 if hybrid else 128,
+        "backend": "FLASHINFER"
+        if hybrid
+        else "FLASH_ATTN_MLA"
+        if case == "dcp-asymmetric"
+        else "FLASHMLA",
+    }
+    if gqa:
+        p.update(prompt=256, tensor_parallel_size=1, backend="TRITON_ATTN")
+        d.update(
+            prompt=256,
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
+            backend="TRITON_ATTN",
+        )
+        if case == "gqa-declared-prefill":
+            d["backend"] = None
+        elif case == "gqa-declared-decode":
+            p["backend"] = None
+        elif case.startswith("gqa-undeclared-split-producer"):
+            p["backend"] = "FLASHINFER"
+            d["backend"] = None
+        elif case == "gqa-split-decode-whole-producer":
+            p.update(backend=None, block_size=64)
+            d["backend"] = "FLASHINFER"
+        else:
+            p["backend"] = d["backend"] = "FLASHINFER"
+            if case == "gqa-remote-only-split":
+                d["block_size"] = 64
+            elif case == "gqa-split-unequal":
+                d["block_size"] = 256
+    if unequal_mla:
+        p.update(prompt=256, tensor_parallel_size=1)
+        d.update(
+            prompt=256,
+            tensor_parallel_size=1,
+            decode_context_parallel_size=1,
+            block_size=256,
+        )
+    # The script imports this function from the package, so its callables are
+    # importable when collectives serialize them to spawned workers.
+    script = tmp_path / "peer.py"
+    script.write_text(
+        "from tests.v1.e2e.test_simulated_forward import _round23_native_peer\n"
+        "if __name__ == '__main__':\n    _round23_native_peer()\n"
+    )
+
+    def command(role, settings):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        env = {
+            **os.environ,
+            "PYTHONPATH": str(Path.cwd()),
+            "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+            "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
+            "VLLM_HOST_IP": "127.0.0.1",
+            "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
+            "VLLM_NIXL_SIDE_CHANNEL_PORT": str(port),
+            "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
+            "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+        }
+        return [
+            sys.executable,
+            str(script),
+            role,
+            str(model),
+            target,
+            json.dumps(settings),
+            str(tmp_path),
+        ], env
+
+    producer_log = tmp_path / "prefill.log"
+    producer_command, env = command("prefill", p)
+    with producer_log.open("w") as f:
+        producer = subprocess.Popen(
+            producer_command, stdout=f, stderr=subprocess.STDOUT, env=env
+        )
+    try:
+        end = time.monotonic() + 240
+        while not (tmp_path / "prefill.json").exists():
+            assert producer.poll() is None, producer_log.read_text()[-8000:]
+            assert time.monotonic() < end, producer_log.read_text()[-8000:]
+            time.sleep(0.2)
+        consumer_command, env = command("decode", d)
+        with (tmp_path / "decode.log").open("w") as f:
+            decoder = subprocess.run(
+                consumer_command,
+                env=env,
+                timeout=180,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        log = (tmp_path / "decode.log").read_text()
+        if refusal:
+            assert refusal in log, log[-8000:]
+        else:
+            assert decoder.returncode == 0, log[-8000:]
+            assert (
+                len(json.loads((tmp_path / "decode.json").read_text())["tokens"]) == 2
+            )
+    finally:
+        (tmp_path / "stop").touch()
+        try:
+            producer.wait(timeout=60)
+        finally:
+            if producer.poll() is None:
+                producer.kill()
+
+    def step_records(role, rank):
+        suffix = "" if rank == 0 else f".tp{rank}"
+        step_log = tmp_path / f"{role}{suffix}.steps"
+        return [json.loads(line) for line in step_log.read_text().splitlines()]
+
+    if hybrid and case != "hybrid-prefix":
+        reasons = json.loads((tmp_path / "state-refusal.json").read_text())
+        assert all(
+            r and "are shorter than its state (533504 bytes)" in r for r in reasons
+        )
+    for rank in range(d["tensor_parallel_size"]):
+        records = step_records("decode", rank)
+        (layout,) = [r["kv_layout"] for r in records if "kv_layout" in r]
+        if gqa:
+            for role, settings in (("prefill", p), ("decode", d)):
+                (info,) = [
+                    r["kv_layout"]
+                    for r in step_records(role, rank)
+                    if "kv_layout" in r
+                ]
+                geometry = info.get("kernel_geometry")
+                if settings["backend"] is None:
+                    assert geometry is None
+                    continue
+                assert geometry["registered_backend"] == "CPU_ATTN"
+                assert geometry["logical_tokens"] == settings["block_size"]
+                kernel = 64 if settings["backend"] == "FLASHINFER" else 128
+                assert geometry["kernel_tokens"] == kernel
+                assert geometry["kernel_blocks_per_logical"] == (
+                    settings["block_size"] // kernel
+                )
+            if refusal:
+                assert not any(
+                    r.get("kv_transfers", {}).get("load", {}).get("each")
+                    for r in records
+                )
+                assert all(
+                    r["kv_check"].get("error") == "receive failed"
+                    for r in records
+                    if "kv_check" in r
+                )
+                if not common["check"]:
+                    assert not any("kv_check" in r for r in records)
+                continue
+            (check,) = [r["kv_check"] for r in records if "kv_check" in r]
+            assert check["mismatched_bytes"] == 0 and check["ok"], check
+            expect_bytes = 256 * 36 * 2 * 8 * 128 * 2
+            assert check["bytes"] == expect_bytes
+            if case in (
+                "gqa-remote-only-split",
+                "gqa-split-both",
+                "gqa-split-decode-whole-producer",
+                "gqa-split-unequal",
+            ):
+                coverage = check["coverage"]
+                assert coverage["problems"] == []
+                (read,) = coverage["reads"]
+                assert (read["rank"], read["completed"]) == (0, True)
+                assert (read["descriptors"], read["bytes"]) == (4 * 36, expect_bytes)
+            loads = [
+                entry
+                for r in records
+                for entry in r.get("kv_transfers", {}).get("load", {}).get("each", ())
+            ]
+            (load,) = loads
+            assert load[0] == expect_bytes, load  # NIXL's per-transfer bytes
+            continue
+        geometry = layout["kernel_geometry"]
+        assert geometry["logical_tokens"] == d["block_size"]
+        assert geometry["registered_logical_blocks"] == layout["num_blocks"]
+        assert geometry["registered_physical_blocks"] == (
+            layout["num_blocks"] * geometry["kernel_blocks_per_logical"]
+        )
+        if hybrid:
+            assert geometry["registered_backend"] == "MAMBA2_ATTN"
+            assert set(geometry["runtime_backends"]) == {"MAMBA2_ATTN", "CPU_ATTN"}
+        else:
+            assert geometry["registered_backend"] == "CPU_MLA"
+            assert geometry["runtime_backends"] == ["CPU_MLA"]
+        assert geometry["allocated_unique_bytes"] == layout["bytes"]
+        assert geometry["registered_bytes"] == layout["bytes"]
+        if refusal:
+            assert not any(
+                r.get("kv_transfers", {}).get("load", {}).get("each") for r in records
+            )
+            continue
+        if not common["check"]:
+            assert not any("kv_check" in r for r in records)
+            continue
+        (check,) = [r["kv_check"] for r in records if "kv_check" in r]
+        if case == "dcp-corrupt" and rank == 0:
+            assert not check["ok"] and check["mismatched_bytes"] == 1, check
+        else:
+            assert check["ok"], check
+        assert check["coverage"]["problems"] == []
+        reads = check["coverage"]["reads"]
+        if hybrid:
+            assert [r["rank"] for r in reads] == [2 * rank, 2 * rank + 1]
+            assert [r["bytes"] for r in reads] == [16_146_432, 12_804_096]
+            assert [r["descriptors"] for r in reads] == [198, 96]
+            assert sum(g.get("zeroed_bytes", 0) for g in check["groups"]) == 3_145_728
+            assert sum(g.get("padding_bytes", 0) for g in check["groups"]) == 344_064
+        else:
+            assert [r["rank"] for r in reads] == [rank]
+            assert reads[0]["bytes"] == check["bytes"] == (2 - rank) * 8_994_816
+            assert reads[0]["descriptors"] == (2 - rank) * 122
+            assert check["untouched_bytes"] == rank * 8_994_816

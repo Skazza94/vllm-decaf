@@ -78,6 +78,12 @@ class CPUMLABackend(MLACommonBackend):
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         if _simulated():
+            from vllm.v1.worker.simulated.kernel_geometry import declared_rule
+
+            if (
+                rule := declared_rule(get_current_vllm_config_or_none(), kv_cache_spec)
+            ) is not None:
+                return list(rule.sizes)
             # Simulated steps never run the decode kernel: each block stays
             # whole, as large as a GPU's (multiples of 16).
             return [MultipleOf(_SIMULATED_BLOCK_MULTIPLE)]
@@ -86,6 +92,10 @@ class CPUMLABackend(MLACommonBackend):
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
         if block_size is not None and _simulated():
+            config = get_current_vllm_config_or_none()
+            assert config is not None
+            if config.simulation_config.kv_kernel_backend is not None:
+                return super().supports_block_size(block_size)
             return block_size % _SIMULATED_BLOCK_MULTIPLE == 0
         return block_size is None or block_size == 16
 

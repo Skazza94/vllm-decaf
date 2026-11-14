@@ -24,6 +24,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
     dcp_pair_refusal,
     dcp_scope_problems,
+    plain_mla,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -363,9 +364,8 @@ def dcp_peer_refusal(
     cannot. With decode context parallelism on either side both instances
     must be in its scope (`dcp_scope_problems`: this one's from its config,
     the peer's as its metadata states it, `simulated_scope`) and the peer
-    must hold pages of this instance's tokens, each block one page (no
-    kernel sub-blocks on either side): a rank's blocks are whole global
-    pages, and the checks pair them by that."""
+    must hold equal logical pages: a rank's blocks are whole global pages,
+    and NIXL pairs them before expanding their kernel blocks."""
     remote_dcp = max(remote_dcp_size, metadata.dcp_size)
     if local_dcp_size == 1 and remote_dcp == 1:
         return None
@@ -377,19 +377,17 @@ def dcp_peer_refusal(
     if problems:
         return dcp_pair_refusal(local_dcp_size, remote_dcp, problems)
     remote = (metadata.block_size, metadata.physical_blocks_per_logical_kv_block)
-    if local_page != (remote[0], 1) or remote[1] != 1:
+    if local_page[0] * local_page[1] != remote[0] * remote[1]:
         return (
-            "A NIXL peer with decode context parallelism (local DCP "
-            f"{local_dcp_size}, remote DCP {remote_dcp}) must hold pages of this "
-            "instance's tokens, one kernel block each: block size and kernel "
-            f"blocks a block {remote}, not {local_page}."
+            "DCP requires matching P/D logical block sizes "
+            f"(local DCP {local_dcp_size}, remote DCP {remote_dcp}): "
+            f"block size and kernel blocks a block {remote}, not {local_page}."
         )
     return None
 
 
 def validate_dcp_peer(worker) -> None:
-    """Refuse at the handshake, before any READ and whether bytes are checked
-    or not, a NIXL peer `dcp_peer_refusal` refuses."""
+    """Check simulated DCP and kernel-block geometry before any native READ."""
     add = worker.add_remote_agent
 
     def add_remote_agent(
@@ -405,11 +403,140 @@ def validate_dcp_peer(worker) -> None:
             worker.vllm_config, worker.dcp_size, local_page, remote_dcp_size, metadata
         ):
             raise ValueError(refusal)
+        local_kernel, local_factor = local_page
+        remote_factor = metadata.physical_blocks_per_logical_kv_block
+        if (
+            remote_factor > 1
+            and worker.vllm_config.simulation_config.kv_kernel_backend is None
+        ):
+            # Without a declaration this instance's blocks are whole kernel
+            # blocks; the checks pair a split peer's rows only on a declared one.
+            raise ValueError(
+                "Simulated NIXL from a peer whose blocks hold several kernel "
+                f"blocks ({remote_factor} of {metadata.block_size} tokens) needs "
+                "this instance to declare its kernel geometry too "
+                "(simulation_config.kv_kernel_backend)."
+            )
+        local_tokens = local_kernel * local_factor
+        remote_tokens = metadata.block_size * remote_factor
+        if (
+            max(local_factor, remote_factor) > 1
+            and local_tokens != remote_tokens
+            and plain_mla(worker.vllm_config.model_config)
+        ):
+            raise ValueError(
+                "Simulated NIXL with split MLA kernel blocks requires equal P/D "
+                f"logical block sizes (local {local_tokens}, remote {remote_tokens})."
+            )
         return add(
             metadata, remote_tp_rank, remote_tp_size, remote_dcp_size, *args, **kwargs
         )
 
     worker.add_remote_agent = add_remote_agent
+
+
+def observe_nixl_registration(worker):
+    """Count bytes in the actual ranges submitted to register_memory."""
+    bridge = worker.nixl_wrapper
+    get = bridge.get_reg_descs
+    ranges = {}
+
+    def observed(descriptors, mem_type):
+        result = get(descriptors, mem_type)
+        # register_memory calls get_reg_descs again with the opaque native
+        # list. Only the first call has the Python range tuples.
+        if isinstance(descriptors, list):
+            for address, length, device, _ in descriptors:
+                ranges[(mem_type, device, address)] = length
+        return result
+
+    bridge.get_reg_descs = observed
+    return ranges, get
+
+
+class NixlPreparedReads:
+    """Addresses and lengths of the descriptors actually submitted by a READ."""
+
+    def __init__(self, worker, request_of, piece_of):
+        bridge = worker.nixl_wrapper
+        make, prep = bridge.make_prepped_xfer, bridge.prep_xfer_dlist
+        check = bridge.check_xfer_state
+        release = getattr(bridge, "release_dlist_handle", None)
+        release_xfer = getattr(bridge, "release_xfer_handle", None)
+        registered = worker.src_xfer_handles_by_block_size.get(worker.block_size)
+        tables = {registered: np.asarray(worker.src_blocks_data, dtype=np.int64)}
+        self.records = {}
+        pending = {}
+
+        def prepare(agent, table, *args, **kwargs):
+            handle = prep(agent, table, *args, **kwargs)
+            if agent == "NIXL_INIT_AGENT":
+                tables[handle] = np.asarray(table, dtype=np.int64)
+            return handle
+
+        def make_prepped_xfer(op, local, ids, remote, remote_ids, *args, **kwargs):
+            handle = make(op, local, ids, remote, remote_ids, *args, **kwargs)
+            if op != "READ":
+                return handle
+            request = request_of(kwargs.get("notif_msg", args[0] if args else b""))
+            from vllm.v1.worker.simulated.state_layout import ReadRecord
+
+            table = tables.get(local)
+            pieces = None
+            if table is not None:
+                count = int(table[:, 4].sum())
+                if any(not 0 <= i < count for i in ids):
+                    table = None
+            if table is not None:
+                starts = np.cumsum(table[:, 4]) - table[:, 4]
+                rows = np.searchsorted(starts, ids, side="right") - 1
+                pieces = [
+                    piece_of(
+                        int(table[r, 0] + (i - starts[r]) * table[r, 3]),
+                        int(table[r, 1]),
+                    )
+                    for i, r in zip(ids, rows, strict=True)
+                ]
+            owner = next(
+                (
+                    (engine, rank)
+                    for engine, ranks in worker.dst_xfer_side_handles.items()
+                    for rank, peer in ranks.items()
+                    if peer == remote
+                ),
+                (None, None),
+            )
+            record = ReadRecord(request, owner[1], handle, pieces, engine=owner[0])
+            self.records.setdefault(request, []).append(record)
+            pending[handle] = record
+            return handle
+
+        def check_xfer_state(handle):
+            result = check(handle)
+            if result in ("DONE", "ERR") and (record := pending.pop(handle, None)):
+                record.done = result == "DONE"
+            return result
+
+        def release_dlist(handle):
+            result = release(handle)
+            tables.pop(handle, None)
+            return result
+
+        def release_transfer(handle):
+            result = release_xfer(handle)
+            pending.pop(handle, None)
+            return result
+
+        if release is not None:
+            bridge.release_dlist_handle = release_dlist
+        if release_xfer is not None:
+            bridge.release_xfer_handle = release_transfer
+        bridge.prep_xfer_dlist = prepare
+        bridge.make_prepped_xfer = make_prepped_xfer
+        bridge.check_xfer_state = check_xfer_state
+
+    def take(self, producer_request):
+        return self.records.pop(producer_request, [])
 
 
 class NixlReadDestinations:
@@ -496,7 +623,19 @@ def validate_state_peer(worker, layout) -> None:
                 f"{metadata.block_size}, not {local_lens} at {worker.block_size}."
             )
         need = sum(want)
-        regions = [i for i in worker._ssm_region_indices if metadata.block_lens[i] < need]
+        factor = getattr(metadata, "physical_blocks_per_logical_kv_block", 1)
+        strides = getattr(metadata, "block_strides", metadata.block_lens)
+        if len(strides) != len(metadata.block_lens):
+            raise ValueError(
+                "A hybrid model's NIXL peer has mismatched region strides."
+            )
+        # NIXL advertises both lengths in kernel units even on a state
+        # region; the actual state descriptor strides by the logical page.
+        regions = [
+            i
+            for i in worker._ssm_region_indices
+            if min(metadata.block_lens[i], strides[i]) * factor < need
+        ]
         if regions:
             raise ValueError(
                 f"A peer's state regions {regions} are shorter than its state ({need} bytes)."

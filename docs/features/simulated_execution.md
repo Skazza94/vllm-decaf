@@ -446,10 +446,11 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           attention page read whole from one producer (NIXL splits no head
           slice at a block-size ratio), without prefix caching for byte
           checks.
-          This follows the simulated backend's FlashAttention-style kernel
-          blocks (kernel block = attention block); a backend with small
-          fixed kernel blocks (FlashInfer's), where NIXL pairs blocks by
-          their physical ratios instead, is not modelled;
+          Without a kernel geometry declaration each attention block stays
+          whole. With a declaration such as `FLASHINFER`, NIXL uses the
+          registered kernel block sizes and the physical-to-logical ratios.
+          Native NIXL refuses hybrid pairs with different ratios when
+          prefix caching is enabled;
         * over NIXL only, Kimi-K3 from prefill TP 8 to decode TP 4,
           without prefix caching: its delta-attention states (Q, K and V
           conv components, the recurrent state FP32 unless
@@ -459,7 +460,6 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           them, each decode attention block (twice the prefill's tokens)
           read as two prefill blocks, the uncovered half of a request's
           last block zero, as NIXL leaves it;
-
       and not for DeepSeek-V4's caches, another MLA hybrid, Kimi-K3 at
       other TP sizes, or speculative decoding. A NIXL decode instance refuses, as
       NIXL does, a larger prefill instance whose KV heads are replicated
@@ -502,10 +502,10 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   the byte checks need the same prefix-caching setting on both instances.
   NIXL's handshake checks the peer's DCP, TP and page size. With DCP on
   either side, NIXL transfers under simulated compute require matching P/D logical block
-  sizes and one kernel block per logical block. The simulator enforces both
-  requirements during the handshake. Upstream vLLM's NIXL connector also
-  rejects unequal logical block sizes; simulating kernel sub-blocks at equal
-  logical sizes remains follow-up work. When either side has DCP, it also checks both instances' scope, including the
+  sizes even when a logical block holds several kernel blocks. The simulator
+  checks logical sizes during the handshake, as upstream vLLM's NIXL connector
+  does. Native NIXL still checks kernel sizes and region layout. When either
+  side has DCP, the simulator checks both instances' scope, including the
   side of DCP 1: this instance's from its config, the producer's from its
   NIXL metadata (`simulated_scope`). Refused with DCP: Mooncake's connector
   (which slices no page by DCP rank), NIXL's push connector,
@@ -514,6 +514,22 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   either side.
 * Blocks of any multiple of 16 tokens, as on a GPU; MLA blocks are not
   forced to the CPU MLA kernel's 16.
+
+For CPU simulations with NIXL pull and AISimulate, set
+`simulation_config.kv_kernel_backend` to a built-in GPU attention backend to
+take its kernel block sizes from vLLM's backend source. The selected rule,
+its source and the registered logical and kernel sizes are in `kv_layout`.
+The CPU backend and AISimulate's timing profile stay as configured.
+An unset declaration keeps the previous CPU block rules, one kernel block a
+block, and such an instance refuses at the NIXL handshake, before any READ, a
+peer whose blocks hold several kernel blocks.
+For dense MLA, if either peer subdivides its blocks, the two peers must
+have the same logical block size, even without decode context parallelism
+or byte checking. Their kernel block sizes can still differ where native
+NIXL allows it.
+The initial rule reader is for plain BF16 KV without drafts: FlashInfer's
+Hopper rule, Triton attention, and the qualified dense MLA rules from
+FlashMLA, FlashInfer MLA, FlashAttention MLA and Triton MLA.
 
 `kv_pattern_fill` (prefill instance) writes a pattern into each request's KV
 blocks, derived from the request, the TP rank, the layer and the block's

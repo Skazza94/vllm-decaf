@@ -93,8 +93,23 @@ class Side:
     TP sizes over NIXL, prefix caching off (`_check_dcp`). A rank's blocks
     are then global pages, DCP rank r every DCP-th from r (`_dcp_audit`)."""
 
+    block_size: int | None = None
+    """This instance's KV block size (--block-size); None: the server's. A
+    hybrid's alignment only raises the asked size, so a pair whose sides
+    resolve to another ratio asks each side for its own (NIXL only: the
+    Mooncake write-task estimate uses the server's)."""
+
+    kv_kernel_backend: str | None = None
+    """A GPU attention backend whose kernel blocks this instance models
+    (simulation_config.kv_kernel_backend); NIXL and AISimulate only."""
+
     def tp(self, server: "Server") -> int:
         return self.tensor_parallel_size or server.tensor_parallel_size
+
+    def block(self, server: "Server") -> int | None:
+        """The block size this instance asks for: its own, else the
+        server's (None: the platform's, a hybrid model's)."""
+        return self.block_size if self.block_size is not None else server.block_size
 
     def rank_networks(self, ranks: int) -> list[str]:
         if isinstance(self.kv_network, str):
@@ -340,6 +355,12 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
     if run.server.connector not in CONNECTORS:
         raise ValueError(f"server.connector is one of {', '.join(CONNECTORS)}, not {run.server.connector!r}")
     _check_backend(run.server)
+    for side in (run.prefill, run.decode):
+        if side.kv_kernel_backend is not None and (
+            not isinstance(side.kv_kernel_backend, str)
+            or run.server.connector != "nixl" or run.server.timing != "aisimulate"
+        ):
+            raise ValueError(f"{side.nodes}: kv_kernel_backend needs a backend name, NIXL and AISimulate")
     if run.server.speculative is not None:
         _check_speculative(run.server)
     if not isinstance(run.expect_fragmentation, bool):
@@ -414,6 +435,10 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         if run.server.block_size is None:
             raise ValueError("router.prefix_index: precise needs server.block_size (the index's block size)")
         for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+            if side.block(run.server) != run.server.block_size:
+                raise ValueError(f"router.prefix_index: precise builds the index from server.block_size "
+                                 f"({run.server.block_size}), not {role}'s {side.block(run.server)}")
+        for role, side in (("prefill", run.prefill), ("decode", run.decode)):
             if side.data_parallel_size > 1 and not rank_routed(run, side):
                 raise ValueError(f"router.prefix_index: precise needs router.dp_routing: rank for {role}'s "
                                  f"{side.data_parallel_size} DP ranks (each rank publishes its own events and "
@@ -430,8 +455,17 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         size = side.tensor_parallel_size
         if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 1):
             raise ValueError(f"{side.nodes}: tensor_parallel_size is a positive integer")
+        if side.block_size is not None and (
+                not isinstance(side.block_size, int) or isinstance(side.block_size, bool) or side.block_size < 1):
+            raise ValueError(f"{side.nodes}: block_size is a positive integer")
         if not isinstance(side.kv_network, str) and len(side.kv_network) != side.tp(run.server):
             raise ValueError(f"{side.nodes}: kv_network needs one network per rank ({side.tp(run.server)})")
+    if run.server.connector != "nixl":
+        # Mooncake's one-request write-task estimate uses the server's size.
+        for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+            if side.block(run.server) != run.server.block_size:
+                raise ValueError(f"server.block_size: {role}'s block_size differs from the server's, which "
+                                 "Mooncake's write-task estimate uses; per-side sizes need server.connector: nixl")
     prefill_tp, decode_tp = run.prefill.tp(run.server), run.decode.tp(run.server)
     if prefill_tp == decode_tp:
         if run.prefill.rank_networks(prefill_tp) != run.decode.rank_networks(decode_tp):
@@ -797,6 +831,8 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         timing_args = {"gpu": run.server.gpu} if run.server.timing == "aisimulate" else {}
     simulation = {"clock": "real", "timing": run.server.timing, "timing_args": timing_args,
                   "log_path": STEP_LOG}
+    if side.kv_kernel_backend is not None:
+        simulation["kv_kernel_backend"] = side.kv_kernel_backend
     if run.kv_check:
         simulation["kv_pattern_fill" if role == "prefill" else "kv_pattern_check"] = True
     spec = run.server.speculative
@@ -842,12 +878,13 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         else:
             env.update(FI_PROVIDER="tcp", FI_ADDR_FORMAT="FI_SOCKADDR_IN", FI_PREFER_SYSCONFIG="0")
     s = run.server
+    block = side.block(s)
     return [
         "env", *(f"{name}={value}" for name, value in env.items()),
         VLLM, "serve", MODEL_DIRECTORY, "--host", "0.0.0.0", "--port", str(port),
         "--served-model-name", MODEL_NAME, "--dtype", s.dtype, "--kv-cache-dtype", s.kv_cache_dtype,
         *(["--quantization", s.quantization] if s.quantization else []),
-        *(["--block-size", str(s.block_size)] if s.block_size is not None else []),
+        *(["--block-size", str(block)] if block is not None else []),
         "--kv-cache-memory-bytes", str(s.kv_cache_memory_bytes), "--max-model-len", str(s.max_model_len),
         "--max-num-batched-tokens", str(s.max_num_batched_tokens), "--max-num-seqs", str(s.max_num_seqs),
         "--tensor-parallel-size", str(side.tp(s)),
