@@ -177,6 +177,19 @@ def gqa_dcp_model(model) -> bool:
     )
 
 
+# Speculative decoding where KV moves under DCP: NIXL needs the DCP
+# interleave at the block size (vLLM resolves it so when the engine starts,
+# `VllmConfig.adjust_dcp_kv_cache_interleave_size`), and vLLM's check
+# (`check_attention_cp_compatibility`) refuses MTP at an interleave above 1
+# on a backend without `supports_mtp_with_cp_non_trivial_interleave_size`,
+# as the simulated CPU MLA backend is.
+SPECULATIVE_DCP_TRANSFERS = (
+    "speculative decoding (over NIXL with DCP the interleave is the block "
+    "size, and the simulated CPU MLA backend does not run MTP at an "
+    "interleave above 1)"
+)
+
+
 def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
     """Qualify the local model and layout before building an AISimulate profile."""
     from vllm.config.simulation import SimulationConfig
@@ -313,7 +326,7 @@ def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]
         problems.append("expert parallelism")
     if vllm_config.speculative_config is not None:
         if transfers or vllm_config.kv_transfer_config is not None:
-            problems.append("speculative decoding")
+            problems.append(SPECULATIVE_DCP_TRANSFERS)
         else:
             problems.extend(standalone_mtp_dcp_problems(vllm_config))
     return problems

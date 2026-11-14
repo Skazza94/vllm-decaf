@@ -9,6 +9,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import sys
 import types
 from types import SimpleNamespace
@@ -2846,7 +2847,7 @@ def test_admits_native_mtp_dcp_and_equivalent_bf16(tmp_path, tp, target_kv, draf
         spec={"kv_cache_dtype": draft_kv},
     )
     assert dcp_scope_problems(config, transfers=False) == []
-    assert dcp_scope_problems(config, transfers=True) == ["speculative decoding"]
+    assert dcp_scope_problems(config, transfers=True) == [SPECULATIVE_DCP_TRANSFERS]
     assert config.speculative_config.draft_model_config.architectures == [
         "DeepSeekMTPModel"
     ]
@@ -2926,8 +2927,24 @@ def test_mtp_dcp_requires_one_native_layer(tmp_path):
         _mtp_dcp_engine_config(tmp_path, hf_overrides={"num_nextn_predict_layers": 2})
 
 
+# vLLM resolves NIXL's DCP interleave to the block size, and refuses MTP
+# above interleave 1 on the CPU MLA backend: the transfer-scope problem.
+SPECULATIVE_DCP_TRANSFERS = (
+    "speculative decoding (over NIXL with DCP the interleave is the block "
+    "size, and the simulated CPU MLA backend does not run MTP at an "
+    "interleave above 1)"
+)
+
+
 @requires_mtp_dcp
-def test_mtp_dcp_refuses_transfer_in_config_and_both_handshake_directions(tmp_path):
+@pytest.mark.parametrize("check", [False, True], ids=["unchecked", "checked"])
+def test_mtp_dcp_refuses_transfer_in_config_and_both_handshake_directions(
+    tmp_path, check
+):
+    """A DCP>1 instance with MTP and a connector is refused when its config
+    is checked; a DCP1 endpoint with MTP starts, advertises the problem, and
+    is refused at the handshake by a DCP peer, and refuses one itself,
+    byte checks on or off."""
     import msgspec
 
     from tests.v1.worker.simulated.test_real_kv_transfer import agent_metadata
@@ -2939,31 +2956,33 @@ def test_mtp_dcp_refuses_transfer_in_config_and_both_handshake_directions(tmp_pa
     from vllm.v1.worker.simulated.kv_transfer import dcp_peer_refusal
 
     def real(role):
+        simulation = {"simulate_forward": True, "timing": "aisimulate"}
+        if check:
+            flag = "kv_pattern_fill" if role == "kv_producer" else "kv_pattern_check"
+            simulation |= {flag: True, "log_path": "steps.jsonl"}
         return {
             "kv_transfer_config": {
                 "kv_connector": "NixlConnector", "kv_role": role,
                 "kv_buffer_device": "cpu",
             },
-            "simulation_config": {
-                "simulate_forward": True, "timing": "aisimulate",
-            },
+            "simulation_config": simulation,
         }
 
-    with pytest.raises(ValueError, match="not with speculative decoding"):
+    with pytest.raises(ValueError, match=re.escape(SPECULATIVE_DCP_TRANSFERS)):
         _mtp_dcp_engine_config(tmp_path / "refused", **real("kv_consumer"))
     source = _mtp_dcp_engine_config(tmp_path / "source", dcp=1, **real("kv_producer"))
     consumer = _mtp_dcp_engine_config(
         tmp_path / "consumer", dcp=1, **real("kv_consumer")
     )
-    assert dcp_scope_problems(source, transfers=True) == ["speculative decoding"]
-    assert simulated_dcp_scope(source) == ["speculative decoding"]
+    assert dcp_scope_problems(source, transfers=True) == [SPECULATIVE_DCP_TRANSFERS]
+    assert simulated_dcp_scope(source) == [SPECULATIVE_DCP_TRANSFERS]
     assert simulated_tp_mismatch(
         consumer, 2, 2, nixl_consumer=True, remote_dcp_size=2
     ) == (
         "Simulated real KV transfers pair decode context parallelism (local DCP 1, "
         "remote DCP 2) for a dense MLA model over tensor parallelism alone on both "
         "sides, TP sizes one dividing the other, without speculative decoding, "
-        "not with speculative decoding."
+        f"not with {SPECULATIVE_DCP_TRANSFERS}."
     )
     metadata = agent_metadata(simulated_scope=simulated_dcp_scope(source))
     metadata = msgspec.msgpack.decode(
@@ -2976,7 +2995,7 @@ def test_mtp_dcp_refuses_transfer_in_config_and_both_handshake_directions(tmp_pa
         "Simulated real KV transfers pair decode context parallelism (local DCP 2, "
         "remote DCP 1) for a dense MLA model over tensor parallelism alone on both "
         "sides, TP sizes one dividing the other, without speculative decoding, "
-        "not with the peer's speculative decoding."
+        f"not with the peer's {SPECULATIVE_DCP_TRANSFERS}."
     )
     assert dcp_peer_refusal(consumer, 1, (16, 1), 1, metadata) is None
 

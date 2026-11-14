@@ -167,9 +167,16 @@ at depth 1, TP2/DCP2 or TP4/DCP4, 16-token pages and interleave 1. This
 profile uses H200 AISimulate vLLM 0.24.0 tables, the published block-FP8
 weights, BF16 model and KV, and the same merge and Q replication settings.
 Prefix caching, KV offloading, and KV transfers are outside this combined
-scope. The single draft layer's sharded KV belongs to the target's cache
-group and shares its scheduler block span. Its cache contributes to the
-engine's virtual memory plan even though the timing model omits draft KV.
+scope. KV transfers stay refused: over NIXL with DCP, vLLM resolves the
+interleave to the block size when the engine starts, and its compatibility
+check refuses MTP at an interleave above 1 on the simulated CPU MLA
+backend, which does not declare support for it. An instance with DCP above
+1 refuses speculative transfers when its configuration is checked; an
+instance at DCP 1 refuses at the handshake, once it learns the peer's DCP,
+before any READ. The single draft layer's sharded KV belongs to the
+target's cache group and shares its scheduler block span. Its cache
+contributes to the engine's virtual memory plan even though the timing
+model omits draft KV.
 
 Speculative decoding is timed for the native single-module MTP of
 DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 only (`method: mtp`, the checkpoint's one MTP layer,
