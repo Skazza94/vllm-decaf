@@ -2658,26 +2658,67 @@ def hetero_logs(prefill_tp: int, decode_tp: int, kv_heads: int, nixl: bool, requ
                     **{f"p{prefill_tp + d}": {"node": "d", "slot": d, "rx": 40, "tx": received[d] + 100}
                        for d in range(decode_tp)}}}
 
-    def scrape(moved=None, kind="write", transfers=0):
-        """A rank's TENT series before and after the workload: an engine
-        that never moved a byte serves no series for it."""
-        def served(moved_bytes, count):
-            lines = ["tent_registered_buffer_bytes 1600"]
-            if moved is not None:
-                lines += [f'tent_{kind}_bytes_total{{transport="tcp"}} {moved_bytes}',
-                          f"tent_{kind}_requests_total {count}", f"tent_transport_attempts_total {count}"]
-            return "\n".join(lines)
-
-        return pd._tent_delta(served(0, 0), served(moved, transfers))
-
     if nixl:
-        tents = {"prefill": [scrape() for _ in range(prefill_tp)],
-                 "decode": [scrape(received[d], "read", len(loads[d])) for d in range(decode_tp)]}
+        tents = {"prefill": [tent_scrape() for _ in range(prefill_tp)],
+                 "decode": [tent_scrape(received[d], "read", len(loads[d])) for d in range(decode_tp)]}
     else:
-        tents = {"prefill": [scrape(sent[p], "write", len(sends[p])) if sends[p] else scrape()
+        tents = {"prefill": [tent_scrape(sent[p], "write", len(sends[p])) if sends[p] else tent_scrape()
                              for p in range(prefill_tp)],
-                 "decode": [scrape() for _ in range(decode_tp)]}
+                 "decode": [tent_scrape() for _ in range(decode_tp)]}
     return prefill, decode, ports, sum(sent.values()), tents
+
+
+def tent_scrape(moved=None, kind="write", transfers=0):
+    """A rank's TENT series before and after the workload: an engine that
+    never moved a byte serves no series for it."""
+    def served(moved_bytes, count):
+        lines = ["tent_registered_buffer_bytes 1600"]
+        if moved is not None:
+            lines += [f'tent_{kind}_bytes_total{{transport="tcp"}} {moved_bytes}',
+                      f"tent_{kind}_requests_total {count}", f"tent_transport_attempts_total {count}"]
+        return "\n".join(lines)
+
+    return pd._tent_delta(served(0, 0), served(moved, transfers))
+
+
+def dp_logs(make, owners, sizes, dps, nixl=True):
+    """One fixture's logs inside data parallelism: ``make(request)`` gives
+    one request's logs (prefill's and decode's, each rank's layout first,
+    and ports), request r produced by prefill DP rank ``owners[r][0]`` and
+    consumed by decode DP rank ``owners[r][1]``. Each rank's log is its
+    layout (its DP rank's) and then its DP rank's requests' records, in
+    `Side.ranks` order; link r carries rank r of every DP rank; each rank's
+    TENT series its own transfers' (none served where it moved nothing)."""
+    bodies = {role: {(dp, tp): [] for dp in range(dps[i]) for tp in range(sizes[role])}
+              for i, role in enumerate(("prefill", "decode"))}
+    layouts = {}
+    payload = {role: [0] * sizes[role] for role in sizes}
+    for request, (pdp, ddp) in owners.items():
+        prefill, decode, ports = make(request)[:3]
+        for role, texts, dp in (("prefill", prefill, pdp), ("decode", decode, ddp)):
+            for tp, text in enumerate(texts):
+                first, *rest = text.splitlines(keepends=True)
+                layouts[(role, tp)] = json.loads(first)["kv_layout"]
+                bodies[role][(dp, tp)] += rest
+        for port in ports["kv"].values():
+            role, direction = ("prefill", "rx") if port["node"] == "p" else ("decode", "tx")
+            payload[role][port["slot"]] += port[direction] - 100
+    texts = {role: [line(kv_layout={**layouts[(role, tp)], "dp_rank": dp}) + "".join(body)
+                    for (dp, tp), body in bodies[role].items()] for role in bodies}
+    ports = {"kv": {**{f"p{p}": {"node": "p", "slot": p, "rx": payload["prefill"][p] + 100, "tx": 40}
+                       for p in range(sizes["prefill"])},
+                    **{f"p{sizes['prefill'] + d}": {"node": "d", "slot": d, "rx": 40,
+                                                    "tx": payload["decode"][d] + 100}
+                       for d in range(sizes["decode"])}}}
+    mover, kind, direction = ("decode", "read", "load") if nixl else ("prefill", "write", "send")
+    tents = {role: [] for role in texts}
+    for role in texts:
+        for text in texts[role]:
+            moves = [(r.get("kv_transfers") or {}).get(direction) or {} for r in pd._records(text)]
+            count = sum(m.get("count", 0) for m in moves)
+            tents[role].append(tent_scrape(sum(m.get("bytes", 0) for m in moves), kind, count)
+                               if role == mover and count else tent_scrape())
+    return texts["prefill"], texts["decode"], ports, sum(payload["prefill"]), tents
 
 
 # Gemma4's groups: sliding layers of 8 KV heads (10-byte slabs), full ones of
@@ -3103,8 +3144,6 @@ class HeterogeneousTpTests(unittest.TestCase):
                  "{node: decode0, kv_network: data0, tensor_parallel_size: 3}", "divide one another"),
                 ("{node: prefill0, kv_network: [data0, data1], tensor_parallel_size: 2}",
                  "{node: decode0, kv_network: data0, tensor_parallel_size: 4}", "one switched network"),
-                ("{node: prefill0, kv_network: data0, tensor_parallel_size: 2, data_parallel_size: 2}",
-                 "{node: decode0, kv_network: data0, tensor_parallel_size: 4}", "without data parallelism"),
                 ("{node: prefill0, kv_network: data0, tensor_parallel_size: 0}",
                  "{node: decode0, kv_network: data0}", "positive integer")):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
@@ -3113,6 +3152,25 @@ class HeterogeneousTpTests(unittest.TestCase):
                 spec.write_text(re.sub(r"^decode:.*$", f"decode: {decode}", text, count=1, flags=re.M))
                 with self.assertRaisesRegex(ValueError, error):
                     pd.load(spec)
+
+    def test_unequal_sizes_pair_inside_data_parallelism(self) -> None:
+        """TP inside DP at unequal sizes: each side's DP ranks run its own TP
+        size, TP rank r of every DP rank on link r of the switched network."""
+        base = (E2E / "runs" / "example.yaml").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            spec = Path(directory) / "run.yaml"
+            text = re.sub(r"^prefill:.*$", "prefill: {node: prefill0, kv_network: kv, tensor_parallel_size: 2, "
+                          "data_parallel_size: 2}", base, count=1, flags=re.M)
+            spec.write_text(re.sub(r"^decode:.*$", "decode: {node: decode0, kv_network: kv, "
+                                   "tensor_parallel_size: 4, data_parallel_size: 2}", text, count=1, flags=re.M))
+            run = pd.load(spec)
+        self.assertEqual((run.prefill.tp(run.server), run.decode.tp(run.server)), (2, 4))
+        addresses = ["10.102.0.1", "10.102.0.3", "10.102.0.5", "10.102.0.7"]
+        command = pd.server_command(run, "decode", addresses)
+        flag = lambda name: command[command.index(name) + 1]
+        self.assertEqual((flag("--tensor-parallel-size"), flag("--data-parallel-size")), ("4", "2"))
+        kv_transfer = json.loads(flag("--kv-transfer-config"))
+        self.assertEqual(kv_transfer["kv_connector_extra_config"]["rank_addresses"], addresses * 2)
 
     def test_rank_r_takes_link_r_of_a_switched_network(self) -> None:
         interfaces = {"control": {"address": "10.250.0.1", "network": "control", "slot": 0},
@@ -3127,6 +3185,311 @@ class HeterogeneousTpTests(unittest.TestCase):
                          ["10.100.0.1", "10.100.0.1"])
         self.assertEqual(pd.global_heads(3, 8, 4), [1])
         self.assertEqual(pd.global_heads(1, 2, 8), [4, 5, 6, 7])
+
+
+# Requests spread over both DP ranks of each side, each decode DP rank
+# receiving from both producer DP ranks.
+SPREAD = {"a": (0, 0), "b": (1, 1), "c": (0, 1), "d": (1, 0)}
+
+
+class HeterogeneousTpDataParallelTests(unittest.TestCase):
+    """Unequal TP sizes inside data parallelism: each DP rank's ranks pair
+    with the producing engine's as at DP1, every rank of both sides audited."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.model = Path(self.directory.name)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def run_for(self, sizes, kv_heads, nixl, dps, requests):
+        config = {"num_key_value_heads": 128, "kv_lora_rank": 512} if kv_heads == 1 else {
+            "num_key_value_heads": kv_heads}
+        (self.model / "config.json").write_text(json.dumps(config))
+        return pd.Run(**{**RUN.__dict__, "model": self.model,
+                         "prefill": pd.Side("p", "kv", tensor_parallel_size=sizes[0], data_parallel_size=dps[0]),
+                         "decode": pd.Side("d", "kv", tensor_parallel_size=sizes[1], data_parallel_size=dps[1]),
+                         "server": pd.Server(connector="nixl" if nixl else "mooncake"),
+                         "workload": pd.Workload(num_prompts=requests)})
+
+    def verdict(self, sizes, kv_heads, nixl, owners=None, dps=(2, 2), change=None) -> dict:
+        owners = owners or {r: tuple(dp if n > 1 else 0 for dp, n in zip(o, dps)) for r, o in SPREAD.items()}
+        prefill, decode, ports, moved, tents = dp_logs(
+            lambda r: hetero_logs(*sizes, kv_heads, nixl, requests=(r,)), owners,
+            {"prefill": sizes[0], "decode": sizes[1]}, dps, nixl)
+        if change:
+            prefill, decode, ports = change(prefill, decode, ports)
+        return pd.check({"completed": len(owners), "errors": []}, prefill, decode,
+                        {"control": 1, "kv": moved + 500},
+                        self.run_for(sizes, kv_heads, nixl, dps, len(owners)), tents, ports)
+
+    @staticmethod
+    def at(sizes, dps, role, dp, tp):
+        """A rank's index in its side's log list (`Side.ranks` order)."""
+        return dp * sizes[0 if role == "prefill" else 1] + tp
+
+    def test_heads_resharded_either_way_inside_dp_over_both_connectors(self) -> None:
+        for sizes, kv_heads in (((4, 2), 4), ((2, 4), 4), ((4, 2), 2), ((4, 2), 1)):
+            for nixl in (True, False):
+                for dps in ((2, 2), (1, 2), (2, 1)):
+                    with self.subTest(sizes=sizes, kv_heads=kv_heads, nixl=nixl, dps=dps):
+                        verdict = self.verdict(sizes, kv_heads, nixl, dps=dps)
+                        self.assertEqual(verdict["problems"], [])
+                        hetero = verdict["hetero_tp"]
+                        self.assertEqual(sum(verdict["dp_pairs"].values()), 4)
+                        self.assertEqual(len(verdict["dp_pairs"]), dps[0] * dps[1])
+                        self.assertTrue(all(pair["bytes"] == pair["expected"] for pair in hetero["pairs"]))
+                        if nixl and dps[1] > 1:
+                            self.assertEqual({pair["decode_dp"] for pair in hetero["pairs"]}, {0, 1})
+        # NIXL: each decode DP rank's READs, as at DP1.
+        hetero = self.verdict((4, 2), 4, True)["hetero_tp"]
+        self.assertEqual(hetero["sources"], {0: [0, 1], 1: [2, 3]})
+        self.assertEqual(self.verdict((4, 2), 4, True)["dp_pairs"], {"0->0": 1, "1->1": 1, "0->1": 1, "1->0": 1})
+
+    def test_every_producer_rank_has_one_owner_of_each_request(self) -> None:
+        """Both requests on DP rank 0, producer rank 1 of DP rank 1 also
+        allocating them. At 4 -> 2 the source map names producer ranks 0 and
+        2 first: ownership is checked on every producer and consumer rank,
+        not only those."""
+        owners = {"a": (0, 0), "b": (0, 0)}
+        sizes, dps = (4, 2), (2, 2)
+
+        def duplicate(prefill, decode, ports):
+            prefill = list(prefill)
+            prefill[self.at(sizes, dps, "prefill", 1, 1)] += allocated("a", "b")
+            return prefill, decode, ports
+
+        self.assertEqual(self.verdict(sizes, 4, True, owners)["problems"], [])
+        problems = self.verdict(sizes, 4, True, owners, change=duplicate)["problems"]
+        self.assertIn("prefill rank 1: 2 request(s) more than one of the prefill DP ranks produced: cmpl-a-0",
+                      problems)
+        self.assertIn("prefill rank 1: 2 request(s) with other prefill DP ranks than rank 0's: cmpl-a-0", problems)
+
+        def swap(prefill, decode, ports):
+            # Request a's allocation on producer rank 3 moved to DP rank 1.
+            prefill = list(prefill)
+            mine, other = self.at(sizes, dps, "prefill", 0, 3), self.at(sizes, dps, "prefill", 1, 3)
+            self.assertIn(allocated("a"), prefill[mine])
+            prefill[mine] = prefill[mine].replace(allocated("a"), "", 1)
+            prefill[other] += allocated("a")
+            return prefill, decode, ports
+
+        problems = self.verdict(sizes, 4, True, owners, change=swap)["problems"]
+        self.assertIn("prefill rank 3: 1 request(s) with other prefill DP ranks than rank 0's: cmpl-a-0", problems)
+
+        def swap_consumer(prefill, decode, ports):
+            # Request a's byte check on decode rank 1 under DP rank 1 instead.
+            decode = list(decode)
+            mine, other = self.at(sizes, dps, "decode", 0, 1), self.at(sizes, dps, "decode", 1, 1)
+            records = pd._records(decode[mine])
+            moved = [r for r in records if (r.get("kv_check") or {}).get("req_id") == "cmpl-a-0-d"]
+            decode[mine] = "".join(line(**r) for r in records if r not in moved)
+            decode[other] += "".join(line(**r) for r in moved)
+            return prefill, decode, ports
+
+        problems = self.verdict(sizes, 4, True, owners, change=swap_consumer)["problems"]
+        self.assertIn("decode rank 1: 1 request(s) with other decode DP ranks than rank 0's: cmpl-a-0", problems)
+
+    def test_nixl_bytes_are_checked_per_decode_dp_rank(self) -> None:
+        """Compensating byte errors on decode DP ranks 0 and 1 leave the sum
+        unchanged: each DP rank's READs are compared on their own."""
+        sizes, dps = (4, 2), (2, 2)
+
+        def compensate(prefill, decode, ports):
+            decode = list(decode)
+            for dp, delta in ((0, 10), (1, -10)):
+                index = self.at(sizes, dps, "decode", dp, 0)
+                records = pd._records(decode[index])
+                for record in records:
+                    load = (record.get("kv_transfers") or {}).get("load")
+                    if load and load["each"]:
+                        load["each"][0][0] += delta
+                        break
+                decode[index] = "".join(line(**r) for r in records)
+            return prefill, decode, ports
+
+        problems = self.verdict(sizes, 4, True, change=compensate)["problems"]
+        for dp in (0, 1):
+            self.assertTrue(any(f"prefill rank 0 -> decode DP rank {dp} rank 0 moved" in p for p in problems),
+                            problems)
+
+    def test_every_dp_ranks_layout_holds_its_heads(self) -> None:
+        sizes, dps = (2, 4), (2, 2)
+
+        def heads(prefill, decode, ports):
+            decode = list(decode)
+            index = self.at(sizes, dps, "decode", 1, 1)
+            records = pd._records(decode[index])
+            records[0]["kv_layout"]["groups"][0]["global_heads"] = [0]
+            decode[index] = "".join(line(**r) for r in records)
+            return prefill, decode, ports
+
+        problems = self.verdict(sizes, 4, True, change=heads)["problems"]
+        self.assertTrue(any("decode DP rank 1 rank 1's group 0 holds head-v1 heads [0], not head-v1 heads [1]" in p
+                            for p in problems), problems)
+
+    def test_a_link_carries_its_rank_of_every_dp_rank(self) -> None:
+        def dp0_only(prefill, decode, ports):
+            port = ports["kv"]["p0"]
+            return prefill, decode, {"kv": {**ports["kv"], "p0": {**port, "rx": port["rx"] // 2}}}
+
+        problems = self.verdict((4, 2), 4, True, change=dp0_only)["problems"]
+        self.assertTrue(any("prefill rank 0's router port RX" in p for p in problems), problems)
+
+    def test_a_producer_rank_lacking_a_request_fails(self) -> None:
+        sizes, dps = (4, 2), (2, 2)
+
+        def drop(prefill, decode, ports):
+            prefill = list(prefill)
+            index = self.at(sizes, dps, "prefill", 1, 2)
+            self.assertIn(allocated("b"), prefill[index])
+            prefill[index] = prefill[index].replace(allocated("b"), "", 1)
+            return prefill, decode, ports
+
+        problems = self.verdict(sizes, 4, True, change=drop)["problems"]
+        self.assertIn("prefill rank 2 produced 3 request(s), not 4", problems)
+
+    def test_mooncake_replicas_answer_for_their_own_engines_requests(self) -> None:
+        """Mooncake 4 -> 2, 2 KV heads: producer ranks 1 and 3 of each DP
+        rank hold heads ranks 0 and 2 send, and answer without a payload for
+        the requests their own engine produced, once each."""
+        sizes, dps = (4, 2), (2, 2)
+        verdict = self.verdict(sizes, 2, False)
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["hetero_tp"]["idle_replicas"], [[0, 1], [0, 3], [1, 1], [1, 3]])
+        self.assertEqual(verdict["hetero_tp"]["unwritten_accepted"], [[0, 1], [0, 3], [1, 1], [1, 3]])
+
+        def answers(rank, edit):
+            """Edit the zero-payload answers of prefill (DP rank, rank) ``rank``,
+            all of them at once (the edited list logged in its first record)."""
+            def change(prefill, decode, ports):
+                prefill = list(prefill)
+                index = self.at(sizes, dps, "prefill", *rank)
+                records = pd._records(prefill[index])
+                sends = [(r.get("kv_transfers") or {}).get("send") or {} for r in records]
+                sends = [send for send in sends if send.get("zero_payload")]
+                edited = edit([answer for send in sends for answer in send["zero_payload"]])
+                for position, send in enumerate(sends):
+                    send["zero_payload"] = edited if position == 0 else []
+                prefill[index] = "".join(line(**r) for r in records)
+                return prefill, decode, ports
+            return change
+
+        lack = "prefill DP rank 0 rank 1's TENT metrics lack tent_write_bytes_total, and it is not a replica"
+        # DP rank 0's rank 1 produced a and c (SPREAD): an answer for b, DP
+        # rank 1's, does not prove it idle, nor does a duplicate or a
+        # missing one.
+        cases = {
+            "prefill DP rank 0 rank 1 answered decode rank 0 without a payload for requests another DP rank "
+            "produced: 1 request(s), cmpl-b-0": answers((0, 1), lambda z: z + [[0, ["cmpl-b-0-d"], z[0][2]]]),
+            "prefill DP rank 0 rank 1 answered decode rank 0 without a payload twice for 1 request(s), cmpl-a-0":
+                answers((0, 1), lambda z: z + z[:1]),
+            "prefill DP rank 0 rank 1 never answered decode rank 0 (no payload and no zero-payload answer) for "
+            "1 request(s), cmpl-a-0": answers((0, 1), lambda z: [a for a in z if a[1] != ["cmpl-a-0-d"]]),
+        }
+        for message, change in cases.items():
+            with self.subTest(message=message):
+                problems = self.verdict(sizes, 2, False, change=change)["problems"]
+                self.assertIn(message, problems)
+                self.assertTrue(any(lack in p for p in problems), problems)
+
+        def moved(prefill, decode, ports):
+            # Request a's answer given by DP rank 1's rank 1, not its own engine's.
+            prefill, decode, ports = answers((0, 1), lambda z: [a for a in z if a[1] != ["cmpl-a-0-d"]])(
+                prefill, decode, ports)
+            return answers((1, 1), lambda z: z + [[0, ["cmpl-a-0-d"], z[0][2]]])(prefill, decode, ports)
+
+        problems = self.verdict(sizes, 2, False, change=moved)["problems"]
+        self.assertIn("prefill DP rank 1 rank 1 answered decode rank 0 without a payload for requests another DP "
+                      "rank produced: 1 request(s), cmpl-a-0", problems)
+        self.assertIn("prefill DP rank 0 rank 1 never answered decode rank 0 (no payload and no zero-payload "
+                      "answer) for 1 request(s), cmpl-a-0", problems)
+
+    def test_an_idle_dp_engine_is_apart_from_an_idle_replica(self) -> None:
+        """Every request on prefill DP rank 0: DP rank 1's engine, given none,
+        moved nothing on any rank (an idle engine, in `idle_ranks`), while
+        DP rank 0's ranks 1 and 3 are its replicas, proven by their answers."""
+        owners = {"a": (0, 0), "b": (0, 1)}
+        verdict = self.verdict((4, 2), 2, False, owners)
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["hetero_tp"]["idle_replicas"], [[0, 1], [0, 3]])
+        self.assertEqual(sorted(verdict["idle_ranks"]),
+                         [f"prefill DP rank 1 rank {r}" for r in range(4)])
+        self.assertEqual(verdict["dp_pairs"], {"0->0": 1, "0->1": 1})
+
+
+class HybridHeterogeneousTpDataParallelTests(unittest.TestCase):
+    """A hybrid's unequal TP sizes inside DP over NIXL: each decode DP rank's
+    state and attention READs reconciled on their own."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.model = Path(self.directory.name)
+        (self.model / "config.json").write_text(json.dumps({"num_key_value_heads": 4}))
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def reconcile(self, sizes, owners, change=None) -> dict:
+        dps = (2, 2)
+        prefill, decode, ports, _, _ = dp_logs(lambda r: hybrid_logs(*sizes, requests=(r,)), owners,
+                                               {"prefill": sizes[0], "decode": sizes[1]}, dps)
+        if change:
+            prefill, decode, ports = change(prefill, decode, ports)
+        run = pd.Run(**{**RUN.__dict__, "model": self.model,
+                        "prefill": pd.Side("p", "kv", tensor_parallel_size=sizes[0], data_parallel_size=2),
+                        "decode": pd.Side("d", "kv", tensor_parallel_size=sizes[1], data_parallel_size=2),
+                        "server": pd.Server(connector="nixl")})
+        logs = {"prefill": dict(zip(run.prefill.ranks(sizes[0]), map(pd._records, prefill))),
+                "decode": dict(zip(run.decode.ranks(sizes[1]), map(pd._records, decode)))}
+        moved = lambda records: sum(((r.get("kv_transfers") or {}).get("load") or {}).get("bytes", 0) for r in records)
+        produced = lambda records: {pd._base_request_id(request) for r in records
+                                    for request in ((r.get("kv_events") or {}).get("allocated") or {})}
+        ranks = {role: {key: {"transfers": {"bytes": moved(records)}, "requests": produced(records)}
+                        for key, records in logs[role].items()} for role in logs}
+        return pd._hetero_tp(run, {"prefill": sizes[0], "decode": sizes[1]}, logs, ranks, ports)
+
+    def test_state_and_attention_pair_inside_dp(self) -> None:
+        for sizes in ((4, 2), (2, 4)):
+            for owners in ({"a": (0, 0), "b": (1, 1)}, {"a": (0, 1), "b": (1, 0)}):
+                with self.subTest(sizes=sizes, owners=owners):
+                    hetero = self.reconcile(sizes, owners)
+                    self.assertEqual(hetero["problems"], [])
+                    self.assertEqual({pair["decode_dp"] for pair in hetero["pairs"]}, {0, 1})
+
+    def test_a_dp_ranks_state_spans_must_be_the_layouts(self) -> None:
+        sizes = (4, 2)
+
+        def spans(prefill, decode, ports):
+            decode = list(decode)
+            index = sizes[1] + 0  # decode DP rank 1, rank 0
+            records = pd._records(decode[index])
+            records[0]["kv_layout"]["groups"][1]["state"]["spans"][0][3] += 2
+            decode[index] = "".join(line(**r) for r in records)
+            return prefill, decode, ports
+
+        problems = self.reconcile(sizes, {"a": (0, 0), "b": (1, 1)}, change=spans)["problems"]
+        self.assertTrue(any(p.startswith("decode DP rank 1 rank 0's group 1 state spans") for p in problems),
+                        problems)
+
+    def test_a_dp_ranks_read_is_its_own(self) -> None:
+        """A READ logged by decode DP rank 1 under DP rank 0 instead: each DP
+        rank's checked READs must be its logged ones."""
+        sizes = (4, 2)
+
+        def move(prefill, decode, ports):
+            decode = list(decode)
+            src, dst = sizes[1] + 0, 0
+            records = pd._records(decode[src])
+            loads = [r for r in records if (r.get("kv_transfers") or {}).get("load")]
+            decode[src] = "".join(line(**r) for r in records if r not in loads)
+            decode[dst] += "".join(line(**r) for r in loads)
+            return prefill, decode, ports
+
+        problems = self.reconcile(sizes, {"a": (0, 0), "b": (1, 1)}, change=move)["problems"]
+        self.assertTrue(any("decode DP rank 1 rank 0's checked READs" in p for p in problems), problems)
+        self.assertTrue(any("decode DP rank 0 rank 0's checked READs" in p for p in problems), problems)
 
 
 class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):

@@ -477,8 +477,6 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         if not (isinstance(run.prefill.kv_network, str) and run.prefill.kv_network == run.decode.kv_network):
             raise ValueError("unequal TP sizes need one switched network for both instances (kv_network its "
                              "name, a link per rank)")
-        if run.prefill.data_parallel_size > 1 or run.decode.data_parallel_size > 1:
-            raise ValueError("unequal TP sizes without data parallelism")
     _check_dcp(run)
     if run.server.connector == "mooncake":
         _check_write_tasks(run)
@@ -1114,8 +1112,9 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         for (dp, tp), records in logs[role].items():
             joint_steps[(role, tp)].update(_request_steps(records))
     ranks: dict[str, dict[tuple[int, int], dict]] = {role: {} for role in sides}
-    # Mooncake producer ranks without a write series (unequal TP only).
-    unwritten: set[int] = set()
+    # Mooncake producer ranks, (DP rank, rank), without a write series
+    # (unequal TP only).
+    unwritten: set[tuple[int, int]] = set()
     # Instances' ranks without a moved series: given no request.
     idle: list[str] = []
     # Decode ranks without a read series under decode context parallelism.
@@ -1270,7 +1269,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                         # A replicated producer's rank that never writes never
                         # increments its write series: `_hetero_tp` accepts
                         # the absence only for a proven idle replica.
-                        unwritten.add(tp)
+                        unwritten.add((dp, tp))
                     elif dcp_pair and role == mover == "decode" and missing == [moved_counter]:
                         # A DCP rank whose pages are all past every handoff
                         # reads nothing: `_dcp_audit` accepts the absence only
@@ -1333,7 +1332,14 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
 
     per_tp = []
     ownership: dict[str, dict[int, int]] = {"producers": {}, "consumers": {}}
-    owners_by_tp: list[dict[str, dict[str, set[int]]]] = []
+    # Each request's owners on every TP rank of each side (DP ranks, or
+    # instances): one, the same on all of the side's TP ranks.
+    owners: dict[str, dict[int, dict[str, set[int]]]] = {
+        role: {tp: {} for tp in range(sizes[role])} for role in sides}
+    for role in sides:
+        for (dp, tp), summary in ranks[role].items():
+            for request in summary["requests"]:
+                owners[role][tp].setdefault(request, set()).add(dp)
     hetero = None
     dcp = None
     if dcp_pair:
@@ -1361,12 +1367,6 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
         if moved < spanned or (run.kv_check and moved != spanned):
             what = "decode checked" if spanned == checked else f"decode's checked blocks span ({checked} checked)"
             problems.append(f"{at}the connector moved {moved} bytes, not the {spanned} {what}")
-        owners: dict[str, dict[str, set[int]]] = {}
-        for role in sides:
-            owners[role] = {}
-            for dp, summary in of[role].items():
-                for request in summary["requests"]:
-                    owners[role].setdefault(request, set()).add(dp)
         # Requests the decode DP ranks own, and the byte checks they logged
         # (none without kv_check).
         consumed = len(set().union(*(summary["requests"] for summary in of["decode"].values())))
@@ -1381,14 +1381,6 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             if byte_checks != pulls:
                 problems.append(f"{at}decode logged {byte_checks} byte check(s) for {pulls} distinct "
                                 f"request(s){' that pulled' if prefix else ''}")
-        for role, label in (("prefill", "prefill DP ranks produced"), ("decode", "decode DP ranks consumed")):
-            shared = sorted(request for request, dps in owners[role].items() if len(dps) > 1)
-            if shared:
-                problems.append(f"{at}{len(shared)} request(s) more than one of the {label}: {shared[0]}")
-        unpaired = sorted(set(owners["prefill"]) ^ set(owners["decode"]))
-        if unpaired:
-            problems.append(f"{at}{len(unpaired)} request(s) not both produced and consumed: {unpaired[0]}")
-        owners_by_tp.append(owners)
         handoff = None
         if any(summary["hybrid"] for summary in of["decode"].values()):
             # The requests decode consumed: its byte checks, else its
@@ -1426,16 +1418,39 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                        for role in sides} if any(s["groups"] for r in sides for s in of[r].values()) else None,
             "handoff": handoff and handoff["evidence"],
         })
-    # Every TP rank of a request's owner is the same DP rank.
-    for role, kind in (("prefill", "producers"), ("decode", "consumers")):
-        first = owners_by_tp[0][role] if owners_by_tp else {}
-        for tp, owners in enumerate(owners_by_tp[1:], start=1):
-            differ = sorted(request for request in first if owners[role].get(request) != first[request])
+    # Every request has one owner on each side, the same DP rank on all of
+    # the side's TP ranks (each producer rank, not only the ones decode
+    # reads), and is both produced and consumed.
+    def rank_at(role: str, tp: int) -> str:
+        return where(None, tp) if tp_size is not None else f"{role} rank {tp}: "
+
+    for role, kind, label in (("prefill", "producers", "prefill DP ranks produced"),
+                              ("decode", "consumers", "decode DP ranks consumed")):
+        for tp, owned in owners[role].items():
+            shared = sorted(request for request, dps in owned.items() if len(dps) > 1)
+            if shared:
+                problems.append(f"{rank_at(role, tp)}{len(shared)} request(s) more than one of the {label}: "
+                                f"{shared[0]}")
+        first = owners[role].get(0, {})
+        for tp in range(1, sizes[role]):
+            differ = sorted(request for request in set(first) | set(owners[role][tp])
+                            if owners[role][tp].get(request) != first.get(request))
             if differ:
-                problems.append(f"rank {tp}: {len(differ)} request(s) with other {role} DP ranks than rank 0's")
+                problems.append(f"{rank_at(role, tp)}{len(differ)} request(s) with other {role} DP ranks than "
+                                f"rank 0's: {differ[0]}")
         for dps in first.values():
             for dp in dps:
                 ownership[kind][dp] = ownership[kind].get(dp, 0) + 1
+    unpaired = sorted(set(owners["prefill"].get(0, {})) ^ set(owners["decode"].get(0, {})))
+    if unpaired:
+        problems.append(f"{len(unpaired)} request(s) not both produced and consumed: {unpaired[0]}")
+    # Requests by producer and consumer owner ("producer->consumer").
+    dp_pairs: dict[str, int] = {}
+    for request, dps in owners["prefill"].get(0, {}).items():
+        consumers = owners["decode"].get(0, {}).get(request) or set()
+        if len(dps) == 1 and len(consumers) == 1:
+            key = f"{next(iter(dps))}->{next(iter(consumers))}"
+            dp_pairs[key] = dp_pairs.get(key, 0) + 1
 
     # Every KV byte crosses its TP rank's network's router once, and no
     # other: each carries its ranks' bytes and little more (headers,
@@ -1497,6 +1512,7 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                             "guarded_bytes": control - exempt},
         "ranks": per_tp,
         "ownership": ownership,
+        **({"dp_pairs": dp_pairs} if data_parallel else {}),
         **({"instances": {role: side.nodes for role, side in sides.items()}}
            if any(side.instances for side in sides.values()) else {}),
         **({"idle_ranks": idle} if idle or any(side.instances for side in sides.values()) else {}),
@@ -2289,22 +2305,25 @@ def _dcp_audit(run: Run, sizes: dict[str, int], logs: dict, unread: set[int] = f
 
 
 def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: dict | None,
-               unwritten: set[int] = frozenset()) -> dict:
+               unwritten: set[tuple[int, int]] = frozenset()) -> dict:
     """Unequal prefill and decode TP sizes, reconciled with the native
     pairing computed here: each decode rank's sources (decode TP >= prefill
     TP: rank d * P/D; else ranks d * P/D + i), each of its global heads sent
     by the lowest-ranked source holding it (a replicated producer's other
     ranks send nothing: Mooncake's answer without a payload, for each of
-    the decode rank's requests); every rank's layout and decode check
-    holding its own global heads; a head's bytes in a block of a layer (its
-    slab) from each side's layout, the same on both; each pair's logged
-    payload equal to the heads it carries; each Mooncake write's plan at
-    those heads' places, in slabs; each NIXL READ's measured descriptors
-    (as many as its hook saw, within NIXL's limit) each one layer's block of
-    the heads it carries; each rank's router port carrying its own payload
-    (prefill RX, decode TX); unique KV apart from the replicated payload.
-    Producer ranks without a TENT write series (`unwritten`) must be such
-    idle replicas."""
+    the decode rank's requests); every rank's layout (each DP rank's) and
+    decode check holding its own global heads; a head's bytes in a block of
+    a layer (its slab) from each side's layout, the same on both; each
+    pair's logged payload equal to the heads it carries (NIXL's per decode
+    DP rank; Mooncake's, whose peer names no DP rank, over the DP ranks);
+    each Mooncake write's plan at those heads' places, in slabs; each NIXL
+    READ's measured descriptors (as many as its hook saw, within NIXL's
+    limit) each one layer's block of the heads it carries; each rank's
+    router port carrying its own payload (prefill RX, decode TX; a link
+    carries its rank of every DP rank); unique KV apart from the replicated
+    payload. Producer ranks without a TENT write series (`unwritten`, (DP
+    rank, rank)) must be idle replicas: their engine's answers without a
+    payload cover each request it produced for each of their decode ranks."""
 
     problems: list[str] = []
     prefill_tp, decode_tp = sizes["prefill"], sizes["decode"]
@@ -2314,17 +2333,20 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
     if kv_heads is None:
         return {**evidence, "problems": [f"{run.model}/config.json gives no num_key_value_heads"],
                 "sources": {d: [0] for d in range(decode_tp)}, "received": {}}
-    def layout(role: str, rank: int) -> dict | None:
-        return next((r["kv_layout"] for r in logs[role].get((0, rank), []) if "kv_layout" in r), None)
+    keys = {role: getattr(run, role).ranks(sizes[role]) for role in sizes}
+    name = _rank_namer(run)
+
+    def layout(role: str, dp: int, rank: int) -> dict | None:
+        return next((r["kv_layout"] for r in logs[role].get((dp, rank), []) if "kv_layout" in r), None)
 
     # Each group's kind, the same on every rank of both sides (a group's
     # correspondence across P and D), then its total KV heads.
-    kind_lists = {(role, rank): [g.get("kind") for g in (layout(role, rank) or {}).get("groups") or []]
-                  for role in sizes for rank in range(sizes[role])}
+    kind_lists = {(role, dp, rank): [g.get("kind") for g in (layout(role, dp, rank) or {}).get("groups") or []]
+                  for role in sizes for dp, rank in keys[role]}
     kinds = next((k for k in kind_lists.values() if k), [])
-    for (role, rank), found in sorted(kind_lists.items()):
+    for (role, dp, rank), found in sorted(kind_lists.items()):
         if found != kinds:
-            problems.append(f"{role} rank {rank}'s groups are {found}, not the others' {kinds}")
+            problems.append(f"{name(role, dp, rank)}'s groups are {found}, not the others' {kinds}")
     if "MambaSpec" in kinds:
         return _hetero_hybrid(run, sizes, logs, ranks, ports, unwritten, kinds, kv_heads, evidence, problems, layout)
     totals, why = group_kv_heads(run.model, kinds) if kinds else ([kv_heads], None)
@@ -2350,15 +2372,15 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
 
     # Each group's head slab: its page (padding excluded) over its heads,
     # the same on every rank of both sides.
-    slabs: dict[tuple[str, int], tuple[int | None, ...]] = {}
+    slabs: dict[tuple[str, int, int], tuple[int | None, ...]] = {}
     for role in sizes:
-        for rank in range(sizes[role]):
-            groups = (layout(role, rank) or {}).get("groups") or []
+        for dp, rank in keys[role]:
+            groups = (layout(role, dp, rank) or {}).get("groups") or []
             mine_slabs = []
             for index, group in enumerate(groups):
                 want = gheads[role][rank][index] if index < len(totals) else None
                 if want is None or group.get("pattern") != "head-v1" or group.get("global_heads") != want:
-                    problems.append(f"{role} rank {rank}'s group {index} holds {group.get('pattern')} heads "
+                    problems.append(f"{name(role, dp, rank)}'s group {index} holds {group.get('pattern')} heads "
                                     f"{group.get('global_heads')}, not head-v1 heads {want}")
                     mine_slabs.append(None)
                     continue
@@ -2370,30 +2392,39 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                 good = all(isinstance(page, int) and page > 0 and page % len(want) == 0 for page in pages)
                 each = tuple(page // len(want) for page in pages) if good else None
                 mine_slabs.append(each[0] if each and len(each) == 1 else each)
-            slabs[(role, rank)] = tuple(mine_slabs) or (None,)
+            slabs[(role, dp, rank)] = tuple(mine_slabs) or (None,)
     distinct = set(slabs.values())
     gslabs = list(next(iter(distinct))) if len(distinct) == 1 else [None]
     if None in gslabs or len(distinct) != 1:
-        problems.append(f"the ranks' layouts give no single head size in a block of a layer: "
-                        f"{ {f'{role}{rank}': (n[0] if len(set(n)) == 1 else n) for (role, rank), n in sorted(slabs.items())} }")
+        shown = {_rank_tag(run, role, dp, rank): (n[0] if len(set(n)) == 1 else n)
+                 for (role, dp, rank), n in sorted(slabs.items())}
+        problems.append(f"the ranks' layouts give no single head size in a block of a layer: {shown}")
         gslabs = [None] * len(totals)
     slab = gslabs[0] if len(set(gslabs)) == 1 else gslabs
     evidence["slab_bytes"] = list(slab) if isinstance(slab, tuple) else slab
 
-    expected: dict[tuple[int, int], int] = {}
+    # A pair's bytes, keyed (producer rank, DP rank, decode rank): NIXL's
+    # decode logs each READ, so its key's DP rank is the consumer's; the
+    # expectations are each decode DP rank's checks.
+    expected: dict[tuple[int, int, int], int] = {}
     unique = 0
-    for d in range(decode_tp):
+    # Each decode rank's requests (its byte checks'), with the DP ranks that
+    # checked them.
+    requested: dict[int, dict[str, set[int]]] = {d: {} for d in range(decode_tp)}
+    for ddp, d in keys["decode"]:
         mine = heads["decode"][d]
-        for record in logs["decode"].get((0, d), []):
+        for record in logs["decode"].get((ddp, d), []):
             check = record.get("kv_check")
             if not check or check.get("kind") not in (None, "transfer") or "error" in check:
                 continue
+            if "req_id" in check:
+                requested[d].setdefault(_base_request_id(check["req_id"]), set()).add(ddp)
             cgroups = check.get("groups") or []
             for position, group in enumerate(cgroups):
                 index = group.get("group", position)
                 want = gheads["decode"][d][index] if isinstance(index, int) and 0 <= index < len(totals) else None
                 if want is None or group.get("pattern") != "head-v1" or group.get("global_heads") != want:
-                    problems.append(f"decode rank {d} checked {check.get('req_id')}'s heads "
+                    problems.append(f"{name('decode', ddp, d)} checked {check.get('req_id')}'s heads "
                                     f"{group.get('global_heads')} ({group.get('pattern')}), not its {want}")
             # Bytes per head, each group's own (its bytes over its heads); a
             # check without per-group bytes counts one set of heads.
@@ -2410,18 +2441,19 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                     # Each request's KV once: every global head's bytes.
                     unique += per_head * totals[index]
                 for p in {gsender[index][(h, d)] for h in gheads["decode"][d][index]}:
-                    expected[(p, d)] = expected.get((p, d), 0) + per_head * sum(
+                    expected[(p, ddp, d)] = expected.get((p, ddp, d), 0) + per_head * sum(
                         1 for h in gheads["decode"][d][index] if gsender[index][(h, d)] == p)
 
-    # Each decode rank's requests (its byte checks'), which each paired
-    # producer answers.
-    requested = {d: {_base_request_id(r["kv_check"]["req_id"]) for r in logs["decode"].get((0, d), [])
-                     if "req_id" in (r.get("kv_check") or {}) and r["kv_check"].get("kind") in (None, "transfer")}
-                 for d in range(decode_tp)}
-    logged: dict[tuple[int, int], int] = {}
-    answers: dict[tuple[int, int], list[str]] = {}
-    # Producer ranks with an answer the pairing or its plan refutes.
-    misanswered: set[int] = set()
+    # The requests each producer rank's DP ranks produced.
+    produced_by = {(dp, p): set(ranks["prefill"].get((dp, p), {}).get("requests") or ())
+                   for dp, p in keys["prefill"]}
+    # Mooncake's prefill logs its writes: its key's DP rank is the producer's.
+    logged: dict[tuple[int, int, int], int] = {}
+    # Zero-payload answers of each (producer rank, decode rank): (request,
+    # the answering DP rank).
+    answers: dict[tuple[int, int], list[tuple[str, int]]] = {}
+    # Producer (DP rank, rank)s with an answer the pairing or its plan refutes.
+    misanswered: set[tuple[int, int]] = set()
     descriptors: list[int] = []
     merged: list[int] = []
     unknown = 0
@@ -2429,7 +2461,7 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
         if not mover:
             continue
         direction = "load" if nixl else "send"
-        for (_, rank), records in logs[role].items():
+        for (dp, rank), records in logs[role].items():
             for record in records:
                 transfer = (record.get("kv_transfers") or {}).get(direction) or {}
                 for entry in transfer.get("each") or []:
@@ -2439,7 +2471,8 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                         unknown += 1
                         continue
                     pair = (peer, rank) if nixl else (rank, peer)
-                    logged[pair] = logged.get(pair, 0) + int(entry[0])
+                    key = (pair[0], dp, pair[1])
+                    logged[key] = logged.get(key, 0) + int(entry[0])
                     if nixl and isinstance(plan, list) and len(plan) > 1 and isinstance(plan[1], int):
                         descriptors.append(plan[1])
                     if nixl and isinstance(entry[3], int):
@@ -2447,98 +2480,117 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                     problems.extend(_plan_problems(pair, entry, plan, nixl, gheads, gsender, sources, gslabs, descriptor_limit(run.server)))
                 for answer in transfer.get("zero_payload") or []:
                     peer, requests, plan = (list(answer) + [None, None, None])[:3]
+                    at = name("prefill", dp, rank)
                     if not isinstance(peer, int) or rank not in paired.get(peer, ()):
-                        problems.append(f"prefill rank {rank} answered decode rank {peer}, not one it pairs with")
-                        misanswered.add(rank)
+                        problems.append(f"{at} answered decode rank {peer}, not one it pairs with")
+                        misanswered.add((dp, rank))
                         continue
                     if not isinstance(requests, list):
-                        problems.append(f"prefill rank {rank} answered decode rank {peer} without a payload "
+                        problems.append(f"{at} answered decode rank {peer} without a payload "
                                         f"for unnamed requests ({requests})")
-                        misanswered.add(rank)
+                        misanswered.add((dp, rank))
                         continue
-                    answers.setdefault((rank, peer), []).extend(map(_base_request_id, requests))
+                    answers.setdefault((rank, peer), []).extend((_base_request_id(r), dp) for r in requests)
                     if not plan or any(not isinstance(region, list) or region[0] for region in plan):
-                        problems.append(f"prefill rank {rank} answered decode rank {peer} without a payload "
+                        problems.append(f"{at} answered decode rank {peer} without a payload "
                                         f"under a plan that sends (or none): {plan}")
-                        misanswered.add(rank)
+                        misanswered.add((dp, rank))
     if unknown:
         problems.append(f"{unknown} transfer(s) logged without their peer rank")
-    for pair in sorted(set(expected) | set(logged)):
-        if logged.get(pair, 0) != expected.get(pair, 0):
-            problems.append(f"prefill rank {pair[0]} -> decode rank {pair[1]} moved {logged.get(pair, 0)} bytes, "
-                            f"not the {expected.get(pair, 0)} of the heads it holds for it")
-    idle: set[int] = set()
+    # NIXL's bytes per consumer DP rank; Mooncake's, whose peer names no DP
+    # rank, summed over the DP ranks.
+    by_pair = lambda key: key if nixl else (key[0], 0, key[2])
+    compared_expected: dict[tuple[int, int, int], int] = {}
+    compared_logged: dict[tuple[int, int, int], int] = {}
+    for source, target in ((expected, compared_expected), (logged, compared_logged)):
+        for key, n in source.items():
+            target[by_pair(key)] = target.get(by_pair(key), 0) + n
+    pair_name = lambda p, dp, d: f"prefill rank {p} -> {name('decode', dp, d) if nixl else f'decode rank {d}'}"
+    for key in sorted(set(compared_expected) | set(compared_logged)):
+        if compared_logged.get(key, 0) != compared_expected.get(key, 0):
+            problems.append(f"{pair_name(*key)} moved {compared_logged.get(key, 0)} bytes, "
+                            f"not the {compared_expected.get(key, 0)} of the heads it holds for it")
+    idle: set[tuple[int, int]] = set()
     if not nixl:
-        # Paired producers that hold no head they send: a replica's answer
-        # for each of the decode rank's requests, once.
-        covered = {p: p not in misanswered for p in range(prefill_tp)}
+        # Paired producers that hold no head they send: their engine's
+        # answer for each request it produced that the decode rank pulled,
+        # once, by the request's own producer DP rank.
+        covered = {key: key not in misanswered for key in keys["prefill"]}
+        expected_pairs = {(p, d) for p, _, d in expected}
         for d in range(decode_tp):
             for p in paired[d]:
                 answered = answers.get((p, d), [])
-                if (p, d) in expected:
+                if (p, d) in expected_pairs:
                     if answered:
                         problems.append(f"prefill rank {p} answered decode rank {d} without a payload for "
                                         f"{len(answered)} request(s), though it holds heads it sends")
-                    covered[p] = False
+                    for dp, rank in keys["prefill"]:
+                        if rank == p:
+                            covered[(dp, rank)] = False
                     continue
-                twice = sorted({r for r in answered if answered.count(r) > 1})
-                missing = sorted(requested[d] - set(answered))
-                extra = sorted(set(answered) - requested[d])
-                for what, which in (
-                        (f"answered decode rank {d} without a payload twice for", twice),
-                        (f"never answered decode rank {d} (no payload and no zero-payload answer) for", missing),
-                        (f"answered decode rank {d} without a payload for requests it never pulled:", extra)):
-                    if which:
-                        problems.append(f"prefill rank {p} {what} {len(which)} request(s), {which[0]}")
-                if twice or missing or extra or not requested[d]:
-                    covered[p] = False
-        idle = {p for p, ok in covered.items() if ok and not any(pp == p for pp, _ in logged)
-                and any(p in paired[d] for d in range(decode_tp))}
-    for p in sorted(unwritten - idle):
-        problems.append(f"prefill rank {p}'s TENT metrics lack tent_write_bytes_total, and it is not a replica "
-                        "whose zero-payload answers cover each of its decode ranks' requests")
-    evidence["idle_replicas"] = sorted(idle)
-    evidence["unwritten_accepted"] = sorted(unwritten & idle)
+                # A request no DP rank of the producer rank produced has no
+                # engine to answer for it.
+                orphans = sorted(set(requested[d]) - set().union(
+                    *(found for (_, rank), found in produced_by.items() if rank == p)))
+                if orphans:
+                    problems.append(f"prefill rank {p} never answered decode rank {d} (no payload and no "
+                                    f"zero-payload answer) for {len(orphans)} request(s) it never produced, "
+                                    f"{orphans[0]}")
+                for dp, rank in keys["prefill"]:
+                    if rank != p:
+                        continue
+                    own = {r for r in requested[d] if r in produced_by[(dp, p)]}
+                    mine = [r for r, answering in answered if answering == dp]
+                    twice = sorted({r for r in mine if mine.count(r) > 1})
+                    missing = sorted(own - set(mine))
+                    extra = sorted(set(mine) - set(requested[d]))
+                    foreign = sorted(set(mine) - own - set(extra))
+                    at = name("prefill", dp, p)
+                    for what, which in (
+                            (f"answered decode rank {d} without a payload twice for", twice),
+                            (f"never answered decode rank {d} (no payload and no zero-payload answer) for", missing),
+                            (f"answered decode rank {d} without a payload for requests it never pulled:", extra),
+                            (f"answered decode rank {d} without a payload for requests another DP rank produced:",
+                             foreign)):
+                        if which:
+                            problems.append(f"{at} {what} {len(which)} request(s), {which[0]}")
+                    if twice or missing or extra or foreign or orphans or not own:
+                        covered[(dp, p)] = False
+        idle = {key for key, ok in covered.items() if ok and not any((dp, pp) == key for pp, dp, _ in logged)
+                and any(key[1] in paired[d] for d in range(decode_tp))}
+    for dp, p in sorted(set(unwritten) - idle):
+        problems.append(f"{name('prefill', dp, p)}'s TENT metrics lack tent_write_bytes_total, and it is not a "
+                        "replica whose zero-payload answers cover each of its decode ranks' requests")
+    shown = (lambda found: [list(key) for key in sorted(found)]) if run.prefill.data_parallel_size > 1 else (
+        lambda found: sorted(p for _, p in found))
+    evidence["idle_replicas"] = shown(idle)
+    evidence["unwritten_accepted"] = shown(set(unwritten) & idle)
     if nixl and descriptor_limit(run.server) is not None and descriptors and max(descriptors) > descriptor_limit(run.server):
         problems.append(f"a NIXL READ selected {max(descriptors)} descriptors, more than the "
                         f"{NIXL_MAX_DESCRIPTORS} guard")
 
-    received = {d: sum(n for (p, dd), n in logged.items() if dd == d) for d in range(decode_tp)}
-    sent = {p: sum(n for (pp, d), n in logged.items() if pp == p) for p in range(prefill_tp)}
+    received = {d: sum(n for (_, _, dd), n in logged.items() if dd == d) for d in range(decode_tp)}
+    sent = {p: sum(n for (pp, _, _), n in logged.items() if pp == p) for p in range(prefill_tp)}
     payload = sum(logged.values())
     mover_role = "decode" if nixl else "prefill"
     moved = sum(summary["transfers"]["bytes"] for summary in ranks[mover_role].values())
     if moved != payload:
         problems.append(f"the connector moved {moved} bytes, not the {payload} its transfers' peers account for")
     for p in range(prefill_tp):
-        produced = ranks["prefill"].get((0, p), {}).get("requests") or set()
+        produced = set().union(*(found for (_, rank), found in produced_by.items() if rank == p))
         if run.kv_check and len(produced) != run.workload.num_prompts:
             problems.append(f"prefill rank {p} produced {len(produced)} request(s), not {run.workload.num_prompts}")
 
-    port_evidence = {}
-    if ports is not None:
-        network = ports.get(run.prefill.kv_network) or {}
-        by_rank = {(described["node"], described["slot"]): described for described in network.values()}
-        for role, node, carried, direction in (("prefill", run.prefill.node, sent, "rx"),
-                                               ("decode", run.decode.node, received, "tx")):
-            for rank, payload_bytes in carried.items():
-                port = by_rank.get((node, rank))
-                if port is None:
-                    problems.append(f"{role} rank {rank}'s router port was not measured")
-                    continue
-                measured = port[direction]
-                port_evidence[f"{role}{rank}"] = {"rx": port["rx"], "tx": port["tx"], "payload": payload_bytes}
-                if measured < payload_bytes or measured > payload_bytes * 1.05 + (1 << 20):
-                    problems.append(f"{role} rank {rank}'s router port {direction.upper()} {measured} bytes, not its "
-                                    f"{payload_bytes} of KV and little more")
-    else:
-        problems.append("no router port counters: unequal TP needs the switched network's")
+    port_evidence, port_problems = _rank_ports(run, ports, sent, received)
+    problems.extend(port_problems)
 
     evidence.update({
-        "pairs": [{"prefill": p, "decode": d, "bytes": logged.get((p, d), 0), "expected": expected.get((p, d), 0),
+        "pairs": [{"prefill": p, **({"decode_dp": dp} if nixl and run.decode.data_parallel_size > 1 else {}),
+                   "decode": d, "bytes": compared_logged.get((p, dp, d), 0),
+                   "expected": compared_expected.get((p, dp, d), 0),
                    "zero_payload_answers": len(answers.get((p, d), []))}
-                  for p in range(prefill_tp) for d in range(decode_tp)
-                  if (p, d) in expected or (p, d) in logged or (p, d) in answers],
+                  for p, dp, d in sorted(set(compared_expected) | set(compared_logged)
+                                         | {(p, 0, d) for p, d in answers})],
         "unique_kv_bytes": unique, "payload_bytes": payload,
         "replication_factor": round(payload / unique, 6) if unique else None,
         "max_descriptors": max(descriptors, default=None), "max_merged_descriptors": max(merged, default=None),
@@ -2546,6 +2598,46 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
         "received": received, "problems": problems,
     })
     return evidence
+
+
+def _rank_namer(run: Run):
+    """A rank's name in a problem: its DP rank's too where the side has
+    several."""
+    def name(role: str, dp: int, rank: int) -> str:
+        if getattr(run, role).data_parallel_size > 1:
+            return f"{role} DP rank {dp} rank {rank}"
+        return f"{role} rank {rank}"
+    return name
+
+
+def _rank_tag(run: Run, role: str, dp: int, rank: int) -> str:
+    return f"{role}{dp}.{rank}" if getattr(run, role).data_parallel_size > 1 else f"{role}{rank}"
+
+
+def _rank_ports(run: Run, ports: dict | None, sent: dict[int, int], received: dict[int, int]
+                ) -> tuple[dict, list[str]]:
+    """Each rank's router port on the switched KV network against its payload
+    (prefill RX, decode TX): link r carries rank r of each of its node's DP
+    ranks."""
+    problems: list[str] = []
+    evidence = {}
+    if ports is None:
+        return evidence, ["no router port counters: unequal TP needs the switched network's"]
+    network = ports.get(run.prefill.kv_network) or {}
+    by_rank = {(described["node"], described["slot"]): described for described in network.values()}
+    for role, node, carried, direction in (("prefill", run.prefill.node, sent, "rx"),
+                                           ("decode", run.decode.node, received, "tx")):
+        for rank, payload_bytes in carried.items():
+            port = by_rank.get((node, rank))
+            if port is None:
+                problems.append(f"{role} rank {rank}'s router port was not measured")
+                continue
+            measured = port[direction]
+            evidence[f"{role}{rank}"] = {"rx": port["rx"], "tx": port["tx"], "payload": payload_bytes}
+            if measured < payload_bytes or measured > payload_bytes * 1.05 + (1 << 20):
+                problems.append(f"{role} rank {rank}'s router port {direction.upper()} {measured} bytes, not its "
+                                f"{payload_bytes} of KV and little more")
+    return evidence, problems
 
 
 def _plan_problems(pair: tuple[int, int], entry: list, plan: list | None, nixl: bool, heads: dict,
@@ -2691,7 +2783,7 @@ def _state_overlap(rank: int, local_tp: int, remote_tp: int, width: int) -> dict
 
 
 def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: dict | None,
-                   unwritten: set[int], kinds: list, kv_heads: int, evidence: dict, problems: list[str],
+                   unwritten: set[tuple[int, int]], kinds: list, kv_heads: int, evidence: dict, problems: list[str],
                    layout) -> dict:
     """Unequal TP sizes for a hybrid model over NIXL (its attention groups
     head-v1, its state groups state-v1), reconciled with ownership computed
@@ -2703,7 +2795,8 @@ def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, por
     owned state, transfer-only regions and attention kept apart); each READ's
     exact bytes (its selected-byte sum and its length histogram) and the
     checker's per-READ record (producer, bytes by group, component and class,
-    completion); NIXL's selected/predicted/measured descriptors. Mooncake does
+    completion); NIXL's selected/predicted/measured descriptors; all of it at
+    every DP rank, each decode DP rank's READs and checks apart. Mooncake does
     not pair a hybrid."""
     prefill_tp, decode_tp = sizes["prefill"], sizes["decode"]
     nixl = run.server.connector == "nixl"
@@ -2711,33 +2804,36 @@ def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, por
     done = {"sources": {d: [0] for d in range(decode_tp)}, "received": {}}
     if not nixl:
         return {**evidence, "problems": problems + ["a hybrid model pairs unequal TP sizes over NIXL only"], **done}
-    groups_of = lambda role, rank: (layout(role, rank) or {}).get("groups") or []
+    keys = {role: getattr(run, role).ranks(sizes[role]) for role in sizes}
+    name = _rank_namer(run)
+    groups_of = lambda role, dp, rank: (layout(role, dp, rank) or {}).get("groups") or []
     state_idx = [i for i, k in enumerate(kinds) if k == "MambaSpec"]
     attn_idx = [i for i, k in enumerate(kinds) if k != "MambaSpec"]
     reference = None
     for role in sizes:
-        for rank in range(sizes[role]):
-            for index, group in enumerate(groups_of(role, rank)):
+        for dp, rank in keys[role]:
+            at = name(role, dp, rank)
+            for index, group in enumerate(groups_of(role, dp, rank)):
                 if index in attn_idx:
                     want = global_heads(rank, sizes[role], kv_heads)
                     if group.get("pattern") != "head-v1" or group.get("global_heads") != want:
-                        problems.append(f"{role} rank {rank}'s group {index} holds {group.get('pattern')} heads "
+                        problems.append(f"{at}'s group {index} holds {group.get('pattern')} heads "
                                         f"{group.get('global_heads')}, not head-v1 heads {want}")
                     continue
                 state = group.get("state")
                 if group.get("pattern") != "state-v1" or not isinstance(state, dict):
-                    problems.append(f"{role} rank {rank}'s group {index} is {group.get('pattern')}, not state-v1")
+                    problems.append(f"{at}'s group {index} is {group.get('pattern')}, not state-v1")
                     continue
                 model = {k: state.get(k) for k in ("family", "components", "conv_rows", "conv_itemsize",
                                                    "ssm_heads", "ssm_head_bytes")}
                 reference = reference or model
                 if model != reference:
-                    problems.append(f"{role} rank {rank}'s group {index} state layout {model} differs from {reference}")
+                    problems.append(f"{at}'s group {index} state layout {model} differs from {reference}")
                 want_spans = _state_spans(reference, rank, sizes[role])
                 if want_spans is None:
-                    problems.append(f"{role} rank {rank}: the state does not split over TP {sizes[role]}")
+                    problems.append(f"{at}: the state does not split over TP {sizes[role]}")
                 elif state.get("spans") != want_spans:
-                    problems.append(f"{role} rank {rank}'s group {index} state spans {state.get('spans')}, "
+                    problems.append(f"{at}'s group {index} state spans {state.get('spans')}, "
                                     f"not the layout's {want_spans}")
     if reference is None or problems:
         return {**evidence, "problems": problems + ([] if reference else ["no state group's layout record"]), **done}
@@ -2763,42 +2859,45 @@ def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, por
             got |= set(_state_overlap(d, decode_tp, prefill_tp, width))
         sources[d] = sorted(got)
     evidence["sources"] = sources
-    expected: dict[tuple[int, int], int] = {}
-    classes: dict[tuple[int, int, str], int] = {}
-    attention_expected: dict[tuple[int, int], int] = {}
+    # Keyed (producer rank, decode DP rank, decode rank): NIXL's decode logs
+    # each READ.
+    expected: dict[tuple[int, int, int], int] = {}
+    classes: dict[tuple[int, int, int, str], int] = {}
+    attention_expected: dict[tuple[int, int, int], int] = {}
     totals = {"attention": 0, "state_logical": 0, "state_transfer_only": 0}
     unique = {"attention": 0, "state_logical": 0, "state_transfer_only": 0}
-    checks: dict[int, list[dict]] = {d: [] for d in range(decode_tp)}
-    for d in range(decode_tp):
+    checks: dict[tuple[int, int], list[dict]] = {key: [] for key in keys["decode"]}
+    for ddp, d in keys["decode"]:
+        at = name("decode", ddp, d)
         local = _state_spans(reference, d, decode_tp)
         span_bytes = sum(sp[3] for sp in local)
-        for record in logs["decode"].get((0, d), []):
+        for record in logs["decode"].get((ddp, d), []):
             check = record.get("kv_check")
             if not check or check.get("kind") not in (None, "transfer") or "error" in check:
                 continue
-            checks[d].append(check)
+            checks[(ddp, d)].append(check)
             coverage = check.get("coverage") or {}
             if not isinstance(coverage, dict) or "reads" not in coverage:
-                problems.append(f"decode rank {d}'s check of {check.get('req_id')} has no READ coverage")
+                problems.append(f"{at}'s check of {check.get('req_id')} has no READ coverage")
             for text in coverage.get("problems") or []:
-                problems.append(f"decode rank {d} {check.get('req_id')}: {text}")
+                problems.append(f"{at} {check.get('req_id')}: {text}")
             if check.get("posted_matches_checked") is not True:
-                problems.append(f"decode rank {d}'s check of {check.get('req_id')} did not match its posted READs")
+                problems.append(f"{at}'s check of {check.get('req_id')} did not match its posted READs")
             for read in coverage.get("reads") or []:
                 if read.get("completed") is not True:
-                    problems.append(f"decode rank {d}: a READ from {read.get('rank')} was not complete")
+                    problems.append(f"{at}: a READ from {read.get('rank')} was not complete")
                 if sum(c[1] for c in (read.get("classes") or {}).values()) != read.get("bytes"):
-                    problems.append(f"decode rank {d}: a READ's classes sum to "
+                    problems.append(f"{at}: a READ's classes sum to "
                                     f"{sum(c[1] for c in (read.get('classes') or {}).values())}, not {read.get('bytes')}")
             for position, group in enumerate(check.get("groups") or []):
                 index = group.get("group", position)
                 if index in attn_idx:
                     mine = global_heads(d, decode_tp, kv_heads)
                     if group.get("pattern") != "head-v1" or group.get("global_heads") != mine:
-                        problems.append(f"decode rank {d} checked {check.get('req_id')}'s heads "
+                        problems.append(f"{at} checked {check.get('req_id')}'s heads "
                                         f"{group.get('global_heads')} ({group.get('pattern')}), not its {mine}")
                     if not isinstance(group.get("bytes"), int) or group["bytes"] % len(mine):
-                        problems.append(f"decode rank {d}: attention group {index} moved {group.get('bytes')} bytes "
+                        problems.append(f"{at}: attention group {index} moved {group.get('bytes')} bytes "
                                         f"over {len(mine)} heads")
                         continue
                     # What the READs carried: the checked bytes but the
@@ -2808,23 +2907,23 @@ def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, por
                         unique["attention"] += per_head * kv_heads
                     totals["attention"] += group["bytes"]
                     for p, heads in attention(d).items():
-                        expected[(p, d)] = expected.get((p, d), 0) + per_head * len(heads)
-                        attention_expected[(p, d)] = attention_expected.get((p, d), 0) + per_head * len(heads)
+                        expected[(p, ddp, d)] = expected.get((p, ddp, d), 0) + per_head * len(heads)
+                        attention_expected[(p, ddp, d)] = attention_expected.get((p, ddp, d), 0) + per_head * len(heads)
                     continue
                 if index not in state_idx or group.get("pattern") != "state-v1":
-                    problems.append(f"decode rank {d} checked group {index} as {group.get('pattern')}, "
+                    problems.append(f"{at} checked group {index} as {group.get('pattern')}, "
                                     "not a state-v1 state group")
                     continue
                 blocks, regions = group.get("blocks"), group.get("regions")
                 if not (isinstance(blocks, int) and isinstance(regions, int) and blocks > 0 and regions > 0):
-                    problems.append(f"decode rank {d}: state group {index} reports {blocks} blocks, {regions} regions")
+                    problems.append(f"{at}: state group {index} reports {blocks} blocks, {regions} regions")
                     continue
                 if group.get("bytes") != blocks * regions * span_bytes:
-                    problems.append(f"decode rank {d}: state group {index} moved {group.get('bytes')} bytes, not "
+                    problems.append(f"{at}: state group {index} moved {group.get('bytes')} bytes, not "
                                     f"{blocks} blocks x {regions} regions x {span_bytes} of its spans")
                 transfer_only = group.get("transfer_only_bytes", 0)
                 if transfer_only % (blocks * span_bytes):
-                    problems.append(f"decode rank {d}: state group {index}'s transfer-only bytes {transfer_only} "
+                    problems.append(f"{at}: state group {index}'s transfer-only bytes {transfer_only} "
                                     f"are not whole regions of {span_bytes}")
                     continue
                 only_regions = transfer_only // (blocks * span_bytes)
@@ -2844,17 +2943,17 @@ def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, por
                         for kind, regs in (("logical", logical_regions), ("transfer-only", only_regions)):
                             n = blocks * regs * (hi - lo) * unit
                             if n:
-                                classes[(p, d, f"g{index}.{sp[0]}.{sp[1]}.{kind}")] = (
-                                    classes.get((p, d, f"g{index}.{sp[0]}.{sp[1]}.{kind}"), 0) + n)
-                                expected[(p, d)] = expected.get((p, d), 0) + n
+                                classes[(p, ddp, d, f"g{index}.{sp[0]}.{sp[1]}.{kind}")] = (
+                                    classes.get((p, ddp, d, f"g{index}.{sp[0]}.{sp[1]}.{kind}"), 0) + n)
+                                expected[(p, ddp, d)] = expected.get((p, ddp, d), 0) + n
 
     # Per-READ telemetry: exact bytes and lengths, then NIXL's three counts.
-    logged: dict[tuple[int, int], int] = {}
-    seen_classes: dict[tuple[int, int, str], int] = {}
-    attention_seen: dict[tuple[int, int], int] = {}
-    telemetry: dict[int, list[tuple]] = {d: [] for d in range(decode_tp)}
+    logged: dict[tuple[int, int, int], int] = {}
+    seen_classes: dict[tuple[int, int, int, str], int] = {}
+    attention_seen: dict[tuple[int, int, int], int] = {}
+    telemetry: dict[tuple[int, int], list[tuple]] = {key: [] for key in keys["decode"]}
     descriptors, merged, unknown = [], [], 0
-    for (_, rank), records in logs["decode"].items():
+    for (ddp, rank), records in logs["decode"].items():
         for record in records:
             for entry in ((record.get("kv_transfers") or {}).get("load") or {}).get("each") or []:
                 peer = entry[5] if len(entry) > 5 else None
@@ -2862,8 +2961,8 @@ def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, por
                 if peer is None:
                     unknown += 1
                     continue
-                at = f"prefill rank {peer} -> decode rank {rank}: "
-                logged[(peer, rank)] = logged.get((peer, rank), 0) + int(entry[0])
+                at = f"prefill rank {peer} -> {name('decode', ddp, rank)}: "
+                logged[(peer, ddp, rank)] = logged.get((peer, ddp, rank), 0) + int(entry[0])
                 if not (isinstance(plan, list) and len(plan) > 4):
                     problems.append(f"{at}a READ without its selected bytes and lengths ({plan})")
                     continue
@@ -2890,72 +2989,63 @@ def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, por
                     if descriptor_limit(run.server) is not None and selected > descriptor_limit(run.server):
                         problems.append(f"{at}a READ of {selected} selected descriptors, more than the "
                                         f"{NIXL_MAX_DESCRIPTORS} guard")
-                telemetry[rank].append((peer, int(entry[0]), selected))
+                telemetry[(ddp, rank)].append((peer, int(entry[0]), selected))
     if unknown:
         problems.append(f"{unknown} transfer(s) logged without their peer rank")
-    for d in range(decode_tp):
-        posted = sorted((r.get("rank"), r.get("bytes"), r.get("descriptors")) for c in checks[d]
+    for ddp, d in keys["decode"]:
+        mine = checks[(ddp, d)]
+        posted = sorted((r.get("rank"), r.get("bytes"), r.get("descriptors")) for c in mine
                         for r in (c.get("coverage") or {}).get("reads") or [])
-        for c in checks[d]:
+        for c in mine:
             for r in (c.get("coverage") or {}).get("reads") or []:
-                for name, (_, n) in (r.get("classes") or {}).items():
-                    if ".attention." in name:
-                        attention_seen[(r.get("rank"), d)] = attention_seen.get((r.get("rank"), d), 0) + n
+                for cls, (_, n) in (r.get("classes") or {}).items():
+                    if ".attention." in cls:
+                        key = (r.get("rank"), ddp, d)
+                        attention_seen[key] = attention_seen.get(key, 0) + n
                         continue
-                    key = (r.get("rank"), d, name)
+                    key = (r.get("rank"), ddp, d, cls)
                     seen_classes[key] = seen_classes.get(key, 0) + n
-        if posted != sorted(telemetry[d]):
-            problems.append(f"decode rank {d}'s checked READs {posted[:3]}... are not its logged READs "
-                            f"{sorted(telemetry[d])[:3]}... (producer, bytes, selected descriptors)")
+        if posted != sorted(telemetry[(ddp, d)]):
+            problems.append(f"{name('decode', ddp, d)}'s checked READs {posted[:3]}... are not its logged READs "
+                            f"{sorted(telemetry[(ddp, d)])[:3]}... (producer, bytes, selected descriptors)")
+    pair_name = lambda p, ddp, d: f"prefill rank {p} -> {name('decode', ddp, d)}"
     for key in sorted(set(classes) | set(seen_classes)):
         if classes.get(key, 0) != seen_classes.get(key, 0):
-            problems.append(f"producer {key[0]} -> decode rank {key[1]}: {key[2]} carried {seen_classes.get(key, 0)} "
-                            f"bytes, not the {classes.get(key, 0)} its owned range gives")
-    for pair in sorted(set(attention_expected) | set(attention_seen)):
-        if attention_expected.get(pair, 0) != attention_seen.get(pair, 0):
-            problems.append(f"prefill rank {pair[0]} -> decode rank {pair[1]}: attention carried "
-                            f"{attention_seen.get(pair, 0)} bytes, not the {attention_expected.get(pair, 0)} "
+            problems.append(f"producer {key[0]} -> {name('decode', key[1], key[2])}: {key[3]} carried "
+                            f"{seen_classes.get(key, 0)} bytes, not the {classes.get(key, 0)} its owned range gives")
+    for key in sorted(set(attention_expected) | set(attention_seen)):
+        if attention_expected.get(key, 0) != attention_seen.get(key, 0):
+            problems.append(f"{pair_name(*key)}: attention carried "
+                            f"{attention_seen.get(key, 0)} bytes, not the {attention_expected.get(key, 0)} "
                             "of the heads it holds for it")
-    for pair in sorted(set(expected) | set(logged)):
-        if logged.get(pair, 0) != expected.get(pair, 0):
-            problems.append(f"prefill rank {pair[0]} -> decode rank {pair[1]} moved {logged.get(pair, 0)} bytes, "
-                            f"not the {expected.get(pair, 0)} its owned heads and state ranges give")
-    for p in sorted(unwritten):
-        problems.append(f"prefill rank {p}'s TENT metrics lack tent_write_bytes_total")
-    received = {d: sum(n for (p, dd), n in logged.items() if dd == d) for d in range(decode_tp)}
-    sent = {p: sum(n for (pp, d), n in logged.items() if pp == p) for p in range(prefill_tp)}
+    for key in sorted(set(expected) | set(logged)):
+        if logged.get(key, 0) != expected.get(key, 0):
+            problems.append(f"{pair_name(*key)} moved {logged.get(key, 0)} bytes, "
+                            f"not the {expected.get(key, 0)} its owned heads and state ranges give")
+    for dp, p in sorted(unwritten):
+        problems.append(f"{name('prefill', dp, p)}'s TENT metrics lack tent_write_bytes_total")
+    received = {d: sum(n for (_, _, dd), n in logged.items() if dd == d) for d in range(decode_tp)}
+    sent = {p: sum(n for (pp, _, _), n in logged.items() if pp == p) for p in range(prefill_tp)}
     payload = sum(logged.values())
     moved = sum(summary["transfers"]["bytes"] for summary in ranks["decode"].values())
     if moved != payload:
         problems.append(f"the connector moved {moved} bytes, not the {payload} its transfers' peers account for")
     for p in range(prefill_tp):
-        produced = ranks["prefill"].get((0, p), {}).get("requests") or set()
+        produced = set().union(*(set(ranks["prefill"].get((dp, rank), {}).get("requests") or ())
+                                 for dp, rank in keys["prefill"] if rank == p))
         if run.kv_check and len(produced) != run.workload.num_prompts:
             problems.append(f"prefill rank {p} produced {len(produced)} request(s), not {run.workload.num_prompts}")
-    port_evidence = {}
-    if ports is not None:
-        network = ports.get(run.prefill.kv_network) or {}
-        by_rank = {(described["node"], described["slot"]): described for described in network.values()}
-        for role, node, carried, direction in (("prefill", run.prefill.node, sent, "rx"),
-                                               ("decode", run.decode.node, received, "tx")):
-            for rank, payload_bytes in carried.items():
-                port = by_rank.get((node, rank))
-                if port is None:
-                    problems.append(f"{role} rank {rank}'s router port was not measured")
-                    continue
-                measured = port[direction]
-                port_evidence[f"{role}{rank}"] = {"rx": port["rx"], "tx": port["tx"], "payload": payload_bytes}
-                if measured < payload_bytes or measured > payload_bytes * 1.05 + (1 << 20):
-                    problems.append(f"{role} rank {rank}'s router port {direction.upper()} {measured} bytes, not its "
-                                    f"{payload_bytes} of KV and little more")
-    else:
-        problems.append("no router port counters: unequal TP needs the switched network's")
+    port_evidence, port_problems = _rank_ports(run, ports, sent, received)
+    problems.extend(port_problems)
+    with_dp = run.decode.data_parallel_size > 1
     evidence.update({
-        "pairs": [{"prefill": p, "decode": d, "bytes": logged.get((p, d), 0), "expected": expected.get((p, d), 0)}
-                  for p in range(prefill_tp) for d in range(decode_tp) if (p, d) in expected or (p, d) in logged],
+        "pairs": [{"prefill": p, **({"decode_dp": ddp} if with_dp else {}), "decode": d,
+                   "bytes": logged.get((p, ddp, d), 0), "expected": expected.get((p, ddp, d), 0)}
+                  for p, ddp, d in sorted(set(expected) | set(logged))],
         "byte_classes": totals, "unique_bytes_by_class": unique, "payload_bytes": payload,
         "max_descriptors": max(descriptors, default=None), "max_merged_descriptors": max(merged, default=None),
-        "state_classes": {f"{p}->{d} {name}": n for (p, d, name), n in sorted(classes.items())},
+        "state_classes": {f"{p}->{f'{ddp}.' if with_dp else ''}{d} {cls}": n
+                          for (p, ddp, d, cls), n in sorted(classes.items())},
         "ports": port_evidence or None, "received": received, "problems": problems,
     })
     return evidence
