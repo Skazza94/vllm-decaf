@@ -1395,14 +1395,16 @@ def test_real_transfers_pair_kimi_k3_from_prefill_tp8_to_decode_tp4_over_nixl_on
     )
 
 
-# The attention block each TP size gives Qwen3.5-27B, through the real engine
-# path (the model builds, AISimulate prices its steps, then the platform
-# aligns the hybrid's block size).
+# The attention block each TP size gives a published hybrid at real
+# initialization (the model builds, AISimulate prices its steps, then the
+# platform aligns the hybrid's block size): argv is model, TP, asked block
+# ("auto" or a size), output, AISimulate's target model and extra LLM kwargs.
 ENGINE_BLOCK_SIZES = r"""
 import json, sys
 
 def main():
-    model, tp, block_size, out = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+    model, tp, block_size, out, target, extra = sys.argv[1:7]
+    tp = int(tp)
     from vllm import LLM
     kwargs = {
         "model": model,
@@ -1412,15 +1414,15 @@ def main():
         "max_model_len": 4096,
         "kv_cache_memory_bytes": 1 << 30,
         "max_num_batched_tokens": 2048,
-        "language_model_only": True,
         "enable_prefix_caching": False,
         "enforce_eager": True,
         "simulation_config": {
             "simulate_forward": True,
             "timing": "aisimulate",
-            "timing_args": {"gpu": "h100", "target_model": "Qwen/Qwen3.5-27B"},
+            "timing_args": {"gpu": "h100", "target_model": target},
         },
     }
+    kwargs.update(json.loads(extra))
     if block_size != "auto":
         kwargs["block_size"] = int(block_size)
     llm = LLM(**kwargs)
@@ -1461,7 +1463,8 @@ def qwen3_5_27b_attention_block_sizes(qwen3_5_27b_model_dir, tmp_path_factory):
             result = work / f"sizes-{tp}-{asked}.json"
             done = subprocess.run(
                 [sys.executable, str(script), qwen3_5_27b_model_dir,
-                 str(tp), asked, str(result)],
+                 str(tp), asked, str(result), "Qwen/Qwen3.5-27B",
+                 json.dumps({"language_model_only": True})],
                 env=env, timeout=900,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             )
@@ -3640,14 +3643,17 @@ def main():
     extra = {"backends": ["Mooncake"],
              **({"kv_lease_duration": lease} if lease else {})}
     simulation = {"simulate_forward": True,
-                  "timing": "linear", "timing_args": {"fixed_us": 100},
+                  "timing": kwargs.pop("timing", "linear"),
+                  "timing_args": kwargs.pop(
+                      "timing_args", {"fixed_us": 100}),
                   "log_path": out + ".steps"}
     if producer:
         simulation["kv_pattern_fill"] = True
     elif check:
         simulation["kv_pattern_check"] = True
     llm = LLM(model=model, skip_tokenizer_init=True, dtype="bfloat16",
-              max_model_len=256, kv_cache_memory_bytes=int(memory),
+              max_model_len=kwargs.pop("max_model_len", 256),
+              kv_cache_memory_bytes=int(memory),
               max_num_batched_tokens=64,
               enable_prefix_caching=kwargs.pop("enable_prefix_caching", False),
               enforce_eager=True, block_size=kwargs.pop("block_size", 16),
@@ -3698,17 +3704,45 @@ def main():
                 return False
             import torch
             from vllm.distributed.kv_transfer import get_kv_transfer_group
-            from vllm.v1.worker.simulated.kv_pattern import SENTINEL, dcp_page
+            from vllm.v1.worker.simulated.kv_pattern import (
+                SENTINEL,
+                NativeChecker,
+                dcp_page,
+            )
             runner = worker.model_runner
             checker = runner._kv_checker
             connector = get_kv_transfer_group().connector_worker
             done = connector.get_transfer_results
+
+            def is_attention(names):
+                # A hybrid's other groups hold its states: Nemotron's Mamba
+                # mixers, Qwen's gated delta nets.
+                return all(
+                    "self_attn" in n or ".mixer.attn" in n for n in names
+                )
 
             def get_transfer_results():
                 results = done()
                 for req_id in results.finished_recving or ():
                     expected = checker.pending.get(req_id)
                     if expected is None:
+                        continue
+                    groups = connector.kv_cache_config.transfer_groups
+                    if isinstance(checker, NativeChecker):
+                        # NIXL's checker spans a hybrid's groups: change one
+                        # attention group's first payload byte.
+                        if mode != "payload":
+                            continue
+                        for group in expected.groups:
+                            names = groups[group.group].layer_names
+                            if not is_attention(names):
+                                continue
+                            block = group.block_ids[0]
+                            caches = [connector.device_kv_caches[n][block]
+                                      for n in names]
+                            caches[0].view(-1).view(torch.uint8)[0] ^= 1
+                            runner._dcp_corrupted = [mode, 0, int(block)]
+                            return results
                         continue
                     (group,) = expected.groups
                     tokens = checker.page_tokens[group.group]
@@ -3718,14 +3752,15 @@ def main():
                                         checker.dcp_size, checker.dcp_rank)
                         if (page < pages) != (mode == "payload"):
                             continue
-                        groups = connector.kv_cache_config.transfer_groups
                         names = groups[group.group].layer_names
                         caches = [connector.device_kv_caches[n][block]
                                   for n in names]
                         data = caches[0].view(-1).view(torch.uint8)
                         if mode == "payload":
                             data[0] ^= 1
-                        elif bool((data == SENTINEL).all()) != (mode == "untouched"):
+                        elif bool((data == SENTINEL).all()) != (
+                            mode == "untouched"
+                        ):
                             continue
                         elif mode == "untouched":
                             data[0] = 1
@@ -3733,7 +3768,7 @@ def main():
                             for cache in caches:
                                 cache.view(-1).view(torch.uint8).fill_(SENTINEL)
                         runner._dcp_corrupted = [mode, page, int(block)]
-                        break
+                        return results
                 return results
 
             connector.get_transfer_results = get_transfer_results
@@ -3760,7 +3795,9 @@ if __name__ == "__main__":
 """
 
 
-def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
+def run_dcp_peers(
+    config, producer_kwargs, consumer_kwargs, tmp_path, memory=(8 << 20, 12 << 20)
+):
     """Run DCP_PEER's TP producer and consumer (None: the producer alone):
     their records, each rank's step log records (`<role>` rank r), and each
     one's output."""
@@ -3797,6 +3834,7 @@ def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
         "VLLM_HOST_IP": "127.0.0.1",
         "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
         "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
     }
     produced, consumed = tmp_path / "producer.json", tmp_path / "consumer.json"
 
@@ -3818,7 +3856,7 @@ def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
     )
     producer_log = tmp_path / "producer.log"
     producer = subprocess.Popen(
-        command("producer", producer_kwargs, produced, 8 * 1024**2),
+        command("producer", producer_kwargs, produced, memory[0]),
         env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_ports(tp))},
         stdout=producer_log.open("w"),
         stderr=subprocess.STDOUT,
@@ -3831,7 +3869,7 @@ def run_dcp_peers(config, producer_kwargs, consumer_kwargs, tmp_path):
             assert time.monotonic() < deadline, "no producer output"
             time.sleep(0.5)
         consumer = consumer_kwargs and subprocess.run(
-            command("consumer", consumer_kwargs, consumed, 12 * 1024**2, str(produced)),
+            command("consumer", consumer_kwargs, consumed, memory[1], str(produced)),
             env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_ports(tp))},
             timeout=600,
             stdout=subprocess.PIPE,
@@ -5396,3 +5434,328 @@ def test_nixl_attention_groups_take_a_peer_of_another_tp_size(
     except Exception as e:  # the stand-in peer fails NIXL's own checks, not ours
         assert "holds its states otherwise" not in str(e)
     assert llm is not None
+
+
+# The published Nemotron-3-Nano, the one AISimulate's bundled configs carry
+# (the issue-3 model, BF16): 52 layers of the hybrid pattern, 32 attention
+# heads over 2 KV heads of head_dim 128, a Mamba2 mixer of 64 heads of 64
+# over 8 groups of a 128-wide state, a 4-wide conv, the state FP32.
+NEMOTRON_3_NANO_AISIMULATE = {
+    "timing": "aisimulate",
+    "timing_args": {
+        "gpu": "h100",
+        "target_model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    },
+}
+
+_NEMOTRON_3_NANO_CONFIG = None
+
+
+def nemotron_3_nano_config():
+    """The published Nemotron-3-Nano configuration, from AISimulate's
+    bundled configs (the one its timing provider compares against)."""
+    global _NEMOTRON_3_NANO_CONFIG
+    if _NEMOTRON_3_NANO_CONFIG is None:
+        import aisimulate_core
+
+        path = os.path.join(
+            os.path.dirname(aisimulate_core.__file__),
+            "model_configs",
+            "nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16_config.json",
+        )
+        with open(path) as f:
+            _NEMOTRON_3_NANO_CONFIG = json.load(f)
+    return _NEMOTRON_3_NANO_CONFIG
+
+
+@pytest.fixture(scope="module")
+def nemotron_3_nano_model_dir(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("nemotron-3-nano")
+    if not REAL:
+        pytest.skip("the published Nemotron-3-Nano config comes from AISimulate")
+    (directory / "config.json").write_text(json.dumps(nemotron_3_nano_config()))
+    return str(directory)
+
+
+@pytest.fixture(scope="module")
+def nemotron_3_nano_attention_block_sizes(nemotron_3_nano_model_dir, tmp_path_factory):
+    """The published Nemotron-3-Nano's attention blocks at real
+    initialization (AISimulate prices it, the platform aligns the hybrid):
+    the automatic sizes, and what an explicit 1,088 becomes at each TP."""
+    import subprocess
+    import sys
+
+    work = tmp_path_factory.mktemp("nemotron-3-nano-sizes")
+    script = work / "sizes.py"
+    script.write_text(ENGINE_BLOCK_SIZES)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "GLOO_SOCKET_IFNAME": "lo",
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+    }
+    out = {}
+    for tp in (1, 2, 4, 8):
+        for asked in ("auto", "1088"):
+            result = work / f"sizes-{tp}-{asked}.json"
+            done = subprocess.run(
+                [sys.executable, str(script), nemotron_3_nano_model_dir,
+                 str(tp), asked, str(result),
+                 "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "{}"],
+                env=env, timeout=900,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            assert done.returncode == 0, done.stdout[-4000:]
+            out[(tp, asked)] = json.loads(result.read_text())
+    return out
+
+
+@pytest.mark.parametrize(
+    "tp,asked,want",
+    [
+        (1, "auto", 2112), (2, "auto", 2112), (4, "auto", 1056), (8, "auto", 544),
+        (1, "1088", 2176), (2, "1088", 2176), (4, "1088", 1088), (8, "1088", 1088),
+    ],
+    ids=["tp1-auto", "tp2-auto", "tp4-auto", "tp8-auto",
+         "tp1-1088", "tp2-1088", "tp4-1088", "tp8-1088"],
+)
+def test_nemotron_3_nano_picks_its_attention_block_sizes(
+    nemotron_3_nano_attention_block_sizes, tp, asked, want
+):
+    """The published Nemotron-3-Nano's attention blocks at real
+    initialization: automatic 2,112 at TP 1 and 2, 1,056 at TP 4 and 544 at
+    TP 8 (the automatic page must reach the rank's state page). An
+    explicit 1,088 becomes the alignment's own base, so it is kept where
+    one such page already covers the state (TP 4 and 8) and doubles to
+    2,176 at TP 1 and 2, where it does not."""
+    assert nemotron_3_nano_attention_block_sizes[(tp, asked)] == want
+
+
+@pytest.mark.parametrize("dirty", [False, True], ids=["clean", "dirty"])
+def test_nixl_peers_pair_nemotron_3_nano_from_prefill_tp8_to_decode_tp4_at_1088(
+    tmp_path, dirty
+):
+    """The round's Nemotron-3-Nano candidate over real NIXL: prefill TP 8
+    (544-token attention blocks, the CPU simulation's automatic size) to
+    decode TP 4 reading 1,088 (each consumer block two producer blocks,
+    block-size ratio 2). A 1,500-token prompt leaves the second consumer
+    block's last producer sub-block uncovered; NIXL zeroes it, the states
+    arrive 1:1 (padded past the producer's page), and every consumer rank's
+    byte check passes. With `dirty`, one payload byte of rank 0's first
+    attention page is changed after the READ, and only that rank's check
+    fails, by exactly one byte."""
+    if not REAL:
+        pytest.skip("the published Nemotron-3-Nano config comes from AISimulate")
+    consumer = {
+        "tensor_parallel_size": 4,
+        "block_size": 1088,
+        "max_model_len": 2600,
+        "prompt_len": 1500,
+        **NEMOTRON_3_NANO_AISIMULATE,
+    }
+    if dirty:
+        consumer["corrupt"] = ["payload", 0]
+    p, c = run_dcp_peers(
+        nemotron_3_nano_config(),
+        {
+            "tensor_parallel_size": 8,
+            "block_size": 32,
+            "max_model_len": 2600,
+            "prompt_len": 1500,
+            **NEMOTRON_3_NANO_AISIMULATE,
+        },
+        consumer,
+        tmp_path,
+        memory=(1 << 30, 1 << 30),
+    )
+    assert (len(p["ranks"]), len(c["ranks"])) == (8, 4)
+    assert p["released"], p["log"][-4000:]
+    assert c["tokens"] == [2], c["log"][-4000:]
+    corrupted = [mark for mark in c["corrupted"] if mark]
+    assert [mark[0] for mark in corrupted] == (
+        ["payload"] if dirty else []
+    ), c["log"][-6000:]
+    for rank in range(4):
+        (check,) = [r["kv_check"] for r in c["logs"][rank] if "kv_check" in r]
+        assert check["ok"] == (not dirty or rank != 0), check
+        assert check["coverage"]["problems"] == [], check["coverage"]
+        assert check["bytes"] == 19488768, check["bytes"]
+        assert check["mismatched_bytes"] == (
+            0 if not dirty or rank != 0 else 1
+        ), check
+        assert [g["pattern"] for g in check["groups"]] == (
+            ["state-v1"] * 4 + ["head-v1"]
+        )
+        for state in check["groups"][:4]:
+            assert (state["zeroed_bytes"], state["padding_bytes"]) == (
+                0, 141312,
+            )
+        (attention,) = [g for g in check["groups"] if g["pattern"] == "head-v1"]
+        assert (attention["blocks"], attention["block_size_ratio"]) == (2, 2)
+        assert attention["zeroed_bytes"] == 1671168, attention
+        assert attention["mismatched_bytes"] == (
+            0 if not dirty or rank != 0 else 1
+        ), attention
+
+
+def test_nixl_peers_pair_qwen3_5_27b_from_prefill_tp4_to_decode_tp8_at_1600(
+    tmp_path,
+):
+    """The round's Qwen3.5-27B candidate, a consumer with more ranks than its
+    producer: prefill TP 4 (800-token attention blocks) to decode TP 8
+    reading 1,600 (ratio 2, one KV head a rank, the gated delta-net states
+    from the producer each span overlaps). A 1,900-token prompt leaves the
+    second consumer block's last producer sub-block uncovered; every consumer
+    rank's byte check passes with it zeroed and the states 1:1."""
+    if not REAL:
+        pytest.skip("the published Qwen3.5-27B config comes from AISimulate")
+    p, c = run_dcp_peers(
+        qwen3_5_27b_config(),
+        {
+            "tensor_parallel_size": 4,
+            "block_size": 32,
+            "max_model_len": 2600,
+            "prompt_len": 1900,
+            "language_model_only": True,
+            **QWEN3_5_27B_AISIMULATE,
+        },
+        {
+            "tensor_parallel_size": 8,
+            "block_size": 1600,
+            "max_model_len": 2600,
+            "prompt_len": 1900,
+            "language_model_only": True,
+            **QWEN3_5_27B_AISIMULATE,
+        },
+        tmp_path,
+        memory=(1 << 30, 1 << 30),
+    )
+    assert (len(p["ranks"]), len(c["ranks"])) == (4, 8)
+    assert p["released"], p["log"][-4000:]
+    assert c["tokens"] == [2], c["log"][-4000:]
+    for rank in range(8):
+        (check,) = [r["kv_check"] for r in c["logs"][rank] if "kv_check" in r]
+        assert check["ok"] and check["mismatched_bytes"] == 0, check
+        assert check["coverage"]["problems"] == [], check["coverage"]
+        assert check["bytes"] == 71671808, check["bytes"]
+        assert [g["pattern"] for g in check["groups"]] == (
+            ["state-v1"] * 3 + ["head-v1"]
+        )
+        for state in check["groups"][:3]:
+            assert (state["zeroed_bytes"], state["padding_bytes"]) == (
+                0, 19800064,
+            )
+        (attention,) = [g for g in check["groups"] if g["pattern"] == "head-v1"]
+        assert (attention["blocks"], attention["block_size_ratio"]) == (2, 2)
+        assert attention["zeroed_bytes"] == 13107200, attention
+
+
+@pytest.mark.parametrize(
+    "producer_tp,consumer_tp,peer_size,instance_size",
+    [(4, 8, 1056, 544), (8, 4, 544, 1056)],
+    ids=["larger-prefill", "neither-divides"],
+)
+@pytest.mark.parametrize("check", [True, False], ids=["checked", "unchecked"])
+def test_nixl_peers_refuse_nemotron_3_nanos_unequal_blocks(
+    tmp_path, check, producer_tp, consumer_tp, peer_size, instance_size
+):
+    """The refusals issue 25 item 3 must keep, in both directions:
+    Nemotron-3-Nano prefill TP 4 (1,056-token attention blocks) to decode
+    TP 8 (automatic 544) — the decode block is smaller and does not divide;
+    prefill TP 8 (544) to decode TP 4 (automatic 1,056) — neither divides.
+    The consumer's handshake refuses the producer before any READ, whether
+    or not it checks bytes."""
+    if not REAL:
+        pytest.skip("the published Nemotron-3-Nano config comes from AISimulate")
+    p, c = run_dcp_peers(
+        nemotron_3_nano_config(),
+        {
+            "tensor_parallel_size": producer_tp,
+            "block_size": 32,
+            "max_model_len": 2600,
+            "prompt_len": 1500,
+            **NEMOTRON_3_NANO_AISIMULATE,
+        },
+        {
+            "tensor_parallel_size": consumer_tp,
+            "block_size": 32,
+            "max_model_len": 2600,
+            "prompt_len": 1500,
+            "check": check,
+            **NEMOTRON_3_NANO_AISIMULATE,
+        },
+        tmp_path,
+        memory=(1 << 30, 1 << 30),
+    )
+    assert c["tokens"] == [0], c["log"][-4000:]
+    assert (
+        f"A hybrid model's NIXL peer has block size {peer_size}, not this "
+        f"instance's {instance_size} or a divisor of it"
+    ) in c["log"]
+    assert (len(p["ranks"]), len(c["ranks"])) == (producer_tp, consumer_tp)
+    assert [r["tp_rank"] for r in c["ranks"]] == list(range(consumer_tp))
+    assert sorted(c["logs"]) == list(range(consumer_tp))
+    for rank in range(consumer_tp):
+        checks = [r["kv_check"] for r in c["logs"][rank] if "kv_check" in r]
+        if not check:
+            assert checks == []
+            continue
+        (failed,) = checks
+        assert (failed["ok"], failed["error"]) == (False, "receive failed")
+        assert "coverage" not in failed and "groups" not in failed
+
+
+@pytest.mark.parametrize(
+    "model,kwargs,producer_tp,consumer_tp,consumer_block",
+    [
+        ("nemotron", NEMOTRON_3_NANO_AISIMULATE, 4, 1, None),
+        ("qwen", QWEN3_5_27B_AISIMULATE, 8, 2, 832),
+    ],
+    ids=["nemotron-3-nano-p4-d1", "qwen3.5-27b-p8-d2"],
+)
+def test_nixl_peers_under_more_producer_ranks_refuse_head_sharded_blocks(
+    model, kwargs, producer_tp, consumer_tp, consumer_block, tmp_path
+):
+    """The pair classes the stage-1 matrix deferred (issue 25 item 2): a
+    decode rank whose page holds more than one KV head (Nemotron 2,112-token
+    blocks at TP 1, Qwen 832-token blocks at TP 2) reading a producer of
+    more ranks at ratio 2. NIXL's own assertion refuses head-sharded
+    attention reads with P_TP > D_TP and heterogeneous block sizes before
+    any READ, so the consumer's request fails as `receive failed`, with no
+    groups."""
+    if not REAL:
+        pytest.skip("the published configs come from AISimulate")
+    if model == "nemotron":
+        config, extra = nemotron_3_nano_config(), {}
+    else:
+        config, extra = qwen3_5_27b_config(), {"language_model_only": True}
+    producer = {
+        "tensor_parallel_size": producer_tp,
+        "block_size": 32,
+        "max_model_len": 2600,
+        "prompt_len": 1500,
+        **extra,
+        **kwargs,
+    }
+    consumer = {
+        "tensor_parallel_size": consumer_tp,
+        "block_size": 32 if consumer_block is None else consumer_block,
+        "max_model_len": 2600,
+        "prompt_len": 1500,
+        **extra,
+        **kwargs,
+    }
+    p, c = run_dcp_peers(
+        config, producer, consumer, tmp_path, memory=(1 << 30, 1 << 30)
+    )
+    assert (len(p["ranks"]), len(c["ranks"])) == (producer_tp, consumer_tp)
+    assert c["tokens"] == [0], c["log"][-4000:]
+    assert (
+        "Head-sharded attention reads with P_TP > D_TP and heterogeneous "
+        "block sizes are not supported"
+    ) in c["log"]
+    for rank in range(consumer_tp):
+        (failed,) = [r["kv_check"] for r in c["logs"][rank] if "kv_check" in r]
+        assert (failed["ok"], failed["error"]) == (False, "receive failed")
+        assert "coverage" not in failed and "groups" not in failed

@@ -681,3 +681,285 @@ def test_native_group_heads_admit_a_hybrid_only_with_its_state_groups():
     assert native_group_heads({"a0": ((0, 1), 16)}, groups, True, frozenset({1, 2})) is None
     # Not a hybrid: unchanged.
     assert native_group_heads(heads, [["a0", "a1"]], False) == ((0, 1),)
+
+
+# The published Nemotron-3-Nano's geometry, as a real `NemotronHConfig`:
+# 52 layers in the model's hybrid pattern, 32 attention heads over 2 KV
+# heads of head_dim 128, a Mamba2 mixer of 64 heads of 64 over 8 groups of a
+# 128-wide state, a 4-wide conv, the state FP32.
+NEMOTRON_3_NANO_CONFIG = None
+
+
+def _nemotron_3_nano_config():
+    global NEMOTRON_3_NANO_CONFIG
+    if NEMOTRON_3_NANO_CONFIG is None:
+        from transformers import NemotronHConfig
+
+        NEMOTRON_3_NANO_CONFIG = NemotronHConfig(
+            hidden_size=2688,
+            num_hidden_layers=52,
+            hybrid_override_pattern=(
+                "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+            ),
+            num_attention_heads=32,
+            num_key_value_heads=2,
+            head_dim=128,
+            mamba_num_heads=64,
+            mamba_head_dim=64,
+            ssm_state_size=128,
+            n_groups=8,
+            conv_kernel=4,
+            mamba_ssm_cache_dtype="float32",
+        )
+    return NEMOTRON_3_NANO_CONFIG
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+def test_nemotron_3_nanos_mamba2_state_splits_tp_1_2_4_and_8(tp):
+    """The published Nemotron-3-Nano's Mamba2 layout: conv x|B|C of 4,096 +
+    1,024 + 1,024 BF16 columns, 64 SSM heads of a 64x128 FP32 state; it
+    splits over every TP size the unequal pairs use."""
+    layout = sl.layout_from_config(_nemotron_3_nano_config(), 2, 4)
+    assert layout.family == "mamba2"
+    assert layout.components == (("x", 4096), ("B", 1024), ("C", 1024))
+    assert layout.ssm_heads == 64
+    assert layout.ssm_head_bytes == 64 * 128 * 4
+    assert layout.divides(tp)
+    assert layout.local_sizes(tp) == (36864 // tp, 2097152 // tp)
+
+
+def _nemotron_attn_row(rank, tp, block):
+    """The attention region of a published Nemotron-3-Nano decoder rank: its
+    heads' page of `block` tokens, 512 B a token (one KV head of head_dim
+    128, K and V, BF16)."""
+    heads = sl.head_global(tp, rank, 2)
+    return {
+        "region": 0, "offset": 0, "state": False, "span": None,
+        "length": block * len(heads) * 128 * 2 * 2,
+        "heads": heads, "group": 0, "logical": True,
+    }
+
+
+def _nemotron_state_rows(rank, tp):
+    layout = sl.layout_from_config(_nemotron_3_nano_config(), 2, 4)
+    return [
+        {
+            "region": 1, "offset": s.offset, "length": s.length, "state": True,
+            "heads": None, "span": s, "group": 1, "logical": True,
+        }
+        for s in layout.spans(rank, tp)
+    ]
+
+
+def _qwen3_5_attn_row(rank, tp, block):
+    heads = sl.head_global(tp, rank, 4)
+    return {
+        "region": 0, "offset": 0, "state": False, "span": None,
+        "length": block * len(heads) * 256 * 2 * 2,
+        "heads": heads, "group": 0, "logical": True,
+    }
+
+
+def _qwen3_5_27b_state_rows_at(rank, tp):
+    layout = sl.layout_from_config(_qwen3_5_27b_text_config(), 2, 4)
+    return [
+        {
+            "region": 1, "offset": s.offset, "length": s.length, "state": True,
+            "heads": None, "span": s, "group": 1, "logical": True,
+        }
+        for s in layout.spans(rank, tp)
+    ]
+
+
+CANDIDATES = [
+    # (id, producer TP, consumer TP, the consumer's explicit block)
+    ("nemotron-3-nano p8-d4 r2", 8, 4, 1088),
+    ("nemotron-3-nano p8-d2 r4", 8, 2, 2176),
+    ("nemotron-3-nano p4-d8 r2", 4, 8, 2112),
+    ("qwen3.5-27b p1-d8 r2", 1, 8, 1600),
+    ("qwen3.5-27b p2-d8 r2", 2, 8, 1600),
+    ("qwen3.5-27b p4-d8 r2", 4, 8, 1600),
+]
+
+
+def _candidate_rows(name, rank, consumer_tp, block):
+    """One decoder rank's attention and state rows at its TP, and the
+    published config's `StateLayout`."""
+    if name == "nemotron":
+        return (
+            _nemotron_attn_row(rank, consumer_tp, block),
+            _nemotron_state_rows(rank, consumer_tp),
+            sl.layout_from_config(_nemotron_3_nano_config(), 2, 4),
+            2,
+        )
+    return (
+        _qwen3_5_attn_row(rank, consumer_tp, block),
+        _qwen3_5_27b_state_rows_at(rank, consumer_tp),
+        sl.layout_from_config(_qwen3_5_27b_text_config(), 2, 4),
+        4,
+    )
+
+
+STATE_CANDIDATES = [
+    # (id, producer TP, consumer TP, the consumer's explicit block, the rank
+    # the state table works, that rank's state pieces per producer)
+    (
+        "nemotron-3-nano p8-d4 r2", 8, 4, 1088, 1,
+        {
+            2: [(1, 0, 0, 3072), (1, 0, 6144, 768), (1, 0, 7680, 768),
+                (1, 0, 9216, 262144), (1, 1, 0, 3072), (1, 1, 6144, 768),
+                (1, 1, 7680, 768), (1, 1, 9216, 262144)],
+            3: [(1, 0, 3072, 3072), (1, 0, 6912, 768), (1, 0, 8448, 768),
+                (1, 0, 271360, 262144), (1, 1, 3072, 3072),
+                (1, 1, 6912, 768), (1, 1, 8448, 768),
+                (1, 1, 271360, 262144)],
+        },
+    ),
+    (
+        "nemotron-3-nano p8-d2 r4", 8, 2, 2176, 0,
+        {
+            p: [(1, 0, 3072 * i, 3072), (1, 0, 12288 + 768 * i, 768),
+                (1, 0, 15360 + 768 * i, 768),
+                (1, 0, 18432 + 262144 * i, 262144),
+                (1, 1, 3072 * i, 3072), (1, 1, 12288 + 768 * i, 768),
+                (1, 1, 15360 + 768 * i, 768),
+                (1, 1, 18432 + 262144 * i, 262144)]
+            for i, p in enumerate((0, 1, 2, 3))
+        },
+    ),
+    (
+        "nemotron-3-nano p4-d8 r2", 4, 8, 2112, 3,
+        {
+            1: [(1, 0, 0, 3072), (1, 0, 3072, 768), (1, 0, 3840, 768),
+                (1, 0, 4608, 262144), (1, 1, 0, 3072), (1, 1, 3072, 768),
+                (1, 1, 3840, 768), (1, 1, 4608, 262144)],
+        },
+    ),
+    (
+        "qwen3.5-27b p4-d8 r2", 4, 8, 1600, 5,
+        {
+            2: [(1, 0, 0, 1536), (1, 0, 1536, 1536), (1, 0, 3072, 4608),
+                (1, 0, 7680, 393216), (1, 1, 0, 1536),
+                (1, 1, 1536, 1536), (1, 1, 3072, 4608),
+                (1, 1, 7680, 393216)],
+        },
+    ),
+    (
+        "qwen3.5-27b p2-d8 r2", 2, 8, 1600, 0,
+        {
+            0: [(1, 0, 0, 1536), (1, 0, 1536, 1536), (1, 0, 3072, 4608),
+                (1, 0, 7680, 393216), (1, 1, 0, 1536),
+                (1, 1, 1536, 1536), (1, 1, 3072, 4608),
+                (1, 1, 7680, 393216)],
+        },
+    ),
+    (
+        "qwen3.5-27b p1-d8 r2", 1, 8, 1600, 0,
+        {
+            0: [(1, 0, 0, 1536), (1, 0, 1536, 1536), (1, 0, 3072, 4608),
+                (1, 0, 7680, 393216), (1, 1, 0, 1536),
+                (1, 1, 1536, 1536), (1, 1, 3072, 4608),
+                (1, 1, 7680, 393216)],
+        },
+    ),
+]
+
+
+def _model_of(table, producer_tp, consumer_tp, block):
+    name = next(c[0] for c in table if c[1:4] == (producer_tp, consumer_tp, block))
+    return "nemotron" if name.startswith("nemotron") else "qwen"
+
+
+@pytest.mark.parametrize(
+    "producer_tp,consumer_tp,block,rank,want_state",
+    [c[1:] for c in STATE_CANDIDATES],
+    ids=[c[0] for c in STATE_CANDIDATES],
+)
+def test_a_candidate_pairings_attention_and_state_are_covered(
+    producer_tp, consumer_tp, block, rank, want_state
+):
+    """A new candidate's ownership at a worked rank: attention is whole pages
+    of the rank's head(s), from the producers the head mapping picks
+    (`attention_sources`), one page a block; the state is its spans once each
+    from the overlapping producers, contiguous global coordinates, one piece
+    a block. READs of exactly attention + state satisfy `coverage_problems`,
+    and a READ from a producer ownership does not name is uncovered."""
+    name = _model_of(STATE_CANDIDATES, producer_tp, consumer_tp, block)
+    attn, state, layout, kv_heads = _candidate_rows(
+        name, rank, consumer_tp, block
+    )
+    blocks = [0, 1]
+    attention = sl.expected_pieces(
+        [attn], blocks, rank, consumer_tp, producer_tp, layout, kv_heads
+    )
+    sources = sl.attention_sources(rank, consumer_tp, producer_tp, kv_heads)
+    assert set(attention) == set(sources)
+    for p in sources:
+        assert attention[p] == [(0, b, 0, attn["length"]) for b in blocks]
+    head_bytes = 128 * 2 * 2 if name == "nemotron" else 256 * 2 * 2
+    heads = sl.head_global(consumer_tp, rank, kv_heads)
+    assert attn["length"] == block * head_bytes * len(heads)
+    got = sl.expected_pieces(
+        state, blocks, rank, consumer_tp, producer_tp, layout, kv_heads
+    )
+    assert {p: sorted(pieces) for p, pieces in got.items()} == want_state
+    want = {
+        p: attention.get(p, []) + got[p] for p in set(attention) | set(got)
+    }
+    reads = [_read(p, want[p]) for p in sorted(want)]
+    assert sl.coverage_problems(want, reads) == []
+    wrong = next(p for p in range(max(producer_tp, consumer_tp)) if p not in want)
+    assert sl.coverage_problems(
+        want, reads + [_read(wrong, attention[min(attention)])]
+    )
+
+
+BLOCKED_HEAD_PIECES = [
+    # (id, producer TP, consumer TP, block, the per-producer head slabs
+    # `expected_pieces` returns: each a share of the page, not a block)
+    ("nemotron-3-nano p4-d1 1056-2112", 4, 1, 2112,
+     {
+         0: [(0, 0, 0, 1081344), (0, 1, 0, 1081344)],
+         2: [(0, 0, 1081344, 1081344), (0, 1, 1081344, 1081344)],
+     }),
+    ("nemotron-3-nano p8-d1 544-2176", 8, 1, 2176,
+     {
+         0: [(0, 0, 0, 1114112), (0, 1, 0, 1114112)],
+         4: [(0, 0, 1114112, 1114112), (0, 1, 1114112, 1114112)],
+     }),
+    ("qwen3.5-27b p8-d2 416-832", 8, 2, 832,
+     {
+         0: [(0, 0, 0, 851968), (0, 1, 0, 851968)],
+         2: [(0, 0, 851968, 851968), (0, 1, 851968, 851968)],
+     }),
+]
+
+
+@pytest.mark.parametrize(
+    "producer_tp,consumer_tp,block,pieces",
+    [c[1:] for c in BLOCKED_HEAD_PIECES],
+    ids=[c[0] for c in BLOCKED_HEAD_PIECES],
+)
+def test_a_multi_head_consumer_reads_head_slabs_nixl_refuses_its_blocks(
+    producer_tp, consumer_tp, block, pieces
+):
+    """The blocked pair classes the stage-1 matrix deferred: at a multi-head
+    consumer, `expected_pieces` still returns each KV head's share of the page
+    — smaller than the page — and READs covering them satisfy
+    `coverage_problems`, so the layout alone would move them. Over NIXL,
+    though, the pair is refused before any READ: the connector asserts that
+    head-sharded attention reads with more producer than consumer ranks and
+    heterogeneous block sizes are unsupported, which
+    test_real_kv_transfer.py reproduces as `receive failed`."""
+    name = _model_of(BLOCKED_HEAD_PIECES, producer_tp, consumer_tp, block)
+    attn, _, layout, kv_heads = _candidate_rows(name, 0, consumer_tp, block)
+    blocks = [0, 1]
+    got = sl.expected_pieces(
+        [attn], blocks, 0, consumer_tp, producer_tp, layout, kv_heads
+    )
+    assert {p: sorted(pl) for p, pl in got.items()} == pieces
+    assert all(
+        length < attn["length"] for _, _, _, length in next(iter(got.values()))
+    )
+    reads = [_read(p, sorted(pl)) for p, pl in got.items()]
+    assert sl.coverage_problems(got, reads) == []
