@@ -2313,25 +2313,36 @@ class NativeChecker(_ConsumerPages):
         producer's smaller block size: NIXL writes block b's `covered`
         sub-blocks (`_sub_blocks`) as the first covered/ratio of its page,
         nothing to a block none covers; its states 1:1, as ownership says.
-        Only a page read whole from one producer splits so (NIXL does not
-        split head slices at a block-size ratio)."""
+        Adjacent head pieces from one producer must first own the whole row
+        exactly once; wire chunks precede the native head-major conversion."""
         index = {b: i for i, b in enumerate(group.block_ids) if b != NULL_BLOCK_ID}
         result = {}
         for p, pieces in by_producer.items():
             kept = []
+            rows = {}
             for region, block, offset, length in pieces:
-                entry = row_of.get(region, {}).get((group.group, offset))
+                entry = next(
+                    (
+                        entry
+                        for (g, _), entry in row_of.get(region, {}).items()
+                        if g == group.group
+                        and entry["offset"] <= offset < entry["offset"] + entry["length"]
+                    ),
+                    None,
+                )
                 if entry is None or entry["state"]:
                     kept.append((region, block, offset, length))
                     continue
-                if length != entry["length"]:
-                    raise ValueError(
-                        f"region {region}: a {length}-byte share of a {entry['length']}-byte "
-                        f"page read at block-size ratio {ratio}"
-                    )
+                key = (region, block, entry["offset"])
+                _, ranges = rows.setdefault(key, (entry, []))
+                ranges.append((offset, length))
+            for (region, block, offset), (entry, ranges) in rows.items():
                 covered = self._sub_blocks(ratio, group, index[block])[1]
-                if covered:
-                    kept.append((region, block, offset, length * covered // ratio))
+                offset, length = sl.attention_wire_prefix(
+                    region, ranges, offset, entry["length"], ratio, covered
+                )
+                if length:
+                    kept.append((region, block, offset, length))
             result[p] = kept
         return result
 

@@ -444,6 +444,30 @@ def expected_pieces(
     return out
 
 
+def attention_wire_prefix(
+    region: int,
+    ranges: Sequence[tuple[int, int]],
+    offset: int,
+    length: int,
+    ratio: int,
+    covered: int,
+) -> tuple[int, int]:
+    """Collapse complete row ownership to its received, chunk-major prefix."""
+    end = offset
+    for start, size in sorted(ranges):
+        if start != end or size <= 0:
+            break
+        end += size
+    else:
+        if end == offset + length:
+            return offset, length * covered // ratio
+    supplied = sum(size for _, size in ranges)
+    raise ValueError(
+        f"region {region}: a {supplied}-byte share of a {length}-byte "
+        f"page read at block-size ratio {ratio}"
+    )
+
+
 def coverage_problems(
     expected: Mapping[int, Sequence[Piece]], reads: Sequence[ReadRecord]
 ) -> list[str]:

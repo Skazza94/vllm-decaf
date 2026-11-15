@@ -443,12 +443,20 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           416 and 800 pair with neither), only a decode block size that is
           a multiple of the prefill's, as NIXL supports: each decode block
           read as several prefill blocks, the states one to one, each
-          attention page read whole from one producer (NIXL splits no head
-          slice at a block-size ratio), without prefix caching for byte
-          checks.
+          attention page read whole from one producer, including pages
+          holding several KV heads. Coverage combines that producer's head
+          intervals only when they own the complete page exactly once,
+          before comparing the native wire chunks. NIXL's refusal of
+          head-sharded reads from several producers at unequal kernel block
+          sizes stays in place, as does the byte-check refusal with prefix
+          caching at unequal logical page sizes.
           Without a kernel geometry declaration each attention block stays
           whole. With a declaration such as `FLASHINFER`, NIXL uses the
           registered kernel block sizes and the physical-to-logical ratios.
+          Non-dividing or reverse logical sizes can use equal declared
+          kernel blocks; this is separate from NIXL's common-unit
+          normalization, which is limited to MLA hybrids. Whole GQA blocks
+          that fail NIXL's directional size rule remain refused.
           Native NIXL refuses hybrid pairs with different ratios when
           prefix caching is enabled;
         * over NIXL only, Kimi-K3 from prefill TP 8 to decode TP 4,
