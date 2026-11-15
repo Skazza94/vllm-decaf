@@ -49,9 +49,18 @@ GPU_SYSTEMS = {
 # data-parallel ranks times each one's tensor-parallel size.
 TENSOR_PARALLEL_SIZES = (1, 2, 4, 8)
 MAX_LOCAL_GPUS = 8
-GQA_DCP_TARGET = "Qwen/Qwen3-30B-A3B"
+# Published GQA models timed under DCP (both at TP8/DCP2: their four KV heads
+# allow no other layout at TP up to 8) and the KV interleaves qualified.
+GQA_DCP_TARGETS = ("Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B")
+GQA_DCP_INTERLEAVES = (1, 16, 32)
 GQA_DCP_TABLE_VERSION = "0.24.0"
-MTP_DCP_TARGET = "deepseek-ai/DeepSeek-V3"
+# Standalone MTP under DCP: the published targets with the system and the
+# estimator's weight mode each was qualified for.
+MTP_DCP_PROFILES = {
+    "deepseek-ai/DeepSeek-V3": ("h200_sxm", "fp8_block"),
+    "deepseek-ai/DeepSeek-V3.2": ("h200_sxm", "fp8_block"),
+    "nvidia/GLM-5-NVFP4": ("b200_sxm", "nvfp4"),
+}
 MTP_DCP_TABLE_VERSION = "0.24.0"
 GQA_DCP_PREFIX_APPROXIMATION = (
     "AISimulate models cached-context prefill with a KV gather; native "
@@ -591,9 +600,10 @@ class AisimulateTimingProvider:
             and vllm_config.speculative_config is not None
         )
 
-        if mtp_dcp and (target != MTP_DCP_TARGET or system != "h200_sxm"):
+        if mtp_dcp and system != MTP_DCP_PROFILES.get(target, (None, None))[0]:
             raise ValueError(
-                "MTP with DCP requires the published DeepSeek-V3 H200 profile."
+                "MTP with DCP requires the published profile of DeepSeek-V3 "
+                "(H200), DeepSeek-V3.2 (H200) or GLM-5-NVFP4 (B200)."
             )
         geometry = self._check_geometry(vllm_config, target_config, target)
 
@@ -682,6 +692,7 @@ class AisimulateTimingProvider:
             self._qualify_mtp_dcp(
                 vllm_config,
                 target_config,
+                target=target,
                 backend_version=backend_version,
                 quant=quant,
                 quant_overridden=bool(quant_modes) or online is not None,
@@ -884,12 +895,15 @@ class AisimulateTimingProvider:
         vllm_config: "VllmConfig",
         target_config: dict[str, Any],
         *,
+        target: str,
         backend_version: str | None,
         quant: str | None,
         quant_overridden: bool,
     ) -> None:
         from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
             dcp_scope_problems,
+            mtp_dcp_page_problem,
+            sparse_mla,
         )
         from vllm.platforms import current_platform
 
@@ -901,12 +915,17 @@ class AisimulateTimingProvider:
             vllm_config, transfers=vllm_config.kv_transfer_config is not None
         ):
             raise ValueError(f"MTP with DCP does not time {', '.join(problems)}.")
+        if problem := mtp_dcp_page_problem(vllm_config):
+            raise ValueError(problem)
         if backend_version not in (None, MTP_DCP_TABLE_VERSION):
             raise ValueError(
                 f"MTP with DCP requires vLLM {MTP_DCP_TABLE_VERSION} timing tables."
             )
-        if quant_overridden or quant != "fp8_block":
-            raise ValueError("MTP with DCP requires published block-FP8 timing modes.")
+        weights = MTP_DCP_PROFILES[target][1]
+        if quant_overridden or quant != weights:
+            raise ValueError(
+                f"MTP with DCP requires published {weights} timing modes."
+            )
         ac = vllm_config.attention_config
         if (
             ac.backend is not None
@@ -924,7 +943,8 @@ class AisimulateTimingProvider:
         model = vllm_config.model_config
         spec = vllm_config.speculative_config
         assert spec is not None and spec.draft_model_config is not None
-        fields = MLA_FIELDS + (
+        sparse = sparse_mla(model)
+        fields = (DSA_FIELDS if sparse else MLA_FIELDS) + (
             "hidden_size",
             "intermediate_size",
             "moe_intermediate_size",
@@ -933,6 +953,7 @@ class AisimulateTimingProvider:
             "num_experts_per_tok",
             "first_k_dense_replace",
             "moe_layer_freq",
+            "mlp_layer_types",
             "q_lora_rank",
             "vocab_size",
             "tie_word_embeddings",
@@ -942,7 +963,6 @@ class AisimulateTimingProvider:
             "scoring_func",
             "norm_topk_prob",
             "num_nextn_predict_layers",
-            "quantization_config",
         )
         local = model.hf_text_config
         draft = spec.draft_model_config.hf_text_config
@@ -953,9 +973,17 @@ class AisimulateTimingProvider:
             if _resolved(local, name) != _resolved(published, name)
             or _resolved(draft, name) != _resolved(published, name)
         ]
+        # A sparse model's local copy may leave its quantization out (the
+        # weights are never loaded); a quantization it names is the published.
+        published_quantization = _resolved(published, "quantization_config")
+        for config in (local, draft):
+            named = _resolved(config, "quantization_config")
+            if named != published_quantization and not (sparse and named is None):
+                changes.append("quantization_config")
+                break
         if changes:
             raise ValueError(
-                "MTP with DCP requires the published DeepSeek-V3 compute and "
+                f"MTP with DCP requires the published {target} compute and "
                 f"weight geometry; local target or draft changes {', '.join(changes)}."
             )
 
@@ -1011,19 +1039,24 @@ class AisimulateTimingProvider:
                 problems.append(
                     "GQA outside one simulated CPU instance with AISimulate"
                 )
-            if target != GQA_DCP_TARGET:
+            if target not in GQA_DCP_TARGETS:
                 problems.append(
-                    f"GQA timing target {target} (requires {GQA_DCP_TARGET})"
+                    f"GQA timing target {target} "
+                    f"(requires {' or '.join(GQA_DCP_TARGETS)})"
                 )
             if system not in ("h100_sxm", "h200_sxm"):
                 problems.append(f"GQA system {system} (requires H100 or H200)")
             if (pc.tensor_parallel_size, dcp) != (8, 2):
                 problems.append("GQA layout other than TP8/DCP2")
-            if (pc.cp_kv_cache_interleave_size, pc.dcp_kv_cache_interleave_size) != (
-                1,
-                1,
+            if pc.cp_kv_cache_interleave_size not in GQA_DCP_INTERLEAVES or (
+                pc.dcp_kv_cache_interleave_size
+                not in (1, pc.cp_kv_cache_interleave_size)
             ):
-                problems.append("GQA interleave other than 1")
+                problems.append(
+                    "GQA interleave other than "
+                    f"{', '.join(map(str, GQA_DCP_INTERLEAVES[:-1]))} or "
+                    f"{GQA_DCP_INTERLEAVES[-1]}"
+                )
             if kv_format != "bfloat16" or str(model.dtype) != "torch.bfloat16":
                 problems.append("GQA model or KV cache dtype other than BF16")
             if quant_overridden or model.quantization is not None:
@@ -1090,7 +1123,7 @@ class AisimulateTimingProvider:
                 sdk_attention_selector="default",
                 sdk_backend_version=GQA_DCP_TABLE_VERSION,
                 kv_cache_format=kv_format,
-                interleave=1,
+                interleave=pc.cp_kv_cache_interleave_size,
             )
         return record
 
@@ -1304,7 +1337,7 @@ class AisimulateTimingProvider:
         target_text = target_config.get("text_config", target_config)
         published_config = type(local_config).from_dict(target_text)
         if (
-            target == GQA_DCP_TARGET
+            target in GQA_DCP_TARGETS
             and vllm_config.parallel_config.decode_context_parallel_size > 1
         ):
             # A config with the same KV heads can still change the model work.

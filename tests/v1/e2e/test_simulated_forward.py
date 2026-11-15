@@ -1142,7 +1142,19 @@ def test_simulate_forward_cpu_dcp_prefix_cache_chunked_prefill(
 
 
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
-def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "target, interleave",
+    [
+        ("Qwen/Qwen3-30B-A3B", 1),
+        ("Qwen/Qwen3-30B-A3B", 16),
+        ("Qwen/Qwen3-30B-A3B", 32),
+        ("Qwen/Qwen3-235B-A22B", 1),
+        ("Qwen/Qwen3-235B-A22B", 16),
+        ("Qwen/Qwen3-235B-A22B", 32),
+    ],
+    ids=["30b-i1", "30b-i16", "30b-i32", "235b-i1", "235b-i16", "235b-i32"],
+)
+def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch, target, interleave):
     """Use the published Qwen3 geometry and inspect each real CPU worker."""
     pytest.importorskip("aisimulate_core")
     from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
@@ -1223,7 +1235,6 @@ def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch) -> None:
             "weight_device": next(runner.model.parameters()).device.type,
         }
 
-    target = "Qwen/Qwen3-30B-A3B"
     raw = bundled_config(target)
     (tmp_path / "config.json").write_text(json.dumps(raw))
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
@@ -1244,6 +1255,7 @@ def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch) -> None:
             decode_context_parallel_size=dcp,
             dcp_comm_backend="ag_rs",
             dcp_q_replicate=False,
+            cp_kv_cache_interleave_size=interleave if dcp > 1 else 1,
             block_size=32,
             kv_cache_memory_bytes=budget,
             max_model_len=256,
@@ -1279,7 +1291,8 @@ def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch) -> None:
             assert state["impl"] == [
                 (
                     "CPU_ATTN", False, dcp, dcp_rank, active, active, active,
-                    1 if active else None, 4, 1,
+                    interleave if active else None,
+                    raw["num_attention_heads"] // 8, 1,
                 )
             ]
             if active:
@@ -1292,7 +1305,9 @@ def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch) -> None:
             assert state["pages"] == [
                 (True, 32, 16384, 1, 128, "torch.bfloat16", True, 32 * dcp)
             ]
-            assert state["block_table"] == (dcp, dcp_rank, 1, [32], [True])
+            assert state["block_table"] == (
+                dcp, dcp_rank, interleave if active else 1, [32], [True]
+            )
             assert state["weight_device"] == "meta"
             assert state["allocated_tensors"] == 0
             assert 0 < state["planned_bytes"] <= budget
@@ -1388,15 +1403,20 @@ def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch) -> None:
     assert totals[2][0] == 2 * totals[1][0]
 
 
-@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
-@pytest.mark.parametrize("tp", [2, 4])
-def test_simulate_forward_cpu_mtp_dcp(tmp_path, monkeypatch, tp):
-    """Inspect the published model's V2 draft and independently price live steps."""
+def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
+    """One real CPU engine of a qualified MTP cell: inspect each worker's
+    draft, cache geometry and block spans, and independently price every
+    logged step. `references` keeps the DCP1 capacity of each (target, tp)."""
     pytest.importorskip("aisimulate_core")
+    import math
     import os
     from pathlib import Path
 
     from tests.v1.worker.simulated.test_aisimulate_timing import (
+        GLM5,
+        MTP_DCP_PROFILES,
+        V3,
+        V32,
         _mtp_dcp_direct_sdk,
         bundled_config,
     )
@@ -1406,15 +1426,12 @@ def test_simulate_forward_cpu_mtp_dcp(tmp_path, monkeypatch, tp):
     def rank_state(worker):
         from vllm.config import get_layers_from_vllm_config
         from vllm.model_executor.layers.attention.mla_attention import MLAAttention
-        from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
         runner = worker.model_runner
         cache = runner.kv_cache_config
         specs = worker.get_kv_cache_spec()
-        (group,) = cache.kv_cache_groups
-        (draft_name,) = runner.speculator.draft_attn_layer_names
+        draft_names = sorted(runner.speculator.draft_attn_layer_names)
         layers = get_layers_from_vllm_config(worker.vllm_config, MLAAttention)
-        draft = layers[draft_name]
 
         def identity(layer):
             impl = layer.impl
@@ -1422,10 +1439,17 @@ def test_simulate_forward_cpu_mtp_dcp(tmp_path, monkeypatch, tp):
                 layer.get_attn_backend().get_name(),
                 impl.dcp_world_size,
                 impl.dcp_rank,
-                impl.cp_kv_cache_interleave_size,
+                impl.can_return_lse_for_decode,
                 impl.need_to_return_lse_for_decode,
             )
 
+        roles = {}
+        for name, spec in specs.items():
+            role = spec.cache_role.value
+            roles.setdefault(role, []).append(
+                (name, spec.block_size, spec.page_size_bytes, spec.dcp_sharded,
+                 str(spec.dtype), spec.is_draft)
+            )
         return {
             "rank": worker.rank,
             "speculator": type(runner.speculator).__name__,
@@ -1433,22 +1457,26 @@ def test_simulate_forward_cpu_mtp_dcp(tmp_path, monkeypatch, tp):
             "draft_meta": next(runner.speculator.model.parameters()).is_meta,
             "target_meta": next(runner.get_model().parameters()).is_meta,
             "speculator_dcp": runner.speculator.dcp_size,
-            "draft_layer": draft_name,
-            "draft_layer_marked": draft.is_draft_layer,
-            "draft_impl": identity(draft),
+            "draft_names": draft_names,
+            "draft_attention": {
+                n: identity(layers[n]) for n in draft_names if n in layers
+            },
+            "draft_marked": {
+                n: layers[n].is_draft_layer for n in draft_names if n in layers
+            },
             "target_impls": sorted(
-                {identity(m) for name, m in layers.items() if name != draft_name}
+                {identity(m) for n, m in layers.items() if n not in draft_names}
             ),
-            "collected_draft_specs": [name for name, s in specs.items() if s.is_draft],
-            "group_layers": sorted(group.layer_names),
-            "spec_layers": sorted(specs),
-            "spec_geometry": sorted(
-                {
-                    (isinstance(s, MLAAttentionSpec), s.block_size, s.page_size_bytes,
-                     str(s.dtype), s.dcp_sharded)
-                    for s in specs.values()
+            "roles": {
+                role: {
+                    "layers": len(rows),
+                    "geometry": sorted({row[1:5] for row in rows}),
+                    "draft": sorted(row[0] for row in rows if row[5]),
                 }
-            ),
+                for role, rows in roles.items()
+            },
+            "group_members": [sorted(g.layer_names) for g in cache.kv_cache_groups],
+            "spec_pages": sum(s.page_size_bytes for s in specs.values()),
             "table": (
                 runner.block_tables.cp_size,
                 runner.block_tables.cp_rank,
@@ -1461,188 +1489,259 @@ def test_simulate_forward_cpu_mtp_dcp(tmp_path, monkeypatch, tp):
             "allocated_tensors": len(runner.kv_caches),
         }
 
-    target = "deepseek-ai/DeepSeek-V3"
+    gpu, _, _, page = MTP_DCP_PROFILES[target]
+    sparse = target != V3
     source = os.getenv("ROUND22_PUBLISHED_V3")
-    raw = json.loads(Path(source).read_text()) if source else bundled_config(target)
+    raw = (
+        json.loads(Path(source).read_text())
+        if target == V3 and source
+        else bundled_config(target)
+    )
+    if sparse:
+        raw = {key: value for key, value in raw.items() if key != "quantization_config"}
+        (tmp_path / "DERIVED.md").write_text("published geometry, no weight kernels")
     (tmp_path / "config.json").write_text(json.dumps(raw))
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    layers_total = raw["num_hidden_layers"]
     lengths = [1024, 1031]
     prompts = [{"prompt_token_ids": [7] * n} for n in lengths]
     budget = 1 << 29
-    totals = {}
-    for dcp in (1, tp):
-        log = tmp_path / f"tp{tp}-dcp{dcp}.jsonl"
-        spec = {"method": "mtp", "num_speculative_tokens": 1}
-        if (tp, dcp) == (2, 2):
-            # Explicit draft BF16 must share the target's auto/BF16 spec.
-            spec["kv_cache_dtype"] = "bfloat16"
-        llm = LLM(
-            model=str(tmp_path),
-            skip_tokenizer_init=True,
-            dtype="bfloat16",
-            enforce_eager=True,
-            tensor_parallel_size=tp,
-            decode_context_parallel_size=dcp,
-            dcp_comm_backend="ag_rs",
-            dcp_q_replicate=False,
-            cp_kv_cache_interleave_size=1,
-            block_size=16,
-            kv_cache_memory_bytes=budget,
-            max_model_len=2048,
-            max_num_batched_tokens=1024,
-            max_num_seqs=4,
-            enable_prefix_caching=False,
-            seed=1234,
-            speculative_config=spec,
-            simulation_config={
-                "simulate_forward": True,
-                "timing": "aisimulate",
-                "timing_args": {"gpu": "h200", "target_model": target},
-                "spec_acceptance_rates": [0.7],
-                "log_path": str(log),
-            },
+    log = tmp_path / "steps.jsonl"
+    extra = {"kv_cache_dtype": "fp8_ds_mla"} if sparse else {}
+    llm = LLM(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        enforce_eager=True,
+        tensor_parallel_size=tp,
+        decode_context_parallel_size=dcp,
+        dcp_comm_backend="ag_rs",
+        dcp_q_replicate=False,
+        cp_kv_cache_interleave_size=1,
+        block_size=page,
+        kv_cache_memory_bytes=budget,
+        max_model_len=2048,
+        max_num_batched_tokens=1024,
+        max_num_seqs=4,
+        enable_prefix_caching=False,
+        seed=1234,
+        speculative_config={"method": "mtp", "num_speculative_tokens": k},
+        simulation_config={
+            "simulate_forward": True,
+            "timing": "aisimulate",
+            "timing_args": {"gpu": gpu, "target_model": target},
+            "spec_acceptance_rates": [0.7],
+            "log_path": str(log),
+        },
+        **extra,
+    )
+    try:
+        outputs = llm.generate(
+            prompts,
+            SamplingParams(max_tokens=16, ignore_eos=True, detokenize=False),
+            use_tqdm=False,
         )
-        try:
-            outputs = llm.generate(
-                prompts,
-                SamplingParams(max_tokens=16, ignore_eos=True, detokenize=False),
-                use_tqdm=False,
-            )
-            cfg = llm.llm_engine.vllm_config
-            capacity = cfg.cache_config.kv_cache_size_tokens
-            lookahead = cfg.num_lookahead_tokens
-            states = llm.collective_rpc(rank_state)
-        finally:
-            llm.llm_engine.engine_core.shutdown()
-            del llm
-            cleanup_dist_env_and_memory()
-        assert all(out.finished and out.outputs[0].finish_reason == "length"
-                   for out in outputs)
-        emitted = {o.request_id: len(o.outputs[0].token_ids) for o in outputs}
-        assert list(emitted.values()) == [16, 16]
-        assert lookahead == 1
-        assert len(states) == tp
-        for rank, state in enumerate(states):
-            assert state["rank"] == rank
-            assert state["speculator"] == "MTPSpeculator"
-            assert state["draft_model"] == "DeepSeekMTP"
-            assert state["draft_meta"] and state["target_meta"]
-            assert state["speculator_dcp"] == dcp
-            assert state["draft_layer_marked"]
-            assert state["draft_layer"] == "model.layers.61.self_attn.attn"
-            assert state["collected_draft_specs"] == [state["draft_layer"]]
-            identity = ("CPU_MLA", dcp, rank % dcp, 1, dcp > 1)
-            assert state["draft_impl"] == identity
-            assert state["target_impls"] == [identity]
-            assert state["group_layers"] == state["spec_layers"]
-            assert len(state["group_layers"]) == 62
-            assert state["spec_geometry"] == [
-                (True, 16, 18432, "torch.bfloat16", True)
+        cfg = llm.llm_engine.vllm_config
+        capacity = cfg.cache_config.kv_cache_size_tokens
+        lookahead = cfg.num_lookahead_tokens
+        resolved_page = cfg.cache_config.block_size
+        states = llm.collective_rpc(rank_state)
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+        del llm
+        cleanup_dist_env_and_memory()
+    assert all(
+        out.finished and out.outputs[0].finish_reason == "length" for out in outputs
+    )
+    emitted = {o.request_id: len(o.outputs[0].token_ids) for o in outputs}
+    assert list(emitted.values()) == [16, 16]
+    assert lookahead == k
+    assert resolved_page == page
+    assert len(states) == tp
+    draft_layer = f"model.layers.{layers_total}.self_attn.attn"
+    for rank, state in enumerate(states):
+        assert state["rank"] == rank
+        assert state["speculator"] == "MTPSpeculator"
+        assert state["draft_meta"] and state["target_meta"]
+        assert state["speculator_dcp"] == dcp
+        assert draft_layer in state["draft_names"]
+        assert state["draft_marked"] == {draft_layer: True}
+        backend = "CPU_SIMULATED_MLA_SPARSE" if sparse else "CPU_MLA"
+        identity = (backend, dcp, rank % dcp, dcp > 1 or sparse, dcp > 1)
+        assert state["draft_attention"] == {draft_layer: identity}
+        assert state["target_impls"] == [identity]
+        roles = state["roles"]
+        draft_attn = f"model.layers.{layers_total}.self_attn.attn"
+        draft_indexer = f"model.layers.{layers_total}.self_attn.indexer.k_cache"
+        # A dense MLA latent is the one "sparse"-role cache of its group.
+        assert sorted(roles) == (["indexer", "sparse"] if sparse else ["sparse"])
+        assert state["draft_names"] == (
+            [draft_attn, draft_indexer] if sparse else [draft_attn]
+        )
+        for role in roles.values():
+            assert [g[0] for g in role["geometry"]] == [page]
+            assert all(g[2] for g in role["geometry"])
+            assert role["layers"] == layers_total + 1
+        assert roles["sparse"]["draft"] == [draft_attn]
+        if sparse:
+            assert roles["indexer"]["draft"] == [draft_indexer]
+            assert [g[:3] for g in roles["sparse"]["geometry"]] == [
+                (page, page * 656, True)
             ]
-            assert state["table"] == (dcp, rank % dcp, 1, [16], [True])
-            assert state["blocks"] == 469
-            assert state["planned_bytes"] == [469 * 62 * 18432]
-            assert state["allocated_tensors"] == 0
-        assert capacity == states[0]["blocks"] * 16 * dcp
-        totals[dcp] = capacity
+            assert [g[:3] for g in roles["indexer"]["geometry"]] == [
+                (page, page * 132, True)
+            ]
+        else:
+            assert roles["sparse"]["geometry"] == [
+                (16, 18432, True, "torch.bfloat16")
+            ]
+        # Each draft cache sits in the resolved group of the target's layers,
+        # which has one block table row and one block span for all of them.
+        (members,) = state["group_members"]
+        assert len(members) == (2 if sparse else 1) * (layers_total + 1)
+        assert set(state["draft_names"]) <= set(members)
+        assert "model.layers.0.self_attn.attn" in members
+        assert state["table"][:3] == (dcp, rank % dcp, 1)
+        assert state["table"][3] == [page] * len(state["table"][3])
+        assert state["allocated_tensors"] == 0
+        (planned,) = state["planned_bytes"]
+        assert planned == state["blocks"] * state["spec_pages"]
+        assert state["blocks"] == states[0]["blocks"]
+    blocks = states[0]["blocks"]
+    assert capacity == blocks * page * dcp
+    key = (target, tp)
+    if dcp == 1:
+        references[key] = (capacity, blocks, states[0]["planned_bytes"])
+    else:
+        # The same planned memory holds the same blocks; each spans DCP pages.
+        assert (blocks, states[0]["planned_bytes"]) == references[key][1:]
+        assert capacity == dcp * references[key][0]
 
-        records = [json.loads(line) for line in log.read_text().splitlines()]
-        (timing,) = [r["timing"]["aisimulate"] for r in records if "timing" in r]
-        assert timing["resolved_config"]["nextn"] == 1
-        assert timing["resolved_config"]["dcp"] == (dcp if dcp > 1 else None)
-        assert timing["speculation"]["verify_width"] == 2
-        assert timing["resolved_config"]["backend_version"] == "0.24.0"
-        accepted = {
-            rec["step_index"]: rec["requests"]
-            for row in records if (rec := row.get("spec_acceptance"))
-        }
-        first_decode = {}
-        produced = {}
-        scheduled_drafts = accepted_drafts = 0
-        boundary_horizons = set()
-        peak_horizons = {}
-        sdk = _mtp_dcp_direct_sdk(tp, dcp)
-        checks = []
-        for row in (r for r in records if "step" in r):
-            step, cost = row["step"], row["cost"]
-            requests = step["requests"]
-            prefill = [q for q in requests if q["is_prefill"]]
-            decode = [q for q in requests if not q["is_prefill"]]
-            contexts = [q["num_computed_tokens"] for q in decode]
-            samples = accepted.pop(step["step_index"], {})
-            assert samples.keys() == {q["req_id"] for q in decode}
-            assert cost["breakdown"]["spec_requests_below_width"] == 0
-            assert cost["breakdown"]["spec_draft_tokens"] == len(decode)
-            for i, q in enumerate(requests):
-                key = q["req_id"].rsplit("-", 1)[0]
-                end = q["num_computed_tokens"] + q["num_scheduled_tokens"]
-                # Calculated horizon; the simulator logs no reservations or writes.
-                span = 16 * dcp
-                horizon = (min(2048, end + lookahead) + span - 1) // span
-                peak_horizons[key] = max(horizon, peak_horizons.get(key, 0))
-                if end == 1024:
-                    boundary_horizons.add(horizon)
-                if q["is_prefill"]:
-                    if end == q["num_prompt_tokens"]:
-                        produced.setdefault(key, []).append(1)
-                    continue
-                first_decode.setdefault(key, q["num_computed_tokens"])
-                assert (q["num_scheduled_tokens"], q["num_spec_tokens"]) == (2, 1)
-                drafted, wins = samples[q["req_id"]]
-                assert drafted == 1 and wins in (0, 1)
-                assert cost["num_accepted"][i] == wins
-                scheduled_drafts += drafted
-                accepted_drafts += wins
-                produced.setdefault(key, []).append(1 + wins)
-            metrics = {
-                "scheduled_requests": {
-                    "num_prefill_requests": len(prefill),
-                    "sum_prefill_tokens": sum(
-                        q["num_scheduled_tokens"] for q in prefill
-                    ),
-                    "var_prefill_length": pvariance(
-                        [q["num_prompt_tokens"] for q in prefill] or [0]
-                    ),
-                    "sum_prefill_kv_tokens": sum(
-                        q["num_computed_tokens"] for q in prefill
-                    ),
-                    "num_decode_requests": len(decode),
-                    "sum_decode_kv_tokens": sum(contexts),
-                    "var_decode_kv_tokens": pvariance(contexts or [0]),
-                    "extend_lengths": [q["num_scheduled_tokens"] for q in requests],
-                    "past_kv_lengths": [q["num_computed_tokens"] for q in requests],
-                }
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    (timing,) = [r["timing"]["aisimulate"] for r in records if "timing" in r]
+    assert timing["target_model"] == target
+    assert timing["resolved_config"]["nextn"] == k
+    assert timing["resolved_config"]["dcp"] == (dcp if dcp > 1 else None)
+    assert timing["speculation"]["verify_width"] == k + 1
+    assert timing["resolved_config"]["backend_version"] == "0.24.0"
+    accepted = {
+        rec["step_index"]: rec["requests"]
+        for row in records if (rec := row.get("spec_acceptance"))
+    }
+    first_decode = {}
+    produced = {}
+    scheduled_drafts = accepted_drafts = 0
+    boundary_horizons = set()
+    peak_horizons = {}
+    sdk = _mtp_dcp_direct_sdk(target, tp, dcp, k)
+    checks = []
+    span = page * dcp
+    for row in (r for r in records if "step" in r):
+        step, cost = row["step"], row["cost"]
+        requests = step["requests"]
+        prefill = [q for q in requests if q["is_prefill"]]
+        decode = [q for q in requests if not q["is_prefill"]]
+        contexts = [q["num_computed_tokens"] for q in decode]
+        samples = accepted.pop(step["step_index"], {})
+        assert samples.keys() == {q["req_id"] for q in decode}
+        assert cost["breakdown"]["spec_requests_below_width"] == 0
+        assert cost["breakdown"]["spec_draft_tokens"] == k * len(decode)
+        for i, q in enumerate(requests):
+            key_ = q["req_id"].rsplit("-", 1)[0]
+            end = q["num_computed_tokens"] + q["num_scheduled_tokens"]
+            # Calculated horizon; the simulator logs no reservations or writes.
+            horizon = math.ceil(min(2048, end + lookahead) / span)
+            peak_horizons[key_] = max(horizon, peak_horizons.get(key_, 0))
+            if end == 1024:
+                boundary_horizons.add(horizon)
+            if q["is_prefill"]:
+                if end == q["num_prompt_tokens"]:
+                    produced.setdefault(key_, []).append(1)
+                continue
+            first_decode.setdefault(key_, q["num_computed_tokens"])
+            assert (q["num_scheduled_tokens"], q["num_spec_tokens"]) == (k + 1, k)
+            drafted, wins = samples[q["req_id"]]
+            assert drafted == k and 0 <= wins <= k
+            assert cost["num_accepted"][i] == wins
+            scheduled_drafts += drafted
+            accepted_drafts += wins
+            produced.setdefault(key_, []).append(1 + wins)
+        metrics = {
+            "scheduled_requests": {
+                "num_prefill_requests": len(prefill),
+                "sum_prefill_tokens": sum(q["num_scheduled_tokens"] for q in prefill),
+                "var_prefill_length": pvariance(
+                    [q["num_prompt_tokens"] for q in prefill] or [0]
+                ),
+                "sum_prefill_kv_tokens": sum(q["num_computed_tokens"] for q in prefill),
+                "num_decode_requests": len(decode),
+                "sum_decode_kv_tokens": sum(contexts),
+                "var_decode_kv_tokens": pvariance(contexts or [0]),
+                "extend_lengths": [q["num_scheduled_tokens"] for q in requests],
+                "past_kv_lengths": [q["num_computed_tokens"] for q in requests],
             }
-            ms = sdk.estimate_forward_pass_time_ms(metrics)
-            logged = cost["breakdown"]["aisimulate_ms"]
-            assert ms > 0 and logged == pytest.approx(ms, rel=1e-9)
-            checks.append({"step": step["step_index"], "global_metrics": metrics,
-                           "sdk_ms": ms, "logged_ms": logged})
-        assert boundary_horizons == {1024 // (16 * dcp) + 1}
-        assert 0 < max(peak_horizons.values()) <= states[0]["blocks"]
-        assert not accepted
-        assert 0 < accepted_drafts < scheduled_drafts
-        assert sorted(first_decode.values()) == lengths
-        assert produced.keys() == emitted.keys()
-        discarded = {}
-        for key, counts in produced.items():
-            # The async scheduler can have a final full-width step in flight
-            # when the preceding step reaches max_tokens.
-            discarded[key] = sum(counts) - emitted[key]
-            assert 0 <= discarded[key] <= counts[-1]
-        (tmp_path / f"tp{tp}-dcp{dcp}-validation.json").write_text(json.dumps({
-            "workers": states, "capacity": capacity, "lookahead": lookahead,
-            "first_decode": first_decode, "completed": emitted,
-            "calculated_boundary_horizon": sorted(boundary_horizons),
-            "calculated_peak_horizons": peak_horizons,
-            "samples_discarded_at_stop": discarded,
-            "drafts": scheduled_drafts, "accepted": accepted_drafts, "steps": checks,
-        }, indent=2))
-        print(f"MTP_DCP TP{tp}/DCP{dcp}: {capacity} tokens, {len(checks)} steps,"
-              f" {accepted_drafts}/{scheduled_drafts} accepted")
-    assert totals[tp] == tp * totals[1]
+        }
+        ms = sdk.estimate_forward_pass_time_ms(metrics)
+        logged = cost["breakdown"]["aisimulate_ms"]
+        assert ms > 0 and logged == pytest.approx(ms, rel=1e-9)
+        checks.append({"step": step["step_index"], "global_metrics": metrics,
+                       "sdk_ms": ms, "logged_ms": logged})
+    # The step ending at 1,024 tokens: the lookahead adds one page span.
+    assert boundary_horizons == {1024 // span + 1}
+    assert 0 < max(peak_horizons.values()) <= blocks
+    assert not accepted
+    assert 0 < accepted_drafts < scheduled_drafts
+    assert sorted(first_decode.values()) == lengths
+    assert produced.keys() == emitted.keys()
+    discarded = {}
+    for key_, counts in produced.items():
+        # The step reaching max_tokens keeps only what completes the output;
+        # the async scheduler can have one more full-width step in flight.
+        finishing = next(
+            i for i in range(len(counts)) if sum(counts[: i + 1]) >= emitted[key_]
+        )
+        assert sum(counts[:finishing]) < emitted[key_]
+        assert len(counts) - finishing - 1 <= 1
+        discarded[key_] = sum(counts) - emitted[key_]
+    summary = {
+        "target": target, "tp": tp, "dcp": dcp, "k": k, "page": page,
+        "workers": states, "capacity": capacity, "lookahead": lookahead,
+        "first_decode": first_decode, "completed": emitted,
+        "calculated_boundary_horizon": sorted(boundary_horizons),
+        "calculated_peak_horizons": peak_horizons,
+        "samples_discarded_at_stop": discarded,
+        "drafts": scheduled_drafts, "accepted": accepted_drafts, "steps": checks,
+    }
+    (tmp_path / "validation.json").write_text(json.dumps(summary, indent=2))
+    print(f"MTP_DCP {target} TP{tp}/DCP{dcp}/k{k}: {capacity} tokens, "
+          f"{len(checks)} steps, {accepted_drafts}/{scheduled_drafts} accepted")
+    return summary
+
+
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "target, tp, dcp, k",
+    [
+        ("deepseek-ai/DeepSeek-V3", 2, 2, 1),
+        ("deepseek-ai/DeepSeek-V3", 4, 4, 1),
+        ("deepseek-ai/DeepSeek-V3", 8, 2, 2),
+        ("deepseek-ai/DeepSeek-V3.2", 8, 4, 2),
+        ("nvidia/GLM-5-NVFP4", 4, 2, 3),
+    ],
+    ids=["v3-tp2-dcp2-k1", "v3-tp4-dcp4-k1", "v3-tp8-dcp2-k2",
+         "v32-tp8-dcp4-k2", "glm5-tp4-dcp2-k3"],
+)
+def test_simulate_forward_cpu_mtp_dcp(tmp_path, monkeypatch, target, tp, dcp, k):
+    """The published geometry's draft, cache spans and AISimulate estimates
+    under DCP, against the same planned memory at DCP 1."""
+    references = {}
+    for size in (1, dcp):
+        directory = tmp_path / f"dcp{size}"
+        directory.mkdir()
+        mtp_dcp_engine_cell(directory, monkeypatch, target, tp, size, k, references)
+
 
 
 def _round23_native_peer():

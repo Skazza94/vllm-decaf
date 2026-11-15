@@ -191,9 +191,53 @@ SPECULATIVE_DCP_TRANSFERS = (
 )
 
 
+# Standalone MTP under DCP, by model type: the cells AISimulate times and the
+# engine validated (TP/DCP layouts, the attention backend's page size). Sparse
+# MLA's FlashMLA pages and indexer hold 64 tokens, DeepSeek-V3's MLA 16.
+MTP_DCP_MODELS = {
+    "deepseek_v3": {
+        "name": "DeepSeek-V3",
+        "architecture": "DeepseekV3ForCausalLM",
+        "sparse": False,
+        "block_size": 16,
+        "layouts": ((2, 2), (4, 2), (4, 4), (8, 2), (8, 4), (8, 8)),
+    },
+    "deepseek_v32": {
+        "name": "DeepSeek-V3.2",
+        "architecture": "DeepseekV32ForCausalLM",
+        "sparse": True,
+        "block_size": 64,
+        "layouts": ((8, 2), (8, 4)),
+    },
+    "glm_moe_dsa": {
+        "name": "GLM-5",
+        "architecture": "GlmMoeDsaForCausalLM",
+        "sparse": True,
+        "block_size": 64,
+        "layouts": ((4, 2), (4, 4)),
+    },
+}
+MTP_DCP_MAX_DEPTH = 3
+MTP_DCP_MODEL_PROBLEM = (
+    "speculative decoding with DCP requires DeepSeek-V3, DeepSeek-V3.2 or GLM-5"
+)
+
+
+def mtp_dcp_page_problem(vllm_config: VllmConfig) -> str | None:
+    """The page size the engine resolved against the qualified model's."""
+    qualified = MTP_DCP_MODELS[vllm_config.model_config.hf_config.model_type]
+    block_size = vllm_config.cache_config.block_size
+    if block_size != qualified["block_size"]:
+        return (
+            f"MTP with DCP requires {qualified['block_size']}-token pages for "
+            f"{qualified['name']}, the engine resolved {block_size}"
+        )
+    return None
+
+
 def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
     """Qualify the local model and layout before building an AISimulate profile."""
-    from vllm.config.simulation import SimulationConfig
+    from vllm.config.simulation import DSA_FP8_CACHE_DTYPES, SimulationConfig
 
     sim = vllm_config.simulation_config
     cache = vllm_config.cache_config
@@ -210,30 +254,44 @@ def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
         problems.append("prefix caching with speculative decoding")
     if sim.timing != "aisimulate":
         problems.append("speculative decoding with DCP requires timing aisimulate")
+    if parallel.nnodes != 1:
+        problems.append("MTP with DCP requires one node")
+    qualified = MTP_DCP_MODELS.get(getattr(model.hf_config, "model_type", None))
+    if (
+        qualified is None
+        or model.architectures != [qualified["architecture"]]
+        or not (sparse_mla(model) if qualified["sparse"] else plain_mla(model))
+    ):
+        return problems + [MTP_DCP_MODEL_PROBLEM]
+    name = qualified["name"]
+    layouts = qualified["layouts"]
     if (
         parallel.tensor_parallel_size,
         parallel.decode_context_parallel_size,
-    ) not in ((2, 2), (4, 4)):
-        problems.append("MTP with DCP requires TP2/DCP2 or TP4/DCP4")
-    if parallel.nnodes != 1:
-        problems.append("MTP with DCP requires one node")
+    ) not in layouts:
+        cells = ", ".join(f"{tp}/{dcp}" for tp, dcp in layouts)
+        problems.append(f"MTP with DCP requires TP/DCP {cells} for {name}")
+    block_size = qualified["block_size"]
+    # Sparse MLA's backend sets its page size when the workers start, so a
+    # page size left to it is checked there (`mtp_dcp_page_problem`).
+    page_ok = cache.block_size == block_size or (
+        qualified["sparse"] and not cache.user_specified_block_size
+    )
     if (
         parallel.cp_kv_cache_interleave_size != 1
         or parallel.dcp_kv_cache_interleave_size != 1
-        or cache.block_size != 16
+        or not page_ok
     ):
-        problems.append("MTP with DCP requires interleave 1 and 16-token pages")
-    if (
-        model.hf_config.model_type != "deepseek_v3"
-        or model.architectures != ["DeepseekV3ForCausalLM"]
-        or not plain_mla(model)
-    ):
-        return problems + ["speculative decoding with DCP requires dense DeepSeek-V3"]
+        problems.append(
+            f"MTP with DCP requires interleave 1 and {block_size}-token pages "
+            f"for {name}"
+        )
     if spec.method != "mtp":
         return problems + [f"speculative method {spec.method} (requires mtp)"]
-    if spec.num_speculative_tokens != 1:
+    if not 1 <= spec.num_speculative_tokens <= MTP_DCP_MAX_DEPTH:
         problems.append(
-            f"{spec.num_speculative_tokens} speculative tokens with DCP (requires 1)"
+            f"{spec.num_speculative_tokens} speculative tokens with DCP "
+            f"(requires 1 to {MTP_DCP_MAX_DEPTH})"
         )
     if spec.uses_dynamic_speculative_decoding() or spec.enable_adaptive_verification:
         problems.append("dynamic or adaptive speculative decoding with DCP")
@@ -260,19 +318,37 @@ def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
         or draft_tp != parallel.tensor_parallel_size
     ):
         problems.append("MTP with DCP requires DeepSeekMTPModel at the target's TP")
-    if (
-        spec.kv_cache_dtype not in (None, "auto", "bfloat16")
-        or cache.cache_dtype not in ("auto", "bfloat16")
-        or str(model.dtype) != "torch.bfloat16"
-        or str(getattr(draft, "dtype", None)) != "torch.bfloat16"
-        or model.quantization != "fp8"
-        or getattr(draft, "quantization", None) != "fp8"
-        or model.quantization_config is not None
-        or getattr(draft, "quantization_config", None) is not None
-    ):
-        problems.append(
-            "MTP with DCP requires published FP8 weights and BF16 model and KV dtype"
+    draft_dtype = getattr(draft, "dtype", None)
+    if qualified["sparse"]:
+        # The packed FP8 latent and indexer caches; the weights' precision is
+        # the published checkpoint's, which the timing provider reads.
+        kv_ok = cache.cache_dtype in DSA_FP8_CACHE_DTYPES and spec.kv_cache_dtype in (
+            None,
+            "auto",
+            cache.cache_dtype,
         )
+        weights_ok = True
+        precision = "BF16 activations and the packed FP8 KV cache"
+    else:
+        kv_ok = cache.cache_dtype in ("auto", "bfloat16") and spec.kv_cache_dtype in (
+            None,
+            "auto",
+            "bfloat16",
+        )
+        weights_ok = (
+            model.quantization == "fp8"
+            and getattr(draft, "quantization", None) == "fp8"
+            and model.quantization_config is None
+            and getattr(draft, "quantization_config", None) is None
+        )
+        precision = "published FP8 weights and BF16 model and KV dtype"
+    if (
+        not kv_ok
+        or not weights_ok
+        or str(model.dtype) != "torch.bfloat16"
+        or str(draft_dtype) != "torch.bfloat16"
+    ):
+        problems.append(f"MTP with DCP requires {precision}")
     if (
         spec.attention_backend is not None
         or spec.moe_backend not in (None, "auto")
@@ -290,7 +366,7 @@ def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]
     KV moves (`transfers`): dense MLA, or sparse MLA or GQA with AISimulate in
     one instance. All use tensor parallelism alone (no pipeline, prefill
     context or data parallelism, no expert parallelism). Speculation is
-    limited to qualified standalone DeepSeek-V3 MTP. Prefix caching is
+    limited to qualified standalone MTP (`MTP_DCP_MODELS`). Prefix caching is
     admitted with transfers too (its byte checks need the same setting on
     both endpoints: their pages' patterns are content-seeded exactly when
     it is on)."""

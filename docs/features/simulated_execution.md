@@ -151,32 +151,47 @@ the default FP8 indexer. FlashMLA requires fewer than 32 local query heads,
 the same padded head count before and after gathering, and HiSparse off.
 For GLM-5 on B200 this represents an explicit packed-cache deployment:
 native `auto` instead uses standard FP8 with FlashInfer. Standalone CPU
-simulation also models GQA for Qwen3-30B-A3B at TP8/DCP2 on H100 or H200
-with BF16, interleave 1 and the same merge requirements. The native reference
+simulation also models GQA for Qwen3-30B-A3B and Qwen3-235B-A22B at TP8/DCP2
+(the only layout vLLM allows for their four KV heads at TP up to 8) on H100 or
+H200 with BF16, KV interleave 1, 16 or 32 and the same merge requirements. The
+native reference
 is FlashAttention 3; AISimulate uses its default attention selector and
 vLLM 0.24.0 tables. It models prefill over cached context with a KV gather;
 native FlashAttention gathers Q and merges the ranks' partial outputs.
 KV page size determines cache geometry; changing it did not change the
-estimates in the qualified queries. GQA DCP with KV transfers, compressed
+estimates in the qualified queries, and AISimulate takes no interleave
+(the estimates are the same at each). GQA models whose layouts need more
+than eight GPUs (Qwen3-8B, MiniMax-M2.5), FP8 KV cache and B200 are not
+qualified. GQA DCP with KV transfers, compressed
 MLA, hybrids, and pipeline, prefill context, data and expert parallelism
 are outside this scope.
 
 With DCP greater than one, speculative decoding is limited to standalone
-CPU simulation of the published DeepSeek-V3 with native single-module MTP
-at depth 1, TP2/DCP2 or TP4/DCP4, 16-token pages and interleave 1. This
-profile uses H200 AISimulate vLLM 0.24.0 tables, the published block-FP8
-weights, BF16 model and KV, and the same merge and Q replication settings.
+CPU simulation of the native single-module MTP of DeepSeek-V3, DeepSeek-V3.2
+and GLM-5 at depth 1 to 3, interleave 1 and AISimulate vLLM 0.24.0 tables,
+at the layouts AISimulate was qualified for: DeepSeek-V3 on H200 (published
+block-FP8 weights, BF16 model and KV, 16-token pages) at TP/DCP 2/2, 4/2, 4/4,
+8/2, 8/4 and 8/8; DeepSeek-V3.2 on H200 (published block-FP8 weights, packed
+`fp8_ds_mla` cache, 64-token pages) at TP8 with DCP 2 or 4; GLM-5 on B200
+(published NVFP4 weights, packed cache, 64-token pages, explicit `ag_rs` and
+Q replication off) at TP4 with DCP 2 or 4. The sparse models' pages are
+FlashMLA's and the indexer's 64 tokens. Larger interleaves are an
+unqualified scope of the simulator (the sparse backend declares MTP support at
+them; the dense CPU MLA backend does not). The merge and Q replication follow
+the settings above.
 Prefix caching, KV offloading, and KV transfers are outside this combined
 scope. KV transfers stay refused: over NIXL with DCP, vLLM resolves the
 interleave to the block size when the engine starts, and its compatibility
-check refuses MTP at an interleave above 1 on the simulated CPU MLA
-backend, which does not declare support for it. An instance with DCP above
+check refuses MTP at an interleave above 1 on the simulated dense CPU MLA
+backend, which does not declare support for it (the sparse backend does;
+sparse MTP with DCP and transfers is outside the qualified scope). An instance with DCP above
 1 refuses speculative transfers when its configuration is checked; an
 instance at DCP 1 refuses at the handshake, once it learns the peer's DCP,
-before any READ. The single draft layer's sharded KV belongs to the
-target's cache group and shares its scheduler block span. Its cache
-contributes to the engine's virtual memory plan even though the timing
-model omits draft KV.
+before any READ. The single draft layer's sharded KV (a sparse model's
+latent and indexer caches) belongs to the target's cache groups and shares
+their scheduler block span; each depth's lookahead enters the scheduler's
+block demand. Its cache contributes to the engine's virtual memory plan even
+though the timing model omits draft KV.
 
 Speculative decoding is timed for the native single-module MTP of
 DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 only (`method: mtp`, the checkpoint's one MTP layer,

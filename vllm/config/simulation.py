@@ -192,7 +192,8 @@ class SimulationConfig:
         Dense MLA can run in one instance or with real NIXL pull transfers,
         prefix caching on or off; the handshake checks the peer's DCP. Sparse MLA
         and qualified GQA require AISimulate and one instance. The same
-        restriction applies to qualified DeepSeek-V3 MTP at depth 1.
+        restriction applies to qualified MTP at depth 1 to 3 (DeepSeek-V3,
+        DeepSeek-V3.2, GLM-5).
         A simulated forward does not run attention kernels."""
         from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
             dcp_scope_problems,
@@ -211,7 +212,8 @@ class SimulationConfig:
                 "alone: dense MLA in one instance or with real NixlConnector "
                 "pull transfers; sparse MLA and qualified GQA only in one "
                 "instance with AISimulate; with speculative decoding, only "
-                "standalone DeepSeek-V3 MTP at depth 1, not with "
+                "standalone MTP of DeepSeek-V3, DeepSeek-V3.2 or GLM-5 at "
+                "depth 1 to 3, not with "
                 f"{', '.join(problems)}."
             )
 
