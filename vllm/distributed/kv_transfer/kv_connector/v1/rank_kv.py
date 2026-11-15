@@ -11,7 +11,7 @@ import os
 
 from vllm import envs
 from vllm.config import KVTransferConfig, VllmConfig
-from vllm.config.simulation import moves_real_kv
+from vllm.config.simulation import NIXL_CONNECTORS, SimulationConfig, moves_real_kv
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -342,13 +342,119 @@ def dcp_pair_refusal(local_dcp_size: int, remote_dcp_size: int, problems) -> str
     )
 
 
+UNEQUAL_TP_MLA_MTP = "simulated/nixl/unequal-tp-mla-mtp/v1"
+UNEQUAL_TP_MLA_MTP_PAGE = 32
+UNEQUAL_TP_MLA_MTP_PAGE_BYTES = UNEQUAL_TP_MLA_MTP_PAGE * (512 + 64) * 2
+UNEQUAL_TP_MLA_MTP_DRAFT = "model.layers.61.self_attn.attn"
+
+
+def qualifies_unequal_tp_mla_mtp(config: VllmConfig) -> bool:
+    """An endpoint in the verified whole-page DeepSeek-V3 MTP scope."""
+    transfer = config.kv_transfer_config
+    spec = config.speculative_config
+    sim, cache, pc = (
+        config.simulation_config,
+        config.cache_config,
+        config.parallel_config,
+    )
+    if (
+        not moves_real_kv(config)
+        or transfer.kv_connector not in NIXL_CONNECTORS
+        or transfer.kv_role not in ("kv_producer", "kv_consumer")
+        or transfer.get_from_extra_config("bidirectional_kv_xfer", False)
+        or not transfer.get_from_extra_config("enforce_handshake_compat", True)
+        or spec is None
+        or spec.num_speculative_tokens != 1
+        or spec.uses_dynamic_speculative_decoding()
+        or spec.enable_adaptive_verification
+        or sim.timing != "aisimulate"
+        or sim.timing_args.get("gpu") != "h200"
+        or sim.timing_args.get("target_model") != "deepseek-ai/DeepSeek-V3"
+        or sim.timing_args.get("quant_modes")
+        or sim.kv_kernel_backend is not None
+        or cache.block_size != UNEQUAL_TP_MLA_MTP_PAGE
+        or cache.enable_prefix_caching
+        or pc.tensor_parallel_size not in (2, 4)
+        or any(
+            size != 1
+            for size in (
+                pc.data_parallel_size,
+                pc.pipeline_parallel_size,
+                pc.prefill_context_parallel_size,
+                pc.decode_context_parallel_size,
+                pc.nnodes,
+            )
+        )
+        or pc.enable_expert_parallel
+    ):
+        return False
+
+    model = config.model_config
+    draft = spec.draft_model_config
+    if (
+        model.hf_config.model_type != "deepseek_v3"
+        or model.architectures != ["DeepseekV3ForCausalLM"]
+        or not plain_mla(model)
+        or SimulationConfig._native_mtp_mismatches(config, effective_kv=True)
+        or draft is None
+        or draft.hf_config.model_type != "deepseek_mtp"
+        or not plain_mla(draft)
+        or spec.draft_parallel_config is None
+        or spec.draft_parallel_config.tensor_parallel_size != pc.tensor_parallel_size
+        or spec.attention_backend is not None
+        or spec.moe_backend not in (None, "auto")
+        or spec.parallel_drafting
+        or spec.revision not in (None, model.revision)
+        or spec.code_revision not in (None, model.code_revision)
+        or cache.cache_dtype not in ("auto", "bfloat16")
+        or spec.kv_cache_dtype not in (None, "auto", "bfloat16")
+    ):
+        return False
+
+    # Match the published V3 KV geometry and block-FP8 weight profile on
+    # both resolved model configs; explicit BF16 and BF16 through auto agree.
+    for endpoint in (model, draft):
+        hf = endpoint.hf_text_config
+        quant = getattr(hf, "quantization_config", None) or {}
+        if (
+            str(endpoint.dtype) != "torch.bfloat16"
+            or endpoint.quantization != "fp8"
+            or endpoint.quantization_config is not None
+            or quant.get("quant_method") != "fp8"
+            or quant.get("weight_block_size") != [128, 128]
+            or hf.num_hidden_layers != 61
+            or hf.hidden_size != 7168
+            or hf.q_lora_rank != 1536
+            or hf.n_routed_experts != 256
+            or hf.num_experts_per_tok != 8
+            or hf.num_nextn_predict_layers != 1
+            or hf.num_attention_heads != 128
+            or hf.kv_lora_rank != 512
+            or hf.qk_rope_head_dim != 64
+        ):
+            return False
+    return True
+
+
+def unequal_tp_mla_mtp_refusal(local_tp_size: int, remote_tp_size: int) -> str:
+    return (
+        "Simulated real KV transfers pair unequal TP sizes for plain attention, "
+        "plain or sparse MLA only (no compressed MLA, recurrent state "
+        f"or draft), not local TP {local_tp_size} and remote TP {remote_tp_size}."
+    )
+
+
 def simulated_dcp_scope(vllm_config: VllmConfig) -> list[str] | None:
     """An instance's `dcp_scope_problems` with real KV transfers under
     simulated compute, which NIXL advertises for its peer to check whichever
-    side has decode context parallelism; None otherwise."""
+    side has decode context parallelism. It also advertises the versioned
+    unequal-TP MLA MTP capability when qualified. None outside simulation."""
     if not moves_real_kv(vllm_config):
         return None
-    return dcp_scope_problems(vllm_config, transfers=True)
+    scope = dcp_scope_problems(vllm_config, transfers=True)
+    if qualifies_unequal_tp_mla_mtp(vllm_config):
+        scope.append(UNEQUAL_TP_MLA_MTP)
+    return scope
 
 
 def simulated_tp_mismatch(
@@ -371,6 +477,8 @@ def simulated_tp_mismatch(
     (`sparse_mla`: an indexer's keys beside it, the same on every rank too). NIXL's
     decode (`nixl_consumer`, the local side) refuses, as NIXL itself does, a
     larger producer whose KV heads are replicated; MLA's latent is exempt.
+    A qualified DeepSeek-V3 MTP consumer can continue to NIXL's handshake,
+    where the peer's capability and its registered regions are checked.
     Decode context parallelism on either side (`remote_dcp_size` the peer's,
     from NIXL's handshake) pairs TP sizes one dividing the other (NIXL maps
     each decode rank's DCP slice to the producer ranks holding it,
@@ -434,11 +542,14 @@ def simulated_tp_mismatch(
         or model.is_hybrid
         or vllm_config.speculative_config is not None
     ):
-        return (
-            "Simulated real KV transfers pair unequal TP sizes for plain attention, "
-            "plain or sparse MLA only (no compressed MLA, recurrent state "
-            f"or draft), not {sizes}."
-        )
+        if (
+            nixl_consumer
+            and {local_tp_size, remote_tp_size} == {2, 4}
+            and local_tp_size == vllm_config.parallel_config.tensor_parallel_size
+            and qualifies_unequal_tp_mla_mtp(vllm_config)
+        ):
+            return None
+        return unequal_tp_mla_mtp_refusal(local_tp_size, remote_tp_size)
     if (
         nixl_consumer
         and not model.use_mla

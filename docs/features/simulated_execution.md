@@ -461,7 +461,13 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           read as two prefill blocks, the uncovered half of a request's
           last block zero, as NIXL leaves it;
       and not for DeepSeek-V4's caches, another MLA hybrid, Kimi-K3 at
-      other TP sizes, or speculative decoding. A NIXL decode instance refuses, as
+      other TP sizes, or other forms of speculative decoding. On the simulated
+      CPU MLA path, NIXL pull also pairs DeepSeek-V3's native MTP at depth 1
+      (TP 2 and TP 4 in either direction, BF16 KV, whole 32-token pages,
+      H200 AISimulate, without prefix caching or other parallel axes).
+      The draft's latent is replicated like the target's: each decode rank
+      reads all payload layers from one mapped producer. Both endpoints must
+      qualify before NIXL posts a READ. A NIXL decode instance refuses, as
       NIXL does, a larger prefill instance whose KV heads are replicated
       (more ranks than KV heads); MLA's latent is exempt. A refused pair
       fails at the handshake;

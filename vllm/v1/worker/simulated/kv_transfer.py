@@ -22,9 +22,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+    UNEQUAL_TP_MLA_MTP,
+    UNEQUAL_TP_MLA_MTP_PAGE,
+    UNEQUAL_TP_MLA_MTP_PAGE_BYTES,
     dcp_pair_refusal,
     dcp_scope_problems,
     plain_mla,
+    qualifies_unequal_tp_mla_mtp,
+    unequal_tp_mla_mtp_refusal,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -373,7 +378,11 @@ def dcp_peer_refusal(
     scope = metadata.simulated_scope
     if scope is None:
         problems.append("a peer that states no simulated scope")
-    problems.extend(f"the peer's {problem}" for problem in scope or ())
+    problems.extend(
+        f"the peer's {problem}"
+        for problem in scope or ()
+        if problem != UNEQUAL_TP_MLA_MTP
+    )
     if problems:
         return dcp_pair_refusal(local_dcp_size, remote_dcp, problems)
     remote = (metadata.block_size, metadata.physical_blocks_per_logical_kv_block)
@@ -386,8 +395,44 @@ def dcp_peer_refusal(
     return None
 
 
+def _matches_mtp_regions(page, names, lengths, group_ids) -> bool:
+    return (
+        page == (UNEQUAL_TP_MLA_MTP_PAGE, 1)
+        and names == [f"model.layers.{i}.self_attn.attn" for i in range(62)]
+        and lengths == [UNEQUAL_TP_MLA_MTP_PAGE_BYTES] * 62
+        and group_ids == [0] * 62
+    )
+
+
+def mtp_peer_refusal(worker, local_page, remote_tp, metadata) -> str | None:
+    """For this actual NIXL agent, verify capability and registered pages."""
+    local_tp = worker.vllm_config.parallel_config.tensor_parallel_size
+    if local_tp == remote_tp or worker.vllm_config.speculative_config is None:
+        return None
+    remote_page = metadata.block_size, metadata.physical_blocks_per_logical_kv_block
+    if (
+        {local_tp, remote_tp} == {2, 4}
+        and qualifies_unequal_tp_mla_mtp(worker.vllm_config)
+        and UNEQUAL_TP_MLA_MTP in (metadata.simulated_scope or ())
+        and _matches_mtp_regions(
+            local_page,
+            worker.region_names,
+            worker.block_len_per_layer,
+            worker.region_group_ids,
+        )
+        and _matches_mtp_regions(
+            remote_page,
+            metadata.region_names,
+            metadata.block_lens,
+            metadata.region_group_ids,
+        )
+    ):
+        return None
+    return unequal_tp_mla_mtp_refusal(local_tp, remote_tp)
+
+
 def validate_dcp_peer(worker) -> None:
-    """Check simulated DCP and kernel-block geometry before any native READ."""
+    """Check simulated DCP, kernel geometry and MTP before any native READ."""
     add = worker.add_remote_agent
 
     def add_remote_agent(
@@ -428,6 +473,8 @@ def validate_dcp_peer(worker) -> None:
                 "Simulated NIXL with split MLA kernel blocks requires equal P/D "
                 f"logical block sizes (local {local_tokens}, remote {remote_tokens})."
             )
+        if refusal := mtp_peer_refusal(worker, local_page, remote_tp_size, metadata):
+            raise ValueError(refusal)
         return add(
             metadata, remote_tp_rank, remote_tp_size, remote_dcp_size, *args, **kwargs
         )

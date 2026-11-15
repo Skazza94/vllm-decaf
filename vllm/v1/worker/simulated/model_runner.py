@@ -33,7 +33,9 @@ from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+    UNEQUAL_TP_MLA_MTP_DRAFT,
     host_dp_ranks,
+    qualifies_unequal_tp_mla_mtp,
     sparse_mla,
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -437,6 +439,8 @@ class SimulatedModelRunner(GPUModelRunner):
             ):
                 self._kv_checker.destinations = NixlReadDestinations(nixl_worker)
                 if self.model_config.use_mla and not sparse_mla(self.model_config):
+                    if qualifies_unequal_tp_mla_mtp(self.vllm_config):
+                        self._kv_checker.mtp_draft_layer = UNEQUAL_TP_MLA_MTP_DRAFT
                     self._kv_checker.watch_prepared_reads(nixl_worker)
         selection = None
         if native:
