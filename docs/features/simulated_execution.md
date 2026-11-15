@@ -467,7 +467,15 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
       H200 AISimulate, without prefix caching or other parallel axes).
       The draft's latent is replicated like the target's: each decode rank
       reads all payload layers from one mapped producer. Both endpoints must
-      qualify before NIXL posts a READ. A NIXL decode instance refuses, as
+      qualify before NIXL posts a READ. The same NIXL pull scope includes
+      DeepSeek-V3.2 (H200 AISimulate, BF16 latent) and GLM-5-NVFP4 (B200
+      AISimulate, NVFP4 weights and packed FP8 latent), on whole 64-token
+      pages. Each sparse MLA layer's indexer cache is replicated beside its
+      latent, including the native draft layer. Byte checks reconcile the
+      source rank and report the draft's latent and indexer separately.
+      Mooncake still refuses unequal-TP MTP: its native layout exchange
+      does not qualify both endpoints' speculative configuration.
+      A NIXL decode instance refuses, as
       NIXL does, a larger prefill instance whose KV heads are replicated
       (more ranks than KV heads); MLA's latent is exempt. A refused pair
       fails at the handshake;

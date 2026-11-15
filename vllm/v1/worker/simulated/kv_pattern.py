@@ -57,7 +57,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
-    UNEQUAL_TP_MLA_MTP_PAGE,
+    UnequalTpMtpLayout,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -1123,7 +1123,7 @@ class PatternChecker(_ConsumerPages):
     parallelism on either side, the handoff's pages are the payload, a page
     past them padding."""
     prepared: NixlPreparedReads | None = None
-    mtp_draft_layer: str | None = None
+    mtp_layout: UnequalTpMtpLayout | None = None
     split_sentinel: int = SENTINEL
     destinations: NixlReadDestinations | None = None
     """The blocks NIXL's READs write (with decode context parallelism, those
@@ -1167,7 +1167,7 @@ class PatternChecker(_ConsumerPages):
             self.split_sentinel = POISON
         names = (
             worker.region_names
-            if self.mtp_draft_layer is not None
+            if self.mtp_layout is not None
             else list(self.views)
         )
         regions = {}
@@ -1345,14 +1345,11 @@ class PatternChecker(_ConsumerPages):
                     return result
             return _compare_dcp_reads(self, req_id, expected, written, identity_of)
         mtp_audit = None
-        draft_name = self.mtp_draft_layer
+        layout = self.mtp_layout
         if self.prepared is not None:
             records = self.prepared.take(expected.remote_request_id)
             remote = self._nixl.transfer_topo.get_engine_info(expected.remote_engine_id)
-            if (
-                draft_name is not None
-                and remote.remote_tp_size != self._nixl.world_size
-            ):
+            if layout is not None and remote.remote_tp_size != self._nixl.world_size:
                 expected, mtp_audit = self._check_mtp_read(expected, records, remote)
             if remote.remote_physical_blocks_per_logical > 1 or (
                 self._nixl._physical_blocks_per_logical_kv_block > 1
@@ -1367,8 +1364,11 @@ class PatternChecker(_ConsumerPages):
                 return result
         groups = []
         mismatched_blocks = []
-        draft_bad = 0
-        draft_checked = 0
+        draft_regions = (
+            layout.draft_regions if mtp_audit is not None and layout is not None else ()
+        )
+        draft_checked = dict.fromkeys(draft_regions, 0)
+        draft_bad = dict.fromkeys(draft_regions, 0)
         for group in expected.groups:
             views = self._groups[group.group]
             group_mismatched = 0
@@ -1390,9 +1390,9 @@ class PatternChecker(_ConsumerPages):
                         self.heads,
                     )
                     wrong = int((view[block_id] != want).sum())
-                    if mtp_audit is not None and layer == draft_name:
-                        draft_checked += view.shape[1]
-                        draft_bad += wrong
+                    if layer in draft_checked:
+                        draft_checked[layer] += view.shape[1]
+                        draft_bad[layer] += wrong
                     if wrong:
                         group_mismatched += wrong
                         mismatched_blocks.append([layer, logical, block_id, wrong])
@@ -1412,15 +1412,24 @@ class PatternChecker(_ConsumerPages):
         evidence = {}
         if mtp_audit is not None:
             coverage, draft_read = mtp_audit
-            evidence = {
-                "coverage": coverage,
-                "draft": {
-                    "layer": draft_name,
-                    "checked_bytes": draft_checked,
-                    "read_bytes": draft_read,
-                    "mismatched_bytes": draft_bad,
-                },
+            evidence["coverage"] = coverage
+            draft_stats = {
+                layer: {
+                    "layer": layer,
+                    "checked_bytes": draft_checked[layer],
+                    "read_bytes": draft_read[layer],
+                    "mismatched_bytes": draft_bad[layer],
+                }
+                for layer in draft_regions
             }
+            if len(draft_regions) == 2:
+                latent, indexer = draft_regions
+                evidence["draft"] = {
+                    "latent": draft_stats[latent],
+                    "indexer": draft_stats[indexer],
+                }
+            else:
+                evidence["draft"] = draft_stats[draft_regions[0]]
         return {
             **evidence,
             "req_id": req_id,
@@ -1438,7 +1447,9 @@ class PatternChecker(_ConsumerPages):
         }
 
     def _check_mtp_read(self, expected, records, remote):
-        pages = -(-(expected.remote_num_tokens or 0) // UNEQUAL_TP_MLA_MTP_PAGE)
+        layout = self.mtp_layout
+        assert layout is not None
+        pages = -(-(expected.remote_num_tokens or 0) // layout.page_size)
         producer = self.tp_rank * remote.remote_tp_size // self._nixl.world_size
         # The handoff names the payload at logical page zero. Decode-only
         # lookahead may allocate more pages but may not be written by a READ.
@@ -1467,14 +1478,16 @@ class PatternChecker(_ConsumerPages):
                 *coverage["problems"][:7],
             ]
             coverage["problem_count"] += 1
-        draft_region = self._native_regions[self.mtp_draft_layer]
-        draft_read = sum(
-            length
-            for record in records
-            if record.done
-            for region, _, _, length in record.pieces or ()
-            if region == draft_region
-        )
+        draft_read = {
+            name: sum(
+                length
+                for record in records
+                if record.done
+                for region, _, _, length in record.pieces or ()
+                if region == self._native_regions[name]
+            )
+            for name in layout.draft_regions
+        }
         return replace(expected, groups=groups), (coverage, draft_read)
 
 

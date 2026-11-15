@@ -8,6 +8,7 @@ sizes real transfers pair."""
 
 import ipaddress
 import os
+from dataclasses import dataclass
 
 from vllm import envs
 from vllm.config import KVTransferConfig, VllmConfig
@@ -345,11 +346,10 @@ def dcp_pair_refusal(local_dcp_size: int, remote_dcp_size: int, problems) -> str
 UNEQUAL_TP_MLA_MTP = "simulated/nixl/unequal-tp-mla-mtp/v1"
 UNEQUAL_TP_MLA_MTP_PAGE = 32
 UNEQUAL_TP_MLA_MTP_PAGE_BYTES = UNEQUAL_TP_MLA_MTP_PAGE * (512 + 64) * 2
-UNEQUAL_TP_MLA_MTP_DRAFT = "model.layers.61.self_attn.attn"
 
 
-def qualifies_unequal_tp_mla_mtp(config: VllmConfig) -> bool:
-    """An endpoint in the verified whole-page DeepSeek-V3 MTP scope."""
+def _qualifies_unequal_tp_mtp_endpoint(config: VllmConfig, page_size: int) -> bool:
+    """Common constraints for a simulated NIXL pull endpoint."""
     transfer = config.kv_transfer_config
     spec = config.speculative_config
     sim, cache, pc = (
@@ -368,11 +368,9 @@ def qualifies_unequal_tp_mla_mtp(config: VllmConfig) -> bool:
         or spec.uses_dynamic_speculative_decoding()
         or spec.enable_adaptive_verification
         or sim.timing != "aisimulate"
-        or sim.timing_args.get("gpu") != "h200"
-        or sim.timing_args.get("target_model") != "deepseek-ai/DeepSeek-V3"
         or sim.timing_args.get("quant_modes")
         or sim.kv_kernel_backend is not None
-        or cache.block_size != UNEQUAL_TP_MLA_MTP_PAGE
+        or cache.block_size != page_size
         or cache.enable_prefix_caching
         or pc.tensor_parallel_size not in (2, 4)
         or any(
@@ -390,22 +388,35 @@ def qualifies_unequal_tp_mla_mtp(config: VllmConfig) -> bool:
         return False
 
     model = config.model_config
+    return (
+        spec.draft_parallel_config is not None
+        and spec.draft_parallel_config.tensor_parallel_size == pc.tensor_parallel_size
+        and spec.attention_backend is None
+        and spec.moe_backend in (None, "auto")
+        and not spec.parallel_drafting
+        and spec.revision in (None, model.revision)
+        and spec.code_revision in (None, model.code_revision)
+    )
+
+
+def qualifies_unequal_tp_mla_mtp(config: VllmConfig) -> bool:
+    """An endpoint in the verified whole-page DeepSeek-V3 MTP scope."""
+    if not _qualifies_unequal_tp_mtp_endpoint(config, UNEQUAL_TP_MLA_MTP_PAGE):
+        return False
+    sim, cache = config.simulation_config, config.cache_config
+    spec = config.speculative_config
+    model = config.model_config
     draft = spec.draft_model_config
     if (
-        model.hf_config.model_type != "deepseek_v3"
+        sim.timing_args.get("gpu") != "h200"
+        or sim.timing_args.get("target_model") != "deepseek-ai/DeepSeek-V3"
+        or model.hf_config.model_type != "deepseek_v3"
         or model.architectures != ["DeepseekV3ForCausalLM"]
         or not plain_mla(model)
         or SimulationConfig._native_mtp_mismatches(config, effective_kv=True)
         or draft is None
         or draft.hf_config.model_type != "deepseek_mtp"
         or not plain_mla(draft)
-        or spec.draft_parallel_config is None
-        or spec.draft_parallel_config.tensor_parallel_size != pc.tensor_parallel_size
-        or spec.attention_backend is not None
-        or spec.moe_backend not in (None, "auto")
-        or spec.parallel_drafting
-        or spec.revision not in (None, model.revision)
-        or spec.code_revision not in (None, model.code_revision)
         or cache.cache_dtype not in ("auto", "bfloat16")
         or spec.kv_cache_dtype not in (None, "auto", "bfloat16")
     ):
@@ -436,6 +447,173 @@ def qualifies_unequal_tp_mla_mtp(config: VllmConfig) -> bool:
     return True
 
 
+@dataclass(frozen=True)
+class UnequalTpMtpLayout:
+    """The ordered ordinary regions of one qualified native MLA MTP profile."""
+
+    capability: str
+    page_size: int
+    target_layers: int
+    latent_page_bytes: int
+    indexer_page_bytes: int = 0
+
+    def layer_regions(self, layer: int) -> tuple[str, ...]:
+        prefix = f"model.layers.{layer}.self_attn"
+        latent = f"{prefix}.attn"
+        if self.indexer_page_bytes:
+            return latent, f"{prefix}.indexer.k_cache"
+        return (latent,)
+
+    @property
+    def draft_regions(self) -> tuple[str, ...]:
+        return self.layer_regions(self.target_layers)
+
+    @property
+    def names(self) -> list[str]:
+        return [
+            name
+            for layer in range(self.target_layers + 1)
+            for name in self.layer_regions(layer)
+        ]
+
+    @property
+    def page_bytes(self) -> list[int]:
+        per_layer = [self.latent_page_bytes]
+        if self.indexer_page_bytes:
+            per_layer.append(self.indexer_page_bytes)
+        return per_layer * (self.target_layers + 1)
+
+
+_DENSE_MTP_LAYOUT = UnequalTpMtpLayout(
+    UNEQUAL_TP_MLA_MTP,
+    UNEQUAL_TP_MLA_MTP_PAGE,
+    61,
+    UNEQUAL_TP_MLA_MTP_PAGE_BYTES,
+)
+_V32_MTP_LAYOUT = UnequalTpMtpLayout(
+    "simulated/nixl/unequal-tp-dsa-v32-mtp/v1",
+    64,
+    61,
+    64 * 576 * 2,
+    64 * 132,
+)
+_GLM5_MTP_LAYOUT = UnequalTpMtpLayout(
+    "simulated/nixl/unequal-tp-dsa-glm5-mtp/v1",
+    64,
+    78,
+    64 * 656,
+    64 * 132,
+)
+UNEQUAL_TP_MTP_CAPABILITIES = frozenset(
+    layout.capability
+    for layout in (_DENSE_MTP_LAYOUT, _V32_MTP_LAYOUT, _GLM5_MTP_LAYOUT)
+)
+
+
+def _sparse_mtp_layout(config: VllmConfig) -> UnequalTpMtpLayout | None:
+    cache, sim, model = (
+        config.cache_config,
+        config.simulation_config,
+        config.model_config,
+    )
+    if not _qualifies_unequal_tp_mtp_endpoint(config, 64) or not sparse_mla(model):
+        return None
+    spec = config.speculative_config
+    draft = spec.draft_model_config
+    if (
+        draft is None
+        or draft.hf_config.model_type != "deepseek_mtp"
+        or not draft.use_mla
+        or draft.is_hybrid
+        or SimulationConfig._native_mtp_mismatches(config, effective_kv=True)
+    ):
+        return None
+
+    glm = model.hf_config.model_type == "glm_moe_dsa"
+    if glm:
+        layout, arch, cache_dtype, quant_method = (
+            _GLM5_MTP_LAYOUT,
+            "GlmMoeDsaForCausalLM",
+            "fp8_ds_mla",
+            "modelopt_fp4",
+        )
+        timing_args = {"gpu": "b200", "target_model": "nvidia/GLM-5-NVFP4"}
+    else:
+        layout, arch, cache_dtype, quant_method = (
+            _V32_MTP_LAYOUT,
+            "DeepseekV32ForCausalLM",
+            "bfloat16",
+            "fp8",
+        )
+        timing_args = {"gpu": "h200", "target_model": "deepseek-ai/DeepSeek-V3.2"}
+    # CPU resolves an explicit BF16 latent to auto on these models.
+    # Below, both the target and the draft are required to be BF16.
+    cache_dtypes = (cache_dtype,) if glm else ("auto", "bfloat16")
+    if (
+        model.architectures != [arch]
+        or sim.timing_args != timing_args
+        or cache.cache_dtype not in cache_dtypes
+        or spec.kv_cache_dtype not in (None, *cache_dtypes)
+    ):
+        return None
+
+    geometry = {
+        "num_hidden_layers": layout.target_layers,
+        "num_nextn_predict_layers": 1,
+        "hidden_size": 6144 if glm else 7168,
+        "intermediate_size": 12288 if glm else 18432,
+        "moe_intermediate_size": 2048,
+        "first_k_dense_replace": 3,
+        "n_shared_experts": 1,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "num_attention_heads": 64 if glm else 128,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 2048 if glm else 1536,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 192 if glm else 128,
+        "v_head_dim": 256 if glm else 128,
+        "index_head_dim": 128,
+        "index_n_heads": 32 if glm else 64,
+        "index_topk": 2048,
+        "vocab_size": 154880 if glm else 129280,
+    }
+    for endpoint in (model, draft):
+        hf = endpoint.hf_text_config
+        quant = endpoint.model_arch_config.quantization_config or {}
+        if (
+            str(endpoint.dtype) != "torch.bfloat16"
+            or endpoint.quantization != quant_method
+            or endpoint.quantization_config is not None
+            or any(getattr(hf, name, None) != value for name, value in geometry.items())
+            or getattr(hf, "index_topk_freq", 1) != 1
+            or getattr(hf, "index_topk_pattern", None) is not None
+            or bool(getattr(hf, "indexer_rope_interleave", False)) != glm
+        ):
+            return None
+        if glm:
+            sidecar = quant.get("quantization") or {}
+            if (
+                sidecar.get("quant_algo") != "NVFP4"
+                or sidecar.get("kv_cache_quant_algo") != "FP8"
+                or sidecar.get("group_size") != 16
+            ):
+                return None
+        elif (
+            quant.get("quant_method") != "fp8"
+            or quant.get("weight_block_size") != [128, 128]
+        ):
+            return None
+    return layout
+
+
+def unequal_tp_mtp_layout(config: VllmConfig) -> UnequalTpMtpLayout | None:
+    """The layout an endpoint may offer to an unequal-TP NIXL peer."""
+    if qualifies_unequal_tp_mla_mtp(config):
+        return _DENSE_MTP_LAYOUT
+    return _sparse_mtp_layout(config)
+
+
 def unequal_tp_mla_mtp_refusal(local_tp_size: int, remote_tp_size: int) -> str:
     return (
         "Simulated real KV transfers pair unequal TP sizes for plain attention, "
@@ -452,8 +630,8 @@ def simulated_dcp_scope(vllm_config: VllmConfig) -> list[str] | None:
     if not moves_real_kv(vllm_config):
         return None
     scope = dcp_scope_problems(vllm_config, transfers=True)
-    if qualifies_unequal_tp_mla_mtp(vllm_config):
-        scope.append(UNEQUAL_TP_MLA_MTP)
+    if layout := unequal_tp_mtp_layout(vllm_config):
+        scope.append(layout.capability)
     return scope
 
 
@@ -546,7 +724,7 @@ def simulated_tp_mismatch(
             nixl_consumer
             and {local_tp_size, remote_tp_size} == {2, 4}
             and local_tp_size == vllm_config.parallel_config.tensor_parallel_size
-            and qualifies_unequal_tp_mla_mtp(vllm_config)
+            and unequal_tp_mtp_layout(vllm_config) is not None
         ):
             return None
         return unequal_tp_mla_mtp_refusal(local_tp_size, remote_tp_size)

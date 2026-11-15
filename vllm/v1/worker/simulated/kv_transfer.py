@@ -22,13 +22,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
-    UNEQUAL_TP_MLA_MTP,
-    UNEQUAL_TP_MLA_MTP_PAGE,
-    UNEQUAL_TP_MLA_MTP_PAGE_BYTES,
+    UNEQUAL_TP_MTP_CAPABILITIES,
+    UnequalTpMtpLayout,
     dcp_pair_refusal,
     dcp_scope_problems,
     plain_mla,
-    qualifies_unequal_tp_mla_mtp,
+    unequal_tp_mtp_layout,
     unequal_tp_mla_mtp_refusal,
 )
 from vllm.logger import init_logger
@@ -381,7 +380,7 @@ def dcp_peer_refusal(
     problems.extend(
         f"the peer's {problem}"
         for problem in scope or ()
-        if problem != UNEQUAL_TP_MLA_MTP
+        if problem not in UNEQUAL_TP_MTP_CAPABILITIES
     )
     if problems:
         return dcp_pair_refusal(local_dcp_size, remote_dcp, problems)
@@ -395,12 +394,28 @@ def dcp_peer_refusal(
     return None
 
 
-def _matches_mtp_regions(page, names, lengths, group_ids) -> bool:
+def _matches_mtp_regions(
+    layout: UnequalTpMtpLayout, page, names, lengths, group_ids, strides
+) -> bool:
     return (
-        page == (UNEQUAL_TP_MLA_MTP_PAGE, 1)
-        and names == [f"model.layers.{i}.self_attn.attn" for i in range(62)]
-        and lengths == [UNEQUAL_TP_MLA_MTP_PAGE_BYTES] * 62
-        and group_ids == [0] * 62
+        page == (layout.page_size, 1)
+        and names == layout.names
+        and lengths == layout.page_bytes
+        and group_ids == [0] * len(names)
+        and (not layout.indexer_page_bytes or strides == lengths)
+    )
+
+
+def _matches_mtp_peer(layout: UnequalTpMtpLayout, metadata) -> bool:
+    return UNEQUAL_TP_MTP_CAPABILITIES.intersection(metadata.simulated_scope or ()) == {
+        layout.capability
+    } and _matches_mtp_regions(
+        layout,
+        (metadata.block_size, metadata.physical_blocks_per_logical_kv_block),
+        metadata.region_names,
+        metadata.block_lens,
+        metadata.region_group_ids,
+        metadata.block_strides,
     )
 
 
@@ -409,22 +424,18 @@ def mtp_peer_refusal(worker, local_page, remote_tp, metadata) -> str | None:
     local_tp = worker.vllm_config.parallel_config.tensor_parallel_size
     if local_tp == remote_tp or worker.vllm_config.speculative_config is None:
         return None
-    remote_page = metadata.block_size, metadata.physical_blocks_per_logical_kv_block
+    layout = unequal_tp_mtp_layout(worker.vllm_config)
     if (
         {local_tp, remote_tp} == {2, 4}
-        and qualifies_unequal_tp_mla_mtp(worker.vllm_config)
-        and UNEQUAL_TP_MLA_MTP in (metadata.simulated_scope or ())
+        and layout is not None
+        and _matches_mtp_peer(layout, metadata)
         and _matches_mtp_regions(
+            layout,
             local_page,
             worker.region_names,
             worker.block_len_per_layer,
             worker.region_group_ids,
-        )
-        and _matches_mtp_regions(
-            remote_page,
-            metadata.region_names,
-            metadata.block_lens,
-            metadata.region_group_ids,
+            worker.block_stride_per_layer,
         )
     ):
         return None
