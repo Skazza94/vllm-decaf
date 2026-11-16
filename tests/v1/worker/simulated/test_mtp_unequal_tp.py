@@ -451,7 +451,7 @@ def test_local_mla_mtp_admission(tmp_path, tp, peer):
     ],
 )
 def test_mla_mtp_other_configurations_keep_their_refusal(
-    tmp_path, monkeypatch, options
+    tmp_path, ds_conv_layout, options
 ):
     from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
         UNEQUAL_TP_MLA_MTP,
@@ -459,7 +459,6 @@ def test_mla_mtp_other_configurations_keep_their_refusal(
         simulated_tp_mismatch,
     )
 
-    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
     config = _engine_config(tmp_path, **options)
     assert UNEQUAL_TP_MLA_MTP not in simulated_dcp_scope(config)
     n = options.get("kv_transfer_config", {}).get("kv_connector") != "MooncakeConnector"

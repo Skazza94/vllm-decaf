@@ -67,7 +67,9 @@ def engine(model, name=None, gpu="h100", *, sim_overrides=None, **kw):
         (NANO, "TRITON_ATTN", "h100", 1056, 1056),
     ],
 )
-def test_selects_declared_kernel_divisor(model, name, gpu, logical, kernel):
+def test_selects_declared_kernel_divisor(
+    ds_conv_layout, model, name, gpu, logical, kernel
+):
     config = engine(model, name, gpu)
     cpu = CPUMLABackend if model == V3 else CPUAttentionBackend
     with set_current_vllm_config(config):

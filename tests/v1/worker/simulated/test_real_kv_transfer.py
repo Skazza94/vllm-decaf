@@ -657,29 +657,6 @@ def test_real_mode_takes_sliding_window_models_over_either_connector(
         assert config.model_config.get_sliding_window() == 32
 
 
-@pytest.fixture
-def ds_conv_layout(monkeypatch):
-    """The DS conv-state layout, its cached resolutions cleared around."""
-    from vllm import envs
-    from vllm.model_executor.layers.mamba.mamba_utils import get_conv_state_layout
-
-    def clear():
-        envs.disable_envs_cache()
-        get_conv_state_layout.cache_clear()
-
-    def use(layout):
-        if layout is None:
-            monkeypatch.delenv("VLLM_SSM_CONV_STATE_LAYOUT", raising=False)
-        else:
-            monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", layout)
-        clear()
-
-    use("DS")
-    yield use
-    monkeypatch.delenv("VLLM_SSM_CONV_STATE_LAYOUT", raising=False)
-    clear()
-
-
 def hybrid_over_nixl_needs_ds(model_dir, ds_conv_layout, **kwargs):
     """Over NIXL, a hybrid model's state moves as its DS conv sub-projections
     and SSM state: refused in the SD layout (the default), taken in DS."""
@@ -4541,7 +4518,7 @@ def test_nixl_peers_refuse_another_page_size_under_dcp(
     sides[1]["check"] = check
     p, c = run_dcp_peers(config, *sides, tmp_path)
     log = c["log"]
-    assert "must hold pages of this instance's tokens" in log, log[-4000:]
+    assert "DCP requires matching P/D logical block sizes" in log, log[-4000:]
     assert f"kernel blocks a block ({producer[0]}, 1), not ({consumer[0]}, 1)" in log
     loads = [
         r
