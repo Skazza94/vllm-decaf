@@ -205,21 +205,28 @@ def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
     """Why a hybrid of this model cannot pair these TP sizes over NIXL, None
     when it can: a Mamba2 or GDN layout that splits over both sizes, no
     speculative decoding, no MLA (but Kimi-K3's, at decode TP4 from prefill
-    TP8, with extra checks when prefix caching is on), and attention KV heads
+    TP8, and the published cold reverse pair), and attention KV heads
     that split or replicate evenly on each side as NIXL maps them (the
     replicated-producer refusal of pure attention does not apply: a hybrid's
     mapping separates attention sources from state sources)."""
     model = vllm_config.model_config
     if model.use_mla:
-        # Kimi-K3 (KDA beside an MLA latent the same on every rank) at decode
-        # TP4 from prefill TP8 only: its attention blocks are then twice the
-        # producer's (each read as two), no GCD split of the producer's.
+        # Kimi-K3 (KDA beside a replicated MLA latent): the ordinary
+        # direction reads two producer blocks per decode attention block.
+        # Only the checked cold reverse case can split a producer block.
         # Kimi-K3's text model is Kimi-Linear's (`kimi_linear`); real
         # transfers admit its KDA class only (`check_real_kv_layers`).
         if getattr(model.hf_text_config, "model_type", None) != "kimi_linear":
             return "an MLA hybrid other than Kimi-K3"
         if (local_tp, remote_tp) != (4, 8):
-            return "Kimi-K3 at TP sizes other than prefill TP8 to decode TP4"
+            from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+                qualifies_kimi_k3_cold,
+            )
+
+            if (local_tp, remote_tp) != (8, 4) or not qualifies_kimi_k3_cold(
+                vllm_config
+            ):
+                return "Kimi-K3 at TP sizes other than prefill TP8 to decode TP4"
         if vllm_config.cache_config.enable_prefix_caching:
             from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
                 KIMI_K3_PREFIX_REFUSAL,
@@ -409,6 +416,8 @@ class ReadRecord:
     """The producer engine the READ's remote handle belongs to (None: not
     known), so a request's coverage is reconciled with its own producer when
     the consumer has met several (a DP producer is one engine a rank)."""
+    source_ranges: list[tuple[int, int]] | None = None
+    """Selected source addresses/lengths in the same order as local pieces."""
 
 
 def expected_pieces(
@@ -513,3 +522,35 @@ def coverage_problems(
         else:
             problems.append(f"missing bytes from producer {rank} in region {region} block {block}: {have} for {need}")
     return problems
+
+
+
+def paired_read_problems(
+    expected: Mapping[Piece, tuple[int, int]],
+    reads: Sequence[ReadRecord],
+    engine: str,
+    rank: int,
+) -> list[str]:
+    """One completed READ with each destination paired to its exact source."""
+    if len(reads) != 1:
+        return [f"expected one READ from producer {rank}, got {len(reads)}"]
+    read = reads[0]
+    if read.engine != engine or read.rank != rank or not read.done:
+        return [f"expected a completed READ from {engine} rank {rank}"]
+    if read.pieces is None or read.source_ranges is None:
+        return ["READ has unresolved source or destination descriptors"]
+    if len(read.pieces) != len(read.source_ranges):
+        return ["READ source and destination descriptor counts differ"]
+    actual = dict(zip(read.pieces, read.source_ranges, strict=True))
+    if len(actual) != len(read.pieces):
+        return ["duplicate destination in paired READ"]
+    missing = expected.keys() - actual.keys()
+    surplus = actual.keys() - expected.keys()
+    if missing or surplus:
+        return [
+            f"paired READ has {len(missing)} missing and {len(surplus)} surplus pieces"
+        ]
+    for dest, source in actual.items():
+        if source != expected[dest]:
+            return [f"wrong paired source for destination {dest}"]
+    return []

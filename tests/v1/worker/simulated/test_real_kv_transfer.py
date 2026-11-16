@@ -6741,3 +6741,396 @@ if __name__ == "__main__":
             env=env,
             check=True,
         )
+
+
+def test_published_kimi_k3_cold_pairing_scope(tmp_path, ds_conv_layout):
+    """The real consumer config admits only the checked cold direction."""
+    from copy import deepcopy
+
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(bundled_config("moonshotai/Kimi-K3"))
+    )
+    config = engine_config(
+        str(tmp_path),
+        simulation={
+            "timing": "aisimulate",
+            "timing_args": {"gpu": "b200", "target_model": "moonshotai/Kimi-K3"},
+            "kv_pattern_check": True,
+            "log_path": str(tmp_path / "steps"),
+        },
+        tensor_parallel_size=8,
+        max_model_len=4096,
+        max_num_batched_tokens=1536,
+        block_size=768,
+        dtype="bfloat16",
+        language_model_only=True,
+    )
+    admit = simulated_tp_mismatch
+    assert admit(config, 8, 4, nixl_consumer=True) is None
+    old_scope = "other than prefill TP8 to decode TP4"
+    assert old_scope in admit(config, 8, 2, nixl_consumer=True)
+    assert "one dividing the other" in admit(config, 8, 3, nixl_consumer=True)
+    assert admit(config, 8, 4, nixl_consumer=False) is not None
+    for section, field, value in (
+        ("cache_config", "enable_prefix_caching", True),
+        ("cache_config", "cache_dtype", "fp8"),
+        ("cache_config", "block_size", 1536),
+        ("cache_config", "kv_offloading_size", 1.0),
+        ("simulation_config", "kv_pattern_check", False),
+        ("simulation_config", "kv_pattern_grain", 768),
+        ("simulation_config", "kv_kernel_backend", "FLASHMLA"),
+        ("parallel_config", "data_parallel_size", 2),
+        ("parallel_config", "pipeline_parallel_size", 2),
+        ("parallel_config", "prefill_context_parallel_size", 2),
+        ("parallel_config", "enable_expert_parallel", True),
+        ("kv_transfer_config", "kv_connector", "NixlPushConnector"),
+        (
+            "kv_transfer_config",
+            "kv_connector_extra_config",
+            {"enforce_handshake_compat": False},
+        ),
+    ):
+        bad = deepcopy(config)
+        setattr(getattr(bad, section), field, value)
+        assert old_scope in admit(bad, 8, 4, nixl_consumer=True), field
+    bad = deepcopy(config)
+    bad.model_config.hf_text_config.linear_attn_config["num_heads"] = 64
+    assert old_scope in admit(bad, 8, 4, nixl_consumer=True)
+
+
+def test_published_kimi_k3_cold_pull_checks_native_source_ranges(tmp_path):
+    """The real planner splits the producer MLA page and keeps KDA's stride."""
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+
+    options = {
+        "language_model_only": True,
+        "timing": "aisimulate",
+        "timing_args": {"gpu": "b200", "target_model": "moonshotai/Kimi-K3"},
+        "max_model_len": 4096,
+        "prompt_len": 1602,
+    }
+    p, d = run_dcp_peers(
+        bundled_config("moonshotai/Kimi-K3"),
+        {**options, "tensor_parallel_size": 4, "block_size": 1536},
+        {**options, "tensor_parallel_size": 8, "block_size": 768},
+        tmp_path,
+        memory=(512 << 20, 512 << 20),
+    )
+    assert d.get("tokens") == [2], d["log"][-5000:]
+    assert p["released"], p["log"][-5000:]
+    for rank in range(8):
+        (check,) = [row["kv_check"] for row in d["logs"][rank] if "kv_check" in row]
+        assert check["ok"] and check["bytes"] == 119_872_512, check
+        cover = check["coverage"]
+        assert not cover["problems"], cover
+        (read,) = cover["reads"]
+        assert (read["rank"], read["descriptors"], read["completed"]) == (
+            rank // 2, 348, True
+        )
+        audit = cover["cold_k3_sources"]
+        assert audit["handoff_tokens"] == 1601 and len(audit["pairs"]) == 348
+        mla = [pair for pair in audit["pairs"] if pair[3] == 884_736]
+        assert len(mla) == 72
+        assert sorted({pair[5] for pair in mla}) == [0, 884_736]
+        assert sum(g["padding_bytes"] for g in check["groups"]) == 4_875_264
+        assert sum(g["zeroed_bytes"] for g in check["groups"]) == 0
+
+
+def test_published_kimi_k3_cold_raw_header(
+    tmp_path, ds_conv_layout
+):
+    """Check raw producer pages using live consumer registration on all ranks."""
+    import subprocess
+    import sys
+
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+
+    raw = bundled_config("moonshotai/Kimi-K3")
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    script = tmp_path / "peer_check.py"
+    script.write_text(
+        r"""
+from dataclasses import replace
+from pathlib import Path
+
+import msgspec
+import sys
+
+from vllm import LLM
+
+
+def registration(self):
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+    worker = get_kv_transfer_group().connector_worker
+    return (worker.tp_rank, worker.xfer_handshake_metadata.agent_metadata_bytes)
+
+
+def check(self, producer_headers):
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+    worker = get_kv_transfer_group().connector_worker
+    rank = worker.tp_rank // 2
+    peer = msgspec.msgpack.decode(producer_headers[rank], type=NixlAgentMetadata)
+    hint = "matching whole-page 1536-to-768 MLA/KDA registration"
+    if sys.argv[2] == "base-guard":
+        try:
+            worker.add_remote_agent(peer, rank, 4)
+        except ValueError as exc:
+            assert "has block size 1536" in str(exc)
+            assert "or a divisor of it" in str(exc)
+            return str(exc)
+        raise AssertionError("base raw registration did not refuse")
+    blocks_before = dict(worker.dst_num_blocks)
+    agents_before = set(worker._remote_agents)
+    assert peer.engine_id not in blocks_before and peer.engine_id not in agents_before
+    for changes, source in (
+        ({"block_size": 768, "physical_blocks_per_logical_kv_block": 2}, rank),
+        ({"block_size": 3072}, rank),
+        ({"region_names": peer.region_names[::-1]}, rank),
+        ({"region_group_ids": [0] * 24}, rank),
+        ({"block_lens": [1769471] * 24}, rank),
+        ({"block_strides": [1769473] * 24}, rank),
+        ({"ssm_sizes": (27648, 786432)}, rank),
+        ({"region_num_blocks": [1] * 24}, rank),
+        ({"dcp_size": 2}, rank),
+        ({}, (rank + 1) % 4),
+    ):
+        try:
+            worker.add_remote_agent(replace(peer, **changes), source, 4)
+        except ValueError as exc:
+            assert hint in str(exc), (changes, str(exc))
+        else:
+            raise AssertionError(changes)
+    assert worker.dst_num_blocks == blocks_before
+    assert set(worker._remote_agents) == agents_before
+    assert not worker._recving_transfers
+    assert worker.xfer_stats.is_empty()
+    return worker.tp_rank
+
+
+if __name__ == "__main__":
+    path = Path(sys.argv[1])
+    producer = sys.argv[2] == "produce"
+    llm = LLM(
+        model=str(path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        language_model_only=True,
+        max_model_len=4096,
+        kv_cache_memory_bytes=1 << 29,
+        max_num_batched_tokens=1536,
+        block_size=1536 if producer else 768,
+        tensor_parallel_size=4 if producer else 8,
+        enable_prefix_caching=False,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "timing": "aisimulate",
+            "timing_args": {"gpu": "b200", "target_model": "moonshotai/Kimi-K3"},
+            "kv_pattern_fill": producer,
+            "kv_pattern_check": not producer,
+            "log_path": str(path / f"{sys.argv[2]}.jsonl"),
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer" if producer else "kv_consumer",
+            "kv_buffer_device": "cpu",
+            "kv_connector_extra_config": {"backends": ["Mooncake"]},
+        },
+    )
+    headers = path / "producer.msgpack"
+    try:
+        if producer:
+            ranks = dict(llm.collective_rpc(registration))
+            assert sorted(ranks) == list(range(4))
+            headers.write_bytes(msgspec.msgpack.encode(ranks))
+        else:
+            ranks = msgspec.msgpack.decode(headers.read_bytes(), type=dict[int, bytes])
+            observed = sorted(llm.collective_rpc(check, args=(ranks,)))
+            if sys.argv[2] == "base-guard":
+                print(observed, flush=True)
+            else:
+                assert observed == list(range(8))
+            (path / "checked-ranks.msgpack").write_bytes(
+                msgspec.msgpack.encode(observed)
+            )
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+"""
+    )
+    env = {
+        **os.environ,
+        "VLLM_HOST_IP": "127.0.0.1",
+        "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
+        "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",  # Own callbacks, local workers.
+    }
+    consumer = "base-guard" if os.environ.get("K3_BASE_RAW") else "consume"
+    for mode in ("produce", consumer):
+        subprocess.run(
+            [sys.executable, "-u", str(script), str(tmp_path), mode],
+            env=env,
+            check=True,
+        )
+
+
+def test_published_kimi_k3_cold_detects_corruption_after_native_read(
+    tmp_path, monkeypatch
+):
+    """Perturb real completed descriptors and cache bytes on rank 0, then restore."""
+    import sys
+
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+
+    callback = r"""
+
+    # Keep actual pools and the scheduler; just choose a noncontiguous
+    # free-list order before either scheduler allocates any request.
+    core = llm.llm_engine.engine_core.engine_core
+    queue = core.scheduler.kv_cache_manager.block_pool.free_block_queue
+    free = queue.get_all_free_blocks()
+    for block in free:
+        queue.remove(block)
+    queue.append_n(free[::-2] + free[-2::-2])
+
+    if not producer:
+        def instrument(worker, output):
+            if worker.rank != 0:
+                return
+            from dataclasses import replace
+            from pathlib import Path
+
+            checker = worker.model_runner._kv_checker
+            selection = checker.selection
+            compare = checker._compare
+            coverage = checker._coverage
+            evidence = {}
+
+            def audit(expected, records):
+                valid = coverage(expected, records)
+                if "coverage" in evidence:
+                    return valid
+                assert not valid["problems"], valid
+                source_audit = valid["cold_k3_sources"]
+                assert source_audit["producer_blocks"][3][0] > (
+                    source_audit["producer_blocks"][3][1] + 1
+                )
+                assert source_audit["consumer_blocks"][3][0] > (
+                    source_audit["consumer_blocks"][3][1] + 1
+                )
+                (read,) = records
+                sources = list(read.source_ranges)
+                sources[0] = (sources[0][0] + 1, sources[0][1])
+                # Keep the transport's exact sizes when swapping sources.
+                # The first two entries are KDA components of equal size.
+                swapped = list(read.source_ranges)
+                assert swapped[0][1] == swapped[1][1]
+                swapped[0], swapped[1] = swapped[1], swapped[0]
+                changes = {
+                    "address": [replace(read, source_ranges=sources)],
+                    "swapped": [replace(read, source_ranges=swapped)],
+                    "missing-piece": [
+                        replace(read, pieces=read.pieces[:-1],
+                                source_ranges=read.source_ranges[:-1])
+                    ],
+                    "duplicate-piece": [
+                        replace(read, pieces=[*read.pieces, read.pieces[0]],
+                                source_ranges=[
+                                    *read.source_ranges, read.source_ranges[0]
+                                ],
+                        )
+                    ],
+                    "missing": [],
+                    "duplicate": [read, read],
+                    "unresolved": [replace(read, source_ranges=None)],
+                    "rank": [replace(read, rank=1)],
+                    "incomplete": [replace(read, done=False)],
+                }
+                evidence["coverage"] = {}
+                for name, invalid in changes.items():
+                    result = coverage(expected, invalid)
+                    assert result["problems"], (name, result)
+                    evidence["coverage"][name] = result["problems"]
+                return valid
+
+            def check(req, expected, *args):
+                selected = {}
+                for group in expected.groups:
+                    for idx, block, place in selection.select(
+                        group.group, group.block_ids
+                    ):
+                        row = selection.rows[idx]
+                        name = ("half-" + str(place) if not row.state
+                                else row.span.component)
+                        selected.setdefault(name, row.view[block][0:1])
+                        if not row.state and place == 2:
+                            selected.setdefault("patterned-tail",
+                                                row.view[block][256 * 1152:][:1])
+                        if row.state:
+                            pad = selection.padding[row.region]
+                            selected.setdefault("padding", pad.view[block][:1])
+                names = ("half-0", "half-1", "patterned-tail", "Q", "K", "V",
+                         "ssm", "padding")
+                evidence["bytes"] = {}
+                for name in names:
+                    byte = selected[name]
+                    byte[0] ^= 1
+                    try:
+                        # Byte comparison consumes observation records. Reuse
+                        # the actual records for each trial and for the result.
+                        prepared = checker.prepared
+                        take = prepared.take
+                        prepared.take = lambda request: list(
+                            prepared.records[request]
+                        )
+                        try:
+                            bad = compare(req, expected, *args)
+                        finally:
+                            prepared.take = take
+                        assert bad["mismatched_bytes"] == 1, (name, bad)
+                        assert not bad["ok"] and bad["posted_matches_checked"]
+                        evidence["bytes"][name] = bad["mismatched_blocks"]
+                    finally:
+                        byte[0] ^= 1
+                Path(output).write_text(json.dumps(evidence))
+                return compare(req, expected, *args)
+
+            checker._coverage = audit
+            checker._compare = check
+
+        llm.collective_rpc(instrument, args=(out + ".corruption",))
+
+"""
+    # Same real planner and transfer fixture; the extra callback only mutates
+    # real observations and destination bytes during the comparison.
+    module = sys.modules[__name__]
+    patched = DCP_PEER.replace(
+        "    ranks = llm.collective_rpc(geometry)",
+        callback + "    ranks = llm.collective_rpc(geometry)",
+    )
+    monkeypatch.setattr(module, "DCP_PEER", patched)
+    options = {
+        "language_model_only": True,
+        "timing": "aisimulate",
+        "timing_args": {"gpu": "b200", "target_model": "moonshotai/Kimi-K3"},
+        "max_model_len": 4096,
+        "prompt_len": 1602,
+    }
+    p, d = run_dcp_peers(
+        bundled_config("moonshotai/Kimi-K3"),
+        {**options, "tensor_parallel_size": 4, "block_size": 1536},
+        {**options, "tensor_parallel_size": 8, "block_size": 768},
+        tmp_path,
+        memory=(512 << 20, 512 << 20),
+    )
+    assert d.get("tokens") == [2], d["log"][-5000:]
+    assert p["released"]
+    records = json.loads((tmp_path / "consumer.json.corruption").read_text())
+    assert len(records["coverage"]) == 9 and len(records["bytes"]) == 8

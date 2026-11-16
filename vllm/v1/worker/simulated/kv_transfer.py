@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
     dcp_pair_refusal,
     dcp_scope_problems,
     plain_mla,
+    qualifies_kimi_k3_cold,
     qualifies_kimi_k3_prefix,
     unequal_tp_mtp_layout,
     unequal_tp_mla_mtp_refusal,
@@ -446,20 +447,21 @@ def mtp_peer_refusal(worker, local_page, remote_tp, metadata) -> str | None:
     return unequal_tp_mla_mtp_refusal(local_tp, remote_tp)
 
 
-def _kimi_k3_regions(worker) -> bool:
+def _kimi_k3_regions(
+    worker, *, tp: int = 4, page: int = 1536, state_mode: str = "align"
+) -> bool:
     """Check the local registered regions against the published MLA/KDA layout."""
     from vllm.v1.worker.simulated.state_layout import check_spec, layout_for
 
-    tp, page = 4, 1536
     page_bytes = page * 576 * 2
     layout = layout_for(worker.vllm_config)
     if (
         layout is None
         or layout.family != "kda"
         or layout.local_sizes(tp) != worker._mamba_ssm_size
-        or worker._mamba_ssm_size != (55296, 1572864)
+        or worker._mamba_ssm_size != (221184 // tp, 6291456 // tp)
         or worker._conv_decomp is None
-        or worker._conv_decomp.proj_bytes != (18432,) * 3
+        or worker._conv_decomp.proj_bytes != (73728 // tp,) * 3
         or worker.block_len_per_layer != [page_bytes] * 24
         or worker.block_stride_per_layer != [page_bytes] * 24
         or worker._region_is_mla != [True] * 24
@@ -499,13 +501,18 @@ def _kimi_k3_regions(worker) -> bool:
             else:
                 if not (
                     isinstance(spec, MambaSpec)
-                    and spec.mamba_cache_mode == "align"
+                    and spec.mamba_cache_mode == state_mode
                     and spec.dtypes == (torch.bfloat16, torch.float32)
                     and not check_spec(layout, spec, tp)
                 ):
                     return False
                 state_groups.add(group_id)
-            if spec.block_size != page or spec.page_size_bytes != page_bytes:
+            tokens = (
+                worker.vllm_config.cache_config.mamba_block_size
+                if isinstance(spec, MambaSpec) and state_mode == "none"
+                else page
+            )
+            if spec.block_size != tokens or spec.page_size_bytes != page_bytes:
                 return False
             # The layer's first byte, not the backing storage's base: several
             # registered regions may be different views of one allocation.
@@ -690,14 +697,29 @@ class NixlPreparedReads:
         release_xfer = getattr(bridge, "release_xfer_handle", None)
         registered = worker.src_xfer_handles_by_block_size.get(worker.block_size)
         tables = {registered: np.asarray(worker.src_blocks_data, dtype=np.int64)}
+        config = getattr(worker, "vllm_config", None)
+        capture_sources = config is not None and qualifies_kimi_k3_cold(config)
         self.records = {}
         pending = {}
 
         def prepare(agent, table, *args, **kwargs):
             handle = prep(agent, table, *args, **kwargs)
-            if agent == "NIXL_INIT_AGENT":
+            if agent == "NIXL_INIT_AGENT" or capture_sources:
                 tables[handle] = np.asarray(table, dtype=np.int64)
             return handle
+
+        def address_ranges(handle, ids):
+            if (table := tables.get(handle)) is None:
+                return None
+            count = int(table[:, 4].sum())
+            if any(not 0 <= i < count for i in ids):
+                return None
+            starts = np.cumsum(table[:, 4]) - table[:, 4]
+            rows = np.searchsorted(starts, ids, side="right") - 1
+            return [
+                (int(table[r, 0] + (i - starts[r]) * table[r, 3]), int(table[r, 1]))
+                for i, r in zip(ids, rows, strict=True)
+            ]
 
         def make_prepped_xfer(op, local, ids, remote, remote_ids, *args, **kwargs):
             handle = make(op, local, ids, remote, remote_ids, *args, **kwargs)
@@ -706,22 +728,12 @@ class NixlPreparedReads:
             request = request_of(kwargs.get("notif_msg", args[0] if args else b""))
             from vllm.v1.worker.simulated.state_layout import ReadRecord
 
-            table = tables.get(local)
-            pieces = None
-            if table is not None:
-                count = int(table[:, 4].sum())
-                if any(not 0 <= i < count for i in ids):
-                    table = None
-            if table is not None:
-                starts = np.cumsum(table[:, 4]) - table[:, 4]
-                rows = np.searchsorted(starts, ids, side="right") - 1
-                pieces = [
-                    piece_of(
-                        int(table[r, 0] + (i - starts[r]) * table[r, 3]),
-                        int(table[r, 1]),
-                    )
-                    for i, r in zip(ids, rows, strict=True)
-                ]
+            local_ranges = address_ranges(local, ids)
+            pieces = (
+                [piece_of(addr, length) for addr, length in local_ranges]
+                if local_ranges is not None
+                else None
+            )
             owner = next(
                 (
                     (engine, rank)
@@ -731,7 +743,16 @@ class NixlPreparedReads:
                 ),
                 (None, None),
             )
-            record = ReadRecord(request, owner[1], handle, pieces, engine=owner[0])
+            record = ReadRecord(
+                request,
+                owner[1],
+                handle,
+                pieces,
+                engine=owner[0],
+                source_ranges=(
+                    address_ranges(remote, remote_ids) if capture_sources else None
+                ),
+            )
             self.records.setdefault(request, []).append(record)
             pending[handle] = record
             return handle
@@ -794,6 +815,59 @@ class NixlReadDestinations:
         return self.blocks.pop(req_id, None)
 
 
+@dataclass(frozen=True)
+class KimiK3ColdPeer:
+    """The original whole-page P registration, before NIXL normalizes it."""
+
+    rank: int
+    bases: tuple[int, ...]
+    num_blocks: int
+
+    @property
+    def stride(self) -> int:
+        return 1536 * 576 * 2
+
+
+def checked_kimi_k3_cold_peer(
+    worker, metadata: NixlAgentMetadata, rank: int, dcp: int
+) -> KimiK3ColdPeer:
+    """Reject any reverse pairing outside the reviewed raw registration."""
+    peer = KimiK3ColdPeer(
+        rank, tuple(metadata.kv_caches_base_addr), metadata.num_blocks
+    )
+    if not (
+        worker.world_size == 8
+        and worker.dcp_size == worker.pcp_size == dcp == 1
+        and worker.enforce_compat_hash
+        and worker.block_size == 768
+        and worker._physical_blocks_per_logical_kv_block == 1
+        and metadata.block_size == 1536
+        and metadata.physical_blocks_per_logical_kv_block == 1
+        and metadata.dcp_size == metadata.pcp_size == 1
+        and rank == worker.tp_rank // 2
+        and metadata.attn_backend_name == worker.backend_name
+        and metadata.kv_cache_layout == worker.kv_cache_layout
+        and metadata.region_names == worker.region_names
+        and metadata.region_group_ids == worker.region_group_ids
+        and metadata.block_lens == metadata.block_strides == [peer.stride] * 24
+        and metadata.ssm_sizes == (55296, 1572864)
+        and metadata.region_mem_types == ["DRAM"] * 24
+        and peer.num_blocks > 0
+        and metadata.region_num_blocks == [peer.num_blocks] * 24
+        and len(peer.bases) == len(set(peer.bases)) == 24
+        and all(addr > 0 for addr in peer.bases)
+        and not metadata.packed_member_layouts
+        and not metadata.region_members
+        and metadata.ple_block_len is None
+        and _kimi_k3_regions(worker, tp=8, page=768, state_mode="none")
+    ):
+        raise ValueError(
+            "Kimi-K3 cold TP4 to TP8 NIXL requires the matching whole-page "
+            "1536-to-768 MLA/KDA registration and the mapped producer rank."
+        )
+    return peer
+
+
 def validate_state_peer(worker, layout) -> None:
     """A hybrid's NIXL peer of another TP size must hold states of the same
     model at its own size: the peer's `ssm_sizes` (conv and SSM bytes, the
@@ -804,8 +878,8 @@ def validate_state_peer(worker, layout) -> None:
     validated locally on each endpoint (`check_spec`, under the identical
     model/config assumption), not observed remotely. Replaces the equal-geometry
     guard (`refuse_foreign_state_geometry`) for eligible states; block sizes
-    are enforced here (equal, or the peer's a divisor of this instance's)
-    whether or not bytes are checked."""
+    are enforced here (equal, or a producer divisor, except the checked
+    cold Kimi-K3 split)."""
     add = worker.add_remote_agent
 
     def add_remote_agent(metadata, remote_tp_rank=0, remote_tp_size=1, *args, **kwargs):
@@ -815,6 +889,18 @@ def validate_state_peer(worker, layout) -> None:
             # The inner pre-registration guard checks these same fields and
             # the exact K3 layout, preserving the original prefix refusal.
             return add(metadata, remote_tp_rank, remote_tp_size, *args, **kwargs)
+        if (
+            layout.family == "kda"
+            and remote_tp_size == 4
+            and qualifies_kimi_k3_cold(worker.vllm_config)
+        ):
+            dcp = args[0] if args else kwargs.get("remote_dcp_size", 1)
+            peer = checked_kimi_k3_cold_peer(worker, metadata, remote_tp_rank, dcp)
+            result = add(metadata, remote_tp_rank, remote_tp_size, *args, **kwargs)
+            if not hasattr(worker, "kimi_k3_cold_peers"):
+                worker.kimi_k3_cold_peers = {}
+            worker.kimi_k3_cold_peers[metadata.engine_id] = peer
+            return result
         # Equal block sizes, or the producer's a divisor of this instance's
         # (NIXL's block-size ratio: each attention block read as several, the
         # states 1:1), whether or not bytes are checked: NIXL's own assertion
@@ -1274,8 +1360,9 @@ class RequestedRead:
     remote_dcp_size: int = 1
     """The producer's decode context parallel size (NIXL)."""
     remote_num_tokens: int | None = None
-    """The tokens whose KV the producer hands off (NIXL): with decode context
-    parallelism, which global pages hold KV and which are padding."""
+    """The tokens whose KV the producer hands off (NIXL)."""
+    remote_block_ids: tuple[tuple[int, ...], ...] | None = None
+    """Original producer group lists, before NIXL expands or clips them."""
 
     @property
     def blocks(self) -> list[int]:
@@ -1315,6 +1402,7 @@ def requested_reads(metadata: object) -> list[RequestedRead]:
                     [len(group) for group in value.remote.block_ids],
                     value.dcp_size,
                     value.remote.num_tokens,
+                    tuple(tuple(group) for group in value.remote.block_ids),
                 )
             )
     return reads

@@ -510,6 +510,17 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           keeps native NIXL pairing: with a decode prefix hit and an
           incomplete final page, it can put the producer's slabs in the
           wrong positions, which the byte check reports;
+        * the reverse Kimi-K3 pair (prefill TP 4 to decode TP 8), only
+          for the published text-only MXFP4 model with BF16 KV, FP32
+          recurrent state, CPU NIXL pull, AISimulate's B200 target,
+          prefix caching off, whole 1,536-token prefill and 768-token
+          decode pages, and KDA cache mode `none` on both sides. Enable
+          producer pattern fill and decode pattern checks. Decode
+          rank `r` reads from producer `r // 2`. The checker verifies
+          the sources and destinations of the native READ against the
+          original producer block IDs independently of the byte check; the
+          raw registration carries geometry, not the producer's fill
+          or prefix settings;
       and not for DeepSeek-V4's caches, another MLA hybrid, Kimi-K3 at
       other TP sizes, or other forms of speculative decoding. On the simulated
       CPU MLA path, NIXL pull also pairs DeepSeek-V3's native MTP at depth 1

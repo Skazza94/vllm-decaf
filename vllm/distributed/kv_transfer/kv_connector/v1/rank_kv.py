@@ -790,6 +790,10 @@ def qualifies_kimi_k3_prefix(config: VllmConfig, *, producer: bool) -> bool:
         and not config.scheduler_config.disable_hybrid_kv_cache_manager
     ):
         return False
+    return _published_kimi_k3(model)
+
+
+def _published_kimi_k3(model) -> bool:
     hf = model.hf_text_config
     geometry = {
         "model_type": "kimi_linear",
@@ -821,6 +825,62 @@ def qualifies_kimi_k3_prefix(config: VllmConfig, *, producer: bool) -> bool:
         and quant.get("quant_method") == "mxfp4"
         and quant.get("format") == "mxfp4-pack-quantized"
         and quant.get("kv_cache_scheme") is None
+    )
+
+
+def qualifies_kimi_k3_cold(config: VllmConfig) -> bool:
+    """The checked TP8 consumer of a whole-page TP4 Kimi-K3 NIXL pull."""
+    from vllm.platforms import current_platform
+
+    model = config.model_config
+    cache = config.cache_config
+    pc = config.parallel_config
+    sim = config.simulation_config
+    kv = config.kv_transfer_config
+    return (
+        model is not None
+        and kv is not None
+        and sim.simulate_forward
+        and current_platform.is_cpu()
+        and model.hf_config.model_type == "kimi_k3"
+        and model.architectures == ["KimiK3ForConditionalGeneration"]
+        and model.multimodal_config is not None
+        and model.multimodal_config.language_model_only
+        and not model.multimodal_config.enable_mm_embeds
+        and model.is_hybrid
+        and model.use_mla
+        and str(model.dtype) == "torch.bfloat16"
+        and config.speculative_config is None
+        and pc.tensor_parallel_size == pc.world_size == 8
+        and pc.data_parallel_size == pc.pipeline_parallel_size == 1
+        and pc.decode_context_parallel_size == pc.prefill_context_parallel_size == 1
+        and pc.nnodes == 1
+        and not pc.enable_expert_parallel
+        and kv.kv_connector in NIXL_CONNECTORS
+        and kv.kv_role == "kv_consumer"
+        and kv.kv_buffer_device == "cpu"
+        and kv.kv_connector_module_path is None
+        and kv.get_from_extra_config("enforce_handshake_compat", True) is True
+        and sim.clock == "real"
+        and sim.timing == "aisimulate"
+        and sim.timing_args == {"gpu": "b200", "target_model": "moonshotai/Kimi-K3"}
+        and sim.kv_kernel_backend is None
+        and sim.kv_pattern_grain is None
+        and not sim.kv_pattern_fill
+        and sim.kv_pattern_check
+        and sim.log_path is not None
+        and not cache.enable_prefix_caching
+        and cache.cache_dtype in ("auto", "bfloat16")
+        and cache.mamba_cache_mode == "none"
+        and cache.block_size == 768
+        and cache.mamba_block_size == model.max_model_len
+        and cache.mamba_cache_dtype in ("auto", "bfloat16")
+        and cache.mamba_ssm_cache_dtype in ("auto", "float32")
+        and cache.kv_offloading_size is None
+        and not cache.use_replayssm
+        and not cache.use_kda_recoverssm
+        and not config.scheduler_config.disable_hybrid_kv_cache_manager
+        and _published_kimi_k3(model)
     )
 
 

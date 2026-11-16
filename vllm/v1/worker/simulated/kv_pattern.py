@@ -984,6 +984,8 @@ class _Expected:
     """The producer's decode context parallel size (NIXL)."""
     remote_num_tokens: int | None = None
     """The tokens whose KV the producer hands off (NIXL)."""
+    remote_block_ids: tuple[tuple[int, ...], ...] | None = None
+    """The producer's original scheduler block lists, before native pairing."""
 
     @property
     def block_ids(self) -> list[int]:
@@ -2375,6 +2377,7 @@ class NativeChecker(_ConsumerPages):
                     read.remote_engine_id,
                     read.remote_block_counts,
                     read.remote_num_tokens,
+                    read.remote_block_ids,
                 )
 
     def expect(
@@ -2386,6 +2389,7 @@ class NativeChecker(_ConsumerPages):
         remote_engine_id: str | None = None,
         remote_block_counts: Sequence[int] | None = None,
         remote_num_tokens: int | None = None,
+        remote_block_ids: tuple[tuple[int, ...], ...] | None = None,
     ) -> None:
         """A read about to be posted into a request's own new blocks: their
         selected spans and padding take the sentinel."""
@@ -2412,6 +2416,7 @@ class NativeChecker(_ConsumerPages):
             groups,
             remote_engine_id,
             remote_num_tokens=remote_num_tokens,
+            remote_block_ids=remote_block_ids,
         )
         self._record_pull_start(req_id, groups)
 
@@ -2554,6 +2559,86 @@ class NativeChecker(_ConsumerPages):
         # Count any copied allocator padding separately from unreceived rows.
         return max(0, min(tokens, handoff_end - start))
 
+    def _cold_k3_source_audit(self, expected, records, engine_id, remote_tp):
+        """Expected source coordinates in the producer's original allocation."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+            qualifies_kimi_k3_cold,
+        )
+
+        s = self.selection
+        w = s.worker
+        config = getattr(w, "vllm_config", None)
+        if remote_tp != 4 or config is None or not qualifies_kimi_k3_cold(config):
+            return None
+        peer = getattr(w, "kimi_k3_cold_peers", {}).get(engine_id)
+        handoff = expected.remote_num_tokens
+        exported = expected.remote_block_ids
+        if (
+            peer is None
+            or handoff is None
+            or handoff <= 0
+            or exported is None
+            or len(exported) != len(expected.groups) or len(exported) != 4
+            or self._split_attention_rows(expected) != (768, 1536, 768, 768)
+        ):
+            return {"problems": ["missing or incompatible cold Kimi-K3 handoff"]}
+        want = {}
+        remote_spans = {
+            span.component: span for span in s.layout.spans(peer.rank, 4)
+        }
+        for group, remote in zip(expected.groups, exported, strict=True):
+            local = group.block_ids
+            state = not _group_heads(self.heads, group.group)
+            npages = 1 if state else -(-handoff // 1536)
+            nlocal = 1 if state else -(-handoff // 768)
+            if not (
+                len(remote) == len(set(remote)) == npages
+                and all(0 < b < peer.num_blocks for b in remote)
+                and len(local) == len(set(local)) == nlocal
+                and all(0 < b < s.num_blocks for b in local)
+                and (state or group.first_logical_block == 0)
+            ):
+                return {"problems": [f"invalid cold Kimi-K3 page lists: {group.group}"]}
+            for row, block, position in s.select(group.group, local):
+                entry = s.rows[row]
+                length = entry.view.shape[1]
+                if state:
+                    span = entry.span
+                    parent = remote_spans[span.component]
+                    pblock = remote[0]
+                    offset = parent.offset + (
+                        span.first - parent.first
+                    ) * span.unit_bytes
+                else:
+                    pblock = remote[position // 2]
+                    offset = (position % 2) * 768 * 576 * 2
+                dest = (entry.region, block, entry.offset, length)
+                if dest in want:
+                    return {"problems": ["duplicate cold Kimi-K3 requested range"]}
+                want[dest] = (
+                    peer.bases[entry.region] + pblock * peer.stride + offset, length
+                )
+        problems = sl.paired_read_problems(want, records, engine_id, peer.rank)
+        report = {
+            "problems": problems,
+            "rank": peer.rank,
+            "handoff_tokens": handoff,
+            "raw_producer_page": 1536,
+            "read_unit": 768,
+            "producer_factor": 2,
+            "producer_blocks": exported,
+            "consumer_blocks": [group.block_ids for group in expected.groups],
+        }
+        if not problems:
+            # Decode the actual paired source addresses in the original P page.
+            report["pairs"] = [
+                (*dest, *divmod(source - peer.bases[dest[0]], peer.stride))
+                for dest, (source, _) in zip(
+                    records[0].pieces, records[0].source_ranges, strict=True
+                )
+            ]
+        return report
+
     def _coverage(self, expected: "_Expected", records: list) -> dict:
         """Ownership against the request's READs (`sl.coverage_problems`),
         with each READ's bytes by group, component and class."""
@@ -2679,6 +2764,9 @@ class NativeChecker(_ConsumerPages):
             )
         records = [r for r in records if r.pieces is not None]
         problems += sl.coverage_problems(want, records)
+        source = self._cold_k3_source_audit(expected, records, engines[0], remote_tp)
+        if source is not None:
+            problems.extend(source["problems"])
         reads = []
         for record in records:
             classes: dict[str, list[int]] = {}
@@ -2713,6 +2801,7 @@ class NativeChecker(_ConsumerPages):
             "problems": problems[:8],
             "problem_count": len(problems),
             "reads": reads,
+            **({"cold_k3_sources": source} if source is not None else {}),
         }
 
     def _uses_kernel_rows(self, expected: _Expected) -> bool:
