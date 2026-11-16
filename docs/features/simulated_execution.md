@@ -501,7 +501,15 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           producers; its MLA latent, the same on every rank, from one of
           them, each decode attention block (twice the prefill's tokens)
           read as two prefill blocks, the uncovered half of a request's
-          last block zero, as NIXL leaves it;
+          last block zero, as NIXL leaves it. A narrow prefix-cached variant
+          admits the published text-only BF16-KV Kimi-K3 configuration with
+          AISimulate's B200 target, whole 768-token prefill and 1,536-token decode
+          pages, align-mode KDA, producer fill, decode byte checks, and
+          `kv_pattern_grain=768` on both sides. Before a READ, decode checks
+          each actual producer's advertised scope and registration. This
+          keeps native NIXL pairing: with a decode prefix hit and an
+          incomplete final page, it can put the producer's slabs in the
+          wrong positions, which the byte check reports;
       and not for DeepSeek-V4's caches, another MLA hybrid, Kimi-K3 at
       other TP sizes, or other forms of speculative decoding. On the simulated
       CPU MLA path, NIXL pull also pairs DeepSeek-V3's native MTP at depth 1

@@ -6325,3 +6325,248 @@ def test_nixl_peers_under_more_producer_ranks_refuse_head_sharded_blocks(
         (failed,) = [r["kv_check"] for r in c["logs"][rank] if "kv_check" in r]
         assert (failed["ok"], failed["error"]) == (False, "receive failed")
         assert "coverage" not in failed and "groups" not in failed
+
+
+def test_published_kimi_k3_prefix_scope_is_specific_to_each_endpoint(
+    tmp_path, ds_conv_layout
+):
+    """Only the verified producer advertises the capability; only its prospective
+    consumer can get past the local guard. Keep the prefix-off pairing."""
+    from copy import deepcopy
+
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    raw = bundled_config("moonshotai/Kimi-K3")
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+
+    def config(producer):
+        return engine_config(
+            str(tmp_path),
+            simulation={
+                "timing": "aisimulate",
+                "timing_args": {"gpu": "b200", "target_model": "moonshotai/Kimi-K3"},
+                "kv_pattern_grain": 768,
+                "kv_pattern_fill": producer,
+                "kv_pattern_check": not producer,
+                "log_path": str(tmp_path / "steps"),
+            },
+            kv_transfer={"kv_role": "kv_producer" if producer else "kv_consumer"},
+            tensor_parallel_size=8 if producer else 4,
+            max_model_len=4096,
+            max_num_batched_tokens=1536,
+            block_size=768 if producer else 1536,
+            dtype="bfloat16",
+            language_model_only=True,
+            enable_prefix_caching=True,
+        )
+
+    p, d = config(True), config(False)
+    assert simulated_tp_mismatch(d, 4, 8, nixl_consumer=True) is None
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        KIMI_K3_PREFIX_CAPABILITY,
+        KIMI_K3_PREFIX_REFUSAL,
+        simulated_dcp_scope,
+    )
+
+    assert KIMI_K3_PREFIX_CAPABILITY in simulated_dcp_scope(p), (
+        p.cache_config, p.parallel_config.world_size,
+        p.model_config.hf_config.model_type, p.model_config.quantization,
+        p.model_config.model_arch_config.quantization_config,
+        p.simulation_config, p.scheduler_config.disable_hybrid_kv_cache_manager,
+    )
+    assert KIMI_K3_PREFIX_CAPABILITY not in simulated_dcp_scope(d)
+    assert "at TP sizes other than" in simulated_tp_mismatch(
+        p, 8, 4, nixl_consumer=True
+    )
+
+    for section, field, value in (
+        ("cache_config", "enable_prefix_caching", False),
+        ("cache_config", "mamba_cache_mode", "none"),
+        ("cache_config", "mamba_block_size", 1536),
+        ("cache_config", "kv_offloading_size", 1.0),
+        ("simulation_config", "kv_pattern_fill", False),
+        ("simulation_config", "kv_pattern_grain", None),
+        ("simulation_config", "kv_pattern_grain", 384),
+        ("simulation_config", "kv_kernel_backend", "FLASHMLA"),
+        ("parallel_config", "decode_context_parallel_size", 2),
+        ("parallel_config", "prefill_context_parallel_size", 2),
+        ("parallel_config", "enable_expert_parallel", True),
+        ("kv_transfer_config", "kv_connector", "NixlPushConnector"),
+        (
+            "kv_transfer_config",
+            "kv_connector_extra_config",
+            {"enforce_handshake_compat": False},
+        ),
+    ):
+        bad = deepcopy(p)
+        setattr(getattr(bad, section), field, value)
+        assert KIMI_K3_PREFIX_CAPABILITY not in simulated_dcp_scope(bad), field
+
+    for section, field, value in (
+        ("simulation_config", "kv_pattern_check", False),
+        ("simulation_config", "kv_pattern_grain", None),
+        ("simulation_config", "kv_pattern_grain", 384),
+        ("cache_config", "mamba_ssm_cache_dtype", "bfloat16"),
+        ("cache_config", "block_size", 768),
+    ):
+        bad = deepcopy(d)
+        setattr(getattr(bad, section), field, value)
+        assert KIMI_K3_PREFIX_REFUSAL in simulated_tp_mismatch(
+            bad, 4, 8, nixl_consumer=True
+        ), field
+
+    bad = deepcopy(d)
+    bad.model_config.hf_text_config.linear_attn_config["head_dim"] = 64
+    assert KIMI_K3_PREFIX_REFUSAL in simulated_tp_mismatch(
+        bad, 4, 8, nixl_consumer=True
+    )
+    d.cache_config.enable_prefix_caching = False
+    assert simulated_tp_mismatch(d, 4, 8, nixl_consumer=True) is None
+
+
+def test_published_kimi_k3_prefix_refuses_bad_peers_before_native_registration(
+    tmp_path, ds_conv_layout
+):
+    """Capture all eight producer headers from real registration, then check
+    each consumer rank with its two mapped sources. Rejected headers leave
+    native agent registration and transfer state empty."""
+    import subprocess
+    import sys
+
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+
+    raw = bundled_config("moonshotai/Kimi-K3")
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    script = tmp_path / "peer_check.py"
+    script.write_text(
+        r"""
+from dataclasses import replace
+from pathlib import Path
+
+import msgspec
+import sys
+
+from vllm import LLM
+
+
+def registration(self):
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+    worker = get_kv_transfer_group().connector_worker
+    return (worker.tp_rank, worker.xfer_handshake_metadata.agent_metadata_bytes)
+
+
+def check(self, producer_headers):
+    from vllm.distributed.kv_transfer import get_kv_transfer_group
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        KIMI_K3_PREFIX_REFUSAL,
+        qualifies_kimi_k3_prefix,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import (
+        _kimi_k3_regions,
+        kimi_k3_prefix_peer_refusal,
+    )
+
+    worker = get_kv_transfer_group().connector_worker
+    for rank in (2 * worker.tp_rank, 2 * worker.tp_rank + 1):
+        peer = msgspec.msgpack.decode(producer_headers[rank], type=NixlAgentMetadata)
+        refusal = kimi_k3_prefix_peer_refusal(worker, (1536, 1), rank, 8, 1, peer)
+        assert refusal is None, (
+            refusal,
+            qualifies_kimi_k3_prefix(worker.vllm_config, producer=False),
+            _kimi_k3_regions(worker),
+            worker.region_names, worker.region_group_ids, worker._mamba_ssm_size,
+            peer,
+        )
+        for changes in (
+            {"simulated_scope": None},
+            {"simulated_scope": ["kimi-k3-prefix-tp8-768-v0"]},
+            {"physical_blocks_per_logical_kv_block": 2, "block_size": 384},
+            {"region_names": peer.region_names[::-1]},
+            {"region_group_ids": [0] * 24},
+            {"block_lens": [884735] * 24},
+            {"block_strides": [884737] * 24},
+            {"ssm_sizes": (27648, 1572864)},
+            {"dcp_size": 2},
+        ):
+            try:
+                worker.add_remote_agent(replace(peer, **changes), rank, 8)
+            except ValueError as exc:
+                assert KIMI_K3_PREFIX_REFUSAL in str(exc), (changes, exc)
+            else:
+                raise AssertionError(changes)
+        assert KIMI_K3_PREFIX_REFUSAL in kimi_k3_prefix_peer_refusal(
+            worker, (1536, 1), (rank + 2) % 8, 8, 1, peer
+        )
+        assert peer.engine_id not in worker.dst_num_blocks
+        assert peer.engine_id not in worker._remote_agents
+    assert not worker._recving_transfers
+    assert worker.xfer_stats.is_empty()
+    return worker.tp_rank
+
+
+if __name__ == "__main__":
+    path = Path(sys.argv[1])
+    producer = sys.argv[2] == "produce"
+    llm = LLM(
+        model=str(path),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        language_model_only=True,
+        max_model_len=4096,
+        kv_cache_memory_bytes=1 << 29,
+        max_num_batched_tokens=1536,
+        block_size=768 if producer else 1536,
+        tensor_parallel_size=8 if producer else 4,
+        enable_prefix_caching=True,
+        enforce_eager=True,
+        simulation_config={
+            "simulate_forward": True,
+            "timing": "aisimulate",
+            "timing_args": {"gpu": "b200", "target_model": "moonshotai/Kimi-K3"},
+            "kv_pattern_grain": 768,
+            "kv_pattern_fill": producer,
+            "kv_pattern_check": not producer,
+            "log_path": str(path / f"{sys.argv[2]}.jsonl"),
+        },
+        kv_transfer_config={
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer" if producer else "kv_consumer",
+            "kv_buffer_device": "cpu",
+            "kv_connector_extra_config": {"backends": ["Mooncake"]},
+        },
+    )
+    headers = path / "producer.msgpack"
+    try:
+        if producer:
+            ranks = dict(llm.collective_rpc(registration))
+            assert sorted(ranks) == list(range(8))
+            headers.write_bytes(msgspec.msgpack.encode(ranks))
+        else:
+            ranks = msgspec.msgpack.decode(headers.read_bytes(), type=dict[int, bytes])
+            observed = sorted(llm.collective_rpc(check, args=(ranks,)))
+            assert observed == [0, 1, 2, 3]
+            (path / "checked-ranks.msgpack").write_bytes(msgspec.msgpack.encode(observed))
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+"""
+    )
+    env = {
+        **os.environ,
+        "VLLM_HOST_IP": "127.0.0.1",
+        "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
+        "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",  # Own callbacks, local workers.
+    }
+    for mode in ("produce", "consume"):
+        subprocess.run(
+            [sys.executable, "-u", str(script), str(tmp_path), mode],
+            env=env,
+            check=True,
+        )

@@ -22,11 +22,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+    KIMI_K3_MLA_LAYERS,
+    KIMI_K3_PREFIX_CAPABILITY,
+    KIMI_K3_PREFIX_REFUSAL,
     UNEQUAL_TP_MTP_CAPABILITIES,
     UnequalTpMtpLayout,
     dcp_pair_refusal,
     dcp_scope_problems,
     plain_mla,
+    qualifies_kimi_k3_prefix,
     unequal_tp_mtp_layout,
     unequal_tp_mla_mtp_refusal,
 )
@@ -442,8 +446,162 @@ def mtp_peer_refusal(worker, local_page, remote_tp, metadata) -> str | None:
     return unequal_tp_mla_mtp_refusal(local_tp, remote_tp)
 
 
+def _kimi_k3_regions(worker) -> bool:
+    """Check the local registered regions against the published MLA/KDA layout."""
+    from vllm.v1.worker.simulated.state_layout import check_spec, layout_for
+
+    tp, page = 4, 1536
+    page_bytes = page * 576 * 2
+    layout = layout_for(worker.vllm_config)
+    if (
+        layout is None
+        or layout.family != "kda"
+        or layout.local_sizes(tp) != worker._mamba_ssm_size
+        or worker._mamba_ssm_size != (55296, 1572864)
+        or worker._conv_decomp is None
+        or worker._conv_decomp.proj_bytes != (18432,) * 3
+        or worker.block_len_per_layer != [page_bytes] * 24
+        or worker.block_stride_per_layer != [page_bytes] * 24
+        or worker._region_is_mla != [True] * 24
+        or len(worker.region_names) != 24
+        or len(worker.region_group_ids) != 24
+        or len(worker._ssm_region_indices) != 23
+    ):
+        return False
+    cache = worker.kv_cache_config
+    mla_groups = set()
+    state_groups = set()
+    layer_numbers = set()
+    bases = worker.kv_caches_base_addr[worker.engine_id][worker.tp_rank]
+    if len(bases) != 24 or len(set(bases)) != 24:
+        return False
+    members: list[dict[int, str]] = [{} for _ in range(24)]
+    for group_id, group in enumerate(cache.transfer_groups):
+        for name in group.layer_names:
+            try:
+                layer = int(name.split(".layers.", 1)[1].split(".", 1)[0]) + 1
+            except (IndexError, ValueError):
+                return False
+            if layer in layer_numbers:
+                return False
+            layer_numbers.add(layer)
+            spec = worker._layer_specs[name]
+            tensor = worker.device_kv_caches[name]
+            if layer in KIMI_K3_MLA_LAYERS:
+                if not (
+                    type(spec) is MLAAttentionSpec
+                    and spec.num_kv_heads == 1
+                    and spec.head_size == 576
+                    and spec.dtype == torch.bfloat16
+                ):
+                    return False
+                mla_groups.add(group_id)
+            else:
+                if not (
+                    isinstance(spec, MambaSpec)
+                    and spec.mamba_cache_mode == "align"
+                    and spec.dtypes == (torch.bfloat16, torch.float32)
+                    and not check_spec(layout, spec, tp)
+                ):
+                    return False
+                state_groups.add(group_id)
+            if spec.block_size != page or spec.page_size_bytes != page_bytes:
+                return False
+            # The layer's first byte, not the backing storage's base: several
+            # registered regions may be different views of one allocation.
+            start = tensor.data_ptr()
+            containing = [
+                i for i, base in enumerate(bases) if base <= start < base + page_bytes
+            ]
+            if len(containing) != 1:
+                return False
+            region = containing[0]
+            if group_id in members[region]:
+                return False
+            members[region][group_id] = name
+    if (
+        layer_numbers != set(range(1, 94))
+        or len(mla_groups) != 1
+        or len(state_groups) != 3
+        or mla_groups & state_groups
+    ):
+        return False
+    shared = set(worker._ssm_region_indices)
+    mla_group = next(iter(mla_groups))
+    return all(
+        set(layers) == (mla_groups | state_groups if i in shared else mla_groups)
+        and worker.region_names[i] in layers.values()
+        and worker.region_group_ids[i] == (-1 if i in shared else mla_group)
+        for i, layers in enumerate(members)
+    )
+
+
+def _is_kimi_k3_prefix_peer(config: VllmConfig, remote_tp: int) -> bool:
+    model = config.model_config
+    return (
+        config.parallel_config.tensor_parallel_size != remote_tp
+        and model is not None
+        and model.is_hybrid
+        and model.use_mla
+        and model.hf_text_config.model_type == "kimi_linear"
+        and config.cache_config.enable_prefix_caching
+        and config.kv_transfer_config.kv_role == "kv_consumer"
+    )
+
+
+def kimi_k3_prefix_peer_refusal(
+    worker,
+    local_page: tuple[int, int],
+    remote_tp_rank: int,
+    remote_tp: int,
+    remote_dcp: int,
+    metadata: NixlAgentMetadata,
+) -> str | None:
+    """The prospective consumer must see the actual producer's scope and regions."""
+    config = worker.vllm_config
+    local_tp = config.parallel_config.tensor_parallel_size
+    if not _is_kimi_k3_prefix_peer(config, remote_tp):
+        return None
+    producer_bytes = 768 * 576 * 2
+    if (
+        (local_tp, remote_tp) == (4, 8)
+        and qualifies_kimi_k3_prefix(config, producer=False)
+        and remote_tp_rank in (2 * worker.tp_rank, 2 * worker.tp_rank + 1)
+        and worker.dcp_size == worker.pcp_size == remote_dcp == 1
+        and metadata.dcp_size == metadata.pcp_size == 1
+        and worker.enforce_compat_hash
+        and local_page == (1536, 1)
+        and metadata.block_size == 768
+        and metadata.physical_blocks_per_logical_kv_block == 1
+        and KIMI_K3_PREFIX_CAPABILITY in (metadata.simulated_scope or ())
+        and metadata.attn_backend_name == worker.backend_name
+        and metadata.kv_cache_layout == worker.kv_cache_layout
+        and metadata.region_names == worker.region_names
+        and metadata.region_group_ids == worker.region_group_ids
+        and metadata.block_lens == metadata.block_strides == [producer_bytes] * 24
+        and metadata.ssm_sizes == (27648, 786432)
+        and metadata.region_mem_types == ["DRAM"] * 24
+        and metadata.num_blocks > 0
+        and metadata.region_num_blocks == [metadata.num_blocks] * 24
+        and len(metadata.kv_caches_base_addr) == 24
+        and len(set(metadata.kv_caches_base_addr)) == 24
+        and all(addr > 0 for addr in metadata.kv_caches_base_addr)
+        and not metadata.packed_member_layouts
+        and not metadata.region_members  # Native hybrid pull registers no member list.
+        and metadata.ple_block_len is None
+        and _kimi_k3_regions(worker)
+    ):
+        return None
+    return (
+        "Simulated real KV transfers pair unequal TP sizes for a hybrid model "
+        "over NIXL only for Mamba2 or GDN states that split on both sides, or "
+        f"Kimi-K3 from prefill TP8 to decode TP4, not local TP {local_tp} and "
+        f"remote TP {remote_tp}: {KIMI_K3_PREFIX_REFUSAL}."
+    )
+
+
 def validate_dcp_peer(worker) -> None:
-    """Check simulated DCP, kernel geometry and MTP before any native READ."""
+    """Check simulated prefix K3, DCP, kernel geometry and MTP before native READ."""
     add = worker.add_remote_agent
 
     def add_remote_agent(
@@ -455,6 +613,15 @@ def validate_dcp_peer(worker) -> None:
         **kwargs,
     ):
         local_page = (worker.block_size, worker._physical_blocks_per_logical_kv_block)
+        if refusal := kimi_k3_prefix_peer_refusal(
+            worker,
+            local_page,
+            remote_tp_rank,
+            remote_tp_size,
+            remote_dcp_size,
+            metadata,
+        ):
+            raise ValueError(refusal)
         if refusal := dcp_peer_refusal(
             worker.vllm_config, worker.dcp_size, local_page, remote_dcp_size, metadata
         ):
@@ -642,6 +809,12 @@ def validate_state_peer(worker, layout) -> None:
     add = worker.add_remote_agent
 
     def add_remote_agent(metadata, remote_tp_rank=0, remote_tp_size=1, *args, **kwargs):
+        if layout.family == "kda" and _is_kimi_k3_prefix_peer(
+            worker.vllm_config, remote_tp_size
+        ):
+            # The inner pre-registration guard checks these same fields and
+            # the exact K3 layout, preserving the original prefix refusal.
+            return add(metadata, remote_tp_rank, remote_tp_size, *args, **kwargs)
         # Equal block sizes, or the producer's a divisor of this instance's
         # (NIXL's block-size ratio: each attention block read as several, the
         # states 1:1), whether or not bytes are checked: NIXL's own assertion

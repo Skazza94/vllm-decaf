@@ -205,7 +205,7 @@ def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
     """Why a hybrid of this model cannot pair these TP sizes over NIXL, None
     when it can: a Mamba2 or GDN layout that splits over both sizes, no
     speculative decoding, no MLA (but Kimi-K3's, at decode TP4 from prefill
-    TP8 without prefix caching), and attention KV heads
+    TP8, with extra checks when prefix caching is on), and attention KV heads
     that split or replicate evenly on each side as NIXL maps them (the
     replicated-producer refusal of pure attention does not apply: a hybrid's
     mapping separates attention sources from state sources)."""
@@ -221,7 +221,13 @@ def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
         if (local_tp, remote_tp) != (4, 8):
             return "Kimi-K3 at TP sizes other than prefill TP8 to decode TP4"
         if vllm_config.cache_config.enable_prefix_caching:
-            return "Kimi-K3 at unequal TP sizes with prefix caching"
+            from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+                KIMI_K3_PREFIX_REFUSAL,
+                qualifies_kimi_k3_prefix,
+            )
+
+            if not qualifies_kimi_k3_prefix(vllm_config, producer=False):
+                return KIMI_K3_PREFIX_REFUSAL
     if vllm_config.speculative_config is not None:
         return "speculative decoding"
     layout = layout_for(vllm_config)

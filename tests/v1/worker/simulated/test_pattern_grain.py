@@ -209,3 +209,66 @@ def test_zero_accounting_keeps_native_and_content_apart():
     assert attention_zeros(size, 2, 2, ("a", "b")) == (0, 0)
     assert attention_zeros(size, 2, 1, "content|whole") == (512, 512)
     assert attention_zeros(size, 1, 1) == (0, 0)
+
+
+def test_published_kimi_k3s_hit_and_pull_use_the_same_content_coordinates():
+    """Replicated MLA and TP-sharded KDA agree at the retained checkpoint;
+    distinct suffixes and a shifted latent are distinguishable at the pull."""
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+    from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+    from vllm.v1.worker.simulated.state_layout import (
+        layout_from_config,
+        state_span_pattern,
+    )
+
+    model = KimiLinearConfig(**bundled_config("moonshotai/Kimi-K3")["text_config"])
+    state = layout_from_config(model, 2, 4)
+    prefill = TokenChains([768, 768], grain=768, state_groups=[1])
+    decode = TokenChains([1536, 1536], backoff=1, grain=768, state_groups=[1])
+    shared = list(range(1536))
+    cold = shared + [4] * 512
+    hit = shared + [8] * 512
+    for name, prompt in (("cold", cold), ("hit", hit)):
+        prefill.admit(name, prompt[:-1])
+        decode.admit(name, prompt)
+    slab = 768 * 576 * 2
+
+    def latent(name, logical, width, identity):
+        return row_pattern(
+            name, "model.layers.3.self_attn", logical, width, 0, identity, (0,)
+        )
+
+    pieces = [
+        latent("cold", b, slab, prefill.identity("cold", 0, b, 768))
+        for b in (0, 1)
+    ]
+    hit_id = decode.identity("hit", 0, 0, 1536)
+    hit_page = latent("hit", 0, 2 * slab, hit_id)
+    assert torch.equal(hit_page, torch.cat(pieces))
+    hit_page[slab + 1] ^= 1
+    assert torch.count_nonzero(hit_page != torch.cat(pieces)).item() == 1
+    first, second = decode.pulled_content("hit", 0, 1)
+    assert second is None
+    expected = latent("hit", 1, 2 * slab, (first, second))
+    assert not expected[slab:].any()
+    assert not torch.equal(expected[:slab], pieces[1])  # Native shifted piece 1.
+    cold_page = latent("cold", 1, 2 * slab, decode.pulled_content("cold", 0, 1))
+    assert not torch.equal(expected[:slab], cold_page[:slab])
+
+    for pblock, ptokens, dblock, dtokens in ((1, 768, 0, 1536), (2, 511, 1, 511)):
+        p = prefill.identity("hit", 1, pblock, ptokens)
+        d = decode.identity("hit", 1, dblock, dtokens)
+        assert p == d and p.startswith(STATE_IDENTITY)
+        for rank in range(4):
+            def spans(identity, size, r):
+                return [
+                    state_span_pattern(identity, "model.layers.0", 0, state, span)
+                    for span in state.spans(r, size)
+                ]
+
+            lo, hi = spans(p, 8, rank * 2), spans(p, 8, rank * 2 + 1)
+            want = torch.cat(spans(d, 4, rank))
+            got = torch.cat([part for pair in zip(lo, hi) for part in pair])
+            assert torch.equal(got, want)
+            got[-1] ^= 1
+            assert torch.count_nonzero(got != want).item() == 1

@@ -730,16 +730,112 @@ def unequal_tp_mla_mtp_refusal(local_tp_size: int, remote_tp_size: int) -> str:
     )
 
 
+KIMI_K3_PREFIX_CAPABILITY = "kimi-k3-prefix-tp8-768-v1"
+KIMI_K3_PREFIX_REFUSAL = "Kimi-K3 at unequal TP sizes with prefix caching"
+KIMI_K3_MLA_LAYERS = (*range(4, 93, 4), 93)
+
+
+def qualifies_kimi_k3_prefix(config: VllmConfig, *, producer: bool) -> bool:
+    """The exact whole-page Kimi-K3 prefix endpoint qualified for NIXL pull."""
+    from vllm.platforms import current_platform
+
+    model = config.model_config
+    cache = config.cache_config
+    parallel = config.parallel_config
+    sim = config.simulation_config
+    transfer = config.kv_transfer_config
+    tp, page = (8, 768) if producer else (4, 1536)
+    if not (
+        model is not None
+        and transfer is not None
+        and sim.simulate_forward
+        and current_platform.is_cpu()
+        and model.hf_config.model_type == "kimi_k3"
+        and model.architectures == ["KimiK3ForConditionalGeneration"]
+        and model.multimodal_config is not None
+        and model.multimodal_config.language_model_only
+        and not model.multimodal_config.enable_mm_embeds
+        and model.is_hybrid
+        and model.use_mla
+        and str(model.dtype) == "torch.bfloat16"
+        and config.speculative_config is None
+        and parallel.tensor_parallel_size == parallel.world_size == tp
+        and parallel.data_parallel_size == parallel.pipeline_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.nnodes == 1
+        and not parallel.enable_expert_parallel
+        and transfer.kv_connector in NIXL_CONNECTORS
+        and transfer.kv_role == ("kv_producer" if producer else "kv_consumer")
+        and transfer.kv_buffer_device == "cpu"
+        and transfer.get_from_extra_config("enforce_handshake_compat", True) is True
+        and sim.clock == "real"
+        and sim.timing == "aisimulate"
+        and sim.timing_args == {"gpu": "b200", "target_model": "moonshotai/Kimi-K3"}
+        and sim.kv_kernel_backend is None
+        and sim.kv_pattern_grain == 768
+        and sim.kv_pattern_fill == producer
+        and sim.kv_pattern_check != producer
+        and (producer or sim.log_path is not None)
+        and cache.enable_prefix_caching
+        and cache.cache_dtype in ("auto", "bfloat16")
+        and cache.mamba_cache_mode == "align"
+        and cache.block_size == cache.mamba_block_size == page
+        and cache.mamba_cache_dtype in ("auto", "bfloat16")
+        and cache.mamba_ssm_cache_dtype in ("auto", "float32")
+        and cache.kv_offloading_size is None
+        and not cache.use_replayssm
+        and not cache.use_kda_recoverssm
+        and config.scheduler_config.enable_chunked_prefill
+        and not config.scheduler_config.disable_hybrid_kv_cache_manager
+    ):
+        return False
+    hf = model.hf_text_config
+    geometry = {
+        "model_type": "kimi_linear",
+        "num_hidden_layers": 93,
+        "hidden_size": 7168,
+        "num_attention_heads": 96,
+        "num_key_value_heads": 96,
+        "kv_lora_rank": 512,
+        "q_lora_rank": 1536,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "num_experts": 896,
+        "num_experts_per_token": 16,
+        "num_nextn_predict_layers": 0,
+    }
+    kda = getattr(hf, "linear_attn_config", None) or {}
+    quant = model.model_arch_config.quantization_config or {}
+    return (
+        all(getattr(hf, field, None) == value for field, value in geometry.items())
+        and tuple(kda.get("full_attn_layers", ())) == KIMI_K3_MLA_LAYERS
+        and tuple(kda.get("kda_layers", ()))
+        == tuple(i for i in range(1, 94) if i not in KIMI_K3_MLA_LAYERS)
+        and kda.get("num_heads") == 96
+        and kda.get("head_dim") == 128
+        and kda.get("short_conv_kernel_size") == 4
+        and model.quantization == "mxfp4"
+        and model.quantization_config is None
+        and quant.get("quant_method") == "mxfp4"
+        and quant.get("format") == "mxfp4-pack-quantized"
+        and quant.get("kv_cache_scheme") is None
+    )
+
+
 def simulated_dcp_scope(vllm_config: VllmConfig) -> list[str] | None:
     """An instance's `dcp_scope_problems` with real KV transfers under
     simulated compute, which NIXL advertises for its peer to check whichever
     side has decode context parallelism. It also advertises the versioned
-    unequal-TP MLA MTP capability when qualified. None outside simulation."""
+    unequal-TP capabilities when qualified. None outside simulation."""
     if not moves_real_kv(vllm_config):
         return None
     scope = dcp_scope_problems(vllm_config, transfers=True)
     if layout := unequal_tp_mtp_layout(vllm_config):
         scope.append(layout.capability)
+    if qualifies_kimi_k3_prefix(vllm_config, producer=True):
+        scope.append(KIMI_K3_PREFIX_CAPABILITY)
     return scope
 
 
