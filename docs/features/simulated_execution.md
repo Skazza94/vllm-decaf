@@ -183,8 +183,16 @@ tokens. Larger interleaves are an
 unqualified scope of the simulator (the sparse backend declares MTP support at
 them; the dense CPU MLA backend does not). The merge and Q replication follow
 the settings above.
-Prefix caching, KV offloading, and KV transfers are outside this combined
-scope. KV transfers stay refused: over NIXL with DCP, vLLM resolves the
+Prefix caching is qualified for these cells with the default MTP lookahead
+hashes: a hit lands on a scheduler block (the page size times DCP), and its
+hash also proves the next token. Divergence exactly at a boundary can
+invalidate the preceding block. The single module's prefill/hash lookahead
+is one token; depth k still reserves k slots beyond the target's scheduled
+tokens. Cached context steps keep the documented plain-MLA timing
+approximation; no pricing correction is applied. Overrides that disable
+lookahead hashes or EAGLE block dropping remain unqualified. KV offloading
+and KV transfers stay outside this combined scope. Over NIXL with DCP,
+vLLM resolves the
 interleave to the block size when the engine starts, and its compatibility
 check refuses MTP at an interleave above 1 on the simulated dense CPU MLA
 backend, which does not declare support for it (the sparse backend does;

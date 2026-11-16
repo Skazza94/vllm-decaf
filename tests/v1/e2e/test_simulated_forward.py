@@ -8,6 +8,10 @@ import pytest
 
 from tests.conftest import VllmRunner
 from tests.models.registry import HF_EXAMPLE_MODELS
+from tests.v1.worker.simulated.test_aisimulate_timing import (
+    MTP_DCP_CELLS,
+    requires_mtp_dcp,
+)
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import HAS_TRITON
@@ -2209,3 +2213,421 @@ def test_declared_geometry_moves_real_kernel_rows(tmp_path, case):
             assert reads[0]["bytes"] == check["bytes"] == (2 - rank) * 8_994_816
             assert reads[0]["descriptors"] == (2 - rank) * 122
             assert check["untouched_bytes"] == rank * 8_994_816
+
+
+def _mtp_prefix_dcp_worker_state(worker):
+    """Inspect real worker cache metadata; standalone simulation stores no KV."""
+    from vllm.config import get_layers_from_vllm_config
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+    runner = worker.model_runner
+    cache = runner.kv_cache_config
+    layers = get_layers_from_vllm_config(worker.vllm_config, MLAAttention)
+    specs = worker.get_kv_cache_spec()
+    draft = sorted(runner.speculator.draft_attn_layer_names)
+    return {
+        "rank": worker.rank,
+        "speculator": type(runner.speculator).__name__,
+        "draft_class": type(runner.speculator.model).__name__,
+        "draft_architectures": list(
+            worker.vllm_config.speculative_config.draft_model_config.architectures
+        ),
+        "target_meta": next(runner.get_model().parameters()).is_meta,
+        "draft_meta": next(runner.speculator.model.parameters()).is_meta,
+        "same_table": runner.speculator.block_tables is runner.block_tables,
+        "draft_names": draft,
+        "draft_marked": {
+            name: layers[name].is_draft_layer for name in draft if name in layers
+        },
+        "groups": [sorted(group.layer_names) for group in cache.kv_cache_groups],
+        "eagle_groups": [group.is_eagle_group for group in cache.kv_cache_groups],
+        "specs": {
+            name: [
+                spec.cache_role.value,
+                spec.block_size,
+                spec.page_size_bytes,
+                spec.dcp_sharded,
+                str(spec.dtype),
+                spec.is_draft,
+            ]
+            for name, spec in specs.items()
+        },
+        "table": [
+            runner.block_tables.cp_size,
+            runner.block_tables.cp_rank,
+            runner.block_tables.cp_interleave,
+            runner.block_tables.block_sizes,
+            runner.block_tables.dcp_sharded.tolist(),
+        ],
+        "attention": {
+            name: [
+                layer.get_attn_backend().get_name(),
+                layer.impl.dcp_world_size,
+                layer.impl.dcp_rank,
+            ]
+            for name, layer in layers.items()
+        },
+        "blocks": cache.num_blocks,
+        "bytes_per_block": sum(spec.page_size_bytes for spec in specs.values()),
+        "planned_bytes": sorted({tensor.size for tensor in cache.kv_cache_tensors}),
+        "allocated_tensors": len(runner.kv_caches),
+    }
+
+
+def _mtp_prefix_dcp_engine_cell(directory, monkeypatch, target, tp, dcp, k):
+    """Real engine, worker RPC on every rank, SDK oracle on output-rank steps."""
+    import math
+
+    from tests.v1.worker.simulated.test_aisimulate_timing import (
+        MTP_DCP_PROFILES,
+        V3,
+        _mtp_dcp_direct_sdk,
+        bundled_config,
+    )
+    from vllm import LLM
+    from vllm.distributed import cleanup_dist_env_and_memory
+    from vllm.v1.worker.simulated.aisimulate_timing import MLA_PREFIX_APPROXIMATION
+
+    directory.mkdir()
+    raw = bundled_config(target)
+    sparse = target != V3
+    if sparse:
+        raw = {key: value for key, value in raw.items() if key != "quantization_config"}
+        (directory / "DERIVED.md").write_text("published geometry, no weight kernels")
+    (directory / "config.json").write_text(json.dumps(raw))
+    gpu, _, _, page = MTP_DCP_PROFILES[target]
+    span = page * dcp
+    warm = [1 + i % 128 for i in range(1537)]
+    shares = [1024, 1025, 1025 + page]
+    tails = [33, 33, 640]
+    prompts = [
+        warm[:shared] + [200 + i] * tail
+        for i, (shared, tail) in enumerate(zip(shares, tails))
+    ]
+    hits = [span * ((shared - 1) // span) for shared in shares]
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    log = directory / "steps.jsonl"
+    params = SamplingParams(
+        temperature=0,
+        max_tokens=16,
+        ignore_eos=True,
+        detokenize=False,
+    )
+    llm = LLM(
+        model=str(directory),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        enforce_eager=True,
+        tensor_parallel_size=tp,
+        decode_context_parallel_size=dcp,
+        dcp_comm_backend="ag_rs",
+        dcp_q_replicate=False,
+        cp_kv_cache_interleave_size=1,
+        block_size=page,
+        kv_cache_memory_bytes=1 << 29,
+        max_model_len=2048,
+        max_num_batched_tokens=512,
+        max_num_seqs=4,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        seed=1234,
+        speculative_config={"method": "mtp", "num_speculative_tokens": k},
+        simulation_config={
+            "simulate_forward": True,
+            "timing": "aisimulate",
+            "timing_args": {"gpu": gpu, "target_model": target},
+            "spec_acceptance_rates": [0.7],
+            "log_path": str(log),
+        },
+        **({"kv_cache_dtype": "fp8_ds_mla"} if sparse else {}),
+    )
+    try:
+        (warm_output,) = llm.generate(
+            [{"prompt_token_ids": warm}],
+            params,
+            use_tqdm=False,
+        )
+        outputs = llm.generate(
+            [{"prompt_token_ids": prompt} for prompt in prompts],
+            params,
+            use_tqdm=False,
+        )
+        config = llm.llm_engine.vllm_config
+        assert config.kv_transfer_config is None
+        assert config.num_lookahead_tokens == k
+        assert (
+            config.num_prefill_lookahead_tokens == config.num_hash_lookahead_tokens == 1
+        )
+        capacity = config.cache_config.kv_cache_size_tokens
+        workers = llm.collective_rpc(_mtp_prefix_dcp_worker_state)
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+        del llm
+        cleanup_dist_env_and_memory()
+    all_outputs = [warm_output, *outputs]
+    (directory / "worker-state.json").write_text(json.dumps(workers, indent=2))
+    (directory / "outputs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "request_id": out.request_id,
+                    "finished": out.finished,
+                    "finish_reason": out.outputs[0].finish_reason,
+                    "tokens": len(out.outputs[0].token_ids),
+                    "cached": out.num_cached_tokens,
+                }
+                for out in all_outputs
+            ],
+            indent=2,
+        )
+    )
+    assert all(
+        out.finished and out.outputs[0].finish_reason == "length" for out in all_outputs
+    )
+    assert [len(out.outputs[0].token_ids) for out in all_outputs] == [16] * 4
+    assert warm_output.num_cached_tokens == 0
+    assert [out.num_cached_tokens for out in outputs] == hits
+    layers = raw["num_hidden_layers"]
+    draft = f"model.layers.{layers}.self_attn.attn"
+    draft_indexer = f"model.layers.{layers}.self_attn.indexer.k_cache"
+    expected_blocks = {
+        V3: 469,
+        "deepseek-ai/DeepSeek-V3.2": 171,
+        "nvidia/GLM-5-NVFP4": 134,
+    }[target]
+    assert len(workers) == tp
+    for rank, worker in enumerate(workers):
+        assert worker["rank"] == rank
+        assert worker["speculator"] == "MTPSpeculator"
+        assert worker["target_meta"] and worker["draft_meta"] and worker["same_table"]
+        assert worker["draft_architectures"] == [
+            "DeepSeekMTPModel" if not sparse else "DeepseekV32MTPModel"
+        ]
+        assert worker["draft_class"] == (
+            "DeepSeekMTP"
+            if not sparse or current_platform.is_cpu()
+            else "DeepseekV32MTP"
+        )
+        assert worker["draft_names"] == ([draft, draft_indexer] if sparse else [draft])
+        assert worker["draft_marked"] == {draft: True}
+        (members,) = worker["groups"]
+        assert len(members) == (layers + 1) * (2 if sparse else 1)
+        assert set(worker["draft_names"]) <= set(members)
+        assert "model.layers.0.self_attn.attn" in members
+        assert worker["eagle_groups"] == [True]
+        assert worker["table"][:3] == [dcp, rank % dcp, 1]
+        assert set(worker["table"][3]) == {page}
+        assert all(worker["table"][4])
+        backend = "CPU_SIMULATED_MLA_SPARSE" if sparse else "CPU_MLA"
+        assert all(
+            identity == [backend, dcp, rank % dcp]
+            for identity in worker["attention"].values()
+        )
+        roles = {}
+        for name, (role, block, size, sharded, dtype, is_draft) in worker[
+            "specs"
+        ].items():
+            roles.setdefault(role, []).append(name)
+            assert block == page and sharded
+            assert is_draft == (name in worker["draft_names"])
+            assert size == (
+                page * (132 if role == "indexer" else 656) if sparse else 18432
+            )
+            if not sparse:
+                assert dtype == "torch.bfloat16"
+        assert sorted(roles) == (["indexer", "sparse"] if sparse else ["sparse"])
+        assert all(len(names) == layers + 1 for names in roles.values())
+        assert worker["blocks"] == expected_blocks
+        assert worker["planned_bytes"] == [expected_blocks * worker["bytes_per_block"]]
+        assert worker["allocated_tensors"] == 0
+    assert capacity == expected_blocks * span
+    # Standalone logs exist only on the output rank; RPC above inspects every worker.
+    assert sorted(directory.glob("steps*.jsonl")) == [log]
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    (timing,) = [row["timing"]["aisimulate"] for row in records if "timing" in row]
+    assert (timing["source"], timing["readiness"]) == ("aic", "ready")
+    resolved = timing["resolved_config"]
+    assert (resolved["tp"], resolved["dcp"], resolved["nextn"]) == (
+        tp,
+        dcp if dcp > 1 else None,
+        k,
+    )
+    assert resolved["backend_version"] == "0.24.0"
+    if not sparse:
+        assert MLA_PREFIX_APPROXIMATION in timing["approximations"]
+    sdk = _mtp_dcp_direct_sdk(target, tp, dcp, k)
+    accepted = {
+        event["step_index"]: event["requests"]
+        for row in records
+        if (event := row.get("spec_acceptance"))
+    }
+    emitted = {out.request_id: len(out.outputs[0].token_ids) for out in all_outputs}
+    produced, first_prefill, first_decode = {}, {}, {}
+    drafted = wins = 0
+    boundary, peak, comparisons = set(), {}, []
+    mixed_steps = 0
+    warm_prefill = []
+    for row in (row for row in records if "step" in row):
+        step, cost = row["step"], row["cost"]
+        requests = step["requests"]
+        prefills = [request for request in requests if request["is_prefill"]]
+        decodes = [request for request in requests if not request["is_prefill"]]
+        mixed_steps += bool(prefills and decodes)
+        contexts = [request["num_computed_tokens"] for request in decodes]
+        samples = accepted.pop(step["step_index"], {})
+        assert samples.keys() == {request["req_id"] for request in decodes}
+        assert cost["breakdown"]["spec_requests_below_width"] == 0
+        assert cost["breakdown"]["spec_draft_tokens"] == k * len(decodes)
+        for index, request in enumerate(requests):
+            key = request["req_id"].rsplit("-", 1)[0]
+            end = request["num_computed_tokens"] + request["num_scheduled_tokens"]
+            horizon = math.ceil(min(2048, end + k) / span)
+            peak[key] = max(peak.get(key, 0), horizon)
+            if request["is_prefill"]:
+                first_prefill.setdefault(
+                    request["num_prompt_tokens"],
+                    [
+                        request["num_computed_tokens"],
+                        request["num_cached_tokens"],
+                    ],
+                )
+                if request["num_prompt_tokens"] == len(warm):
+                    warm_prefill.append(
+                        [
+                            request["num_scheduled_tokens"],
+                            request["num_computed_tokens"],
+                            request["num_cached_tokens"],
+                        ]
+                    )
+                    if end == 512:
+                        boundary.add(horizon)
+                if end == request["num_prompt_tokens"]:
+                    produced.setdefault(key, []).append(1)
+                continue
+            first_decode.setdefault(key, request["num_computed_tokens"])
+            assert (request["num_scheduled_tokens"], request["num_spec_tokens"]) == (
+                k + 1,
+                k,
+            )
+            count, kept = samples[request["req_id"]]
+            assert count == k and 0 <= kept <= k
+            assert cost["num_accepted"][index] == kept
+            drafted += count
+            wins += kept
+            produced.setdefault(key, []).append(1 + kept)
+        metrics = {
+            "scheduled_requests": {
+                "num_prefill_requests": len(prefills),
+                "sum_prefill_tokens": sum(q["num_scheduled_tokens"] for q in prefills),
+                "var_prefill_length": pvariance(
+                    [q["num_prompt_tokens"] for q in prefills] or [0]
+                ),
+                "sum_prefill_kv_tokens": sum(
+                    q["num_computed_tokens"] for q in prefills
+                ),
+                "num_decode_requests": len(decodes),
+                "sum_decode_kv_tokens": sum(contexts),
+                "var_decode_kv_tokens": pvariance(contexts or [0]),
+                "extend_lengths": [q["num_scheduled_tokens"] for q in requests],
+                "past_kv_lengths": [q["num_computed_tokens"] for q in requests],
+            }
+        }
+        ms = sdk.estimate_forward_pass_time_ms(metrics)
+        logged = cost["breakdown"]["aisimulate_ms"]
+        assert math.isfinite(ms) and ms > 0
+        assert logged == pytest.approx(ms, rel=1e-9)
+        comparisons.append(
+            {
+                "step": step["step_index"],
+                "metrics": metrics,
+                "sdk_ms": ms,
+                "logged_ms": logged,
+            }
+        )
+    assert not accepted and 0 < wins < drafted
+    assert produced.keys() == emitted.keys()
+    assert warm_prefill == [[512, 0, 0], [512, 512, 0], [512, 1024, 0], [1, 1536, 0]]
+    assert first_prefill[len(warm)] == [0, 0]
+    for prompt, hit in zip(prompts, hits):
+        assert first_prefill[len(prompt)] == [hit, hit]
+    assert sorted(first_decode.values()) == sorted([len(warm), *map(len, prompts)])
+    assert boundary == {math.ceil((512 + k) / span)}
+    assert max(peak.values()) <= expected_blocks
+    assert mixed_steps > 0
+    discarded = {}
+    for key, counts in produced.items():
+        finishing = next(
+            i for i in range(len(counts)) if sum(counts[: i + 1]) >= emitted[key]
+        )
+        assert sum(counts[:finishing]) < emitted[key]
+        assert len(counts) - finishing - 1 <= 1
+        discarded[key] = sum(counts) - emitted[key]
+    summary = {
+        "target": target,
+        "tp": tp,
+        "dcp": dcp,
+        "k": k,
+        "page": page,
+        "scheduler_span": span,
+        "hits": hits,
+        "workers": workers,
+        "capacity": capacity,
+        "hash_lookahead": 1,
+        "prefill_lookahead": 1,
+        "reserve_lookahead": k,
+        "completed": emitted,
+        "drafts": drafted,
+        "accepted": wins,
+        "samples_discarded_at_stop": discarded,
+        "calculated_boundary_horizon": sorted(boundary),
+        "calculated_peak_horizons": peak,
+        "mixed_steps": mixed_steps,
+        "output_rank_steps": comparisons,
+    }
+    (directory / "validation.json").write_text(json.dumps(summary, indent=2))
+    print(
+        f"MTP_PREFIX_DCP {target} TP{tp}/DCP{dcp}/k{k}: "
+        f"hits={hits}, {len(comparisons)} SDK checks, {wins}/{drafted} accepted"
+    )
+    return summary
+
+
+@pytest.fixture(scope="module")
+def mtp_prefix_dcp_references():
+    """Cache completed control data, never engines or scheduler state."""
+    return {}
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize("target,tp,dcp,k", MTP_DCP_CELLS)
+def test_simulate_forward_cpu_mtp_prefix_dcp(
+    tmp_path, monkeypatch, target, tp, dcp, k, mtp_prefix_dcp_references
+):
+    """Each native-admitted cached MTP cell against its completed DCP1 control."""
+    actual = _mtp_prefix_dcp_engine_cell(
+        tmp_path / "candidate",
+        monkeypatch,
+        target,
+        tp,
+        dcp,
+        k,
+    )
+    key = (target, tp, k)
+    if key not in mtp_prefix_dcp_references:
+        mtp_prefix_dcp_references[key] = _mtp_prefix_dcp_engine_cell(
+            tmp_path / "reference-dcp1",
+            monkeypatch,
+            target,
+            tp,
+            1,
+            k,
+        )
+    reference = mtp_prefix_dcp_references[key]
+    assert actual["capacity"] == dcp * reference["capacity"]
+    assert actual["hits"][2] == 1024 < reference["hits"][2]
+    assert actual["hits"][1] == reference["hits"][1] == 1024
+    assert [worker["planned_bytes"] for worker in actual["workers"]] == [
+        worker["planned_bytes"] for worker in reference["workers"]
+    ]

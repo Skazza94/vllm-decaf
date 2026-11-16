@@ -3352,7 +3352,12 @@ def test_admits_equivalent_bf16_kv_settings(tmp_path, tp, target_kv, draft_kv):
 @pytest.mark.parametrize(
     "target,options,spec,reason",
     [
-        (V3, {"enable_prefix_caching": True}, {}, "prefix caching with speculative"),
+        (
+            V3,
+            {"enable_prefix_caching": True},
+            {"disable_lookahead_block_hashes": True},
+            "prefix caching with speculative",
+        ),
         (V3, {"tp": 16, "dcp": 2}, {}, "requires TP/DCP 2/2, 4/2, 4/4, 8/2, 8/4"),
         (V32, {"tp": 4, "dcp": 2}, {}, "requires TP/DCP 8/2, 8/4 for DeepSeek-V3.2"),
         (
@@ -3739,3 +3744,136 @@ def test_mtp_dcp_refuses_another_sdk_target(tmp_path, target):
             gpu=MTP_DCP_PROFILES[target][0],
             target_model="deepseek-ai/DeepSeek-R1",
         )
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize("target,tp,dcp,k", MTP_DCP_CELLS)
+def test_admits_mtp_prefix_dcp_cells(tmp_path, target, tp, dcp, k):
+    """Default one-token hash proof admits every qualified prefix/MTP cell."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import dcp_scope_problems
+
+    config = _mtp_dcp_engine_config(
+        tmp_path,
+        target=target,
+        tp=tp,
+        dcp=dcp,
+        enable_prefix_caching=True,
+        spec={"num_speculative_tokens": k},
+    )
+    assert dcp_scope_problems(config, transfers=False) == []
+    assert dcp_scope_problems(config, transfers=True)[-1] == SPECULATIVE_DCP_TRANSFERS
+    assert config.num_lookahead_tokens == k
+    assert config.num_prefill_lookahead_tokens == config.num_hash_lookahead_tokens == 1
+    assert not config.speculative_config.use_multi_module_mtp()
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize("target,tp,dcp,k", MTP_DCP_CELLS)
+@pytest.mark.parametrize(
+    "policy", ["disable_lookahead_block_hashes", "disable_eagle_block_drop"]
+)
+def test_mtp_prefix_dcp_keeps_unqualified_hash_policies_refused(
+    tmp_path, target, tp, dcp, k, policy
+):
+    with pytest.raises(ValueError, match="prefix caching with speculative decoding"):
+        _mtp_dcp_engine_config(
+            tmp_path,
+            target=target,
+            tp=tp,
+            dcp=dcp,
+            enable_prefix_caching=True,
+            spec={"num_speculative_tokens": k, policy: True},
+        )
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize("target,tp,dcp,k", MTP_DCP_CELLS)
+def test_mtp_prefix_dcp_cached_and_mixed_steps_match_direct_sdk(
+    tmp_path, target, tp, dcp, k
+):
+    """Price global cached lengths independently, preserving the SDK limitation."""
+    from vllm.v1.worker.simulated.aisimulate_timing import MLA_PREFIX_APPROXIMATION
+
+    page = MTP_DCP_PROFILES[target][3]
+    span = page * dcp
+    config = _mtp_dcp_engine_config(
+        tmp_path,
+        target=target,
+        tp=tp,
+        dcp=dcp,
+        enable_prefix_caching=True,
+        spec={"num_speculative_tokens": k},
+    )
+    timed = provider(config, gpu=MTP_DCP_PROFILES[target][0], target_model=target)
+    assumptions = timed.assumptions()["aisimulate"]
+    assert (assumptions["source"], assumptions["readiness"]) == ("aic", "ready")
+    assert assumptions["speculation"]["verify_width"] == k + 1
+    if target == V3:
+        assert MLA_PREFIX_APPROXIMATION in assumptions["approximations"]
+    sdk = _mtp_dcp_direct_sdk(target, tp, dcp, k)
+    hit = 1024 - span
+    prefill = dataclasses.replace(
+        sim_req("cached", 33 + span, hit, 1057),
+        num_cached_tokens=hit,
+    )
+    for mixed in (False, True):
+        requests = [prefill]
+        if mixed:
+            requests.append(
+                dataclasses.replace(
+                    sim_req("decode", k + 1, 1537, 1537),
+                    num_spec_tokens=k,
+                )
+            )
+        metrics = {
+            "scheduled_requests": {
+                "num_prefill_requests": 1,
+                "sum_prefill_tokens": 33 + span,
+                "var_prefill_length": 0,
+                "sum_prefill_kv_tokens": hit,
+                "num_decode_requests": int(mixed),
+                "sum_decode_kv_tokens": 1537 if mixed else 0,
+                "var_decode_kv_tokens": 0,
+                "extend_lengths": [33 + span] + ([k + 1] if mixed else []),
+                "past_kv_lengths": [hit] + ([1537] if mixed else []),
+            }
+        }
+        expected = sdk.estimate_forward_pass_time_ms(metrics)
+        actual = timed.estimate(sim_step(int(mixed), *requests))
+        assert math.isfinite(expected) and expected > 0
+        assert actual.device_s * 1000 == pytest.approx(expected, rel=1e-9)
+        assert actual.breakdown["spec_draft_tokens"] == k * int(mixed)
+        assert actual.breakdown["spec_requests_below_width"] == 0
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize("target", [V3, V32, GLM5])
+def test_mtp_prefix_dcp_native_match_unit_config(tmp_path, target):
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import dcp_scope_problems
+
+    tp, dcp = {V3: (2, 2), V32: (8, 4), GLM5: (4, 4)}[target]
+    span = MTP_DCP_PROFILES[target][3] * dcp
+    for name, unit in [("default", None), ("explicit", span)]:
+        config = _mtp_dcp_engine_config(
+            tmp_path / name,
+            target=target,
+            tp=tp,
+            dcp=dcp,
+            enable_prefix_caching=True,
+            prefix_match_unit=unit,
+        )
+        assert config.cache_config.prefix_match_unit == unit
+        assert config.num_hash_lookahead_tokens == 1
+        assert dcp_scope_problems(config, transfers=False) == []
+
+
+@requires_mtp_dcp
+@pytest.mark.parametrize(
+    "policy", ["disable_lookahead_block_hashes", "disable_eagle_block_drop"]
+)
+def test_mtp_prefix_dcp_preserves_prefix_off_policies(tmp_path, policy):
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import dcp_scope_problems
+
+    config = _mtp_dcp_engine_config(tmp_path, spec={policy: True})
+    assert not config.cache_config.enable_prefix_caching
+    assert dcp_scope_problems(config, transfers=False) == []

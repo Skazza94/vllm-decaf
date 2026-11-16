@@ -235,6 +235,33 @@ def mtp_dcp_page_problem(vllm_config: VllmConfig) -> str | None:
     return None
 
 
+def _standalone_mtp_prefix_problems(
+    config: VllmConfig, problems: list[str], prefix_index: int
+) -> list[str]:
+    """Preserve the original diagnostic unless the cell and hash policy qualify."""
+    spec = config.speculative_config
+    assert spec is not None
+    parallel = config.parallel_config
+    pure_tp = (
+        parallel.pipeline_parallel_size == 1
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.data_parallel_size == 1
+        and not parallel.enable_expert_parallel
+    )
+    if config.cache_config.enable_prefix_caching and (
+        problems
+        or not pure_tp
+        or spec.disable_lookahead_block_hashes
+        or spec.disable_eagle_block_drop
+    ):
+        return (
+            problems[:prefix_index]
+            + ["prefix caching with speculative decoding"]
+            + problems[prefix_index:]
+        )
+    return problems
+
+
 def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
     """Qualify the local model and layout before building an AISimulate profile."""
     from vllm.config.simulation import DSA_FP8_CACHE_DTYPES, SimulationConfig
@@ -250,8 +277,7 @@ def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
         problems.append("KV transfers with speculative decoding and DCP")
     if cache.kv_offloading_size is not None:
         problems.append("KV offloading with speculative decoding and DCP")
-    if cache.enable_prefix_caching:
-        problems.append("prefix caching with speculative decoding")
+    prefix_index = len(problems)
     if sim.timing != "aisimulate":
         problems.append("speculative decoding with DCP requires timing aisimulate")
     if parallel.nnodes != 1:
@@ -262,7 +288,9 @@ def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
         or model.architectures != [qualified["architecture"]]
         or not (sparse_mla(model) if qualified["sparse"] else plain_mla(model))
     ):
-        return problems + [MTP_DCP_MODEL_PROBLEM]
+        return _standalone_mtp_prefix_problems(
+            vllm_config, problems + [MTP_DCP_MODEL_PROBLEM], prefix_index
+        )
     name = qualified["name"]
     layouts = qualified["layouts"]
     if (
@@ -287,7 +315,11 @@ def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
             f"for {name}"
         )
     if spec.method != "mtp":
-        return problems + [f"speculative method {spec.method} (requires mtp)"]
+        return _standalone_mtp_prefix_problems(
+            vllm_config,
+            problems + [f"speculative method {spec.method} (requires mtp)"],
+            prefix_index,
+        )
     if not 1 <= spec.num_speculative_tokens <= MTP_DCP_MAX_DEPTH:
         problems.append(
             f"{spec.num_speculative_tokens} speculative tokens with DCP "
@@ -357,7 +389,7 @@ def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
         or spec.code_revision not in (None, model.code_revision)
     ):
         problems.append("draft kernel, parallel drafting or revision override with DCP")
-    return problems
+    return _standalone_mtp_prefix_problems(vllm_config, problems, prefix_index)
 
 
 def dcp_scope_problems(vllm_config: VllmConfig, *, transfers: bool) -> list[str]:
