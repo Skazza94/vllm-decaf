@@ -25,7 +25,10 @@ def strided(rows, base=0, device=0):
     """NIXL's Nx5 strided list (address, length, device, stride, count) of
     runs given as (offset, length, stride, count)."""
     return np.array(
-        [(base + offset, length, device, stride, count) for offset, length, stride, count in rows],
+        [
+            (base + offset, length, device, stride, count)
+            for offset, length, stride, count in rows
+        ],
         dtype=np.uint64,
     )
 
@@ -36,7 +39,8 @@ def regions(layers, blocks, length, stride, base=0):
     page for MLA, a head slice for split attention); a block's descriptor is
     region * blocks + block."""
     return strided(
-        [(layer * blocks * stride, length, stride, blocks) for layer in range(layers)], base
+        [(layer * blocks * stride, length, stride, blocks) for layer in range(layers)],
+        base,
     )
 
 
@@ -45,7 +49,9 @@ def ids(layers, blocks, block_ids):
 
 
 def predict(local, local_ids, remote, remote_ids, skip=False):
-    return nixl_merged_descriptors(nixl_runs(local), local_ids, nixl_runs(remote), remote_ids, skip)
+    return nixl_merged_descriptors(
+        nixl_runs(local), local_ids, nixl_runs(remote), remote_ids, skip
+    )
 
 
 # Two explicitly prepared dense runs at addresses 0 and 8 (length and stride
@@ -62,19 +68,61 @@ CASES = {
     "boundary": (BOUNDARY, [1, 2], BOUNDARY, [1, 2], 2),
     "within one run": (BOUNDARY, [0, 1], BOUNDARY, [2, 3], 1),
     # MLA, equal TP: the same consecutive blocks on both sides, one a layer.
-    "mla consecutive": (MLA, ids(LAYERS, BLOCKS, [2, 3, 4, 5]), MLA, ids(LAYERS, BLOCKS, [2, 3, 4, 5]), 3),
+    "mla consecutive": (
+        MLA,
+        ids(LAYERS, BLOCKS, [2, 3, 4, 5]),
+        MLA,
+        ids(LAYERS, BLOCKS, [2, 3, 4, 5]),
+        3,
+    ),
     # MLA, other block ids on the producer, still consecutive: one a layer.
-    "mla shifted": (MLA, ids(LAYERS, BLOCKS, [0, 1, 2]), MLA, ids(LAYERS, BLOCKS, [5, 6, 7]), 3),
+    "mla shifted": (
+        MLA,
+        ids(LAYERS, BLOCKS, [0, 1, 2]),
+        MLA,
+        ids(LAYERS, BLOCKS, [5, 6, 7]),
+        3,
+    ),
     # Fragmented: two runs of blocks a layer.
-    "mla fragmented": (MLA, ids(LAYERS, BLOCKS, [0, 1, 4, 5]), MLA, ids(LAYERS, BLOCKS, [0, 1, 4, 5]), 6),
+    "mla fragmented": (
+        MLA,
+        ids(LAYERS, BLOCKS, [0, 1, 4, 5]),
+        MLA,
+        ids(LAYERS, BLOCKS, [0, 1, 4, 5]),
+        6,
+    ),
     # Contiguous on one side only: nothing merges.
-    "local contiguous only": (MLA, ids(LAYERS, BLOCKS, [0, 1, 2]), MLA, ids(LAYERS, BLOCKS, [0, 2, 4]), 9),
-    "remote contiguous only": (MLA, ids(LAYERS, BLOCKS, [1, 3, 5]), MLA, ids(LAYERS, BLOCKS, [1, 2, 3]), 9),
+    "local contiguous only": (
+        MLA,
+        ids(LAYERS, BLOCKS, [0, 1, 2]),
+        MLA,
+        ids(LAYERS, BLOCKS, [0, 2, 4]),
+        9,
+    ),
+    "remote contiguous only": (
+        MLA,
+        ids(LAYERS, BLOCKS, [1, 3, 5]),
+        MLA,
+        ids(LAYERS, BLOCKS, [1, 2, 3]),
+        9,
+    ),
     # CP1's head slices (length below stride): never merged.
-    "head-sliced": (SLICED, ids(LAYERS, BLOCKS, [2, 3, 4, 5]), SLICED, ids(LAYERS, BLOCKS, [2, 3, 4, 5]), 12),
+    "head-sliced": (
+        SLICED,
+        ids(LAYERS, BLOCKS, [2, 3, 4, 5]),
+        SLICED,
+        ids(LAYERS, BLOCKS, [2, 3, 4, 5]),
+        12,
+    ),
     # A selection reaching the last block of one layer and the first of the
     # next: the regions abut in memory, but each is its own run.
-    "across regions": (MLA, [BLOCKS - 2, BLOCKS - 1, BLOCKS], MLA, [BLOCKS - 2, BLOCKS - 1, BLOCKS], 2),
+    "across regions": (
+        MLA,
+        [BLOCKS - 2, BLOCKS - 1, BLOCKS],
+        MLA,
+        [BLOCKS - 2, BLOCKS - 1, BLOCKS],
+        2,
+    ),
 }
 
 
@@ -120,7 +168,9 @@ def test_the_hook_logs_selected_and_predicted_beside_the_measured_count():
         made.append(handle)
         # A stand-in "measured" count: what NIXL would report.
         telemetry[handle] = SimpleNamespace(
-            xferDuration=1000, postDuration=10, totalBytes=64,
+            xferDuration=1000,
+            postDuration=10,
+            totalBytes=64,
             descCount=predict(MLA, local_ids, MLA, remote_ids) or len(local_ids),
         )
         return handle
@@ -144,7 +194,9 @@ def test_the_hook_logs_selected_and_predicted_beside_the_measured_count():
     worker.dst_xfer_side_handles = {"prefill": {0: remote}}
     selected = ids(LAYERS, BLOCKS, [1, 2, 3])
     for local in (registered, unknown):
-        handle = wrapper.make_prepped_xfer("READ", local, selected, remote, selected, b"req:1")
+        handle = wrapper.make_prepped_xfer(
+            "READ", local, selected, remote, selected, b"req:1"
+        )
         worker.xfer_stats.record_transfer(wrapper.get_xfer_telemetry(handle))
     plans = worker.xfer_stats.data["plan"]
     # [slot, selected, predicted] then the selected bytes and length table,
@@ -155,7 +207,10 @@ def test_the_hook_logs_selected_and_predicted_beside_the_measured_count():
 
 
 NATIVE = importlib.util.find_spec("nixl") is not None and os.path.exists(
-    os.path.join(os.environ.get("NIXL_PLUGIN_DIR", "/opt/nixl/lib/plugins"), "libplugin_Mooncake.so")
+    os.path.join(
+        os.environ.get("NIXL_PLUGIN_DIR", "/opt/nixl/lib/plugins"),
+        "libplugin_Mooncake.so",
+    )
 )
 
 
@@ -172,16 +227,33 @@ def _agents(monkeypatch):
     monkeypatch.setenv("NIXL_MOONCAKE_IP_ADDR", "127.0.0.1")
     monkeypatch.setenv("NIXL_TELEMETRY_ENABLE", "y")
     disabled = {"enable": False}
-    monkeypatch.setenv("MC_TENT_CONF", __import__("json").dumps({
-        "rpc_server_hostname": "127.0.0.1",
-        "transports": {"tcp": disabled, "rdma": disabled, "shm": disabled, "gds": disabled,
-                       "ascend_direct": disabled,
-                       "hp_tcp": {"enable": True, "bind_address": "127.0.0.1",
-                                  "advertise_address": "127.0.0.1", "rail_addresses": ["127.0.0.1"]}},
-    }))
+    monkeypatch.setenv(
+        "MC_TENT_CONF",
+        __import__("json").dumps(
+            {
+                "rpc_server_hostname": "127.0.0.1",
+                "transports": {
+                    "tcp": disabled,
+                    "rdma": disabled,
+                    "shm": disabled,
+                    "gds": disabled,
+                    "ascend_direct": disabled,
+                    "hp_tcp": {
+                        "enable": True,
+                        "bind_address": "127.0.0.1",
+                        "advertise_address": "127.0.0.1",
+                        "rail_addresses": ["127.0.0.1"],
+                    },
+                },
+            }
+        ),
+    )
     from nixl._api import nixl_agent, nixl_agent_config
 
-    a, b = (nixl_agent(name, nixl_agent_config(backends=["Mooncake"])) for name in ("A", "B"))
+    a, b = (
+        nixl_agent(name, nixl_agent_config(backends=["Mooncake"]))
+        for name in ("A", "B")
+    )
     size = LAYERS * BLOCKS * 2 * PAGE
     src = np.zeros(size, dtype=np.uint8)
     dst = (np.arange(size) % 251).astype(np.uint8)
@@ -208,17 +280,23 @@ def test_nixl_measures_the_predicted_descriptors(agents):
     descriptors are the prediction, every selected byte landing."""
     a, src, dst = agents
     for name, (local_rows, local_ids, remote_rows, remote_ids, want) in CASES.items():
-        local = a.prep_xfer_dlist("NIXL_INIT_AGENT", local_rows + np.array(
-            [src.ctypes.data, 0, 0, 0, 0], dtype=np.uint64), mem_type="DRAM")
-        remote = a.prep_xfer_dlist("B", remote_rows + np.array(
-            [dst.ctypes.data, 0, 0, 0, 0], dtype=np.uint64), mem_type="DRAM")
+        local = a.prep_xfer_dlist(
+            "NIXL_INIT_AGENT",
+            local_rows + np.array([src.ctypes.data, 0, 0, 0, 0], dtype=np.uint64),
+            mem_type="DRAM",
+        )
+        remote = a.prep_xfer_dlist(
+            "B",
+            remote_rows + np.array([dst.ctypes.data, 0, 0, 0, 0], dtype=np.uint64),
+            mem_type="DRAM",
+        )
         src[:] = 0
         telemetry = a.get_xfer_telemetry(read(a, local, local_ids, remote, remote_ids))
         assert telemetry.descCount == want, name
         for li, ri in zip(local_ids, remote_ids):
             ls, rs = _start(local_rows, li), _start(remote_rows, ri)
             length = int(_run(local_rows, li)[0][1])
-            assert (src[ls:ls + length] == dst[rs:rs + length]).all(), name
+            assert (src[ls : ls + length] == dst[rs : rs + length]).all(), name
 
 
 @pytest.mark.skipif(not NATIVE, reason="needs NIXL with its Mooncake backend")
@@ -231,27 +309,47 @@ def test_the_hook_predicts_what_nixl_measures(agents):
     )
 
     a, src, dst = agents
-    worker = SimpleNamespace(nixl_wrapper=a, xfer_stats=NixlKVConnectorStats(),
-                             dst_xfer_side_handles={})
+    worker = SimpleNamespace(
+        nixl_wrapper=a, xfer_stats=NixlKVConnectorStats(), dst_xfer_side_handles={}
+    )
     NixlReadPeers(worker)
     measured = []
-    for rows, local_blocks, remote_blocks in ((MLA, [0, 1, 2, 3], [4, 5, 6, 7]),
-                                              (SLICED, [0, 1, 2, 3], [0, 1, 2, 3])):
-        local = a.prep_xfer_dlist("NIXL_INIT_AGENT", rows + np.array(
-            [src.ctypes.data, 0, 0, 0, 0], dtype=np.uint64), mem_type="DRAM")
-        remote = a.prep_xfer_dlist("B", rows + np.array(
-            [dst.ctypes.data, 0, 0, 0, 0], dtype=np.uint64), mem_type="DRAM")
+    for rows, local_blocks, remote_blocks in (
+        (MLA, [0, 1, 2, 3], [4, 5, 6, 7]),
+        (SLICED, [0, 1, 2, 3], [0, 1, 2, 3]),
+    ):
+        local = a.prep_xfer_dlist(
+            "NIXL_INIT_AGENT",
+            rows + np.array([src.ctypes.data, 0, 0, 0, 0], dtype=np.uint64),
+            mem_type="DRAM",
+        )
+        remote = a.prep_xfer_dlist(
+            "B",
+            rows + np.array([dst.ctypes.data, 0, 0, 0, 0], dtype=np.uint64),
+            mem_type="DRAM",
+        )
         worker.dst_xfer_side_handles = {"prefill": {0: remote}}
-        handle = read(a, local, ids(LAYERS, BLOCKS, local_blocks), remote,
-                      ids(LAYERS, BLOCKS, remote_blocks))
+        handle = read(
+            a,
+            local,
+            ids(LAYERS, BLOCKS, local_blocks),
+            remote,
+            ids(LAYERS, BLOCKS, remote_blocks),
+        )
         telemetry = a.get_xfer_telemetry(handle)
         measured.append(telemetry.descCount)
         worker.xfer_stats.record_transfer(telemetry)
     assert measured == [LAYERS, 4 * LAYERS]
     plans = worker.xfer_stats.data["plan"]
-    assert [plan[:3] for plan in plans] == [[0, 4 * LAYERS, LAYERS], [0, 4 * LAYERS, 4 * LAYERS]]
-    assert all(plan[3] == sum(n * c for n, c in plan[4].items()) and sum(plan[4].values()) == 4 * LAYERS
-               for plan in plans)
+    assert [plan[:3] for plan in plans] == [
+        [0, 4 * LAYERS, LAYERS],
+        [0, 4 * LAYERS, 4 * LAYERS],
+    ]
+    assert all(
+        plan[3] == sum(n * c for n, c in plan[4].items())
+        and sum(plan[4].values()) == 4 * LAYERS
+        for plan in plans
+    )
 
 
 def _run(rows, index):
