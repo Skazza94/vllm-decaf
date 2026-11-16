@@ -1859,13 +1859,53 @@ def native_output(scheduler_output, tokens):
     )
 
 
-def test_a_native_same_step_prefill_dedup_is_compared_after_its_writer():
+@pytest.fixture
+def opt_model_dir(tmp_path):
+    # facebook/opt-125m at 27dcfa74d334bc871f3234de431e71c6eeba5dd6.
+    config = {
+        "_name_or_path": "facebook/opt-125m",
+        "activation_dropout": 0.0,
+        "activation_function": "relu",
+        "architectures": ["OPTForCausalLM"],
+        "attention_dropout": 0.0,
+        "bos_token_id": 2,
+        "do_layer_norm_before": True,
+        "dropout": 0.1,
+        "eos_token_id": 2,
+        "ffn_dim": 3072,
+        "hidden_size": 768,
+        "init_std": 0.02,
+        "layerdrop": 0.0,
+        "max_position_embeddings": 2048,
+        "model_type": "opt",
+        "num_attention_heads": 12,
+        "num_hidden_layers": 12,
+        "pad_token_id": 1,
+        "prefix": "</s>",
+        "torch_dtype": "float16",
+        "transformers_version": "4.21.0.dev0",
+        "use_cache": True,
+        "vocab_size": 50272,
+        "word_embed_proj_dim": 768,
+    }
+    model_dir = tmp_path / "opt-125m"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(config))
+    return str(model_dir)
+
+
+def test_a_native_same_step_prefill_dedup_is_compared_after_its_writer(opt_model_dir):
     """The native scheduler shares A's pages with B in the step that computes
     them (`test_prefix_caching_for_prefill_dedup`): B's hit is compared after
     A's writes, read-only, A named as their writer."""
     from tests.v1.core.utils import create_scheduler
 
-    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK, num_blocks=32)
+    scheduler = create_scheduler(
+        model=opt_model_dir,
+        enable_prefix_caching=True,
+        block_size=BLOCK,
+        num_blocks=32,
+    )
     a, b = native_requests({"a": PROMPT_A, "b": PROMPT_A[:8] + [7, 7]})
     scheduler.add_request(a)
     scheduler.add_request(b)
@@ -1887,14 +1927,19 @@ def test_a_native_same_step_prefill_dedup_is_compared_after_its_writer():
     assert holds(prefill, shared[1], filler.chains, "a", 1, BLOCK)
 
 
-def test_a_native_same_step_decode_adoption_is_compared_after_its_writer():
+def test_a_native_same_step_decode_adoption_is_compared_after_its_writer(opt_model_dir):
     """A's decode step computes the last token of its page 2 (two of its
     tokens generated); the native scheduler caches that page as it schedules
     the token, and B, admitted in the same step, hits it. The checker writes
     the page, then compares B's hit."""
     from tests.v1.core.utils import create_scheduler
 
-    scheduler = create_scheduler(enable_prefix_caching=True, block_size=BLOCK, num_blocks=32)
+    scheduler = create_scheduler(
+        model=opt_model_dir,
+        enable_prefix_caching=True,
+        block_size=BLOCK,
+        num_blocks=32,
+    )
     (a,) = native_requests({"a": PROMPT_A})
     scheduler.add_request(a)
     decode = block_views(caches(32), 32)
