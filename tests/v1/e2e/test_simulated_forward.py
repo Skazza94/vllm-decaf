@@ -28,6 +28,43 @@ SIMULATED_FORWARD_MODELS = [
     pytest.param("openai/gpt-oss-120b", 2, id="gpt-oss-120b"),
 ]
 
+# Qwen/Qwen3-0.6B at revision c1899de289a04d12100db370d81485cdf75e47ca.
+QWEN3_0_6B_CONFIG = {
+    "architectures": ["Qwen3ForCausalLM"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "bos_token_id": 151643,
+    "eos_token_id": 151645,
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 1024,
+    "initializer_range": 0.02,
+    "intermediate_size": 3072,
+    "max_position_embeddings": 40960,
+    "max_window_layers": 28,
+    "model_type": "qwen3",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 28,
+    "num_key_value_heads": 8,
+    "rms_norm_eps": 1e-06,
+    "rope_scaling": None,
+    "rope_theta": 1000000,
+    "sliding_window": None,
+    "tie_word_embeddings": True,
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.51.0",
+    "use_cache": True,
+    "use_sliding_window": False,
+    "vocab_size": 151936,
+}
+
+
+@pytest.fixture(scope="module")
+def qwen3_0_6b_dir(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("qwen3-0.6b")
+    (directory / "config.json").write_text(json.dumps(QWEN3_0_6B_CONFIG))
+    return str(directory)
+
 
 @pytest.mark.parametrize(
     "kwargs, error",
@@ -58,12 +95,12 @@ SIMULATED_FORWARD_MODELS = [
         ({"enable_lora": True}, "LoRA"),
     ],
 )
-def test_simulated_config_rejections(kwargs, error) -> None:
+def test_simulated_config_rejections(qwen3_0_6b_dir, kwargs, error) -> None:
     from vllm.engine.arg_utils import EngineArgs
 
     with pytest.raises(ValueError, match=error):
         EngineArgs(
-            model="Qwen/Qwen3-0.6B", max_model_len=1024, simulate_forward=True, **kwargs
+            model=qwen3_0_6b_dir, max_model_len=1024, simulate_forward=True, **kwargs
         ).create_engine_config()
 
 
