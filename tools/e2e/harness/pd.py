@@ -103,6 +103,12 @@ class Side:
     """A GPU attention backend whose kernel blocks this instance models
     (simulation_config.kv_kernel_backend); NIXL and AISimulate only."""
 
+    prefix_cache_retention_interval: int = 0
+    """This instance's --prefix-cache-retention-interval (vLLM's default 0:
+    a hybrid's or sliding window's states only at semantic checkpoints, the
+    replay boundary and shared-prefix junctions); a positive multiple of its
+    block size also keeps periodic ones."""
+
     def tp(self, server: "Server") -> int:
         return self.tensor_parallel_size or server.tensor_parallel_size
 
@@ -299,6 +305,10 @@ class Run:
     leave decode nothing a later prompt can hit (sliding windows, of which
     only the last blocks are pulled): decode must then show no hit at all,
     so a surprise is a problem either way."""
+    kv_pattern_grain: int | None = None
+    """With kv_check and prefix caching over NIXL, a hybrid pair whose decode
+    attention block is a multiple of prefill's: prefill's block size, given
+    to both instances (simulation_config.kv_pattern_grain)."""
     server: Server = field(default_factory=Server)
     workload: Workload = field(default_factory=Workload)
     startup_timeout: float = 600.0
@@ -317,7 +327,7 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
 
     known = {"name", "topology", "model", "prefill", "decode", "client", "control_network", "kv_check",
              "expect_fragmentation", "expect_prefill_hit_requests", "expect_decode_prefix_hits", "server", "workload", "router",
-             "startup_timeout"}
+             "startup_timeout", "kv_pattern_grain"}
     if unknown := set(raw) - known:
         raise ValueError(f"unknown run key(s): {', '.join(sorted(unknown))}")
     router_raw = raw.get("router")
@@ -339,6 +349,7 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
             expect_fragmentation=raw.get("expect_fragmentation", False),
             expect_prefill_hit_requests=raw.get("expect_prefill_hit_requests"),
             expect_decode_prefix_hits=raw.get("expect_decode_prefix_hits", True),
+            kv_pattern_grain=raw.get("kv_pattern_grain"),
             server=Server(**(raw.get("server") or {})), workload=Workload(**(raw.get("workload") or {})),
             startup_timeout=float(raw.get("startup_timeout", 600)),
         )
@@ -365,6 +376,14 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         _check_speculative(run.server)
     if not isinstance(run.expect_fragmentation, bool):
         raise ValueError(f"expect_fragmentation is true or false, not {run.expect_fragmentation!r}")
+    if (grain := run.kv_pattern_grain) is not None:
+        if not isinstance(grain, int) or isinstance(grain, bool) or grain < 1:
+            raise ValueError("kv_pattern_grain is a positive integer")
+        if not (run.kv_check and run.server.enable_prefix_caching and run.server.connector == "nixl"):
+            raise ValueError("kv_pattern_grain needs kv_check, server.enable_prefix_caching and NIXL")
+        if run.prefill.block(run.server) != grain:
+            raise ValueError(f"kv_pattern_grain {grain} must be prefill's block size, "
+                             f"not {run.prefill.block(run.server)}")
     if run.expect_fragmentation and not run.kv_check:
         raise ValueError("expect_fragmentation needs kv_check (it counts byte-checked transfers)")
     if not isinstance(run.expect_decode_prefix_hits, bool):
@@ -458,6 +477,9 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         if side.block_size is not None and (
                 not isinstance(side.block_size, int) or isinstance(side.block_size, bool) or side.block_size < 1):
             raise ValueError(f"{side.nodes}: block_size is a positive integer")
+        interval = side.prefix_cache_retention_interval
+        if not isinstance(interval, int) or isinstance(interval, bool) or interval < 0:
+            raise ValueError(f"{side.nodes}: prefix_cache_retention_interval is a non-negative integer")
         if not isinstance(side.kv_network, str) and len(side.kv_network) != side.tp(run.server):
             raise ValueError(f"{side.nodes}: kv_network needs one network per rank ({side.tp(run.server)})")
     if run.server.connector != "nixl":
@@ -833,6 +855,8 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         simulation["kv_kernel_backend"] = side.kv_kernel_backend
     if run.kv_check:
         simulation["kv_pattern_fill" if role == "prefill" else "kv_pattern_check"] = True
+        if run.kv_pattern_grain is not None:
+            simulation["kv_pattern_grain"] = run.kv_pattern_grain
     spec = run.server.speculative
     if spec is not None:
         simulation["spec_acceptance_rates"] = spec["acceptance_rates"]
@@ -883,6 +907,8 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         "--served-model-name", MODEL_NAME, "--dtype", s.dtype, "--kv-cache-dtype", s.kv_cache_dtype,
         *(["--quantization", s.quantization] if s.quantization else []),
         *(["--block-size", str(block)] if block is not None else []),
+        *(["--prefix-cache-retention-interval", str(side.prefix_cache_retention_interval)]
+          if side.prefix_cache_retention_interval else []),
         "--kv-cache-memory-bytes", str(s.kv_cache_memory_bytes), "--max-model-len", str(s.max_model_len),
         "--max-num-batched-tokens", str(s.max_num_batched_tokens), "--max-num-seqs", str(s.max_num_seqs),
         "--tensor-parallel-size", str(side.tp(s)),

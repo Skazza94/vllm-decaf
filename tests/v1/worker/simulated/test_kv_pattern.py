@@ -2411,7 +2411,19 @@ def test_native_geometry_check_admits_other_tp_only_with_head_patterns():
         checker(worker(block_sizes=(16, 8)), None)._check_geometry()
     checker(worker(block_sizes=(16, 8)), (2, 3))._check_geometry()
     with pytest.raises(ValueError, match="without prefix caching"):
-        checker(worker(block_sizes=(16, 8)), (2, 3), chains=object())._check_geometry()
+        checker(
+            worker(block_sizes=(16, 8)), (2, 3), chains=TokenChains([16])
+        )._check_geometry()
+    # kv_pattern_grain: the producer's block size, dividing this instance's.
+    grained = TokenChains([16], grain=8)
+    checker(worker(block_sizes=(16, 8)), (2, 3), chains=grained)._check_geometry()
+    for sizes, chains in (
+        ((16, 4), grained),
+        ((16,), grained),
+        ((16, 8), TokenChains([16], grain=4)),
+    ):
+        with pytest.raises(ValueError, match="kv_pattern_grain"):
+            checker(worker(block_sizes=sizes), (2, 3), chains=chains)._check_geometry()
 
 
 def test_native_group_heads_decide_the_selections_eligibility():

@@ -96,6 +96,14 @@ class SimulationConfig:
     with a sentinel, and compare them with the prefill instance's pattern when
     the read finishes. Results go to the step log (`kv_check` records)."""
 
+    kv_pattern_grain: int | None = Field(default=None, gt=0)
+    """Real KV transfers of a hybrid model over NIXL with prefix caching and
+    the pattern flags, between attention block sizes one dividing the other:
+    the producer's attention block size, set on both instances. Attention
+    content is then keyed in pieces of this many tokens and a state by its
+    endpoint, so a consumer's larger block holds the same bytes whether
+    pulled, computed or hit. None: each block by its own size."""
+
     fallback_token_id: int = Field(default=0, ge=0)
     """Output token of requests without `trace_decode_token_ids`."""
 
@@ -130,6 +138,12 @@ class SimulationConfig:
                 raise ValueError("record_step_timing needs a CUDA-alike platform.")
             if parallel.worker_cls == "auto":
                 parallel.worker_cls = _RECORDING_WORKER
+        if self.kv_pattern_grain is not None and not (
+            self.kv_pattern_fill or self.kv_pattern_check
+        ):
+            raise ValueError(
+                "kv_pattern_grain needs kv_pattern_fill or kv_pattern_check."
+            )
         if (self.kv_pattern_fill or self.kv_pattern_check) and not (
             moves_real_kv(vllm_config)
         ):
@@ -494,6 +508,19 @@ class SimulationConfig:
                     "the DS conv-state layout for a hybrid model over NIXL "
                     "(VLLM_SSM_CONV_STATE_LAYOUT=DS)"
                 )
+        if self.kv_pattern_grain is not None and not (
+            cache.enable_prefix_caching
+            and model.is_hybrid
+            and kv_transfer.kv_connector in NIXL_CONNECTORS
+            and self.kv_kernel_backend is None
+            and vllm_config.speculative_config is None
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        ):
+            problems.append(
+                "kv_pattern_grain only for a hybrid model over NIXL with prefix "
+                "caching, no kv_kernel_backend, speculative decoding or decode "
+                "context parallelism"
+            )
         if vllm_config.speculative_config is not None:
             problems.extend(self._real_kv_mtp_problems(vllm_config))
         if self.kv_pattern_fill and kv_transfer.kv_role != "kv_producer":

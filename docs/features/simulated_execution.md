@@ -467,8 +467,15 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           intervals only when they own the complete page exactly once,
           before comparing the native wire chunks. NIXL's refusal of
           head-sharded reads from several producers at unequal kernel block
-          sizes stays in place, as does the byte-check refusal with prefix
-          caching at unequal logical page sizes.
+          sizes stays in place. With prefix caching, byte checks at unequal
+          attention block sizes need `kv_pattern_grain` (the prefill's
+          block size, on both instances): attention content is keyed in
+          pieces of that many tokens and a state by its endpoint, so a
+          decode block holds the same bytes whether pulled, computed or
+          hit. The pull planning is the pinned NIXL's (decode blocks split
+          into producer-sized sub-blocks, then the producer's list trimmed
+          from its end); where that pairs a sub-block with another producer
+          block than its tokens', its check fails.
           Without a kernel geometry declaration each attention block stays
           whole. With a declaration such as `FLASHINFER`, NIXL uses the
           registered kernel block sizes and the physical-to-logical ratios.

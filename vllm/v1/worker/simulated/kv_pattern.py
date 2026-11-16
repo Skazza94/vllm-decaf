@@ -306,7 +306,7 @@ def row_pattern(
     logical_block: int,
     size: int,
     tp_rank: int = 0,
-    identity: str | None = None,
+    identity: "str | tuple[str | None, ...] | None" = None,
     heads: Sequence[int] | None = None,
     sub_blocks: tuple[int, int] = (1, 1),
 ) -> torch.Tensor:
@@ -316,8 +316,30 @@ def row_pattern(
     a span its heads do not divide) the rank's pattern. `sub_blocks` (R,
     covered): a block of R producer blocks (NIXL's block-size ratio), each
     head's slab their R slabs in token order, those past the `covered` first
-    zero (NIXL zeroes what it did not transfer)."""
+    zero (NIXL zeroes what it did not transfer). An `identity` of pieces
+    (`kv_pattern_grain`) gives each slab's R pieces their own content, a
+    piece None zero, whatever `sub_blocks` says."""
     ratio, covered = sub_blocks
+    if isinstance(identity, tuple):
+        # A block of grain-sized pieces (`TokenChains._pieces`): piece k is
+        # the producer's block `logical_block * ratio + k`, by its content.
+        pieces = identity
+        ratio = len(pieces)
+        if not heads or size % (len(heads) * ratio):
+            raise ValueError(
+                f"{name}: a block of {ratio} pieces needs head patterns "
+                f"({len(heads or ())} heads in {size} bytes)"
+            )
+        slab = size // len(heads) // ratio
+        return torch.cat(
+            [
+                _stream(f"{piece}|h{head}|{name}|{logical_block * ratio + k}", slab)
+                if piece is not None
+                else torch.zeros(slab, dtype=torch.uint8)
+                for head in heads
+                for k, piece in enumerate(pieces)
+            ]
+        )
     if heads and size % (len(heads) * ratio) == 0:
         base = identity if identity is not None else get_base_request_id(request_id)
         slab = size // len(heads) // ratio
@@ -412,6 +434,11 @@ class OutsideLifecycle(ValueError):
     """A block whose content the token chains cannot name."""
 
 
+STATE_IDENTITY = "state|"
+"""Prefix of a state's content keyed by its endpoint (`TokenChains._state`):
+its pattern takes no block index."""
+
+
 def _digest(previous: bytes, tokens: Sequence[int]) -> bytes:
     data = previous + np.asarray(tokens, dtype=np.int64).tobytes()
     return hashlib.blake2b(data, digest_size=16).digest()
@@ -425,13 +452,25 @@ class TokenChains:
     in its blocks, whichever request computed them; a partial block's names
     its tokens so far."""
 
-    def __init__(self, block_sizes: Sequence[int], backoff: int = 0) -> None:
+    def __init__(
+        self,
+        block_sizes: Sequence[int],
+        backoff: int = 0,
+        grain: int | None = None,
+        state_groups: Sequence[int] = (),
+    ) -> None:
         self.block_sizes = list(block_sizes)
-        """Each KV cache group's."""
+        """Each KV cache group's (allocation: block tables index by them)."""
         self.backoff = backoff
         """The trailing prompt tokens a producer leaves to the consumer (a
         hybrid's last one, a bounded window replay's): a pull's content ends
         before them."""
+        self.grain = grain
+        """`kv_pattern_grain`: attention content keyed in pieces of this many
+        tokens (the producer's block size), so a block larger than it holds
+        the same bytes on either side of a pair whether pulled, computed or
+        hit; states keyed by their endpoint alone. None: by block."""
+        self.state_groups = frozenset(state_groups)
         self.tokens: dict[str, list[int] | None] = {}
         self.prompt_lens: dict[str, int] = {}
         # Each request's full blocks' chained digests, by block size.
@@ -453,13 +492,52 @@ class TokenChains:
     def drop(self, req_id: str) -> None:
         self.tokens.pop(req_id, None)
         self.prompt_lens.pop(req_id, None)
-        for size in set(self.block_sizes):
+        for size in {*self.block_sizes, self.grain}:
             self._full.pop((req_id, size), None)
 
-    def identity(self, req_id: str, group: int, logical: int, n: int) -> str:
+    def identity(
+        self, req_id: str, group: int, logical: int, n: int
+    ) -> "str | tuple[str | None, ...]":
         """The content of a group's logical block holding its first `n`
-        tokens."""
+        tokens. With a grain: a state's is its endpoint's (`_state`); an
+        attention block larger than the grain is its pieces' (`_pieces`)."""
         size = self.block_sizes[group]
+        if self.grain is not None:
+            if group in self.state_groups:
+                return self._state(req_id, logical * size + n)
+            if size != self.grain:
+                return self._pieces(req_id, size, logical, logical * size + n)
+        return self._at(req_id, size, logical, n)
+
+    def _pieces(
+        self, req_id: str, size: int, logical: int, end: int
+    ) -> tuple[str | None, ...]:
+        """A block's grain-sized pieces: each one's content (its tokens and
+        every earlier one, keyed at the grain, as the producer's own block
+        is), None for a piece starting at or past `end`."""
+        grain = self.grain
+        assert grain is not None
+        ratio = size // grain
+        first = logical * ratio
+        return tuple(
+            self._at(req_id, grain, k, min(grain, end - k * grain))
+            if k * grain < end
+            else None
+            for k in range(first, first + ratio)
+        )
+
+    def _state(self, req_id: str, end: int) -> str:
+        """A state's content: its endpoint and every token before it, keyed
+        at the grain, whatever block holds it on either instance."""
+        grain = self.grain
+        assert grain is not None
+        if end == 0:
+            return f"{STATE_IDENTITY}empty"
+        last = (end - 1) // grain
+        piece = self._at(req_id, grain, last, end - last * grain)
+        return f"{STATE_IDENTITY}end{end}|{piece}"
+
+    def _at(self, req_id: str, size: int, logical: int, n: int) -> str:
         end = logical * size + n
         tokens = self._known(req_id, end)
         full = self._full.setdefault((req_id, size), [])
@@ -482,12 +560,21 @@ class TokenChains:
             )
         return tokens
 
-    def padding(self, req_id: str, group: int, logical: int, end: int) -> str:
+    def padding(
+        self, req_id: str, group: int, logical: int, end: int
+    ) -> "str | tuple[None, ...]":
         """A block starting at or past a content's end (`end` tokens: an
         allocation's padding, or a block awaiting tokens): its place and the
-        content it follows, read no further than that end."""
+        content it follows, read no further than that end. With a grain, an
+        attention block of pieces holds none (each zero when pulled)."""
         size = self.block_sizes[group]
         self._known(req_id, end)
+        if (
+            self.grain is not None
+            and group not in self.state_groups
+            and size != self.grain
+        ):
+            return (None,) * (size // self.grain)
         if end == 0:
             return f"content|B{size}|pad|i{logical}|empty"
         last = (end - 1) // size
@@ -512,6 +599,37 @@ class TokenChains:
         if logical * size >= end:
             return self.padding(req_id, group, logical, end)
         return self.identity(req_id, group, logical, min(size, end - logical * size))
+
+
+def state_group_indices(groups) -> list[int]:
+    """The KV cache groups holding recurrent states (Mamba2 / GDN)."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return [
+        index
+        for index, group in enumerate(groups)
+        if all(isinstance(spec, MambaSpec) for spec in layer_specs([group]).values())
+    ]
+
+
+def check_pattern_grain(chains: TokenChains, producer: bool) -> None:
+    """`kv_pattern_grain` against this instance's attention block sizes: a
+    producer's own (its blocks are the pieces), a consumer's a multiple."""
+    grain = chains.grain
+    sizes = {
+        size
+        for group, size in enumerate(chains.block_sizes)
+        if group not in chains.state_groups
+    }
+    bad = {size for size in sizes if size != grain} if producer else {
+        size for size in sizes if size % grain
+    }
+    if not sizes or bad:
+        want = "equal to" if producer else "a multiple of"
+        raise ValueError(
+            f"kv_pattern_grain {grain} needs attention block sizes {want} it on "
+            f"the {'producer' if producer else 'consumer'}, not {sorted(sizes)}."
+        )
 
 
 def _lifecycle_failure(req_id: str, kind: str, error: Exception) -> dict:
@@ -1977,8 +2095,11 @@ def _expected_bytes(
     r = s.rows[row]
     if r.state and getattr(s, "layout", None) is not None:
         base = identity if identity is not None else get_base_request_id(request_id)
+        # A state keyed by its endpoint takes no block index (either
+        # instance's would differ).
+        place = 0 if base.startswith(STATE_IDENTITY) else logical
         return sl.state_span_pattern(
-            base, s.state_identity(group, r.region), logical, s.layout, r.span
+            base, s.state_identity(group, r.region), place, s.layout, r.span
         )
     if not r.state and getattr(s, "factor", 1) > 1:
         return _attention_slice(
@@ -1998,6 +2119,22 @@ def _expected_bytes(
         identity, None if r.state else _group_heads(heads, group),
         (1, 1) if r.state else sub_blocks,
     )
+
+
+def attention_zeros(
+    size: int, ratio: int, covered: int, identity=None
+) -> tuple[int, int]:
+    """A block's attention span of `size` bytes read as `ratio` producer
+    sub-blocks: (the bytes NIXL zeroes, past the `covered` sub-blocks its
+    pairing wrote; the bytes its content expects zero, the pieces of a
+    `kv_pattern_grain` identity past the handoff, else the same). The two
+    differ where the pinned pairing writes a sub-block the content ends
+    before: transfer accounting keeps the first, the byte verdict uses the
+    second."""
+    native = size * (ratio - covered) // ratio
+    if isinstance(identity, tuple):
+        return native, size * identity.count(None) // len(identity)
+    return native, native
 
 
 def _attention_slice(
@@ -2285,11 +2422,22 @@ class NativeChecker(_ConsumerPages):
         w = self.selection.worker
         if self.heads is not None:
             sizes = set(w.src_xfer_handles_by_block_size) - {w.block_size}
+            grain = self.chains.grain if self.chains else None
+            if grain is not None:
+                remote = sizes or {w.block_size}
+                if remote != {grain} or w.block_size % grain:
+                    raise ValueError(
+                        f"kv_pattern_grain {grain} must be the producer's attention "
+                        f"block size, dividing this instance's {w.block_size}, "
+                        f"not a producer of {sorted(remote)}."
+                    )
+                return
             if any(w.block_size % size for size in sizes) or (sizes and self.chains):
                 raise ValueError(
                     "Pattern checks of several KV cache groups over NIXL need a "
                     "remote of equal block size, or one dividing this instance's "
-                    f"{w.block_size} without prefix caching, not {sorted(sizes)}."
+                    f"{w.block_size} without prefix caching (or with "
+                    f"kv_pattern_grain), not {sorted(sizes)}."
                 )
             return
         other = {
@@ -2604,6 +2752,9 @@ class NativeChecker(_ConsumerPages):
                 else group.first_logical_block
             )
             payload = transfer_only = wrong_total = zeroed = moved_padding = 0
+            expected_zero = 0
+            # `kv_pattern_grain`: wrong bytes by logical block and piece.
+            piece_wrong: dict[int, list[int]] = {}
             for row, block, place in selected:
                 r = s.rows[row]
                 view = r.view
@@ -2659,21 +2810,29 @@ class NativeChecker(_ConsumerPages):
                         block=block,
                     )
                     if not r.state:
-                        zeroed += view.shape[1] * (ratio - sub_blocks[1]) // ratio
-                wrong = int((view[block] != want).sum())
+                        native, due = attention_zeros(
+                            view.shape[1], ratio, sub_blocks[1], identity
+                        )
+                        zeroed += native
+                        expected_zero += due
+                differs = view[block] != want
+                wrong = int(differs.sum())
                 payload += view.shape[1]
                 if r.region not in s.members[group.group]:
                     transfer_only += view.shape[1]
                 if wrong:
                     wrong_total += wrong
                     mismatched_blocks.append(
-                        [
-                            s.name(group.group, row),
-                            first + places[place],
-                            block,
-                            wrong,
-                        ]
+                        [s.name(group.group, row), logical, block, wrong]
                     )
+                    if isinstance(identity, tuple) and not r.state:
+                        # Each piece's, in token order (every head slab's
+                        # share summed).
+                        heads = len(_group_heads(self.heads, group.group))
+                        by_piece = differs.reshape(heads, len(identity), -1)
+                        counts = piece_wrong.setdefault(logical, [0] * len(identity))
+                        for k, n in enumerate(by_piece.sum(dim=(0, 2)).tolist()):
+                            counts[k] += n
             padding = padding_wrong = 0
             for region in s.state_regions(selected) & set(s.padding):
                 view = s.padding[region].view
@@ -2725,6 +2884,14 @@ class NativeChecker(_ConsumerPages):
                     "padding_bytes": padding,
                     "mismatched_bytes": wrong_total + padding_wrong,
                     "padding_mismatched_bytes": padding_wrong,
+                    **(
+                        {
+                            "expected_zero_bytes": expected_zero,
+                            "mismatched_pieces": piece_wrong,
+                        }
+                        if self.chains is not None and self.chains.grain is not None
+                        else {}
+                    ),
                 }
             )
         mismatched_bytes = sum(g["mismatched_bytes"] for g in groups)

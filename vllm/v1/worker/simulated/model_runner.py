@@ -46,11 +46,13 @@ from vllm.v1.worker.simulated.kv_pattern import (
     PatternFiller,
     TokenChains,
     block_views,
+    check_pattern_grain,
     group_pattern,
     head_map,
     layer_total_heads,
     native_group_heads,
     native_state_heads,
+    state_group_indices,
 )
 from vllm.v1.worker.simulated.state_layout import STATE_PATTERN, state_layout_record
 from vllm.v1.worker.simulated.kv_transfer import (
@@ -342,10 +344,14 @@ class SimulatedModelRunner(GPUModelRunner):
             TokenChains(
                 [group.kv_cache_spec.block_size for group in groups],
                 backoff=prefill_backoff(layer_specs(groups)),
+                grain=sim.kv_pattern_grain,
+                state_groups=state_group_indices(groups),
             )
             if self.cache_config.enable_prefix_caching
             else None
         )
+        if chains is not None and chains.grain is not None:
+            check_pattern_grain(chains, sim.kv_pattern_fill)
         # Each attention layer's page is its global KV heads' patterns, so a
         # connector may re-shard heads between unequal TP sizes; NIXL's
         # selection of several groups keeps its rank's.
