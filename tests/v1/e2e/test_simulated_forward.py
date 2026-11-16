@@ -1729,9 +1729,13 @@ def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
         ("deepseek-ai/DeepSeek-V3", 8, 2, 2),
         ("deepseek-ai/DeepSeek-V3.2", 8, 4, 2),
         ("nvidia/GLM-5-NVFP4", 4, 2, 3),
+        ("deepseek-ai/DeepSeek-V3", 8, 8, 5),
+        ("deepseek-ai/DeepSeek-V3.2", 8, 2, 5),
+        ("nvidia/GLM-5-NVFP4", 4, 4, 4),
     ],
     ids=["v3-tp2-dcp2-k1", "v3-tp4-dcp4-k1", "v3-tp8-dcp2-k2",
-         "v32-tp8-dcp4-k2", "glm5-tp4-dcp2-k3"],
+         "v32-tp8-dcp4-k2", "glm5-tp4-dcp2-k3", "v3-tp8-dcp8-k5",
+         "v32-tp8-dcp2-k5", "glm5-tp4-dcp4-k4"],
 )
 def test_simulate_forward_cpu_mtp_dcp(tmp_path, monkeypatch, target, tp, dcp, k):
     """The published geometry's draft, cache spans and AISimulate estimates

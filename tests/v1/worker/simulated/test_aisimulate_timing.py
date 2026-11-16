@@ -2946,7 +2946,7 @@ MTP_DCP_LAYOUTS = {
     V32: ((8, 2), (8, 4)),
     GLM5: ((4, 2), (4, 4)),
 }
-MTP_DCP_DEPTHS = (1, 2, 3)
+MTP_DCP_DEPTHS = (1, 2, 3, 4, 5)
 MTP_DCP_CELLS = [
     pytest.param(
         target, tp, dcp, k, id=f"{target.split('/')[1]}-tp{tp}-dcp{dcp}-k{k}"
@@ -3047,6 +3047,12 @@ def test_admits_equivalent_bf16_kv_settings(tmp_path, tp, target_kv, draft_kv):
         (V3, {"enable_prefix_caching": True}, {}, "prefix caching with speculative"),
         (V3, {"tp": 16, "dcp": 2}, {}, "requires TP/DCP 2/2, 4/2, 4/4, 8/2, 8/4"),
         (V32, {"tp": 4, "dcp": 2}, {}, "requires TP/DCP 8/2, 8/4 for DeepSeek-V3.2"),
+        (
+            V32,
+            {"tp": 8, "dcp": 8},
+            {"num_speculative_tokens": 2},
+            "requires TP/DCP 8/2, 8/4 for DeepSeek-V3.2",
+        ),
         (GLM5, {"tp": 8, "dcp": 2}, {}, "requires TP/DCP 4/2, 4/4 for GLM-5"),
         (V3, {"block_size": 32}, {}, "interleave 1 and 16-token pages"),
         (V32, {"block_size": 32}, {}, "interleave 1 and 64-token pages"),
@@ -3063,9 +3069,9 @@ def test_admits_equivalent_bf16_kv_settings(tmp_path, tp, target_kv, draft_kv):
         (GLM5, {"dtype": "float16"}, {}, "packed FP8 KV cache"),
         (V3, {}, {"draft_tensor_parallel_size": 1}, "draft tensor parallelism 1"),
         (V32, {}, {"draft_tensor_parallel_size": 1}, "draft tensor parallelism 1"),
-        (V3, {}, {"num_speculative_tokens": 4}, "4 speculative tokens with DCP"),
-        (V32, {}, {"num_speculative_tokens": 4}, "requires 1 to 3"),
-        (GLM5, {}, {"num_speculative_tokens": 5}, "requires 1 to 3"),
+        (V3, {}, {"num_speculative_tokens": 6}, "6 speculative tokens with DCP"),
+        (V32, {}, {"num_speculative_tokens": 6}, "requires 1 to 5"),
+        (GLM5, {}, {"num_speculative_tokens": 6}, "requires 1 to 5"),
         (
             V3,
             {"simulation_config": {"simulate_forward": True, "timing": "linear"}},

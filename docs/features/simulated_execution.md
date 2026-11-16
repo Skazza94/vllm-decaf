@@ -168,14 +168,18 @@ are outside this scope.
 
 With DCP greater than one, speculative decoding is limited to standalone
 CPU simulation of the native single-module MTP of DeepSeek-V3, DeepSeek-V3.2
-and GLM-5 at depth 1 to 3, interleave 1 and AISimulate vLLM 0.24.0 tables,
+and GLM-5 at depth 1 to 5, interleave 1 and AISimulate vLLM 0.24.0 tables,
 at the layouts AISimulate was qualified for: DeepSeek-V3 on H200 (published
 block-FP8 weights, BF16 model and KV, 16-token pages) at TP/DCP 2/2, 4/2, 4/4,
 8/2, 8/4 and 8/8; DeepSeek-V3.2 on H200 (published block-FP8 weights, packed
 `fp8_ds_mla` cache, 64-token pages) at TP8 with DCP 2 or 4; GLM-5 on B200
 (published NVFP4 weights, packed cache, 64-token pages, explicit `ag_rs` and
-Q replication off) at TP4 with DCP 2 or 4. The sparse models' pages are
-FlashMLA's and the indexer's 64 tokens. Larger interleaves are an
+Q replication off) at TP4 with DCP 2 or 4. DeepSeek-V3.2 at TP8 with DCP 8
+stays refused: AISimulate times it, but with the qualified FP8 FlashMLA path
+vLLM refuses it natively, since the backend requires the local (16) and the
+DCP-gathered (128) query heads to pad to the same decode kernel envelope (64
+against 128). The sparse models' pages are FlashMLA's and the indexer's 64
+tokens. Larger interleaves are an
 unqualified scope of the simulator (the sparse backend declares MTP support at
 them; the dense CPU MLA backend does not). The merge and Q replication follow
 the settings above.

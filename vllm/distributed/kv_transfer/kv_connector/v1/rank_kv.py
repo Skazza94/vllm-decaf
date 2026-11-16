@@ -217,7 +217,7 @@ MTP_DCP_MODELS = {
         "layouts": ((4, 2), (4, 4)),
     },
 }
-MTP_DCP_MAX_DEPTH = 3
+MTP_DCP_MAX_DEPTH = 5
 MTP_DCP_MODEL_PROBLEM = (
     "speculative decoding with DCP requires DeepSeek-V3, DeepSeek-V3.2 or GLM-5"
 )
