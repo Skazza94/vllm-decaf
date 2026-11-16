@@ -70,6 +70,221 @@ def qwen3_0_6b_dir(tmp_path_factory):
     return str(directory)
 
 
+# Qwen/Qwen3-235B-A22B at revision 8efa61729e24bd65b1d152b5ab5409052aa80e65.
+QWEN3_235B_A22B_CONFIG = {
+    "architectures": ["Qwen3MoeForCausalLM"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "bos_token_id": 151643,
+    "decoder_sparse_step": 1,
+    "eos_token_id": 151645,
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 4096,
+    "initializer_range": 0.02,
+    "intermediate_size": 12288,
+    "max_position_embeddings": 40960,
+    "max_window_layers": 94,
+    "mlp_only_layers": [],
+    "model_type": "qwen3_moe",
+    "moe_intermediate_size": 1536,
+    "norm_topk_prob": True,
+    "num_attention_heads": 64,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "num_hidden_layers": 94,
+    "num_key_value_heads": 4,
+    "output_router_logits": False,
+    "rms_norm_eps": 1e-06,
+    "rope_scaling": None,
+    "rope_theta": 1000000.0,
+    "router_aux_loss_coef": 0.001,
+    "sliding_window": None,
+    "tie_word_embeddings": False,
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.51.0",
+    "use_cache": True,
+    "use_sliding_window": False,
+    "vocab_size": 151936,
+}
+
+
+# allenai/Olmo-3-7B-Think at revision d97e442d7cc678210054dbcc9b440894d62c89a4.
+OLMO3_7B_THINK_CONFIG = {
+    "architectures": ["Olmo3ForCausalLM"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "eos_token_id": 100257,
+    "hidden_act": "silu",
+    "hidden_size": 4096,
+    "initializer_range": 0.02,
+    "intermediate_size": 11008,
+    "layer_types": [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+    ],
+    "max_position_embeddings": 65536,
+    "model_type": "olmo3",
+    "num_attention_heads": 32,
+    "num_hidden_layers": 32,
+    "num_key_value_heads": 32,
+    "pad_token_id": 100277,
+    "rms_norm_eps": 1e-06,
+    "rope_scaling": {
+        "attention_factor": 1.2079441541679836,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "factor": 8.0,
+        "original_max_position_embeddings": 8192,
+        "rope_type": "yarn",
+    },
+    "rope_theta": 500000,
+    "sliding_window": 4096,
+    "tie_word_embeddings": False,
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.57.0",
+    "use_cache": False,
+    "vocab_size": 100278,
+}
+
+
+# openai/gpt-oss-120b at revision b5c939de8f754692c1647ca79fbf85e8c1e70f8a.
+GPT_OSS_120B_CONFIG = {
+    "architectures": ["GptOssForCausalLM"],
+    "attention_bias": True,
+    "attention_dropout": 0.0,
+    "eos_token_id": 200002,
+    "experts_per_token": 4,
+    "head_dim": 64,
+    "hidden_act": "silu",
+    "hidden_size": 2880,
+    "initial_context_length": 4096,
+    "initializer_range": 0.02,
+    "intermediate_size": 2880,
+    "layer_types": [
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+    ],
+    "max_position_embeddings": 131072,
+    "model_type": "gpt_oss",
+    "num_attention_heads": 64,
+    "num_experts_per_tok": 4,
+    "num_hidden_layers": 36,
+    "num_key_value_heads": 8,
+    "num_local_experts": 128,
+    "output_router_logits": False,
+    "pad_token_id": 199999,
+    "quantization_config": {
+        "modules_to_not_convert": [
+            "model.layers.*.self_attn",
+            "model.layers.*.mlp.router",
+            "model.embed_tokens",
+            "lm_head",
+        ],
+        "quant_method": "mxfp4",
+    },
+    "rms_norm_eps": 1e-05,
+    "rope_scaling": {
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "factor": 32.0,
+        "original_max_position_embeddings": 4096,
+        "rope_type": "yarn",
+        "truncate": False,
+    },
+    "rope_theta": 150000,
+    "router_aux_loss_coef": 0.9,
+    "sliding_window": 128,
+    "swiglu_limit": 7.0,
+    "tie_word_embeddings": False,
+    "transformers_version": "4.55.0.dev0",
+    "use_cache": True,
+    "vocab_size": 201088,
+}
+
+SIMULATED_FORWARD_CONFIGS = {
+    "Qwen/Qwen3-235B-A22B": QWEN3_235B_A22B_CONFIG,
+    "allenai/Olmo-3-7B-Think": OLMO3_7B_THINK_CONFIG,
+    "openai/gpt-oss-120b": GPT_OSS_120B_CONFIG,
+}
+
+
+@pytest.fixture(scope="module")
+def simulated_forward_model_dir(tmp_path_factory):
+    def write(model: str) -> str:
+        directory = tmp_path_factory.mktemp(model.replace("/", "--"))
+        (directory / "config.json").write_text(
+            json.dumps(SIMULATED_FORWARD_CONFIGS[model])
+        )
+        return str(directory)
+
+    return write
+
+
 @pytest.mark.parametrize(
     "kwargs, error",
     [
@@ -113,12 +328,10 @@ def test_simulate_forward_quantized_checkpoint(
 ) -> None:
     """A quantized checkpoint is simulated as deployed: its layers take the
     checkpoint's quantization, and its KV cache the dtype it declares."""
-    from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
-
     # apply_model() ships a function to the workers.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
-    config = get_hf_file_to_dict("config.json", "Qwen/Qwen3-0.6B")
+    config = dict(QWEN3_0_6B_CONFIG)
     config["quantization_config"] = {
         "quant_method": "modelopt",
         "quant_algo": "FP8",
@@ -128,7 +341,7 @@ def test_simulate_forward_quantized_checkpoint(
 
     with vllm_runner(
         str(tmp_path),
-        tokenizer_name="Qwen/Qwen3-0.6B",
+        skip_tokenizer_init=True,
         simulate_forward=True,
         kv_cache_memory_bytes=1024**3,
         max_model_len=1024,
@@ -202,8 +415,10 @@ def test_simulate_forward_model_matrix(
     vllm_runner: type[VllmRunner],
     model: str,
     min_kv_cache_groups: int,
+    simulated_forward_model_dir,
 ) -> None:
-    _check_model_available(model)
+    local_model_dir = simulated_forward_model_dir(model)
+    _check_model_available(local_model_dir)
 
     # No max_tokens: generation must stop after the trace instead of padding
     # to max_model_len.
@@ -215,7 +430,8 @@ def test_simulate_forward_model_matrix(
     prompt = [1000, 1001, 1002, 1003]
 
     with vllm_runner(
-        model,
+        local_model_dir,
+        skip_tokenizer_init=True,
         simulate_forward=True,
         disable_hybrid_kv_cache_manager=False,
         kv_cache_memory_bytes=16 * 1024**3,
