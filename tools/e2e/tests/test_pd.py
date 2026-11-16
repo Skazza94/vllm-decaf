@@ -4370,3 +4370,107 @@ class DecodeContextParallelTests(unittest.TestCase):
         self.assertEqual(problems(1, 8, 1), [])
         bad = problems(1, 8, 0)
         self.assertTrue(any("holds 8 blocks from 0, not the rest of the cdiv(1060, 64 * DCP 2)" in p for p in bad), bad)
+
+
+class MtpStatePullTests(unittest.TestCase):
+    """A hybrid's MTP with prefix caching: the scheduler admits a pulled
+    state as its group's running slot, ``cdiv(computed + scheduled, block) - 1``,
+    though the pull named the slot of the table it saw; attention keeps its
+    places, and a pulled state group implies no decode hit."""
+
+    GROUPS = [{"kind": "MambaSpec", "block_size": 800, "speculative_blocks": 1, "layers": 16,
+               "block_bytes": 100, "transfer": {"bytes_per_block": 1600}},
+              {"kind": "FullAttentionSpec", "block_size": 800, "layers": 16, "block_bytes": 100,
+               "transfer": {"bytes_per_block": 1600}}]
+
+    @staticmethod
+    def admission(state_table, pull_state=(2, [7]), computed=1023, scheduled=1):
+        return {"r": [{"computed": computed, "scheduled": scheduled,
+                       "table": {0: state_table, 1: [4, 5]},
+                       "pull": {0: pull_state, 1: (0, [4, 5])}}]}
+
+    def problems(self, admissions):
+        return pd._hit_problems({"groups": self.GROUPS}, [], admissions)[0]
+
+    def test_the_pulled_state_admitted_as_the_running_slot(self):
+        self.assertEqual(self.problems(self.admission([0, 7, 9])), [])
+        self.assertEqual(pd._running_state_slot(self.GROUPS[0], {"computed": 1023, "scheduled": 1}), 1)
+        # A step crossing a block keeps the running state in the next block.
+        self.assertEqual(pd._running_state_slot(self.GROUPS[0], {"computed": 799, "scheduled": 2}), 1)
+        self.assertEqual(pd._running_state_slot(self.GROUPS[0], {"computed": 1599, "scheduled": 1}), 1)
+        self.assertIsNone(pd._running_state_slot(self.GROUPS[1], {"computed": 1023, "scheduled": 1}))
+
+    def test_another_block_or_the_scratch_slot_is_refused(self):
+        for table in ([0, 8, 9], [0, 9, 7], [7, 0, 9]):
+            bad = self.problems(self.admission(table))
+            self.assertTrue(any("is not its running slot 1" in p for p in bad), (table, bad))
+        bad = self.problems(self.admission([0, 7, 9], pull_state=(2, [7, 8])))
+        self.assertTrue(any("is not its running slot" in p for p in bad), bad)
+
+    def test_a_pulled_state_without_its_admission_step_fails(self):
+        # The pull's own place would pass (block 7 at 0), but its running slot
+        # with 799 + 2 tokens is 1 (block 9): without the step it is unknown.
+        for pull, table in (((0, [7]), [7, 9, 10]), ((2, [7]), [0, 7, 9])):
+            bad = self.problems(self.admission(table, pull_state=pull, computed=799, scheduled=None))
+            self.assertTrue(any("has no admission step" in p for p in bad), (pull, bad))
+        bad = self.problems(self.admission([7, 9, 10], pull_state=(0, [7]), computed=799, scheduled=2))
+        self.assertTrue(any("is not its running slot 1" in p for p in bad), bad)
+
+    @staticmethod
+    def records(admissions, delay=0.0):
+        """A decode step log: each admission's step (logged first) and then
+        its events, naming that step (``step_index``); scheduled at
+        ``t_scheduled``, the step's modeled start ``delay`` later (a step
+        queued behind the device)."""
+        out = [{"kv_layout": {"groups": MtpStatePullTests.GROUPS}}]
+        for index, (computed, scheduled, table) in enumerate(admissions):
+            scheduled_at = 100.0 + index
+            out.append({"step": {"step_index": index, "requests": [
+                {"req_id": "r", "num_computed_tokens": computed, "num_scheduled_tokens": scheduled,
+                 "num_prompt_tokens": 1024}]}, "t_start": scheduled_at + delay})
+            out.append({"t_scheduled": scheduled_at, "step_index": index - 1, "kv_events": {
+                "reads_posted": ["r"],
+                "allocated_groups": {"r": [{"group": 0, "first": 2, "blocks": [7]},
+                                           {"group": 1, "first": 0, "blocks": [4, 5]}]}}})
+            out.append({"t_scheduled": scheduled_at, "step_index": index, "kv_events": {
+                "admitted": {"r": computed},
+                "allocated_groups": {"r": [{"group": 0, "first": 0, "blocks": table},
+                                           {"group": 1, "first": 0, "blocks": [4, 5]}]}}})
+        return out
+
+    def test_the_step_is_its_index_not_its_modeled_start(self):
+        # Scheduled at 100.0, modeled to start at 100.01: still its step.
+        good = pd._admissions(self.records([(799, 2, [0, 7, 9])], delay=0.01))
+        self.assertEqual(good["r"][0]["scheduled"], 2)
+        self.assertEqual(self.problems(good), [])
+        bad = self.problems(pd._admissions(self.records([(799, 2, [7, 9, 10])], delay=0.01)))
+        self.assertTrue(any("is not its running slot 1" in p for p in bad), bad)
+
+    def test_each_admission_takes_its_own_step(self):
+        # Two admissions at 799 computed, scheduled 1 then 2: slots 0 and 1.
+        good = pd._admissions(self.records([(799, 1, [7, 9]), (799, 2, [0, 7, 9])]))
+        self.assertEqual([a["scheduled"] for a in good["r"]], [1, 2])
+        self.assertEqual(self.problems(good), [])
+        # The second still in slot 0, as the first step's count would allow.
+        bad = self.problems(pd._admissions(self.records([(799, 1, [7, 9]), (799, 2, [7, 0, 9])])))
+        self.assertTrue(any("is not its running slot 1" in p for p in bad), bad)
+
+    def test_a_missing_or_ambiguous_step_is_none(self):
+        records = self.records([(1023, 1, [0, 7, 9])])
+        missing = [r for r in records if "step" not in r]
+        self.assertIsNone(pd._admissions(missing)["r"][0]["scheduled"])
+        twice = records + [dict(records[1])]
+        self.assertIsNone(pd._admissions(twice)["r"][0]["scheduled"])
+        unnamed = [{k: v for k, v in r.items() if k != "step_index"} for r in records]
+        self.assertIsNone(pd._admissions(unnamed)["r"][0]["scheduled"])
+        bad = self.problems(pd._admissions(unnamed))
+        self.assertTrue(any("has no admission step" in p for p in bad), bad)
+
+    def test_a_pulled_state_group_implies_no_decode_hit(self):
+        got = pd._hit_problems({"groups": self.GROUPS}, [{"req_id": "r", "kind": "hit", "ok": True,
+                                                          "groups": [{"group": 0, "logical_blocks": [1],
+                                                                      "block_ids": [7], "blocks": 1,
+                                                                      "bytes": 1600}],
+                                                          "blocks": 1, "bytes": 1600}],
+                               self.admission([0, 7, 9]))[0]
+        self.assertTrue(any("logged 1 prefix hit check(s), not the 0" in p for p in got), got)

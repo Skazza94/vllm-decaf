@@ -458,6 +458,7 @@ class TokenChains:
         backoff: int = 0,
         grain: int | None = None,
         state_groups: Sequence[int] = (),
+        endpoint_states: bool = False,
     ) -> None:
         self.block_sizes = list(block_sizes)
         """Each KV cache group's (allocation: block tables index by them)."""
@@ -471,6 +472,11 @@ class TokenChains:
         the same bytes on either side of a pair whether pulled, computed or
         hit; states keyed by their endpoint alone. None: by block."""
         self.state_groups = frozenset(state_groups)
+        self.endpoint_states = endpoint_states
+        """A hybrid's MTP with prefix caching: each state keyed by its endpoint
+        (`_state`), as with a grain, so a pulled state is the producer's at the
+        handoff whichever slot NIXL writes (the scheduler moves it to the
+        running slot when it admits the request)."""
         self.tokens: dict[str, list[int] | None] = {}
         self.prompt_lens: dict[str, int] = {}
         # Each request's full blocks' chained digests, by block size.
@@ -499,14 +505,15 @@ class TokenChains:
         self, req_id: str, group: int, logical: int, n: int
     ) -> "str | tuple[str | None, ...]":
         """The content of a group's logical block holding its first `n`
-        tokens. With a grain: a state's is its endpoint's (`_state`); an
-        attention block larger than the grain is its pieces' (`_pieces`)."""
+        tokens. With a grain or `endpoint_states`, a state's is its
+        endpoint's (`_state`); with a grain, an attention block larger than
+        the grain is its pieces' (`_pieces`)."""
         size = self.block_sizes[group]
-        if self.grain is not None:
-            if group in self.state_groups:
-                return self._state(req_id, logical * size + n)
-            if size != self.grain:
-                return self._pieces(req_id, size, logical, logical * size + n)
+        keyed = self.grain is not None or self.endpoint_states
+        if group in self.state_groups and keyed:
+            return self._state(req_id, logical * size + n, size)
+        if self.grain is not None and size != self.grain:
+            return self._pieces(req_id, size, logical, logical * size + n)
         return self._at(req_id, size, logical, n)
 
     def _pieces(
@@ -526,11 +533,11 @@ class TokenChains:
             for k in range(first, first + ratio)
         )
 
-    def _state(self, req_id: str, end: int) -> str:
+    def _state(self, req_id: str, end: int, size: int) -> str:
         """A state's content: its endpoint and every token before it, keyed
-        at the grain, whatever block holds it on either instance."""
-        grain = self.grain
-        assert grain is not None
+        at the grain (else at the group's block size), whatever block holds
+        it on either instance."""
+        grain = self.grain if self.grain is not None else size
         if end == 0:
             return f"{STATE_IDENTITY}empty"
         last = (end - 1) // grain
@@ -590,6 +597,10 @@ class TokenChains:
         """A block as the consumer pulls it: the producer's prompt content,
         which stops `backoff` tokens short of the consumer's prompt."""
         end = self.prompt_lens.get(req_id, 0) - self.backoff
+        if self.endpoint_states and group in self.state_groups:
+            # NIXL moves the producer's running state, the one at its handoff,
+            # into whichever slot the read names.
+            return self._state(req_id, end, self.block_sizes[group])
         return self._content(req_id, group, logical, end)
 
     def _content(self, req_id: str, group: int, logical: int, end: int) -> str:
@@ -1000,8 +1011,19 @@ class _ConsumerPages(_ContentPages):
         if self.chains is not None:
             # Where each group's pulled blocks start among the request's:
             # the blocks before them are its local prefix hit (or a window's
-            # clipped head, null).
-            self.pull_starts[req_id] = {g.group: g.first_logical_block for g in groups}
+            # clipped head, null). With endpoint-keyed states a state group
+            # the pull fills has none: the scheduler admits the pulled state
+            # as the running slot, which a slot index before the pull's may
+            # name (`endpoint_states`).
+            chains = self.chains
+            self.pull_starts[req_id] = {
+                g.group: 0
+                if chains.endpoint_states
+                and g.group in chains.state_groups
+                and any(b != NULL_BLOCK_ID for b in g.block_ids)
+                else g.first_logical_block
+                for g in groups
+            }
 
     def _admit_scheduled(self, scheduler_output: "SchedulerOutput") -> None:
         chains = self.chains
@@ -2093,11 +2115,14 @@ def _expected_bytes(
     selection has a layout, else `row_pattern` (head patterns for attention,
     the rank's for any other)."""
     r = s.rows[row]
+    # A state keyed by its endpoint takes no block index (either instance's
+    # would differ).
+    endpoint = r.state and isinstance(identity, str) and identity.startswith(
+        STATE_IDENTITY
+    )
     if r.state and getattr(s, "layout", None) is not None:
         base = identity if identity is not None else get_base_request_id(request_id)
-        # A state keyed by its endpoint takes no block index (either
-        # instance's would differ).
-        place = 0 if base.startswith(STATE_IDENTITY) else logical
+        place = 0 if endpoint else logical
         return sl.state_span_pattern(
             base, s.state_identity(group, r.region), place, s.layout, r.span
         )
@@ -2115,8 +2140,9 @@ def _expected_bytes(
             s.factor,
         )
     return row_pattern(
-        request_id, s.name(group, row), logical, r.view.shape[1], tp_rank,
-        identity, None if r.state else _group_heads(heads, group),
+        request_id, s.name(group, row), 0 if endpoint else logical,
+        r.view.shape[1], tp_rank, identity,
+        None if r.state else _group_heads(heads, group),
         (1, 1) if r.state else sub_blocks,
     )
 

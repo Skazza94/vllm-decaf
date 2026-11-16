@@ -483,12 +483,17 @@ class SimulationConfig:
             # latents and indexer keys and DeepSeek-V4's packed groups. With
             # speculative decoding a page is written once its tokens are known
             # and their KV computed (drafts only once accepted). A hybrid's
-            # speculative state blocks, which align mode relocates, are not
-            # validated with it.
-            if vllm_config.speculative_config is not None and model.is_hybrid:
+            # states are then keyed by their endpoint (`TokenChains`
+            # `endpoint_states`), over NIXL only.
+            if (
+                vllm_config.speculative_config is not None
+                and model.is_hybrid
+                and kv_transfer.kv_connector not in NIXL_CONNECTORS
+            ):
                 problems.append(
-                    "no speculative decoding with prefix caching for "
-                    "kv_pattern_fill and kv_pattern_check on a hybrid model"
+                    "speculative decoding with prefix caching for "
+                    "kv_pattern_fill and kv_pattern_check on a hybrid model "
+                    "over NIXL only"
                 )
         if sparse_mla or model.is_attention_free:
             problems.append(

@@ -3151,19 +3151,48 @@ def _admissions(records: list[dict]) -> dict[str, list[dict]]:
     before, that pull's (first place, blocks) by group."""
     admissions: dict[str, list[dict]] = {}
     posted: dict[str, dict[int, tuple[int, list[int]]]] = {}
+    # Each step's scheduled tokens by request, keyed by its index: an
+    # admission's events name their step (``step_index``).
+    by_index: dict[int, list[dict[str, int]]] = {}
+    for record in records:
+        if "step" in record:
+            by_index.setdefault(record["step"].get("step_index"), []).append(
+                {r["req_id"]: r["num_scheduled_tokens"] for r in record["step"].get("requests", [])})
     for record in records:
         events = record.get("kv_events") or {}
         by_group = events.get("allocated_groups") or {}
         for request in events.get("reads_posted") or []:
             posted[request] = {entry["group"]: (entry["first"], list(entry["blocks"]))
                                for entry in by_group.get(request, [])}
+        steps = by_index.get(record["step_index"], []) if "step_index" in record else []
         for request, computed in (events.get("admitted") or {}).items():
+            # The admission's own step: exactly one record of that index
+            # holding the request, else none (missing or ambiguous).
+            scheduled = [step[request] for step in steps if request in step]
             admissions.setdefault(request, []).append({
                 "computed": computed,
+                "scheduled": scheduled[0] if len(scheduled) == 1 else None,
                 "table": {entry["group"]: list(entry["blocks"]) for entry in by_group.get(request, [])
                           if entry["first"] == 0},
                 "pull": posted.pop(request, None)})
     return admissions
+
+
+def _speculative_state(spec: dict) -> bool:
+    """A state group with speculative blocks (a hybrid's MTP with prefix
+    caching), whose pulled state the scheduler moves when it admits it."""
+    return spec.get("kind") == "MambaSpec" and bool(spec.get("speculative_blocks"))
+
+
+def _running_state_slot(spec: dict, admission: dict) -> int | None:
+    """Such a group's running slot when a request is admitted: native align
+    mode keeps the running state at the last ``1 + k`` blocks' first,
+    ``cdiv(computed + scheduled, block_size) - 1``, which the scheduler moves
+    a pulled state to (the pull names its slot by the table it saw). None
+    for any other group, or without the admission's own step."""
+    if not _speculative_state(spec) or admission.get("scheduled") is None:
+        return None
+    return -(-(admission["computed"] + admission["scheduled"]) // spec["block_size"]) - 1
 
 
 def _hit_problems(layout: dict, hits: list[dict], admissions: dict[str, list[dict]]) -> tuple[list[str], list[dict]]:
@@ -3187,7 +3216,23 @@ def _hit_problems(layout: dict, hits: list[dict], admissions: dict[str, list[dic
     for request, adms in admissions.items():
         for admission in adms:
             pull, table = admission["pull"], admission["table"]
+            # A pulled state group's running slot (MTP's speculative blocks):
+            # its pulled block must be the one admitted there.
+            moved = {}
             for group, (first, blocks) in (pull or {}).items():
+                held = [block for block in blocks if block]
+                if not (0 <= group < len(groups) and _speculative_state(groups[group]) and held):
+                    continue
+                slot = moved[group] = _running_state_slot(groups[group], admission)
+                if slot is None:
+                    problems.append(f"{request}'s pull of state group {group} has no admission step (missing or "
+                                    "ambiguous) to place its running slot")
+                elif len(held) != 1 or table.get(group, [])[slot:slot + 1] != held:
+                    problems.append(f"{request}'s pull of state group {group} ({held}) is not its running "
+                                    f"slot {slot} when admitted ({table.get(group, [])})")
+            for group, (first, blocks) in (pull or {}).items():
+                if group in moved:
+                    continue
                 size = (groups[group]["block_size"] * scale) if 0 <= group < len(groups) else None
                 if table.get(group, [])[first:first + len(blocks)] != blocks:
                     problems.append(f"{request}'s pull of group {group} ({len(blocks)} block(s) from {first}) is "
@@ -3197,7 +3242,7 @@ def _hit_problems(layout: dict, hits: list[dict], admissions: dict[str, list[dic
                                     f"{admission['computed']} tokens it was admitted with")
             want = {}
             for group, spec in enumerate(groups):
-                count = (pull.get(group, (0, []))[0] if pull is not None
+                count = (0 if group in moved else pull.get(group, (0, []))[0] if pull is not None
                          else admission["computed"] // (spec["block_size"] * scale))
                 row = table.get(group, [])
                 places = [(place, row[place]) for place in range(min(count, len(row))) if row[place]]

@@ -833,15 +833,23 @@ class StepLogWriter:
             self._f.flush()
 
     def write_kv_events(
-        self, events: dict[str, object], t: float, t_scheduled: float
+        self,
+        events: dict[str, object],
+        t: float,
+        t_scheduled: float,
+        step_index: int | None = None,
     ) -> None:
         """Append a step's request lifecycle events (`scheduled_kv_events`,
         `ReadsInFlight.events`), leaving out empty ones. The scheduler's took
         effect by `t_scheduled`, the step's start; the connector's (reads
-        posted, transfers ended, notifications sent) by `t`, its end."""
+        posted, transfers ended, notifications sent) by `t`, its end.
+        `step_index`: the step record they belong to (None for a poll that
+        scheduled no tokens)."""
         events = {kind: ids for kind, ids in events.items() if ids}
         if events:
             rec = {"kv_events": events, "t_scheduled": t_scheduled, "t": t}
+            if step_index is not None:
+                rec["step_index"] = step_index
             self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
             self._f.flush()
 

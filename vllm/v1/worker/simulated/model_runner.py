@@ -158,6 +158,7 @@ class SimulatedModelRunner(GPUModelRunner):
         # sliding window), for those events.
         self._kv_allocations: GroupAllocations | None = None
         self._kv_events_scheduled_at = 0.0
+        self._kv_events_step: int | None = None
         # Real KV transfers in flight on this consumer: request -> its blocks.
         self._reads_in_flight = ReadsInFlight()
         self._logged_threads: set[int] = set()
@@ -346,6 +347,10 @@ class SimulatedModelRunner(GPUModelRunner):
                 backoff=prefill_backoff(layer_specs(groups)),
                 grain=sim.kv_pattern_grain,
                 state_groups=state_group_indices(groups),
+                endpoint_states=(
+                    self.model_config.is_hybrid
+                    and self.vllm_config.speculative_config is not None
+                ),
             )
             if self.cache_config.enable_prefix_caching
             else None
@@ -659,6 +664,12 @@ class SimulatedModelRunner(GPUModelRunner):
                 scheduler_output, self._kv_allocations
             )
             self._kv_events_scheduled_at = t_entry
+            # The step record this step's events belong to (a poll has none).
+            self._kv_events_step = (
+                self._step_index
+                if scheduler_output.total_num_scheduled_tokens
+                else None
+            )
 
         if not scheduler_output.total_num_scheduled_tokens:
             # Nothing to run; the engine core uses this output directly and
@@ -840,7 +851,10 @@ class SimulatedModelRunner(GPUModelRunner):
                 self._reads_in_flight.blocks[req_id] = allocated[req_id]
             events.update(self._reads_in_flight.events(kv_output))
             self.step_log.write_kv_events(
-                events, self.clock.now(), self._kv_events_scheduled_at
+                events,
+                self.clock.now(),
+                self._kv_events_scheduled_at,
+                self._kv_events_step,
             )
         if self._stall_dump_s is not None:
             faulthandler.cancel_dump_traceback_later()

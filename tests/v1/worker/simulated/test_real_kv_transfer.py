@@ -653,13 +653,13 @@ def test_real_mode_allows_prefix_caching(model_dir, mla_model_dir):
             assert config.simulation_config.kv_pattern_check
 
 
-def test_pattern_checks_with_prefix_caching_take_dsa_and_mtp_but_a_hybrids(
+def test_pattern_checks_with_prefix_caching_take_dsa_mtp_and_hybrid_mtp_over_nixl(
     tmp_path_factory, ds_conv_layout
 ):
     """A DSA layer's latent and indexer keys are its block's content like any
-    page; so are MTP's pages, written once accepted. A hybrid's speculative
-    state blocks are not validated with content patterns: refused with
-    checks, not without them."""
+    page; so are MTP's pages, written once accepted. A hybrid's MTP takes its
+    states keyed by their endpoint, over NIXL only: refused with checks over
+    another connector, not without them."""
     check = {"kv_pattern_check": True, "log_path": "/tmp/steps"}
     v32 = write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2-pc", DEEPSEEK_V32)
     for prefix_caching in (True, False):
@@ -700,10 +700,19 @@ def test_pattern_checks_with_prefix_caching_take_dsa_and_mtp_but_a_hybrids(
         "tiny-qwen3.5-mtp-pc",
         {**QWEN3_5_MOE, "text_config": {**text, "mtp_num_hidden_layers": 1}},
     )
-    with pytest.raises(ValueError, match="prefix caching .* on a hybrid model"):
+    config = engine_config(
+        qwen,
+        check,
+        speculative_config=mtp,
+        enable_prefix_caching=True,
+        language_model_only=True,
+    )
+    assert config.cache_config.enable_prefix_caching
+    with pytest.raises(ValueError, match="on a hybrid model over NIXL only"):
         engine_config(
             qwen,
             check,
+            {"kv_connector": "MooncakeConnector"},
             speculative_config=mtp,
             enable_prefix_caching=True,
             language_model_only=True,
@@ -3735,6 +3744,11 @@ def main():
     # Optional: more simulation fields, and (consumer) a byte of the last page
     # written at a step's completion flipped after the first request.
     corrupt = kwargs.pop("corrupt_completion_page", False)
+    # Optional (consumer): prompts served from decode's own cache (no remote
+    # handoff), and a state checkpoint (logical block) of the first request
+    # whose byte is flipped after it.
+    local = set(kwargs.pop("local_prompts", []))
+    corrupt_state = kwargs.pop("corrupt_state_block", None)
     simulation = {"simulate_forward": True,
                   "timing": "linear", "timing_args": {"fixed_us": 100},
                   "log_path": out + ".steps",
@@ -3772,12 +3786,28 @@ def main():
         outputs = []
         for prompt, params, max_tokens in zip(prompts, remote["params"],"""
     r""" json.loads(sys.argv[8])):
+            extra = {} if len(outputs) in local else {"kv_transfer_params": params}
             (output,) = llm.generate(
                 [{"prompt_token_ids": prompt}],
                 SamplingParams(max_tokens=max_tokens, ignore_eos=True, detokenize=False,
-                               extra_args={"kv_transfer_params": params}),
+                               extra_args=extra),
                 use_tqdm=False)
             outputs.append(list(output.outputs[0].token_ids))
+            if corrupt_state is not None and len(outputs) == 1:
+                engine = llm.llm_engine.engine_core.engine_core
+                worker = engine.model_executor.driver_worker.worker
+                checker = worker.model_runner._kv_checker
+                group = min(checker.chains.state_groups)
+                with open(out + ".steps") as f:
+                    writes = [json.loads(line)["""
+    r""""kv_write"] for line in f if '"kv_write"' in line]
+                block = [w for w in writes if w["group"] == group
+                         and w["logical_block"] == corrupt_state][-1]["block_id"]
+                s = checker.selection
+                row = next(r for r in s.rows
+                           if r.state and r.region in s.members[group])
+                row.view[block][0] ^= 0xFF
+                corrupted = block
             if corrupt and len(outputs) == 1:
                 with open(out + ".steps") as f:
                     writes = [json.loads(line)["""
@@ -3791,7 +3821,7 @@ def main():
                 corrupted = block
         with open(out, "w") as f:
             json.dump({"outputs": outputs,"""
-    r""" "corrupted": corrupted if corrupt else None}, f)
+    r""" "corrupted": corrupted if corrupt or corrupt_state is not None else None}, f)
     with open(out + ".steps") as f:
         lines = [json.loads(line) for line in f]
     with open(out + ".checks", "w") as f:
@@ -3803,6 +3833,147 @@ if __name__ == "__main__":
     main()
 """
 )
+
+
+@pytest.mark.parametrize(
+    "acceptance, corrupt", [(1.0, False), (0.0, False), (1.0, True)],
+    ids=["accepted", "rejected", "corrupt-state"],
+)
+def test_nixl_peers_check_a_hybrids_decode_written_state_hit_with_mtp(
+    tmp_path_factory, tmp_path, ds_conv_layout, acceptance, corrupt
+):
+    """#6 for a hybrid (tiny Qwen3.5, native MTP k 1, 16-token blocks): A
+    (40 tokens) is pulled, its state keyed by its endpoint whichever slot NIXL
+    writes, and decode generates 48 tokens, every state checkpoint kept
+    (retention None). B, A's prompt, its 48 generated tokens and 10 more, runs
+    on decode alone: its native hit (five matched blocks, the last dropped
+    for MTP) reaches the state at 64 tokens, one decode computed after A's
+    handoff, and compares equal with drafts accepted or rejected; with that
+    state's byte flipped after A, B's hit fails exactly there."""
+    import socket
+    import subprocess
+    import sys
+
+    def free_port():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    text = QWEN3_5_MOE["text_config"]
+    model = write_model_dir(
+        tmp_path_factory,
+        "tiny-qwen3.5-mtp-prefix",
+        {**QWEN3_5_MOE, "text_config": {**text, "mtp_num_hidden_layers": 1}},
+    )
+    a = [(7 * i) % 120 + 1 for i in range(40)]
+    b = a + [0] * 48 + [3] * 10
+    prompts, max_tokens = json.dumps([a, b]), json.dumps([48, 2])
+    spec = {
+        "speculative_config": {"method": "mtp", "num_speculative_tokens": 1},
+        "simulation": {"spec_acceptance_rates": [acceptance]},
+        "language_model_only": True,
+        "prefix_cache_retention_interval": None,
+    }
+    consumer_kwargs = {
+        **spec,
+        "local_prompts": [1],
+        **({"corrupt_state_block": 3} if corrupt else {}),
+    }
+    script = tmp_path / "peer.py"
+    script.write_text(NIXL_PREFIX_PEER)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+    }
+    produced, consumed = tmp_path / "producer.json", tmp_path / "consumer.json"
+    producer = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            "producer",
+            model,
+            json.dumps(spec),
+            str(produced),
+            str(64 * 1024**2),
+            json.dumps([a]),
+        ],
+        env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+    )
+    try:
+        deadline = time.monotonic() + 600
+        while not produced.exists():
+            assert producer.poll() is None, "the producer exited"
+            assert time.monotonic() < deadline, "no producer output"
+            time.sleep(0.5)
+        handoffs = json.loads(produced.read_text())
+        # B has no handoff: decode serves it from its own cache.
+        remote = tmp_path / "remote.json"
+        remote.write_text(json.dumps({"params": handoffs["params"] + [None]}))
+        consumer = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "consumer",
+                model,
+                json.dumps(consumer_kwargs),
+                str(consumed),
+                str(64 * 1024**2),
+                prompts,
+                str(remote),
+                max_tokens,
+            ],
+            env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+            timeout=600,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert consumer.returncode == 0, consumer.stdout[-4000:]
+    finally:
+        (tmp_path / "producer.json.done").touch()
+        try:
+            producer.wait(timeout=60)
+        finally:
+            producer.kill()
+    result = json.loads(consumed.read_text())
+    assert result["outputs"][0] == [0] * 48
+    steps = [json.loads(line) for line in (tmp_path / "consumer.json.steps").open()]
+    (layout,) = [r["kv_layout"] for r in steps if "kv_layout" in r][:1]
+    states = {
+        i for i, g in enumerate(layout["groups"]) if g["kind"] == "MambaSpec"
+    }
+    assert states
+    assert all(layout["groups"][g]["speculative_blocks"] == 1 for g in states)
+    drafts = [r["spec_acceptance"] for r in steps if "spec_acceptance" in r]
+    assert drafts, "no draft verified"
+    # Each admission's events name the step record that scheduled it.
+    scheduled = {
+        r["step"]["step_index"]: {q["req_id"] for q in r["step"]["requests"]}
+        for r in steps
+        if "step" in r
+    }
+    admitted = [r for r in steps if (r.get("kv_events") or {}).get("admitted")]
+    assert len(admitted) == 2
+    for record in admitted:
+        assert set(record["kv_events"]["admitted"]) <= scheduled[record["step_index"]]
+    c_checks = json.loads((tmp_path / "consumer.json.checks").read_text())
+    pulls = [c for c in c_checks if "kind" not in c]
+    assert len(pulls) == 1 and pulls[0]["ok"], pulls
+    (hit,) = [c for c in c_checks if c.get("kind") == "hit"]
+    by_group = {g["group"]: g for g in hit["groups"]}
+    # The hit reaches the state at 64 tokens (logical block 3), past A's
+    # handoff (39 tokens): a state decode computed and wrote.
+    for group in states:
+        assert by_group[group]["logical_blocks"][-1] == 3, hit
+    if corrupt:
+        assert not hit["ok"], hit
+        assert {m[2] for m in hit["mismatched_blocks"]} == {result["corrupted"]}
+    else:
+        assert all(c["ok"] for c in c_checks), c_checks
 
 
 def test_nixl_peers_check_prefix_hits_and_pages_completed_by_generation(

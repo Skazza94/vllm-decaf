@@ -606,15 +606,18 @@ the block's end, as prefix caching keys a full block. Prefix hits are then
 compared too, read-only, on both instances (`kind` hit, apart from the
 transferred blocks). Such a run takes token prompts only (no LoRA adapter,
 `cache_salt`, prompt embeddings or multimodal inputs), and speculative
-decoding only for a model without recurrent states (MTP of DeepSeek-V3,
-DeepSeek-V3.2, GLM-5 or DeepSeek-V4): decode writes a block's content once
-its tokens are known and their KV computed, a draft's only once accepted,
-at the end of the step that accepted it (each such write a `kv_write`
-record, apart from the checks). A hybrid's speculative state blocks, which
-vLLM relocates with prefix caching, are not checked (its MTP with prefix
-caching runs without byte checks). A hybrid's state is its block's content
-too: the tokens it has absorbed, which stop one short of the prompt on a
-prefill instance (decode expects that). A hit ending inside a block is
+decoding: decode writes a block's content once its tokens are known and
+their KV computed, a draft's only once accepted, at the end of the step
+that accepted it (each such write a `kv_write` record, apart from the
+checks). A hybrid's state is its block's content too: the tokens it has
+absorbed, which stop one short of the prompt on a prefill instance (decode
+expects that). With a hybrid's MTP (over NIXL only) each state is keyed by
+its endpoint alone, so a pulled state is the producer's at the handoff
+whichever slot the read names: vLLM's scheduler moves it to the running
+slot when it admits the request, and relocates speculative state blocks as
+drafts are accepted or rejected. A state group the pull fills has no hit
+of decode's own. MTP drops the last matched block of a prefix hit, so a
+shared prefix reaches a hit only past its first block. A hit ending inside a block is
 reported as outside the checks. Decode reuses a cached prefix of its own
 only where its pulls left one: not a sliding window's (the connector moves
 a window's last blocks only: DeepSeek-V4, Gemma4), and for a hybrid its
