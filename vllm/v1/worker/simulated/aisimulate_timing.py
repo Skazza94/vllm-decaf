@@ -45,10 +45,14 @@ GPU_SYSTEMS = {
     "h200": "h200_sxm",
     "b200": "b200_sxm",
 }
-# Tensor-parallel sizes of one modeled NVLink domain, and its GPUs: the
-# data-parallel ranks times each one's tensor-parallel size.
+# Tensor-parallel sizes of one modeled NVLink domain, and the modeled GPUs (the
+# data-parallel ranks times each one's tensor-parallel size): up to one 8-GPU
+# node, or exactly two. AISimulate takes no node count: its systems' nodes hold
+# 8 GPUs, a collective of more GPUs is priced between nodes, and an expert
+# group of ranks times tensor-parallel size GPUs spans ceil(that / 8) nodes.
 TENSOR_PARALLEL_SIZES = (1, 2, 4, 8)
-MAX_LOCAL_GPUS = 8
+NODE_GPUS = 8
+TWO_NODE_GPUS = 2 * NODE_GPUS
 # Published GQA models timed under DCP (both at TP8/DCP2: their four KV heads
 # allow no other layout at TP up to 8) and the KV interleaves qualified.
 GQA_DCP_TARGETS = ("Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B")
@@ -62,6 +66,12 @@ MTP_DCP_PROFILES = {
     "nvidia/GLM-5-NVFP4": ("b200_sxm", "nvfp4"),
 }
 MTP_DCP_TABLE_VERSION = "0.24.0"
+NODES_APPROXIMATION = (
+    "AISimulate prices a collective of more than one 8-GPU node's GPUs at its "
+    "system's inter-node bandwidth and counts nodes as ceil(GPUs / 8); it takes "
+    "no placement of ranks on nodes, and the simulator's workers all run on one "
+    "host"
+)
 GQA_DCP_PREFIX_APPROXIMATION = (
     "AISimulate models cached-context prefill with a KV gather; native "
     "FlashAttention gathers Q and merges partial cached attention outputs"
@@ -529,7 +539,8 @@ class AisimulateTimingProvider:
 
     Supported: tensor parallelism within one node (TP 1, 2, 4 or 8), or
     an MoE model's local data-parallel attention with expert parallelism
-    (each rank tensor-parallel or not, up to 8 GPUs); decode context
+    (each rank tensor-parallel or not, up to 8 modeled GPUs or exactly 16, in
+    AISimulate's 8-GPU nodes); decode context
     parallelism of dense MLA, qualified sparse MLA or qualified GQA
     inside its tensor-parallel group without data parallelism, with
     vLLM's default merge (`ag_rs`, no Q
@@ -840,6 +851,7 @@ class AisimulateTimingProvider:
             "expert_dtype": expert_dtype,
             "startup_probes": probes,
             "decode_context_parallel": dcp,
+            "topology": self._topology_record(topology),
             "speculation": speculation,
             "kv_cache_mode_note": (
                 "an FP16 KV cache is timed as BF16 (two bytes; an approximation)"
@@ -858,6 +870,11 @@ class AisimulateTimingProvider:
             + ([V4_APPROXIMATION] if v4 else [])
             + ([MLA_PREFIX_APPROXIMATION] if plain_mla else [])
             + ([GQA_DCP_PREFIX_APPROXIMATION] if gqa_dcp else [])
+            + (
+                [NODES_APPROXIMATION]
+                if topology["tp"] * topology["attention_dp"] > NODE_GPUS
+                else []
+            )
             + (MTP_APPROXIMATIONS if nextn else [])
             + (
                 [HYBRID_MTP_APPROXIMATION]
@@ -1128,6 +1145,21 @@ class AisimulateTimingProvider:
         return record
 
     @staticmethod
+    def _topology_record(topology: dict[str, Any]) -> dict[str, Any]:
+        """The modeled GPUs and the groups AISimulate prices: the attention
+        group is a rank's tensor-parallel GPUs, the expert group all the
+        GPUs an MoE layer's experts span."""
+        modeled = topology["tp"] * topology["attention_dp"]
+        moe = topology["moe_tp_size"]
+        return {
+            "modeled_gpus": modeled,
+            "node_gpus": NODE_GPUS,
+            "nodes": -(-modeled // NODE_GPUS),
+            "attention_group": topology["tp"],
+            "expert_group": None if moe is None else moe * topology["moe_ep_size"],
+        }
+
+    @staticmethod
     def _topology(vllm_config: "VllmConfig") -> dict[str, Any]:
         """The parallel layout, refused outside the supported scope."""
         pc = vllm_config.parallel_config
@@ -1158,10 +1190,11 @@ class AisimulateTimingProvider:
             )
 
             local = host_dp_ranks(pc)[1]
-            if local != dp or tp * dp > MAX_LOCAL_GPUS:
+            if local != dp or (tp * dp > NODE_GPUS and tp * dp != TWO_NODE_GPUS):
                 problems.append(
                     f"{dp} data-parallel ranks of tensor parallelism {tp} "
-                    f"({local} local; up to {MAX_LOCAL_GPUS} GPUs, all local)"
+                    f"({local} local; {tp * dp} modeled GPUs, up to {NODE_GPUS} or "
+                    f"{TWO_NODE_GPUS}, all local)"
                 )
         elif ep:
             problems.append("expert parallelism without data parallelism")

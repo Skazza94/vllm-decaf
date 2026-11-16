@@ -462,12 +462,13 @@ def test_an_unmapped_kv_cache_dtype_is_refused(fake_aisimulate):
         ({"data_parallel_size": 2}, "without an MoE model's expert parallelism"),
         (
             {
-                "data_parallel_size": 4,
+                "data_parallel_size": 6,
                 "enable_expert_parallel": True,
                 "tensor_parallel_size": 4,
             },
-            "4 data-parallel ranks of tensor parallelism 4 .*up to 8 GPUs",
+            "6 data-parallel ranks of tensor parallelism 4 .*24 modeled GPUs",
         ),
+        ({"tensor_parallel_size": 32}, "tensor parallelism 32"),
         (
             {
                 "data_parallel_size": 4,
@@ -476,7 +477,10 @@ def test_an_unmapped_kv_cache_dtype_is_refused(fake_aisimulate):
             },
             "2 local",
         ),
-        ({"data_parallel_size": 16, "enable_expert_parallel": True}, "up to 8"),
+        (
+            {"data_parallel_size": 32, "enable_expert_parallel": True},
+            "32 modeled GPUs, up to 8 or 16",
+        ),
     ],
 )
 def test_unsupported_layouts_are_refused(fake_aisimulate, parallel, problem):
@@ -598,10 +602,314 @@ def test_tensor_parallelism_inside_dp_spreads_the_experts_over_every_gpu(
     ) == (tp, dp, 1, tp * dp)
 
 
+# Modeled GPUs (tensor parallelism times data-parallel ranks): every total
+# the provider already timed up to one node (also 3, 5, 6 and 7), and
+# exactly two nodes.
+@pytest.mark.parametrize(
+    "tp, dp",
+    [
+        (1, 3),
+        (1, 5),
+        (1, 6),
+        (1, 7),
+        (2, 3),
+        (1, 8),
+        (8, 1),
+        (1, 16),
+        (2, 8),
+        (4, 4),
+        (8, 2),
+    ],
+)
+def test_modeled_gpus_up_to_a_node_or_exactly_two_nodes_are_admitted(
+    fake_aisimulate, tp, dp
+):
+    provider(
+        engine_config(
+            tensor_parallel_size=tp,
+            data_parallel_size=dp,
+            enable_expert_parallel=dp > 1,
+        )
+    )
+    config = fake_aisimulate.instances[0].config.kwargs
+    assert (config["tp"], config["attention_dp"]) == (tp, dp)
+    assert config["moe_ep_size"] == (tp * dp if dp > 1 else 1)
+
+
+@pytest.mark.parametrize(
+    "tp, dp", [(1, 9), (2, 5), (4, 3), (2, 7), (1, 15), (1, 17), (2, 9), (4, 5), (8, 3)]
+)
+def test_modeled_gpus_between_and_above_one_and_two_nodes_are_refused(
+    fake_aisimulate, tp, dp
+):
+    with pytest.raises(ValueError, match=f"{tp * dp} modeled GPUs"):
+        provider(
+            engine_config(
+                tensor_parallel_size=tp,
+                data_parallel_size=dp,
+                enable_expert_parallel=True,
+            )
+        )
+
+
+@pytest.mark.parametrize("tp, dp", [(16, 1), (16, 2), (2, 16), (32, 1)])
+def test_tensor_parallelism_above_a_node_stays_refused(fake_aisimulate, tp, dp):
+    """Sixteen modeled GPUs are TP up to 8 times DP: a TP group of 16 is not
+    timed (the CPU simulation's tensor-parallel groups stop at 8 ranks), and
+    neither are more GPUs than two nodes."""
+    with pytest.raises(ValueError, match="tensor parallelism|modeled GPUs"):
+        provider(
+            engine_config(
+                tensor_parallel_size=tp,
+                data_parallel_size=dp,
+                enable_expert_parallel=dp > 1,
+            )
+        )
+    assert not fake_aisimulate.instances
+
+
+def test_the_topology_record_names_the_groups_and_the_nodes(fake_aisimulate):
+    """TP8 x DP2: attention groups of eight, one expert group of sixteen GPUs
+    across two of AISimulate's 8-GPU nodes."""
+    nodes = "ceil\\(GPUs / 8\\)"
+
+    def record(**kwargs):
+        return provider(engine_config(**kwargs)).assumptions()["aisimulate"]
+
+    two = record(
+        tensor_parallel_size=8, data_parallel_size=2, enable_expert_parallel=True
+    )
+    assert two["topology"] == {
+        "modeled_gpus": 16,
+        "node_gpus": 8,
+        "nodes": 2,
+        "attention_group": 8,
+        "expert_group": 16,
+    }
+    assert any(re.search(nodes, note) for note in two["approximations"])
+    one = record(tensor_parallel_size=8)
+    assert one["topology"] == {
+        "modeled_gpus": 8,
+        "node_gpus": 8,
+        "nodes": 1,
+        "attention_group": 8,
+        "expert_group": 8,
+    }
+    assert not any(re.search(nodes, note) for note in one["approximations"])
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize("gpu", ["a100", "h100", "h200", "b200"])
+def test_the_gpu_systems_have_the_eight_gpu_nodes_the_provider_counts(gpu):
+    """AISimulate takes no node count: its systems' node width is what the
+    provider's node count assumes."""
+    from aisimulate_core.sdk.perf_database import get_database
+
+    from vllm.v1.worker.simulated.aisimulate_timing import GPU_SYSTEMS, NODE_GPUS
+
+    node = get_database(GPU_SYSTEMS[gpu], "vllm", "current").system_spec["node"]
+    assert node["num_gpus_per_node"] == NODE_GPUS
+    assert 0 < node["inter_node_bw"] < node["intra_node_bw"]
+
+
+def sdk_reference(model, system, tp, dp, worker, **modes):
+    """A direct SDK model of a data-parallel MoE layout, from explicit
+    values: attention on each rank's `tp` GPUs, the experts over all of them."""
+    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+
+    return RustForwardPassPerfModel.best_available(
+        ForwardPassPerfModelConfig(
+            model=model,
+            system=system,
+            backend="vllm",
+            worker_type=worker,
+            backend_version=None,
+            tp=tp,
+            pp=1,
+            attention_dp=dp,
+            dcp=None,
+            cp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=tp * dp,
+            enable_eplb=False,
+            nextn=0,
+            comm_quant_mode="half",
+            estimation_mode="op_level",
+            database_mode="SILICON",
+            fallback_policy="deny",
+            **modes,
+        )
+    )
+
+
+def rank_lists(step, dp):
+    from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
+
+    return [
+        rank_metrics([r for r in step.requests if r.dp_rank == rank])
+        for rank in range(dp)
+    ]
+
+
+BF16 = dict(
+    gemm_quant_mode="bfloat16",
+    moe_quant_mode="bfloat16",
+    fmha_quant_mode="bfloat16",
+    kvcache_quant_mode="bfloat16",
+)
+FP8_BLOCK = {**BF16, "gemm_quant_mode": "fp8_block", "moe_quant_mode": "fp8_block"}
+
+
 @pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
 @pytest.mark.parametrize(
-    "target", ["Qwen/Qwen3-30B-A3B", "deepseek-ai/DeepSeek-V3"]
+    "target, modes, tp, dp",
+    [
+        ("Qwen/Qwen3-30B-A3B", BF16, 8, 2),
+        ("deepseek-ai/DeepSeek-V3", FP8_BLOCK, 8, 2),
+        ("deepseek-ai/DeepSeek-V3", FP8_BLOCK, 4, 4),
+        ("Qwen/Qwen3-30B-A3B", BF16, 1, 16),
+    ],
 )
+def test_the_real_package_times_two_nodes_as_its_own_estimate(target, modes, tp, dp):
+    """Sixteen modeled GPUs are the pinned estimator's own layout for them
+    (collectives past eight GPUs priced between nodes): the provider's steps,
+    ranks idle included, equal direct SDK calls of an expected configuration."""
+    local = bundled_config(target)
+    layout = {
+        "tensor_parallel_size": tp,
+        "data_parallel_size": dp,
+        "enable_expert_parallel": True,
+    }
+    p = provider(
+        engine_config(target, local, **layout), gpu="h200", target_model=target
+    )
+    record = p.assumptions()["aisimulate"]
+    assert (record["source"], record["readiness"]) == ("aic", "ready")
+    assert record["resolved_config"]["estimation_mode"] == "op_level"
+    assert record["topology"]["modeled_gpus"] == 16
+    assert record["topology"]["nodes"] == 2
+    direct = sdk_reference(target, "h200_sxm", tp, dp, "aggregated", **modes)
+    steps = [
+        sim_step(0, on_rank(sim_req("p", 1024, 0, 1024), 0)),  # the rest idle
+        sim_step(
+            1,
+            on_rank(sim_req("d", 1, 4000, 3000), dp - 1),
+            on_rank(sim_req("c", 257, 2049, 4096), 0),
+        ),  # the first and the last busy
+    ]
+    for step in steps:
+        expected = direct.estimate_forward_pass_time_ms(rank_lists(step, dp))
+        assert p.estimate(step).device_s * 1000 == pytest.approx(expected, rel=1e-9)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize(
+    "tp, dp, role, worker",
+    [(8, 2, "kv_producer", "prefill"), (4, 2, "kv_consumer", "decode")],
+)
+def test_kimi_k3_prefill_and_decode_data_parallel_layouts_match_the_sdk(
+    tmp_path, monkeypatch, tp, dp, role, worker
+):
+    """Prefill TP8 x DP2 (sixteen GPUs, two nodes) and decode TP4 x DP2 (one
+    node): the worker type follows the role, and every DP workload list the
+    startup captured, idle ranks included, is what a direct SDK call of the
+    expected layout gets; so are busy/busy and busy/idle steps."""
+    monkeypatch.setenv("VLLM_SSM_CONV_STATE_LAYOUT", "DS")
+    target = "moonshotai/Kimi-K3"
+    raw = bundled_config(target)
+    text = {k: v for k, v in raw["text_config"].items() if k != "quantization_config"}
+    config = real_engine_config(
+        tmp_path,
+        "kimi-k3",
+        {**raw, "text_config": text},
+        derived=True,
+        language_model_only=True,
+        tensor_parallel_size=tp,
+        data_parallel_size=dp,
+        enable_expert_parallel=True,
+        kv_cache_memory_bytes=1 << 28,
+        kv_transfer_config={"kv_connector": "NixlConnector", "kv_role": role},
+    )
+    p = provider(config, gpu="b200", target_model=target)
+    record = p.assumptions()["aisimulate"]
+    assert record["config"]["worker_type"] == worker
+    assert record["resolved_config"]["worker_type"] == worker
+    assert (record["config"]["tp"], record["config"]["attention_dp"]) == (tp, dp)
+    assert (record["config"]["moe_tp_size"], record["config"]["moe_ep_size"]) == (
+        1,
+        tp * dp,
+    )
+    assert record["topology"] == {
+        "modeled_gpus": tp * dp,
+        "node_gpus": 8,
+        "nodes": 2 if tp * dp > 8 else 1,
+        "attention_group": tp,
+        "expert_group": tp * dp,
+    }
+    # The published checkpoint's precision, as the provider infers it.
+    direct = sdk_reference(
+        target,
+        "b200_sxm",
+        tp,
+        dp,
+        worker,
+        gemm_quant_mode="bfloat16",
+        moe_quant_mode="w4a16_mxfp4",
+        fmha_quant_mode="bfloat16",
+        kvcache_quant_mode="bfloat16",
+    )
+    for probe in record["startup_probes"]:
+        assert len(probe["metrics"]) == dp
+        idle = probe["metrics"][1:]
+        assert all(m["scheduled_requests"]["extend_lengths"] == [] for m in idle)
+        assert probe["ms"] == pytest.approx(
+            direct.estimate_forward_pass_time_ms(probe["metrics"]), rel=1e-9
+        )
+    for step in (
+        sim_step(0, on_rank(sim_req("p", 1024, 0, 1024), 0)),  # busy and idle
+        sim_step(
+            1,
+            on_rank(sim_req("p", 1024, 0, 1024), 0),
+            on_rank(sim_req("d", 1, 4000, 3000), dp - 1),
+        ),  # busy and busy
+    ):
+        assert p.estimate(step).device_s * 1000 == pytest.approx(
+            direct.estimate_forward_pass_time_ms(rank_lists(step, dp)), rel=1e-9
+        )
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize(
+    "target", ["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-V3.2"]
+)
+def test_mla_decode_context_parallelism_at_tp16_is_refused(tmp_path, target):
+    kwargs = dict(tensor_parallel_size=16, decode_context_parallel_size=2)
+    if target.endswith("V3.2"):
+        config = sparse_dcp_config(tmp_path, target, 16, 2)
+    else:
+        raw = bundled_config(target)
+        raw.pop("quantization_config")
+        config = real_engine_config(
+            tmp_path, target.replace("/", "--"), raw, derived=True, **kwargs
+        )
+    with pytest.raises(ValueError, match="tensor parallelism 16"):
+        provider(config, gpu="h200", target_model=target)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
+@pytest.mark.parametrize("tp, dcp", [(16, 2), (16, 4), (32, 2)])
+def test_gqa_decode_context_parallelism_above_tp8_is_refused(tmp_path, tp, dcp):
+    """Natively valid for the model, outside the timed tensor-parallel sizes."""
+    target = "Qwen/Qwen3-30B-A3B"
+    config = _gqa_dcp_config(tmp_path, target=target, tp=tp, dcp=dcp)
+    with pytest.raises(ValueError, match=f"tensor parallelism {tp}"):
+        provider(config, gpu="h200", target_model=target)
+
+
+@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.parametrize("target", ["Qwen/Qwen3-30B-A3B", "deepseek-ai/DeepSeek-V3"])
 def test_the_real_package_times_tensor_parallelism_inside_dp(target):
     """The provider's joint step of a TP-inside-DP server is the pinned
     estimator's own for that layout, and not the one of DP ranks of one GPU."""
