@@ -651,8 +651,8 @@ def test_retained_tokens_extend_the_window_edge():
 @pytest.mark.parametrize("tp", TPS)
 @pytest.mark.parametrize("depth", DEPTHS)
 def test_the_provider_is_the_direct_sdk_for_each_pricing_input(tp, depth, worker):
-    pytest.importorskip("aisimulate_core")
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    pytest.importorskip("aisim_core")
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import (
         AisimulateTimingProvider,
@@ -666,6 +666,7 @@ def test_the_provider_is_the_direct_sdk_for_each_pricing_input(tp, depth, worker
     resolved = record["resolved_config"]
     assert (resolved["tp"], resolved["nextn"]) == (tp, depth or 0)
     assert resolved["worker_type"] == worker
+    assert resolved["backend_version"] == "0.30.0"
     assert resolved["estimation_mode"] == "op_level"
     assert resolved["database_mode"] == "SILICON"
     assert resolved["fallback_policy"] == "deny"
@@ -674,7 +675,7 @@ def test_the_provider_is_the_direct_sdk_for_each_pricing_input(tp, depth, worker
             model=V4,
             system="b200_sxm",
             backend="vllm",
-            backend_version="0.24.0",
+            backend_version="0.30.0",
             worker_type=worker,
             tp=tp,
             pp=1,

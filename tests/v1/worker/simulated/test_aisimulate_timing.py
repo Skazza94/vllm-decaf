@@ -20,7 +20,7 @@ from tests.v1.worker.simulated.utils import sim_req, sim_step
 from vllm.platforms import current_platform
 from vllm.v1.worker.simulated.timing import get_timing_provider
 
-REAL = importlib.util.find_spec("aisimulate_core") is not None
+REAL = importlib.util.find_spec("aisim_core") is not None
 
 QWEN3_MOE = {
     "architectures": ["Qwen3MoeForCausalLM"],
@@ -178,33 +178,33 @@ def infer_quant_modes(raw):
 @pytest.fixture
 def fake_aisimulate(tmp_path, monkeypatch):
     """A stand-in AISimulate package with the bundled configs above."""
-    configs = tmp_path / "aisimulate_core" / "model_configs"
+    configs = tmp_path / "aisim_core" / "model_configs"
     configs.mkdir(parents=True)
     for name, config in BUNDLED.items():
         (configs / f"{name.replace('/', '--')}_config.json").write_text(
             json.dumps(config)
         )
-    core = types.ModuleType("aisimulate_core")
-    core.__file__ = str(tmp_path / "aisimulate_core" / "__init__.py")
-    sdk = types.ModuleType("aisimulate_core.sdk")
+    core = types.ModuleType("aisim_core")
+    core.__file__ = str(tmp_path / "aisim_core" / "__init__.py")
+    sdk = types.ModuleType("aisim_core.sdk")
     sdk.ForwardPassPerfModelConfig = FakeConfig
     sdk.RustForwardPassPerfModel = FakeModel
-    utils = types.ModuleType("aisimulate_core.sdk.utils")
+    utils = types.ModuleType("aisim_core.sdk.utils")
     utils._infer_quantization_fields = infer_quantization
     utils._load_model_config_from_model_path = load_full_config(str(configs))
-    models = types.ModuleType("aisimulate_core.sdk.models")
-    helpers = types.ModuleType("aisimulate_core.sdk.models.helpers")
+    models = types.ModuleType("aisim_core.sdk.models")
+    helpers = types.ModuleType("aisim_core.sdk.models.helpers")
     helpers._infer_quant_modes_from_raw_config = infer_quant_modes
     # Every bundled config here is one the package lists as pre-downloaded.
-    common = types.ModuleType("aisimulate_core.sdk.common")
+    common = types.ModuleType("aisim_core.sdk.common")
     common.DefaultHFModels = set(BUNDLED)
     for name, module in (
-        ("aisimulate_core", core),
-        ("aisimulate_core.sdk", sdk),
-        ("aisimulate_core.sdk.utils", utils),
-        ("aisimulate_core.sdk.common", common),
-        ("aisimulate_core.sdk.models", models),
-        ("aisimulate_core.sdk.models.helpers", helpers),
+        ("aisim_core", core),
+        ("aisim_core.sdk", sdk),
+        ("aisim_core.sdk.utils", utils),
+        ("aisim_core.sdk.common", common),
+        ("aisim_core.sdk.models", models),
+        ("aisim_core.sdk.models.helpers", helpers),
     ):
         monkeypatch.setitem(sys.modules, name, module)
     for name, sidecar in SIDECARS.items():
@@ -334,7 +334,7 @@ def test_the_worker_type_follows_the_kv_role(fake_aisimulate, role, worker_type)
 
 def test_a_dense_target_maps_tensor_parallelism_only(fake_aisimulate, tmp_path):
     dense = {**QWEN3_MOE, "architectures": ["Qwen3ForCausalLM"]}
-    configs = tmp_path / "aisimulate_core" / "model_configs"
+    configs = tmp_path / "aisim_core" / "model_configs"
     (configs / "Qwen--Qwen3-8B-Test_config.json").write_text(json.dumps(dense))
     provider(engine_config("Qwen/Qwen3-8B-Test", dense, tensor_parallel_size=2))
     config = fake_aisimulate.instances[0].config.kwargs
@@ -395,7 +395,7 @@ def test_an_override_labels_a_modified_target(fake_aisimulate):
 def test_kv_or_state_geometry_must_match(fake_aisimulate, tmp_path):
     # (Defaults resolve through the real config classes: the real-config
     # test below.)
-    configs = tmp_path / "aisimulate_core" / "model_configs"
+    configs = tmp_path / "aisim_core" / "model_configs"
     with pytest.raises(ValueError, match="num_key_value_heads"):
         provider(
             engine_config("Qwen/Qwen3-30B-A3B", {**QWEN3_MOE, "num_key_value_heads": 8})
@@ -698,12 +698,12 @@ def test_the_topology_record_names_the_groups_and_the_nodes(fake_aisimulate):
     assert not any(re.search(nodes, note) for note in one["approximations"])
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize("gpu", ["a100", "h100", "h200", "b200"])
 def test_the_gpu_systems_have_the_eight_gpu_nodes_the_provider_counts(gpu):
     """AISimulate takes no node count: its systems' node width is what the
     provider's node count assumes."""
-    from aisimulate_core.sdk.perf_database import get_database
+    from aisim_core.sdk.perf_database import get_database
 
     from vllm.v1.worker.simulated.aisimulate_timing import GPU_SYSTEMS, NODE_GPUS
 
@@ -715,7 +715,7 @@ def test_the_gpu_systems_have_the_eight_gpu_nodes_the_provider_counts(gpu):
 def sdk_reference(model, system, tp, dp, worker, **modes):
     """A direct SDK model of a data-parallel MoE layout, from explicit
     values: attention on each rank's `tp` GPUs, the experts over all of them."""
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     return RustForwardPassPerfModel.best_available(
         ForwardPassPerfModelConfig(
@@ -760,7 +760,7 @@ BF16 = dict(
 FP8_BLOCK = {**BF16, "gemm_quant_mode": "fp8_block", "moe_quant_mode": "fp8_block"}
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize(
     "target, modes, tp, dp",
     [
@@ -802,7 +802,7 @@ def test_the_real_package_times_two_nodes_as_its_own_estimate(target, modes, tp,
         assert p.estimate(step).device_s * 1000 == pytest.approx(expected, rel=1e-9)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize(
     "tp, dp, role, worker",
     [(8, 2, "kv_producer", "prefill"), (4, 2, "kv_consumer", "decode")],
@@ -878,7 +878,7 @@ def test_kimi_k3_prefill_and_decode_data_parallel_layouts_match_the_sdk(
         )
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize(
     "target", ["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-V3.2"]
@@ -897,7 +897,7 @@ def test_mla_decode_context_parallelism_at_tp16_is_refused(tmp_path, target):
         provider(config, gpu="h200", target_model=target)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize("tp, dcp", [(16, 2), (16, 4), (32, 2)])
 def test_gqa_decode_context_parallelism_above_tp8_is_refused(tmp_path, tp, dcp):
@@ -908,12 +908,12 @@ def test_gqa_decode_context_parallelism_above_tp8_is_refused(tmp_path, tp, dcp):
         provider(config, gpu="h200", target_model=target)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize("target", ["Qwen/Qwen3-30B-A3B", "deepseek-ai/DeepSeek-V3"])
 def test_the_real_package_times_tensor_parallelism_inside_dp(target):
     """The provider's joint step of a TP-inside-DP server is the pinned
     estimator's own for that layout, and not the one of DP ranks of one GPU."""
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
 
@@ -1120,8 +1120,8 @@ def test_only_op_level_estimates_are_taken(fake_aisimulate, monkeypatch, mode):
 
 
 def test_a_missing_package_is_a_clear_error(monkeypatch):
-    monkeypatch.setitem(sys.modules, "aisimulate_core", None)
-    with pytest.raises(ImportError, match="aisimulate package"):
+    monkeypatch.setitem(sys.modules, "aisim_core", None)
+    with pytest.raises(ImportError, match="needs the aisim package"):
         provider(engine_config())
 
 
@@ -1219,10 +1219,10 @@ def test_it_is_chosen_by_name(fake_aisimulate):
 def bundled_config(target):
     import os
 
-    import aisimulate_core
+    import aisim_core
 
     path = os.path.join(
-        os.path.dirname(aisimulate_core.__file__),
+        os.path.dirname(aisim_core.__file__),
         "model_configs",
         f"{target.replace('/', '--')}_config.json",
     )
@@ -1230,18 +1230,18 @@ def bundled_config(target):
         return json.load(f)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_the_real_package_prices_handoff_mixed_and_uneven_dp_steps():
     import importlib.metadata
 
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     # Qwen3-30B-A3B, the decode role: the consumer's first step is the
     # native N - 1 handoff (a one-token prefill), then mixed/chunked work.
     qwen = bundled_config("Qwen/Qwen3-30B-A3B")
     p = provider(engine_config("Qwen/Qwen3-30B-A3B", qwen, role="kv_consumer"))
     record = p.assumptions()["aisimulate"]
-    assert record["package_version"] == importlib.metadata.version("aisimulate")
+    assert record["package_version"] == importlib.metadata.version("aisim")
     assert (record["source"], record["readiness"]) == ("aic", "ready")
     handoff = p.estimate(sim_step(0, sim_req("h", 1, 1023, 1024))).device_s
     mixed = p.estimate(
@@ -1380,7 +1380,7 @@ def real_engine_config(tmp_path, name, raw, derived=False, **kwargs):
     ).create_engine_config()
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_real_configs_are_compared_through_their_own_classes(tmp_path):
     # Positive controls: Qwen3 (defaults spelled out) and GPT-oss, a BF16
     # copy of its MXFP4 checkpoint, layer types generated by its class.
@@ -1452,7 +1452,7 @@ def test_real_configs_are_compared_through_their_own_classes(tmp_path):
             )
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize(
     "target, gpu", [("Qwen/Qwen3.5-27B", "h100"), ("Qwen/Qwen3.5-35B-A3B", "h200")]
 )
@@ -1496,7 +1496,7 @@ def test_a_multimodal_model_is_timed_as_its_language_model_only(tmp_path, target
         )
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_an_engine_runs_on_aisimulate_timing(tmp_path, monkeypatch):
     """`timing: aisimulate` through the engine: Qwen3-30B-A3B built on the
     meta device, one request completed, each step priced by AISimulate."""
@@ -1542,7 +1542,7 @@ def test_an_engine_runs_on_aisimulate_timing(tmp_path, monkeypatch):
 V4 = "deepseek-ai/DeepSeek-V4-Flash"
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_deepseek_v4_ratios_are_compared_as_the_native_helper_resolves_them(
     tmp_path,
 ):
@@ -1593,9 +1593,9 @@ def test_deepseek_v4_ratios_are_compared_as_the_native_helper_resolves_them(
         )
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_deepseek_v4_modes_and_cache_precision_with_the_real_package():
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
 
@@ -1634,7 +1634,7 @@ def test_deepseek_v4_modes_and_cache_precision_with_the_real_package():
         provider(engine_config(V4, published), gpu="h200")
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize("cache_dtype", ["auto", "fp8"])
 def test_a_deepseek_v4_engine_runs_on_aisimulate_timing(
     tmp_path, monkeypatch, cache_dtype
@@ -1683,10 +1683,10 @@ def test_a_deepseek_v4_engine_runs_on_aisimulate_timing(
         del llm
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize("k", [1, 3])
 def test_deepseek_v3_mtp_depths_match_the_pinned_estimator(k):
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
 
@@ -1723,7 +1723,7 @@ def test_deepseek_v3_mtp_depths_match_the_pinned_estimator(k):
     assert p.estimate(partial).device_s * 1000 == pytest.approx(ms, rel=1e-9)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize(
     "target, local",
     [
@@ -1762,7 +1762,7 @@ def test_dsa_sparse_mla_is_timed_with_its_indexer_geometry(tmp_path, target, loc
         )
     # An FP8 cache, under any of its names, is FlashMLA's packed one, timed
     # in one FP8 mode: the provider's estimate is the pinned estimator's.
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
 
@@ -1821,13 +1821,13 @@ def dcp_engine_config(tmp_path, local, dcp, **kwargs):
     )
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_the_real_package_times_dense_mla_decode_context_parallelism(tmp_path):
     """DeepSeek-V3 at DCP2 is the pinned estimator's own DCP2 profile, given
     the requests' global lengths (it stripes the decode KV and adds the
     merge itself): a cached-context prefill chunk and decodes of odd
     contexts. DCP1 keeps the profile without a DCP size."""
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
 
@@ -1865,7 +1865,7 @@ def test_the_real_package_times_dense_mla_decode_context_parallelism(tmp_path):
         assert ms != pytest.approx(one.estimate(step).device_s * 1000, rel=1e-3)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize(
     "variant, problem",
     [
@@ -1883,7 +1883,7 @@ def test_dcp_merge_variants_the_estimator_cannot_set_are_refused(
         provider(config, gpu="h200", target_model="deepseek-ai/DeepSeek-V3")
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_glm_5s_dcp_defaults_leave_it_timed_without_dcp(tmp_path):
     """GLM-5 sets the a2a merge and Q replication even without DCP: they
     apply only when DCP is on, so GLM-5 at DCP1 is timed as before."""
@@ -1904,7 +1904,7 @@ def test_glm_5s_dcp_defaults_leave_it_timed_without_dcp(tmp_path):
     assert p.assumptions()["aisimulate"]["decode_context_parallel"] is None
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_a_bundled_config_the_package_would_download_is_read_locally(tmp_path):
     """Kimi-K2-Instruct's and Mixtral's configs ship with the package, which
     lists them as not pre-downloaded and would fetch the published ones:
@@ -1912,7 +1912,7 @@ def test_a_bundled_config_the_package_would_download_is_read_locally(tmp_path):
     import json as json_module
     import os
 
-    from aisimulate_core.sdk.common import DefaultHFModels
+    from aisim_core.sdk.common import DefaultHFModels
 
     for target, gpu, tp in (
         ("moonshotai/Kimi-K2-Instruct", "b200", 8),
@@ -1936,7 +1936,7 @@ def test_a_bundled_config_the_package_would_download_is_read_locally(tmp_path):
     assert p.config["model"] == "Qwen/Qwen3-30B-A3B"
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize(
     "target, gpu, kwargs, field, changed",
     [
@@ -1984,29 +1984,20 @@ def test_sliding_window_families_are_timed_with_their_layer_kinds(
         provider(config("changed", local), gpu=gpu, target_model=target)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_mimo_v2_flash_is_priced_with_its_own_layer_kinds(tmp_path):
-    """MiMo-V2-Flash marks its sliding layers 1, AISimulate's hybrid graph its
-    global ones: the estimator reads a normalized copy (recorded), whose graph
-    prices the model's 9 full (one dense, eight MoE) and 39 sliding MoE
-    layers, while the geometry compared is the published config's."""
-    from aisimulate_core.sdk import config as sdk_config
-    from aisimulate_core.sdk.models import get_model
+    """The SDK reads MiMo's published pattern as 9 full and 39 sliding layers."""
+    from aisim_core.sdk import config as sdk_config
+    from aisim_core.sdk.models import get_model
 
     target = "XiaomiMiMo/MiMo-V2-Flash"
     raw = {k: v for k, v in bundled_config(target).items() if k != "quantization_config"}
     local = real_engine_config(tmp_path, "mimo-bf16", raw, derived=True)
     p = provider(local, gpu="h200", target_model=target)
     a = p.assumptions()["aisimulate"]
-    assert a["target_config_source"] == "bundled, normalized local copy"
-    assert a["timing_input"]["transformation"].startswith("hybrid_layer_pattern inverted")
+    assert a["target_config_source"] == "bundled"
+    assert p.config["model"] == target
     assert a["compared_geometry"]["hybrid_layer_pattern"] == raw["hybrid_layer_pattern"]
-    with open(os.path.join(p.config["model"], "config.json")) as f:
-        read = json.load(f)
-    assert read["hybrid_layer_pattern"] == [1 - v for v in raw["hybrid_layer_pattern"]]
-    assert {k: v for k, v in read.items() if k != "hybrid_layer_pattern"} == {
-        k: v for k, v in bundled_config(target).items() if k != "hybrid_layer_pattern"
-    }
     model = get_model(
         p.config["model"],
         sdk_config.ModelConfig(tp_size=1, moe_tp_size=1, moe_ep_size=1),
@@ -2030,7 +2021,7 @@ def test_mimo_v2_flash_is_priced_with_its_own_layer_kinds(tmp_path):
         ]
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize(
     "target, gpu, tp, kwargs, derived, modes",
     [
@@ -2078,7 +2069,7 @@ def test_full_attention_families_are_timed_as_published(
         provider(config("changed", changed), gpu=gpu, target_model=target)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize("tp", [4, 8])
 def test_kimi_k3_is_timed_with_its_mla_modules(tmp_path, tp):
     """Kimi-K3 (KDA and MLA layers, latent SiTU experts): a BF16 copy of its
@@ -2087,11 +2078,11 @@ def test_kimi_k3_is_timed_with_its_mla_modules(tmp_path, tp):
     compared (a changed KDA head width is not the target's). AISimulate
     prices its MLA layers from MLA-module rows, falling back silently to a
     GQA stack where a module row is missing: the rows answer, both phases."""
-    from aisimulate_core.sdk import config as sdk_config
-    from aisimulate_core.sdk.engine import _evaluate_single_op
-    from aisimulate_core.sdk.models import get_model
-    from aisimulate_core.sdk.operations.overlap import FallbackOp
-    from aisimulate_core.sdk.perf_database import get_database
+    from aisim_core.sdk import config as sdk_config
+    from aisim_core.sdk.engine import _evaluate_single_op
+    from aisim_core.sdk.models import get_model
+    from aisim_core.sdk.operations.overlap import FallbackOp
+    from aisim_core.sdk.perf_database import get_database
 
     target = "moonshotai/Kimi-K3"
     raw = bundled_config(target)
@@ -2139,7 +2130,7 @@ def test_kimi_k3_is_timed_with_its_mla_modules(tmp_path, tp):
         provider(config("changed", changed), gpu="b200", target_model=target)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_each_caller_reads_its_own_bundled_snapshot(tmp_path):
     """A bundled config the package would download is copied, with its
     quantization sidecar or explicitly without one, into a snapshot private
@@ -2193,7 +2184,7 @@ def test_each_caller_reads_its_own_bundled_snapshot(tmp_path):
     assert not os.path.exists(model)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_kimi_k2_5_is_timed_with_its_mixed_precision(tmp_path):
     """Kimi-K2.5 (a vision-language wrapper served as its language model), a
     BF16 local copy timed as the published checkpoint: AISimulate's own
@@ -2218,7 +2209,7 @@ def test_kimi_k2_5_is_timed_with_its_mixed_precision(tmp_path):
     assert a["compared_geometry"]["kv_lora_rank"] == raw["text_config"]["kv_lora_rank"]
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize("k", [1, 3])
 @pytest.mark.parametrize(
     "target, local",
@@ -2230,7 +2221,7 @@ def test_kimi_k2_5_is_timed_with_its_mixed_precision(tmp_path):
 def test_dsa_mtp_depths_match_the_pinned_estimator(tmp_path, target, local, k):
     """DeepSeek-V3.2's and GLM-5's one MTP layer is AISimulate's MTP depth k,
     its estimates the estimator's own (op-level, BF16 cache)."""
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
 
@@ -2265,12 +2256,12 @@ def test_dsa_mtp_depths_match_the_pinned_estimator(tmp_path, target, local, k):
     )
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize("k", [1, 3])
 def test_qwen3_5_mtp_depths_match_the_pinned_estimator(tmp_path, k):
     """Qwen3.5's one MTP layer (in its text config), served as its language
     model, is AISimulate's MTP depth k like DeepSeek's."""
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
 
@@ -2322,7 +2313,7 @@ def test_qwen3_5_mtp_depths_match_the_pinned_estimator(tmp_path, k):
     )
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_a_deepseek_v3_mtp_engine_runs_on_aisimulate_timing(tmp_path, monkeypatch):
     """Native single-module MTP through the engine: drafts scheduled and
     accepted (sampled), every step priced at depth 1."""
@@ -2383,7 +2374,7 @@ def test_a_deepseek_v3_mtp_engine_runs_on_aisimulate_timing(tmp_path, monkeypatc
         del llm
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_deepseek_v3_mtp_draft_precision_through_native_configs(tmp_path):
     """Real `EngineArgs`/`SpeculativeConfig`: the draft inheriting the
     target's precision is accepted; its own KV cache dtype or LM-head
@@ -2419,7 +2410,7 @@ def test_deepseek_v3_mtp_draft_precision_through_native_configs(tmp_path):
 V4_FLASH = "deepseek-ai/DeepSeek-V4-Flash"
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_a_deepseek_v4_mtp_engine_builds_its_draft_layer_on_aisimulate_timing(
     tmp_path, monkeypatch
 ):
@@ -2598,7 +2589,7 @@ def test_layers_quantized_online_are_timed_only_as_configured(fake_aisimulate):
         unmapped.bind_model(built_model(online_method("Fp8PtpcOnlineLinearMethod")))
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 def test_online_fp8_is_timed_only_as_the_plain_shorthand(tmp_path):
     """Through vLLM's own argument resolution: the three shorthands alone
     are timed; one with a `--quantization-config` of its own (experts
@@ -2642,7 +2633,7 @@ def test_online_fp8_is_timed_only_as_the_plain_shorthand(tmp_path):
                 )
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize(
     "target, online, modes",
     [
@@ -2654,7 +2645,7 @@ def test_online_fp8_is_timed_only_as_the_plain_shorthand(tmp_path):
 def test_online_fp8_is_timed_as_the_pinned_estimator_times_it(target, online, modes):
     """Online FP8 of a published BF16 model: the estimator's FP8 modes, its
     own estimate for them, and not the published precision's."""
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
 
@@ -2685,7 +2676,7 @@ def test_online_fp8_is_timed_as_the_pinned_estimator_times_it(target, online, mo
     assert ms != pytest.approx(published.estimate(step).device_s * 1000, rel=1e-9)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.parametrize(
     "target, gpu, tp, quant, modes",
     [
@@ -2740,7 +2731,7 @@ def sparse_dcp_config(
     ).create_engine_config()
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize(
     "target, gpu, tp, dcp, weight_mode, alias",
@@ -2754,7 +2745,7 @@ def sparse_dcp_config(
 def test_sparse_mla_dcp_prices_global_lengths(
     tmp_path, monkeypatch, target, gpu, tp, dcp, weight_mode, alias
 ):
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
     reference_config = {
@@ -2838,7 +2829,7 @@ def test_sparse_mla_dcp_prices_global_lengths(
         )
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize(
     "cache, gpu, overrides, problems",
@@ -2877,7 +2868,7 @@ def test_sparse_mla_dcp_refuses_a_different_cache_or_merge(
         assert problem in str(failure.value)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize(
     "sparse, env, config_flag, accepted",
@@ -2943,11 +2934,11 @@ def _gqa_dcp_config(
     return EngineArgs(**(kwargs | overrides)).create_engine_config()
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize("gpu", ["h100", "h200"])
 def test_gqa_dcp_uses_global_lengths_and_the_qualified_profile(tmp_path, gpu):
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     target = "Qwen/Qwen3-30B-A3B"
     step = sim_step(
@@ -2977,7 +2968,7 @@ def test_gqa_dcp_uses_global_lengths_and_the_qualified_profile(tmp_path, gpu):
             model=target,
             system=f"{gpu}_sxm",
             backend="vllm",
-            backend_version="0.24.0",
+            backend_version="0.24.0" if size == 2 else "0.30.0",
             worker_type="aggregated",
             tp=8,
             pp=1,
@@ -3025,7 +3016,7 @@ def test_gqa_dcp_uses_global_lengths_and_the_qualified_profile(tmp_path, gpu):
         assert timing.estimate(step).device_s * 1000 == pytest.approx(ms, rel=1e-9)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize(
     "engine_kwargs, timing_kwargs, reason",
@@ -3077,7 +3068,7 @@ def test_gqa_dcp_refuses_unqualified_deployments(
         provider(config, **args)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize(
     "tp, dcp, overrides, reason",
@@ -3120,7 +3111,7 @@ def test_gqa_dcp_keeps_native_head_and_simulator_scope_checks(
 GQA_DCP_MODELS = ("Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-235B-A22B")
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize("target", GQA_DCP_MODELS)
 @pytest.mark.parametrize("gpu", ["h100", "h200"])
@@ -3130,7 +3121,7 @@ def test_gqa_dcp_models_and_interleaves_match_the_sdk(
 ):
     """The SDK takes global lengths and no interleave: each admitted model and
     interleave is the same estimate as a direct SDK call."""
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     config = _gqa_dcp_config(
         tmp_path, target=target, cp_kv_cache_interleave_size=interleave
@@ -3209,7 +3200,7 @@ def test_gqa_dcp_models_and_interleaves_match_the_sdk(
         assert timing.estimate(step).device_s * 1000 == pytest.approx(ms, rel=1e-9)
 
 
-@pytest.mark.skipif(not REAL, reason="aisimulate is not installed")
+@pytest.mark.skipif(not REAL, reason="aisim is not installed")
 @pytest.mark.skipif(not current_platform.is_cpu(), reason="Tests the CPU platform.")
 @pytest.mark.parametrize(
     "target, tp, dcp, overrides, reason",
@@ -3616,7 +3607,7 @@ def test_mtp_dcp_sparse_page_size_left_to_the_backend_is_checked_by_the_provider
 
 
 def _mtp_dcp_direct_sdk(target, tp, dcp, k):
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     gpu, weights, kv, _ = MTP_DCP_PROFILES[target]
     return RustForwardPassPerfModel.best_available(
@@ -3624,7 +3615,7 @@ def _mtp_dcp_direct_sdk(target, tp, dcp, k):
             model=target,
             system=f"{gpu}_sxm",
             backend="vllm",
-            backend_version="0.24.0",
+            backend_version="0.24.0" if dcp > 1 else "0.30.0",
             worker_type="aggregated",
             tp=tp,
             pp=1,
@@ -3672,7 +3663,7 @@ def test_mtp_dcp_passes_global_full_width_metrics_to_sdk(
     assert (resolved["tp"], resolved["dcp"], resolved["nextn"]) == (
         tp, dcp if dcp > 1 else None, k
     )
-    assert resolved["backend_version"] == "0.24.0"
+    assert resolved["backend_version"] == ("0.24.0" if dcp > 1 else "0.30.0")
     assert resolved["estimation_mode"] == "op_level"
     assert resolved["kvcache_quant_mode"] == kv
     assert record["speculation"] == {

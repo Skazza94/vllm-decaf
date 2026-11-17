@@ -132,7 +132,7 @@ A timing provider prices every step. Select it with `--simulation-config`:
 
 | `timing` | A step costs | Use |
 | :--- | :--- | :--- |
-| **`aisimulate`** | [AISimulate](https://github.com/ai-dynamo/aisimulate)'s estimate for that batch of the published model on a given GPU | The main provider: GPU step times without a GPU or a recording |
+| **`aisimulate`** | [AISim](https://github.com/ai-dynamo/aisim)'s estimate for that batch of the published model on a given GPU | The main provider: GPU step times without a GPU or a recording |
 | `linear` | A fixed cost plus per-token and per-request terms | Quick experiments and tests |
 | `replay` / `table` | What a recorded real deployment took for the same (or the nearest) batch | Reproducing a deployment you have measured |
 | `zero` | Nothing | Functional tests |

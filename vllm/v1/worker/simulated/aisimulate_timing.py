@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Step times from AISimulate (https://github.com/ai-dynamo/aisimulate).
+"""Step times from AISim (https://github.com/ai-dynamo/aisim).
 
 AISimulate's forward-pass performance model prices one step of a published
 model on a GPU, from kernels measured on that GPU under a vLLM release. This
@@ -20,7 +20,6 @@ import math
 import os
 import shutil
 import tempfile
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from vllm import envs
@@ -337,51 +336,22 @@ APPROXIMATIONS = [
 ]
 
 
-def _mimo_v2_flash_timing_input(config: dict[str, Any]) -> dict[str, Any]:
-    """MiMo-V2-Flash's hybrid_layer_pattern marks its sliding layers 1 (as its
-    model reads it), AISimulate's hybrid graph its global ones: inverted, the
-    estimator prices 9 full and 39 sliding layers, the model's own."""
-    return {
-        **config,
-        "hybrid_layer_pattern": [1 - v for v in config["hybrid_layer_pattern"]],
-    }
-
-
-# A bundled config AISimulate would misread, by architecture: what it is
-# given instead (a timing input only; the served model and the geometry
-# compared are the published config's), and what was changed.
-TIMING_INPUTS: dict[str, tuple[Callable[[dict[str, Any]], dict[str, Any]], str]] = {
-    "MiMoV2FlashForCausalLM": (
-        _mimo_v2_flash_timing_input,
-        "hybrid_layer_pattern inverted (MiMo marks sliding layers 1, AISimulate "
-        "global ones)",
-    ),
-}
-
-
 def _offline_model(
-    target: str, bundled: str, timing_input: Callable | None = None
+    target: str, bundled: str
 ) -> tuple[str, tempfile.TemporaryDirectory | None]:
     """The model AISimulate is given: its name when the package lists it as
     pre-downloaded; else a private snapshot of the package's own bundled
     config (with its quantization sidecar, or none when it bundles none),
     which it reads locally where it would otherwise download the published
-    config. A config it would misread (`timing_input`) is always given as a
-    snapshot of that function's copy. The snapshot is this caller's alone:
+    config. The snapshot is this caller's alone:
     keep the returned directory alive while AISimulate may read it."""
-    from aisimulate_core.sdk.common import DefaultHFModels
+    from aisim_core.sdk.common import DefaultHFModels
 
-    if target in DefaultHFModels and timing_input is None:
+    if target in DefaultHFModels:
         return target, None
     snapshot = tempfile.TemporaryDirectory(prefix="aisimulate-")
     config = os.path.join(snapshot.name, "config.json")
-    if timing_input is None:
-        shutil.copyfile(bundled, config)
-    else:
-        with open(bundled) as f:
-            normalized = timing_input(json.load(f))
-        with open(config, "w") as f:
-            json.dump(normalized, f, indent=2)
+    shutil.copyfile(bundled, config)
     sidecar = bundled.removesuffix("_config.json") + "_hf_quant_config.json"
     if os.path.isfile(sidecar):
         shutil.copyfile(sidecar, os.path.join(snapshot.name, "hf_quant_config.json"))
@@ -392,7 +362,7 @@ def _full_config(target: str) -> dict[str, Any]:
     """The target's config as AISimulate loads it: with its quantization
     sidecar (`hf_quant_config.json`), where a ModelOpt checkpoint keeps what
     its `config.json` may not say."""
-    from aisimulate_core.sdk.utils import _load_model_config_from_model_path
+    from aisim_core.sdk.utils import _load_model_config_from_model_path
 
     return _load_model_config_from_model_path(target)
 
@@ -402,7 +372,7 @@ def _inferred_modes(target: str) -> dict[str, str]:
     full config (BF16 where a layer kind is left unquantized): a
     compressed-tensors one's groups and ignore list, a ModelOpt one's NVFP4,
     per-tensor FP8 or mixed per-layer precision."""
-    from aisimulate_core.sdk.models.helpers import _infer_quant_modes_from_raw_config
+    from aisim_core.sdk.models.helpers import _infer_quant_modes_from_raw_config
 
     inferred = _infer_quant_modes_from_raw_config(_full_config(target))
 
@@ -578,16 +548,16 @@ class AisimulateTimingProvider:
                 f"not {gpu!r}."
             )
         try:
-            import aisimulate_core
-            from aisimulate_core.sdk import (
+            import aisim_core
+            from aisim_core.sdk import (
                 ForwardPassPerfModelConfig,
                 RustForwardPassPerfModel,
             )
-            from aisimulate_core.sdk.utils import _infer_quantization_fields
+            from aisim_core.sdk.utils import _infer_quantization_fields
         except ImportError as e:
             raise ImportError(
-                "The aisimulate timing provider needs the aisimulate package "
-                "(pip install --no-deps aisimulate from pypi.nvidia.com)."
+                "The aisimulate timing provider needs the aisim package "
+                "(install the pin in docker/Dockerfile.aisim)."
             ) from e
 
         # A multimodal model is timed as its language model: no input may
@@ -601,7 +571,7 @@ class AisimulateTimingProvider:
         topology = self._topology(vllm_config)
         target, local_config = self._target(vllm_config, target_model)
         bundled = os.path.join(
-            os.path.dirname(aisimulate_core.__file__),
+            os.path.dirname(aisim_core.__file__),
             "model_configs",
             f"{target.replace('/', '--')}_config.json",
         )
@@ -626,10 +596,7 @@ class AisimulateTimingProvider:
 
         # One snapshot for the provider's lifetime: quant inference and the
         # estimator read the same files.
-        timing_input, transformation = TIMING_INPUTS.get(
-            (target_config.get("architectures") or [None])[0], (None, None)
-        )
-        model, self._snapshot = _offline_model(target, bundled, timing_input)
+        model, self._snapshot = _offline_model(target, bundled)
         v4 = target_config.get("architectures") == ["DeepseekV4ForCausalLM"]
         # Plain MLA: a latent (`kv_lora_rank`), no indexer, not V4's caches.
         text = target_config.get("text_config") or target_config
@@ -812,9 +779,9 @@ class AisimulateTimingProvider:
             target, system, topology, decode_width=nextn + 1 if mtp_dcp else 1
         )
         try:
-            version = importlib.metadata.version("aisimulate")
+            version = importlib.metadata.version("aisim")
         except importlib.metadata.PackageNotFoundError:
-            version = getattr(aisimulate_core, "__version__", None)
+            version = None
         from vllm import __version__ as vllm_version
 
         modified = bool(quant_modes) or online is not None
@@ -830,23 +797,9 @@ class AisimulateTimingProvider:
             "target_config_source": (
                 "bundled"
                 if self.config["model"] == target
-                else "bundled, normalized local copy"
-                if transformation
                 else "bundled, local copy"
             ),
             "target_config_sha256": _file_sha256(bundled),
-            # What the estimator read instead of the bundled config, when it
-            # would misread that: the change and the file it read.
-            "timing_input": (
-                {
-                    "transformation": transformation,
-                    "config_sha256": _file_sha256(
-                        os.path.join(self.config["model"], "config.json")
-                    ),
-                }
-                if transformation
-                else None
-            ),
             "target_quantization": quant,
             "online_quantization": online,
             "target_modified": modified,

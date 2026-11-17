@@ -639,7 +639,7 @@ def _native_layout_oracle(config, target, block):
 def _direct_sdk_oracle(config, provider, direct_models, requests):
     import math
 
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
     from vllm.v1.worker.simulated.timing import StepDescriptor, parallel_summary
@@ -1182,7 +1182,7 @@ def _run_spec_pair(directory, case):
 def _assert_spec_pair(path, case):
     import math
 
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from vllm.v1.worker.simulated.aisimulate_timing import rank_metrics
     from vllm.v1.worker.simulated.timing import StepDescriptor

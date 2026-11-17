@@ -186,7 +186,7 @@ def test_geometry_does_not_change_fixed_work_aisimulate():
     from vllm.v1.worker.simulated.aisimulate_timing import AisimulateTimingProvider
     from vllm.v1.worker.simulated.timing import SimRequestStep, StepDescriptor
 
-    pytest.importorskip("aisimulate_core")
+    pytest.importorskip("aisim_core")
     providers = [
         AisimulateTimingProvider(engine(V3, name), gpu="h100", target_model=V3)
         for name in (None, "FLASHMLA")

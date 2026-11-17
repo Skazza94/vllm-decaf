@@ -900,8 +900,8 @@ def test_simulate_forward_cpu_sparse_mla_dcp(
     tmp_path, monkeypatch, target, gpu, tp, weight_mode
 ) -> None:
     """Published DSA geometry keeps both KV roles sharded and times live steps."""
-    pytest.importorskip("aisimulate_core")
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    pytest.importorskip("aisim_core")
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
     from vllm import LLM
     from vllm.distributed import cleanup_dist_env_and_memory
     from vllm.inputs import TokensPrompt
@@ -1192,7 +1192,7 @@ def test_simulated_cpu_sparse_mla_dcp_keeps_native_head_limits(
     tmp_path, monkeypatch, capfd, target, gpu, tp, dcp, reason
 ):
     """An SDK estimate cannot override native FlashMLA metadata limits."""
-    pytest.importorskip("aisimulate_core")
+    pytest.importorskip("aisim_core")
     from vllm import LLM
 
     monkeypatch.delenv("VLLM_DCP_Q_REPLICATE", raising=False)
@@ -1413,8 +1413,8 @@ def test_simulate_forward_cpu_dcp_prefix_cache_chunked_prefill(
 )
 def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch, target, interleave):
     """Use the published Qwen3 geometry and inspect each real CPU worker."""
-    pytest.importorskip("aisimulate_core")
-    from aisimulate_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
+    pytest.importorskip("aisim_core")
+    from aisim_core.sdk import ForwardPassPerfModelConfig, RustForwardPassPerfModel
 
     from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
     from vllm import LLM
@@ -1667,7 +1667,7 @@ def mtp_dcp_engine_cell(
     draft, cache geometry and block spans, and independently price every
     logged step. `references` keeps the DCP1 capacity of each (target, tp).
     `interleave` is the KV interleave under DCP (1 at DCP1)."""
-    pytest.importorskip("aisimulate_core")
+    pytest.importorskip("aisim_core")
     import math
     import os
     from pathlib import Path
@@ -2209,7 +2209,7 @@ def test_declared_geometry_moves_real_kernel_rows(tmp_path, case):
 
     from tests.v1.worker.simulated.test_kernel_geometry import NANO, V3, published_path
 
-    pytest.importorskip("aisimulate_core")
+    pytest.importorskip("aisim_core")
     pytest.importorskip("nixl")
     hybrid = case.startswith("hybrid")
     gqa = case.startswith("gqa")

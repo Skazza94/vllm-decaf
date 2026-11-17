@@ -24,7 +24,7 @@ pytestmark = pytest.mark.skipif(
 
 # The 27B fixtures read AISimulate's published model config; when the SDK is
 # absent the rest of this file must still collect and run.
-REAL = find_spec("aisimulate_core") is not None
+REAL = find_spec("aisim_core") is not None
 
 SIMULATED_WORKER = "vllm.v1.worker.simulated.worker.SimulatedWorker"
 
@@ -410,10 +410,10 @@ def qwen3_5_27b_config():
     configs carry (and its timing provider compares against)."""
     global _QWEN3_5_27B_CONFIG
     if _QWEN3_5_27B_CONFIG is None:
-        import aisimulate_core
+        import aisim_core
 
         path = os.path.join(
-            os.path.dirname(aisimulate_core.__file__),
+            os.path.dirname(aisim_core.__file__),
             "model_configs",
             "Qwen--Qwen3.5-27B_config.json",
         )
@@ -1822,12 +1822,12 @@ def qwen3_5_mtp_model_dirs(tmp_path_factory):
     (AISimulate's bundled ones, each with its one MTP layer)."""
     if not REAL:
         pytest.skip("the published Qwen3.5 configs come from AISimulate")
-    import aisimulate_core
+    import aisim_core
 
     dirs = {}
     for name in ("Qwen3.5-27B", "Qwen3.5-35B-A3B"):
         path = os.path.join(
-            os.path.dirname(aisimulate_core.__file__),
+            os.path.dirname(aisim_core.__file__),
             "model_configs",
             f"Qwen--{name}_config.json",
         )
@@ -6435,10 +6435,10 @@ def nemotron_3_nano_config():
     bundled configs (the one its timing provider compares against)."""
     global _NEMOTRON_3_NANO_CONFIG
     if _NEMOTRON_3_NANO_CONFIG is None:
-        import aisimulate_core
+        import aisim_core
 
         path = os.path.join(
-            os.path.dirname(aisimulate_core.__file__),
+            os.path.dirname(aisim_core.__file__),
             "model_configs",
             "nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16_config.json",
         )

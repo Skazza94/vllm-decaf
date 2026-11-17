@@ -75,11 +75,15 @@ step, its DP rank; plus batch totals, common-prefix blocks and the parallel
 configuration. It returns a `StepCost`.
 
 For a GPU's step times without a recording, `aisimulate` asks
-[AISimulate](https://github.com/ai-dynamo/aisimulate)'s
+[AISim](https://github.com/ai-dynamo/aisim)'s
 forward-pass performance model for each step. It needs the optional
-`aisimulate` package and prices the scheduler's actual batch, one workload
-per attention data-parallel rank, from kernel timings measured on that GPU
-under a vLLM release, with no analytical fallback.
+`aisim==0.15.0.dev202611140000000105` package and prices the scheduler's
+actual batch, one workload per attention data-parallel rank, from kernel timings measured on that GPU
+under a vLLM release, with no analytical fallback. Automatic table selection
+with this pin resolves to vLLM 0.30.0 for H100, H200 and B200; A100 keeps
+its 0.14.0 override. The qualified DCP queries below retain explicit 0.24.0
+tables. A table change can substantially change estimates; it does not
+establish improved GPU timing accuracy.
 
 `docker/Dockerfile.aisim` adds the pinned package to the CPU image (see
 [Running without a GPU](#running-without-a-gpu) for `vllm:cpu`). From the
@@ -119,11 +123,11 @@ and its FP4 experts. A DSA model's FP8 cache (DeepSeek-V3.2's, GLM-5's),
 under any of those FP8 names, is timed and recorded as the packed one too
 (`kv_cache_format: fp8_ds_mla`, the configured dtype beside it). GLM-5 on
 B200 has to name its cache (`fp8`, the GPU's default there, or `bfloat16`):
-`auto` is FP8 on that GPU and BF16 on a CPU host. A bundled config AISimulate would misread is given to
-it as a private normalized copy, the change and both configs' hashes in the
-`timing` record: MiMo-V2-Flash's `hybrid_layer_pattern`, which marks its
-sliding layers 1 where AISimulate reads global ones, is inverted. Startup
-also times one prefill and one decode step: a target AISimulate lacks data
+`auto` is FP8 on that GPU and BF16 on a CPU host. The SDK reads
+MiMo-V2-Flash's published `hybrid_layer_pattern` directly; its sliding layers
+are marked 1. Bundled configs and quantization sidecars are read offline,
+using a private copy when the SDK needs a local model path. Startup also
+times one prefill and one decode step: a target AISimulate lacks data
 for at those shapes fails before serving,
 but a later batch of another shape can still lack data and fail then.
 
@@ -223,9 +227,8 @@ full width even when a step drafted fewer; draft weights and KV, prefill
 draft work and host glue are omitted. Acceptance comes from
 `spec_acceptance_rates` and does not change a step's cost. The pinned
 AISimulate version has a cached-prefix timing limitation for plain-MLA context
-steps (not sparse MLA): in DeepSeek-V3 and Kimi-K3 probes, estimates decrease as
-an already-positive prefix grows with the new-token count fixed, while
-generation estimates increase. Prefix-cache hits, later prefill chunks and
+steps (not sparse MLA): in DeepSeek-V3 and Kimi-K3 probes, estimates decrease
+over some already-positive prefix intervals with the new-token count fixed. Prefix-cache hits, later prefill chunks and
 decode's resumed context step take this path; other plain-MLA models (Kimi-K2)
 likely share it, unmeasured. No timing correction is applied. The `timing`
 record lists such approximations, and names the target, the resolved
