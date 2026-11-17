@@ -285,6 +285,12 @@ MLA_PREFIX_APPROXIMATION = (
     "fixed; prefix-cache hits, later prefill chunks and decode's resumed "
     "context step use this path; no timing correction is applied"
 )
+MTP_DCP_INTERLEAVE_APPROXIMATION = (
+    "AISimulate takes no KV interleave: the estimates at an interleave above 1 "
+    "are the interleave-1 estimates with the decode-width classification; the "
+    "backend's interleave-dependent GPU costs (its metadata classification and "
+    "kernel selection for the verified rows) are not modeled"
+)
 HYBRID_MTP_APPROXIMATION = (
     "the MTP drafter, a full-attention layer, is priced as the hybrid target's "
     "layers ((L + k) / L of its graph): its attention and delta-net mix, not "
@@ -870,6 +876,11 @@ class AisimulateTimingProvider:
             + ([V4_APPROXIMATION] if v4 else [])
             + ([MLA_PREFIX_APPROXIMATION] if plain_mla else [])
             + ([GQA_DCP_PREFIX_APPROXIMATION] if gqa_dcp else [])
+            + (
+                [MTP_DCP_INTERLEAVE_APPROXIMATION]
+                if mtp_dcp and dsa and dcp["interleave"] > 1
+                else []
+            )
             + (
                 [NODES_APPROXIMATION]
                 if topology["tp"] * topology["attention_dp"] > NODE_GPUS

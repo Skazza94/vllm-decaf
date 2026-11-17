@@ -1660,10 +1660,13 @@ def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch, target, interleave)
     assert totals[2][0] == 2 * totals[1][0]
 
 
-def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
+def mtp_dcp_engine_cell(
+    tmp_path, monkeypatch, target, tp, dcp, k, references, interleave=1
+):
     """One real CPU engine of a qualified MTP cell: inspect each worker's
     draft, cache geometry and block spans, and independently price every
-    logged step. `references` keeps the DCP1 capacity of each (target, tp)."""
+    logged step. `references` keeps the DCP1 capacity of each (target, tp).
+    `interleave` is the KV interleave under DCP (1 at DCP1)."""
     pytest.importorskip("aisimulate_core")
     import math
     import os
@@ -1677,8 +1680,16 @@ def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
         _mtp_dcp_direct_sdk,
         bundled_config,
     )
+    from tests.v1.worker.simulated.test_mtp_dcp_interleave import (
+        assert_step_placement,
+    )
     from vllm import LLM
     from vllm.distributed import cleanup_dist_env_and_memory
+    from vllm.v1.worker.simulated.aisimulate_timing import (
+        MTP_DCP_INTERLEAVE_APPROXIMATION,
+    )
+
+    effective = interleave if dcp > 1 else 1
 
     def rank_state(worker):
         from vllm.config import get_layers_from_vllm_config
@@ -1744,6 +1755,18 @@ def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
             "blocks": cache.num_blocks,
             "planned_bytes": sorted({t.size for t in cache.kv_cache_tensors}),
             "allocated_tensors": len(runner.kv_caches),
+            "interleave": (
+                worker.vllm_config.parallel_config.cp_kv_cache_interleave_size
+            ),
+            "reorder_thresholds": sorted(
+                {
+                    builder.reorder_batch_threshold
+                    for groups in runner.attn_groups
+                    for group in groups
+                    for builder in group.metadata_builders
+                    if getattr(builder, "reorder_batch_threshold", None) is not None
+                }
+            ),
         }
 
     gpu, _, _, page = MTP_DCP_PROFILES[target]
@@ -1776,7 +1799,7 @@ def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
         decode_context_parallel_size=dcp,
         dcp_comm_backend="ag_rs",
         dcp_q_replicate=False,
-        cp_kv_cache_interleave_size=1,
+        cp_kv_cache_interleave_size=effective,
         block_size=page,
         kv_cache_memory_bytes=budget,
         max_model_len=2048,
@@ -1860,7 +1883,16 @@ def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
         assert len(members) == (2 if sparse else 1) * (layers_total + 1)
         assert set(state["draft_names"]) <= set(members)
         assert "model.layers.0.self_attn.attn" in members
-        assert state["table"][:3] == (dcp, rank % dcp, 1)
+        assert state["table"][:3] == (dcp, rank % dcp, effective)
+        assert state["interleave"] == effective
+        if sparse:
+            # The sparse builder reorders verified rows as decode rows only
+            # at interleave 1 under DCP (`supports_dcp_with_varlen`).
+            thresholds = state["reorder_thresholds"]
+            if dcp > 1 and effective > 1:
+                assert thresholds == [1]
+            else:
+                assert thresholds and all(t >= k + 1 for t in thresholds)
         assert state["table"][3] == [page] * len(state["table"][3])
         assert state["allocated_tensors"] == 0
         (planned,) = state["planned_bytes"]
@@ -1883,6 +1915,11 @@ def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
     assert timing["resolved_config"]["dcp"] == (dcp if dcp > 1 else None)
     assert timing["speculation"]["verify_width"] == k + 1
     assert timing["resolved_config"]["backend_version"] == "0.24.0"
+    if dcp > 1:
+        assert timing["decode_context_parallel"]["interleave"] == effective
+    assert (MTP_DCP_INTERLEAVE_APPROXIMATION in timing["approximations"]) == (
+        sparse and effective > 1
+    )
     accepted = {
         rec["step_index"]: rec["requests"]
         for row in records if (rec := row.get("spec_acceptance"))
@@ -1898,6 +1935,7 @@ def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
     for row in (r for r in records if "step" in r):
         step, cost = row["step"], row["cost"]
         requests = step["requests"]
+        assert_step_placement(requests, k, dcp, effective, page)
         prefill = [q for q in requests if q["is_prefill"]]
         decode = [q for q in requests if not q["is_prefill"]]
         contexts = [q["num_computed_tokens"] for q in decode]
@@ -1964,7 +2002,8 @@ def mtp_dcp_engine_cell(tmp_path, monkeypatch, target, tp, dcp, k, references):
         discarded[key_] = sum(counts) - emitted[key_]
     summary = {
         "target": target, "tp": tp, "dcp": dcp, "k": k, "page": page,
-        "workers": states, "capacity": capacity, "lookahead": lookahead,
+        "interleave": effective, "workers": states, "capacity": capacity,
+        "lookahead": lookahead,
         "first_decode": first_decode, "completed": emitted,
         "calculated_boundary_horizon": sorted(boundary_horizons),
         "calculated_peak_horizons": peak_horizons,
@@ -2487,11 +2526,24 @@ def _mtp_prefix_dcp_worker_state(worker):
         "bytes_per_block": sum(spec.page_size_bytes for spec in specs.values()),
         "planned_bytes": sorted({tensor.size for tensor in cache.kv_cache_tensors}),
         "allocated_tensors": len(runner.kv_caches),
+        "interleave": worker.vllm_config.parallel_config.cp_kv_cache_interleave_size,
+        "reorder_thresholds": sorted(
+            {
+                builder.reorder_batch_threshold
+                for groups in runner.attn_groups
+                for group in groups
+                for builder in group.metadata_builders
+                if getattr(builder, "reorder_batch_threshold", None) is not None
+            }
+        ),
     }
 
 
-def _mtp_prefix_dcp_engine_cell(directory, monkeypatch, target, tp, dcp, k):
-    """Real engine, worker RPC on every rank, SDK oracle on output-rank steps."""
+def _mtp_prefix_dcp_engine_cell(
+    directory, monkeypatch, target, tp, dcp, k, interleave=1
+):
+    """Real engine, worker RPC on every rank, SDK oracle on output-rank steps.
+    `interleave` is the KV interleave under DCP (1 at DCP1)."""
     import math
 
     from tests.v1.worker.simulated.test_aisimulate_timing import (
@@ -2500,9 +2552,17 @@ def _mtp_prefix_dcp_engine_cell(directory, monkeypatch, target, tp, dcp, k):
         _mtp_dcp_direct_sdk,
         bundled_config,
     )
+    from tests.v1.worker.simulated.test_mtp_dcp_interleave import (
+        assert_step_placement,
+    )
     from vllm import LLM
     from vllm.distributed import cleanup_dist_env_and_memory
-    from vllm.v1.worker.simulated.aisimulate_timing import MLA_PREFIX_APPROXIMATION
+    from vllm.v1.worker.simulated.aisimulate_timing import (
+        MLA_PREFIX_APPROXIMATION,
+        MTP_DCP_INTERLEAVE_APPROXIMATION,
+    )
+
+    effective = interleave if dcp > 1 else 1
 
     directory.mkdir()
     raw = bundled_config(target)
@@ -2540,7 +2600,7 @@ def _mtp_prefix_dcp_engine_cell(directory, monkeypatch, target, tp, dcp, k):
         decode_context_parallel_size=dcp,
         dcp_comm_backend="ag_rs",
         dcp_q_replicate=False,
-        cp_kv_cache_interleave_size=1,
+        cp_kv_cache_interleave_size=effective,
         block_size=page,
         kv_cache_memory_bytes=1 << 29,
         max_model_len=2048,
@@ -2633,7 +2693,14 @@ def _mtp_prefix_dcp_engine_cell(directory, monkeypatch, target, tp, dcp, k):
         assert set(worker["draft_names"]) <= set(members)
         assert "model.layers.0.self_attn.attn" in members
         assert worker["eagle_groups"] == [True]
-        assert worker["table"][:3] == [dcp, rank % dcp, 1]
+        assert worker["table"][:3] == [dcp, rank % dcp, effective]
+        assert worker["interleave"] == effective
+        if sparse:
+            thresholds = worker["reorder_thresholds"]
+            if dcp > 1 and effective > 1:
+                assert thresholds == [1]
+            else:
+                assert thresholds and all(t >= k + 1 for t in thresholds)
         assert set(worker["table"][3]) == {page}
         assert all(worker["table"][4])
         backend = "CPU_SIMULATED_MLA_SPARSE" if sparse else "CPU_MLA"
@@ -2673,6 +2740,11 @@ def _mtp_prefix_dcp_engine_cell(directory, monkeypatch, target, tp, dcp, k):
     assert resolved["backend_version"] == "0.24.0"
     if not sparse:
         assert MLA_PREFIX_APPROXIMATION in timing["approximations"]
+    if dcp > 1:
+        assert timing["decode_context_parallel"]["interleave"] == effective
+    assert (MTP_DCP_INTERLEAVE_APPROXIMATION in timing["approximations"]) == (
+        sparse and effective > 1
+    )
     sdk = _mtp_dcp_direct_sdk(target, tp, dcp, k)
     accepted = {
         event["step_index"]: event["requests"]
@@ -2688,6 +2760,7 @@ def _mtp_prefix_dcp_engine_cell(directory, monkeypatch, target, tp, dcp, k):
     for row in (row for row in records if "step" in row):
         step, cost = row["step"], row["cost"]
         requests = step["requests"]
+        assert_step_placement(requests, k, dcp, effective, page)
         prefills = [request for request in requests if request["is_prefill"]]
         decodes = [request for request in requests if not request["is_prefill"]]
         mixed_steps += bool(prefills and decodes)
@@ -2786,6 +2859,7 @@ def _mtp_prefix_dcp_engine_cell(directory, monkeypatch, target, tp, dcp, k):
         "dcp": dcp,
         "k": k,
         "page": page,
+        "interleave": effective,
         "scheduler_span": span,
         "hits": hits,
         "workers": workers,

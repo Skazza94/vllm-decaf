@@ -305,15 +305,24 @@ def standalone_mtp_dcp_problems(vllm_config: VllmConfig) -> list[str]:
     page_ok = cache.block_size == block_size or (
         qualified["sparse"] and not cache.user_specified_block_size
     )
-    if (
-        parallel.cp_kv_cache_interleave_size != 1
-        or parallel.dcp_kv_cache_interleave_size != 1
-        or not page_ok
-    ):
-        problems.append(
-            f"MTP with DCP requires interleave 1 and {block_size}-token pages "
-            f"for {name}"
+    if not page_ok:
+        problems.append(f"MTP with DCP requires {block_size}-token pages for {name}")
+    interleave = parallel.cp_kv_cache_interleave_size
+    if qualified["sparse"]:
+        # The sparse backend declares MTP support at any interleave vLLM allows:
+        # one dividing the page. The deprecated alias counts only as 1 or equal.
+        interleave_ok = (
+            1 <= interleave <= block_size
+            and block_size % interleave == 0
+            and parallel.dcp_kv_cache_interleave_size in (1, interleave)
         )
+        if not interleave_ok:
+            problems.append(
+                f"MTP with DCP requires a KV interleave dividing the {block_size}"
+                f"-token page for {name} (dcp_kv_cache_interleave_size 1 or equal)"
+            )
+    elif interleave != 1 or parallel.dcp_kv_cache_interleave_size != 1:
+        problems.append(f"MTP with DCP requires interleave 1 for {name}")
     if spec.method != "mtp":
         return _standalone_mtp_prefix_problems(
             vllm_config,

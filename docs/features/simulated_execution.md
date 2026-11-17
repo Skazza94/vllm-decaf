@@ -168,7 +168,7 @@ are outside this scope.
 
 With DCP greater than one, speculative decoding is limited to standalone
 CPU simulation of the native single-module MTP of DeepSeek-V3, DeepSeek-V3.2
-and GLM-5 at depth 1 to 5, interleave 1 and AISimulate vLLM 0.24.0 tables,
+and GLM-5 at depth 1 to 5 and AISimulate vLLM 0.24.0 tables,
 at the layouts AISimulate was qualified for: DeepSeek-V3 on H200 (published
 block-FP8 weights, BF16 model and KV, 16-token pages) at TP/DCP 2/2, 4/2, 4/4,
 8/2, 8/4 and 8/8; DeepSeek-V3.2 on H200 (published block-FP8 weights, packed
@@ -179,10 +179,19 @@ stays refused: AISimulate times it, but with the qualified FP8 FlashMLA path
 vLLM refuses it natively, since the backend requires the local (16) and the
 DCP-gathered (128) query heads to pad to the same decode kernel envelope (64
 against 128). The sparse models' pages are FlashMLA's and the indexer's 64
-tokens. Larger interleaves are an
-unqualified scope of the simulator (the sparse backend declares MTP support at
-them; the dense CPU MLA backend does not). The merge and Q replication follow
-the settings above.
+tokens. DeepSeek-V3 requires KV interleave 1: its CPU MLA backend does not
+declare MTP support above it, and vLLM refuses it. The sparse models also take
+any interleave vLLM allows for their 64-token page (1, 2, 4, 8, 16, 32 or 64),
+the sparse backend declaring MTP support at them; the deprecated
+`dcp_kv_cache_interleave_size` counts only as 1 or equal to
+`cp_kv_cache_interleave_size`. The interleave decides which DCP rank holds
+which token inside a scheduler block (the page size times DCP); the pages,
+capacity and lookahead do not depend on it. AISimulate takes no interleave: the
+estimates at an interleave above 1 are the interleave-1 estimates with the
+decode-width classification. The sparse backend's batch metadata classifies
+verified rows differently above interleave 1; its interleave-dependent GPU
+costs are not modeled, and the timing assumptions record this. The merge and Q
+replication follow the settings above.
 Prefix caching is qualified for these cells with the default MTP lookahead
 hashes: a hit lands on a scheduler block (the page size times DCP), and its
 hash also proves the next token. Divergence exactly at a boundary can
