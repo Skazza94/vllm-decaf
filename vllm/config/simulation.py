@@ -518,13 +518,11 @@ class SimulationConfig:
             and model.is_hybrid
             and kv_transfer.kv_connector in NIXL_CONNECTORS
             and self.kv_kernel_backend is None
-            and vllm_config.speculative_config is None
             and vllm_config.parallel_config.decode_context_parallel_size == 1
         ):
             problems.append(
                 "kv_pattern_grain only for a hybrid model over NIXL with prefix "
-                "caching, no kv_kernel_backend, speculative decoding or decode "
-                "context parallelism"
+                "caching, no kv_kernel_backend or decode context parallelism"
             )
         if vllm_config.speculative_config is not None:
             problems.extend(self._real_kv_mtp_problems(vllm_config))

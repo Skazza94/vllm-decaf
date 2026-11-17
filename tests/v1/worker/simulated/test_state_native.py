@@ -113,6 +113,7 @@ def test_a_state_group_of_the_wrong_layout_is_not_eligible():
             ),
             cache_config=SimpleNamespace(mamba_ssm_cache_dtype="auto"),
             speculative_config=None,
+            num_speculative_tokens=0,
             parallel_config=SimpleNamespace(tensor_parallel_size=tp),
         )
 

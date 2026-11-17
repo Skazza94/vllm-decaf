@@ -472,7 +472,11 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           larger size and divisible by both (Gemma4's 8 and 2: TP 1 with 2);
         * over NIXL only, a hybrid of Mamba2 or gated delta-net states
           whose state splits over both sizes and whose KV heads split or
-          replicate evenly on each side; where the two sizes give it
+          replicate evenly on each side (with Qwen3.5's native MTP too: the
+          conv state widened to `conv_kernel - 1 + k` rows, as vLLM
+          allocates it, and the draft's attention layer read with the
+          target's; decode refuses a producer of another depth before any
+          READ, its state sizes differing); where the two sizes give it
           different attention block sizes (Nemotron-3-Nano: 1056 tokens at
           TP 4, 2112 at TP 2; Qwen3.5-27B: 800 at TP 1, 2 and 4, 416 at
           TP 8, a requested 400 kept at TP 8 and aligned to 800 below it;

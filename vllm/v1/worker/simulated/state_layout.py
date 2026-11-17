@@ -103,14 +103,15 @@ def _itemsize(dtype) -> int:
 
 
 def layout_from_config(
-    text_config, conv_itemsize: int, ssm_itemsize: int
+    text_config, conv_itemsize: int, ssm_itemsize: int, num_spec: int = 0
 ) -> StateLayout | None:
     """The model's state from its config, None for a model that is none of
     them (Nemotron-H / Mamba2: `mamba_num_heads`, `mamba_head_dim`, `n_groups`,
     `ssm_state_size`, `conv_kernel`; GDN: `linear_*`; Kimi-K3's KDA: its
     nested `linear_attn_config`, its conv `Q|K|V` and recurrent heads as
     `MambaStateShapeCalculator.kda_state_shape` builds them, key heads the
-    value heads')."""
+    value heads'); its conv rows `kernel - 1 + num_spec`, as the native
+    shapes widen them for speculative decoding."""
     get = lambda name: getattr(text_config, name, None)
     kda = get("linear_attn_config")
     if get("model_type") == "kimi_linear" and isinstance(kda, dict):
@@ -122,7 +123,7 @@ def layout_from_config(
         return StateLayout(
             "kda",
             (("Q", width), ("K", width), ("V", width)),
-            kernel - 1,
+            kernel - 1 + num_spec,
             conv_itemsize,
             heads,
             dim * dim * ssm_itemsize,
@@ -136,7 +137,7 @@ def layout_from_config(
         return StateLayout(
             "gdn",
             (("Q", key), ("K", key), ("V", value)),
-            get("linear_conv_kernel_dim") - 1,
+            get("linear_conv_kernel_dim") - 1 + num_spec,
             conv_itemsize,
             get("linear_num_value_heads"),
             get("linear_value_head_dim") * get("linear_key_head_dim") * ssm_itemsize,
@@ -154,7 +155,7 @@ def layout_from_config(
         return StateLayout(
             "mamba2",
             (("x", get("mamba_num_heads") * get("mamba_head_dim")), ("B", groups), ("C", groups)),
-            kernel - 1,
+            kernel - 1 + num_spec,
             conv_itemsize,
             get("mamba_num_heads"),
             get("mamba_head_dim") * state * ssm_itemsize,
@@ -170,12 +171,12 @@ def layout_for(vllm_config) -> StateLayout | None:
     native allocation resolves them (`MambaStateDtypeCalculator`): conv of the
     cache's `mamba_cache_dtype`, SSM of its `mamba_ssm_cache_dtype` (an "auto"
     one the config's own, as the hybrid configs' verification sets it, else
-    the conv dtype); None for a model without one or one run with
-    speculative decoding (a widened conv state)."""
+    the conv dtype), its conv rows widened by the speculative depth
+    (`vllm_config.num_speculative_tokens`, as native allocation reads it);
+    None for a model without one."""
     from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
 
-    if vllm_config.speculative_config is not None:
-        return None
+    num_spec = vllm_config.num_speculative_tokens
     model = vllm_config.model_config
     text = model.hf_text_config
     cache = vllm_config.cache_config
@@ -187,7 +188,7 @@ def layout_for(vllm_config) -> StateLayout | None:
             getattr(cache, "mamba_cache_dtype", "auto"),
             cache.mamba_ssm_cache_dtype,
         )
-        return layout_from_config(text, _itemsize(conv), _itemsize(ssm))
+        return layout_from_config(text, _itemsize(conv), _itemsize(ssm), num_spec)
     name = cache.mamba_ssm_cache_dtype
     if name == "auto":
         name = (
@@ -198,15 +199,17 @@ def layout_for(vllm_config) -> StateLayout | None:
     conv, ssm = MambaStateDtypeCalculator._mamba_state_dtype(
         model.dtype, getattr(cache, "mamba_cache_dtype", "auto"), name
     )
-    return layout_from_config(text, _itemsize(conv), _itemsize(ssm))
+    return layout_from_config(text, _itemsize(conv), _itemsize(ssm), num_spec)
 
 
 def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
     """Why a hybrid of this model cannot pair these TP sizes over NIXL, None
-    when it can: a Mamba2 or GDN layout that splits over both sizes, no
-    speculative decoding, no MLA (but Kimi-K3's, at decode TP4 from prefill
-    TP8, or the published checked cold pairs), and attention KV heads
-    that split or replicate evenly on each side as NIXL maps them (the
+    when it can: a Mamba2 or GDN layout that splits over both sizes,
+    speculative decoding only with a GDN state (Qwen3.5's native MTP, the
+    model gate being `REAL_KV_MTP_DRAFTS`), no MLA (but Kimi-K3's, at
+    decode TP4 from prefill TP8, or the published checked cold pairs), and
+    attention KV heads that split or replicate evenly on each side as NIXL
+    maps them (the
     replicated-producer refusal of pure attention does not apply: a hybrid's
     mapping separates attention sources from state sources)."""
     model = vllm_config.model_config
@@ -236,11 +239,11 @@ def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
 
             if not qualifies_kimi_k3_prefix(vllm_config, producer=False):
                 return KIMI_K3_PREFIX_REFUSAL
-    if vllm_config.speculative_config is not None:
-        return "speculative decoding"
     layout = layout_for(vllm_config)
     if layout is None:
         return "a recurrent state that is neither Mamba2 nor GDN (or has no known layout)"
+    if vllm_config.speculative_config is not None and layout.family != "gdn":
+        return f"speculative decoding with a {layout.family} state"
     for tp in (local_tp, remote_tp):
         if not layout.divides(tp):
             return (

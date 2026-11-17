@@ -85,6 +85,7 @@ def test_element_sizes_are_resolved_as_the_native_allocation_resolves_them():
     def config(mamba="auto", ssm="auto", text=NEMOTRON):
         return SimpleNamespace(
             speculative_config=None,
+            num_speculative_tokens=0,
             model_config=SimpleNamespace(hf_text_config=text, dtype=torch.bfloat16),
             cache_config=SimpleNamespace(
                 mamba_cache_dtype=mamba, mamba_ssm_cache_dtype=ssm

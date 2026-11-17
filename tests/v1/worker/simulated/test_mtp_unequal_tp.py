@@ -422,7 +422,6 @@ def test_local_mla_mtp_admission(tmp_path, tp, peer):
         {"hf_overrides": {"kv_lora_rank": 256}},
         {"model": "deepseek-ai/DeepSeek-V3.2", "block_size": 64},
         {"model": "deepseek-ai/DeepSeek-V4-Flash", "block_size": 256},
-        {"model": "Qwen/Qwen3.5-27B", "language_model_only": True},
         {
             "kv_transfer_config": {
                 "kv_connector": "MooncakeConnector",
@@ -448,7 +447,6 @@ def test_local_mla_mtp_admission(tmp_path, tp, peer):
         "changed-latent",
         "sparse",
         "compressed",
-        "hybrid",
         "mooncake",
         "hash-off",
     ],
@@ -469,11 +467,7 @@ def test_mla_mtp_other_configurations_keep_their_refusal(
     assert unequal_tp_mtp_layout(config) is None
     n = options.get("kv_transfer_config", {}).get("kv_connector") != "MooncakeConnector"
     message = simulated_tp_mismatch(config, 2, 4, nixl_consumer=n)
-    assert (
-        "not local TP 2 and remote TP 4: speculative decoding." in message
-        if options.get("model") == "Qwen/Qwen3.5-27B"
-        else REFUSAL in message
-    )
+    assert REFUSAL in message
     assert simulated_tp_mismatch(config, 2, 2, nixl_consumer=n) is None
 
 

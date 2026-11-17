@@ -437,6 +437,9 @@ def mtp_peer_refusal(worker, local_page, remote_tp, metadata) -> str | None:
     local_tp = worker.vllm_config.parallel_config.tensor_parallel_size
     if local_tp == remote_tp or worker.vllm_config.speculative_config is None:
         return None
+    if worker.vllm_config.model_config.is_hybrid:
+        # Its state layout pairs it (`state_layout.pairing_problem`).
+        return None
     layout = unequal_tp_mtp_layout(worker.vllm_config)
     if (
         local_tp in (1, 2, 4, 8)

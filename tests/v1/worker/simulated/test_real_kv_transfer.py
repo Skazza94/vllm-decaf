@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration of real NIXL KV transfers under simulated compute."""
 
+import itertools
 import json
 import math
 import os
@@ -1779,6 +1780,223 @@ def test_qwen3_5_27bs_attention_block_sizes_predict_the_tp_pairs(
     assert accepted == {
         (p, d): 8 not in (p, d) for p in (1, 2, 4, 8) for d in (1, 2, 4, 8) if d != p
     }
+
+
+def _mtp_sizes(by_tp_depth):
+    return {
+        (tp, k): size
+        for tp, sizes in by_tp_depth.items()
+        for k, size in enumerate(sizes, 1)
+    }
+
+
+QWEN3_5_MTP_BLOCK_SIZES = {
+    "Qwen3.5-27B": _mtp_sizes(
+        {
+            1: [800] * 3 + [832] * 2,
+            2: [800] * 3 + [832] * 2,
+            4: [800] * 3 + [832] * 2,
+            8: [416] * 5,
+        }
+    ),
+    "Qwen3.5-35B-A3B": _mtp_sizes(
+        {1: [1056] + [1088] * 4, 2: [1056] + [1088] * 4, 4: [544] * 5, 8: [288] * 5}
+    ),
+}
+# (prefill TP, decode TP, depth) whose prefill block does not divide the
+# decode block, both prefix modes.
+QWEN3_5_MTP_REFUSED = {
+    name: {
+        (p, d, k)
+        for p, d in itertools.permutations((1, 2, 4, 8), 2)
+        for k in range(1, 6)
+        if sizes[(d, k)] % sizes[(p, k)]
+    }
+    for name, sizes in QWEN3_5_MTP_BLOCK_SIZES.items()
+}
+
+
+@pytest.fixture(scope="module")
+def qwen3_5_mtp_model_dirs(tmp_path_factory):
+    """The published Qwen3.5-27B and Qwen3.5-35B-A3B configurations
+    (AISimulate's bundled ones, each with its one MTP layer)."""
+    if not REAL:
+        pytest.skip("the published Qwen3.5 configs come from AISimulate")
+    import aisimulate_core
+
+    dirs = {}
+    for name in ("Qwen3.5-27B", "Qwen3.5-35B-A3B"):
+        path = os.path.join(
+            os.path.dirname(aisimulate_core.__file__),
+            "model_configs",
+            f"Qwen--{name}_config.json",
+        )
+        directory = tmp_path_factory.mktemp(name.lower())
+        with open(path) as f:
+            (directory / "config.json").write_text(f.read())
+        dirs[name] = str(directory)
+    return dirs
+
+
+@pytest.fixture(scope="module")
+def qwen3_5_mtp_block_sizes(qwen3_5_mtp_model_dirs, tmp_path_factory):
+    """The attention block each TP size picks for each model at each MTP
+    depth 1-5 (the depth widens the conv state, so the page a block must
+    cover), its engine, AISimulate timing and platform initialization for
+    real."""
+    import subprocess
+    import sys
+
+    work = tmp_path_factory.mktemp("qwen3-5-mtp-sizes")
+    script = work / "sizes.py"
+    script.write_text(ENGINE_BLOCK_SIZES)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "GLOO_SOCKET_IFNAME": "lo",
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+    }
+    out = {}
+    for name, directory in qwen3_5_mtp_model_dirs.items():
+        target = f"Qwen/{name}"
+        for tp, k in itertools.product((1, 2, 4, 8), range(1, 6)):
+            extra = {
+                "language_model_only": True,
+                "kv_cache_memory_bytes": 2 << 30,
+                "speculative_config": {"method": "mtp", "num_speculative_tokens": k},
+                "simulation_config": {
+                    "simulate_forward": True,
+                    "timing": "aisimulate",
+                    "timing_args": {"gpu": "h100", "target_model": target},
+                    "spec_acceptance_rates": [0.5] * k,
+                },
+            }
+            result = work / f"{name}-{tp}-{k}.json"
+            done = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    directory,
+                    str(tp),
+                    "auto",
+                    str(result),
+                    target,
+                    json.dumps(extra),
+                ],
+                env=env,
+                timeout=900,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            assert done.returncode == 0, done.stdout[-4000:]
+            out[(name, tp, k)] = json.loads(result.read_text())
+    return out
+
+
+def test_qwen3_5s_mtp_pairs_unequal_tp_as_it_pairs_without(
+    qwen3_5_mtp_model_dirs,
+    qwen3_5_mtp_block_sizes,
+    qwen3_5_27b_attention_block_sizes,
+    ds_conv_layout,
+):
+    """#33, offline over the published Qwen3.5-27B and Qwen3.5-35B-A3B: at
+    every TP size 1-8 and MTP depth 1-5 the state layout is the native
+    allocation's (`gated_delta_net_state_shape`, its conv rows widened by the
+    depth), and over the 12 directed pairs x 5 depths x prefix caching off
+    and on (120 rows a model) the state-side gate admits each; the
+    handshake's block-size rule, on the sizes the engine picks at each depth
+    (the 27B's at depth 1 the same as without MTP), pairs a decode block
+    that is a multiple of the prefill's and names the others."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateShapeCalculator,
+    )
+
+    from vllm.v1.worker.simulated import state_layout as sl
+
+    for name, directory in qwen3_5_mtp_model_dirs.items():
+        text = json.loads((Path(directory) / "config.json").read_text())
+        text = text.get("text_config", text)
+        configs = {}
+        for tp in (1, 2, 4, 8):
+            for k in range(1, 6):
+                for prefix in (False, True):
+                    configs[(tp, k, prefix)] = engine_config(
+                        directory,
+                        dtype="bfloat16",
+                        tensor_parallel_size=tp,
+                        language_model_only=True,
+                        enable_prefix_caching=prefix,
+                        speculative_config={
+                            "method": "mtp",
+                            "num_speculative_tokens": k,
+                        },
+                    )
+                layout = sl.layout_for(configs[(tp, k, False)])
+                conv, ssm = MambaStateShapeCalculator.gated_delta_net_state_shape(
+                    tp,
+                    text["linear_num_key_heads"],
+                    text["linear_num_value_heads"],
+                    text["linear_key_head_dim"],
+                    text["linear_value_head_dim"],
+                    text["linear_conv_kernel_dim"],
+                    num_spec=k,
+                )
+                assert layout.family == "gdn" and layout.conv_rows == conv[1], (
+                    name,
+                    tp,
+                    k,
+                    conv,
+                )
+                assert layout.local_sizes(tp) == (
+                    conv[0] * conv[1] * layout.conv_itemsize,
+                    math.prod(ssm) * layout.ssm_itemsize,
+                ), (name, tp, k)
+        sizes = {
+            (tp, k): qwen3_5_mtp_block_sizes[(name, tp, k)]
+            for tp, k in itertools.product((1, 2, 4, 8), range(1, 6))
+        }
+        if name == "Qwen3.5-27B":
+            assert {tp: sizes[(tp, 1)] for tp in (1, 2, 4, 8)} == {
+                tp: qwen3_5_27b_attention_block_sizes[(tp, "auto")]
+                for tp in (1, 2, 4, 8)
+            }
+        ledger = {}
+        for (decode, k, prefix), config in configs.items():
+            for prefill in (1, 2, 4, 8):
+                if prefill == decode:
+                    continue
+                verdict = sl.pairing_problem(config, decode, prefill)
+                assert verdict is None, (name, prefill, decode, k, prefix, verdict)
+                assert (
+                    simulated_tp_mismatch(config, decode, prefill, nixl_consumer=True)
+                    is None
+                )
+                # Mooncake's connector re-shards no hybrid state.
+                assert "unequal TP sizes" in simulated_tp_mismatch(
+                    config, decode, prefill
+                )
+                block, peer = sizes[(decode, k)], sizes[(prefill, k)]
+                ledger[(prefill, decode, k, prefix)] = (
+                    None
+                    if block % peer == 0
+                    else f"prefill block {peer} not dividing decode's {block}"
+                )
+        assert len(ledger) == 120
+        # The engine's sizes, pinned: depth 4 widens the 27B's state page past
+        # 800 tokens' attention, depth 2 the 35B-A3B's past 1056.
+        assert sizes == QWEN3_5_MTP_BLOCK_SIZES[name]
+        refused = {row for row, why in ledger.items() if why}
+        assert {(p, d, k) for p, d, k, _ in refused} == QWEN3_5_MTP_REFUSED[name]
+        assert all((p, d, k, not x) in refused for p, d, k, x in refused)
+    # Every pair into TP 8's 416; out of it only below depth 4 (800 blocks).
+    assert QWEN3_5_MTP_REFUSED["Qwen3.5-27B"] == {
+        (p, 8, k) for p in (1, 2, 4) for k in range(1, 6)
+    } | {(8, d, k) for d in (1, 2, 4) for k in (1, 2, 3)}
 
 
 def test_kimi_k3s_kda_state_dtypes_follow_kdas_own_rule(
@@ -4286,6 +4504,8 @@ def main():
     # page, write into a page it left (padding it did not move), or zero a
     # padding page it moved in every layer (its sentinel).
     corrupt = kwargs.pop("corrupt", None)
+    # Consumer: the prompts it pulls (by index), all by default.
+    consume = kwargs.pop("consume", None)
     # Seconds a producer holds a request's blocks for its readers.
     lease = kwargs.pop("kv_lease_duration", None)
     extra = {"backends": ["Mooncake"],
@@ -4294,7 +4514,9 @@ def main():
                   "timing": kwargs.pop("timing", "linear"),
                   "timing_args": kwargs.pop(
                       "timing_args", {"fixed_us": 100}),
-                  "log_path": out + ".steps"}
+                  "log_path": out + ".steps",
+                  # Speculative decoding's acceptance rates, for instance.
+                  **kwargs.pop("simulation", {})}
     if producer:
         simulation["kv_pattern_fill"] = True
     elif check:
@@ -4376,6 +4598,33 @@ def main():
                     if expected is None:
                         continue
                     groups = connector.kv_cache_config.transfer_groups
+                    if isinstance(checker, NativeChecker) and mode in (
+                            "conv-spec", "ssm"):
+                        # A pulled state's byte: its first region's conv row
+                        # of column 0 past the kernel's (a speculative row),
+                        # or its SSM state's first.
+                        selection = checker.selection
+                        layout = selection.layout
+                        for group in expected.groups:
+                            blocks = [b for b in group.block_ids if b]
+                            regions = selection.members[group.group]
+                            rows = sorted(
+                                (r for r in selection.rows
+                                 if r.state and r.region in regions),
+                                key=lambda r: (r.region, r.offset))
+                            if not blocks or not rows:
+                                continue
+                            first = [r for r in rows
+                                     if r.region == rows[0].region]
+                            row, byte = (
+                                (first[0], (layout.conv_rows - 1)
+                                 * layout.conv_itemsize)
+                                if mode == "conv-spec" else (first[-1], 0))
+                            row.view[blocks[-1]][byte] ^= 1
+                            runner._dcp_corrupted = [
+                                mode, group.group, int(blocks[-1])]
+                            return results
+                        continue
                     if isinstance(checker, NativeChecker):
                         # NIXL's checker spans a hybrid's groups: change one
                         # attention group's first payload byte.
@@ -4424,10 +4673,25 @@ def main():
 
         mode, target = corrupt
         assert any(llm.collective_rpc(install, args=(mode, target)))
+    def count_reads(worker):
+        from vllm.distributed.kv_transfer import get_kv_transfer_group
+        wrapper = get_kv_transfer_group().connector_worker.nixl_wrapper
+        make, runner = wrapper.make_prepped_xfer, worker.model_runner
+        runner._dcp_posted = 0
+
+        def counted(*args, **kw):
+            runner._dcp_posted += 1
+            return make(*args, **kw)
+
+        wrapper.make_prepped_xfer = counted
+
+    llm.collective_rpc(count_reads)
     with open(sys.argv[6]) as f:
         remote = json.load(f)
     tokens = []
-    for ids, handoff in zip(prompts, remote["params"]):
+    for index, (ids, handoff) in enumerate(zip(prompts, remote["params"])):
+        if consume is not None and index not in consume:
+            continue
         params = SamplingParams(max_tokens=2, ignore_eos=True, detokenize=False,
                                 extra_args={"kv_transfer_params": handoff})
         (output,) = llm.generate([{"prompt_token_ids": ids}], params,
@@ -4435,8 +4699,10 @@ def main():
         tokens.append(len(output.outputs[0].token_ids))
     corrupted = llm.collective_rpc(
         lambda worker: getattr(worker.model_runner, "_dcp_corrupted", None))
+    posted = llm.collective_rpc(lambda worker: worker.model_runner._dcp_posted)
     with open(out, "w") as f:
-        json.dump({"ranks": ranks, "tokens": tokens, "corrupted": corrupted}, f)
+        json.dump({"ranks": ranks, "tokens": tokens, "corrupted": corrupted,
+                   "posted": posted}, f)
 
 if __name__ == "__main__":
     main()
