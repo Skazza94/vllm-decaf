@@ -2041,6 +2041,20 @@ def global_heads(rank: int, tp: int, kv_heads: int) -> list[int]:
     return [rank * kv_heads // tp]
 
 
+def _group_pages(group: dict) -> list[int | None]:
+    """The bytes of a KV cache group's block one descriptor moves, one for each of its page
+    sizes (sparse MLA: a latent's and an indexer's layers). A packed group (DeepSeek-V4's: each
+    block row holds one group's layers, `block_stride` past their pages) moves its whole row in
+    one descriptor, whichever layers' pages the row holds."""
+    transfer = group.get("transfer") or {}
+    stride = group.get("block_stride")
+    if (transfer.get("descriptors_per_block") == 1 and isinstance(stride, int) and not isinstance(stride, bool)
+            and stride > (group.get("block_bytes") or 0) and transfer.get("bytes_per_block") == stride):
+        return [stride]
+    return sorted({kind.get("real_page_bytes") or kind.get("page_bytes") for kind in group.get("kinds") or []},
+                  key=str) or [group.get("real_page_bytes") or group.get("block_bytes")]
+
+
 def group_kv_heads(model: Path, kinds: list) -> tuple[list[int] | None, str | None]:
     """Each KV cache group's total KV heads, from its layout `kind`: the
     model's own for all groups, except in the config family that gives its
@@ -2412,9 +2426,7 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                     continue
                 # A group of several page sizes (sparse MLA: a latent's and an
                 # indexer's layers) has a slab for each.
-                pages = sorted({kind.get("real_page_bytes") or kind.get("page_bytes")
-                                for kind in group.get("kinds") or []}, key=str) or [
-                    group.get("real_page_bytes") or group.get("block_bytes")]
+                pages = _group_pages(group)
                 good = all(isinstance(page, int) and page > 0 and page % len(want) == 0 for page in pages)
                 each = tuple(page // len(want) for page in pages) if good else None
                 mine_slabs.append(each[0] if each and len(each) == 1 else each)

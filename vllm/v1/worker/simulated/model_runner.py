@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
     sparse_mla,
     unequal_tp_mtp_layout,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.v4_unequal_tp import v4_model
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.simulated.kv_pattern import (
     NativeChecker,
@@ -55,6 +56,7 @@ from vllm.v1.worker.simulated.kv_pattern import (
     state_group_indices,
 )
 from vllm.v1.worker.simulated.state_layout import STATE_PATTERN, state_layout_record
+from vllm.v1.worker.simulated.v4_reads import build_members
 from vllm.v1.worker.simulated.kv_transfer import (
     NixlReadDestinations,
     NixlReadPeers,
@@ -319,6 +321,20 @@ class SimulatedModelRunner(GPUModelRunner):
                 self.clock.now(),
             )
 
+    def _v4_members(self, groups, kv_caches_dict):
+        """DeepSeek-V4's packed rows: each group's layers' registered slices
+        as NIXL advertises them (None for any other model)."""
+        if not v4_model(self.model_config):
+            return None
+        worker = getattr(get_kv_transfer_group(), "connector_worker", None)
+        specs = layer_specs(groups)
+        return build_members(
+            [group.layer_names for group in groups],
+            worker._packed_member_layouts,
+            {name: spec.real_page_size_bytes for name, spec in specs.items()},
+            self.model_config.hf_text_config.num_hidden_layers,
+        )
+
     def _make_kv_connector(self, kv_caches_dict):  # type: ignore[override]
         """Real KV transfers: the native connector; with pattern checks, also
         the views of the tensors it registers."""
@@ -371,6 +387,7 @@ class SimulatedModelRunner(GPUModelRunner):
             tp.world_size,
             layer_total_heads(self.model_config, [n for names in layers for n in names]),
             packed_latent=sparse_mla(self.model_config),
+            replicated_mla=v4_model(self.model_config),
         )
         heads = None
         if sim.kv_pattern_fill or sim.kv_pattern_check:
@@ -483,6 +500,7 @@ class SimulatedModelRunner(GPUModelRunner):
                     self.kv_cache_config.transfer_group_ids,
                     chains,
                     heads=native_heads,
+                    v4=self._v4_members(groups, kv_caches_dict),
                 )
                 self._kv_checker.watch_reads()
             logger.info(

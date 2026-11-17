@@ -546,7 +546,7 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           for each READ. Reverse TP 4 to TP 8 with prefix caching stays
           refused: NIXL needs matching physical blocks per logical
           page for a prefix-cached hybrid;
-      and not for DeepSeek-V4's caches, another MLA hybrid, Kimi-K3 at
+      and not for another MLA hybrid, Kimi-K3 at
       other TP sizes, or other forms of speculative decoding. On the simulated
       CPU MLA path, NIXL pull also pairs native single-module MTP of
       DeepSeek-V3, DeepSeek-V3.2 and GLM-5-NVFP4 at depths 1 to 5, with unequal
@@ -568,6 +568,26 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
       KV geometry are checked as that KV layout, not timed as a smaller model.
       Unequal logical page sizes, DCP and custom kernel declarations stay
       outside this MTP scope; native checks and pairings remain unchanged.
+      DeepSeek-V4 (the published V4-Flash on AISimulate's B200 target, packed
+      FP8 cache, NIXL pull, tensor parallelism of 1, 2, 4 or 8 alone,
+      prefix caching on or off on both sides, no MTP or native MTP of any
+      depth from 1 to 5 on each side, equal in presence) pairs one size
+      dividing the other: every cache layer is one replicated shard, so
+      each decode rank reads whole packed rows from the producer rank
+      `rank * producer TP // decode TP`, and the producer ranks it does not
+      read still complete their sends. Each endpoint states its
+      qualification as one scope entry (role, prefix mode, MTP presence,
+      cache format, geometry digest, GPU target and TP size; never the MTP
+      depth); before registering a peer of another TP size the decode side
+      requires the producer's entry, its own and the peer's registered
+      geometry to agree, with byte checks on or off, and NIXL's own
+      compatibility hash still applies (MTP on one side only is refused by
+      it). Each layer's page is checked as the global head's pattern, so
+      any producer rank gives the same bytes; the READ itself is checked
+      apart: exactly one completed record of the handoff's producer engine
+      and the owner rank, delivering each expected row once, and the
+      draft's payload, alignment and the row's tail reported apart from the
+      target's, the whole row still compared.
       Mooncake still refuses unequal-TP MTP: its native layout exchange
       does not qualify both endpoints' speculative configuration.
       A NIXL decode instance refuses, as

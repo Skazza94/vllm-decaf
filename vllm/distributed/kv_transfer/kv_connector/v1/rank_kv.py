@@ -14,6 +14,11 @@ from vllm import envs
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.config.simulation import NIXL_CONNECTORS, SimulationConfig, moves_real_kv
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
+from vllm.distributed.kv_transfer.kv_connector.v1.v4_unequal_tp import (
+    unequal_tp_v4_refusal,
+    v4_capability,
+    v4_model,
+)
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -975,6 +980,8 @@ def simulated_dcp_scope(vllm_config: VllmConfig) -> list[str] | None:
         scope.append(layout.capability)
     if qualifies_kimi_k3_prefix(vllm_config, producer=True):
         scope.append(KIMI_K3_PREFIX_CAPABILITY)
+    if (capability := v4_capability(vllm_config)) is not None:
+        scope.append(capability)
     return scope
 
 
@@ -1068,6 +1075,14 @@ def simulated_tp_mismatch(
                 f"Kimi-K3 from prefill TP8 to decode TP4, not {sizes}: {problem}."
             )
         return None
+    if v4_model(model):
+        return unequal_tp_v4_refusal(
+            vllm_config,
+            local_tp_size,
+            remote_tp_size,
+            nixl_consumer,
+            unequal_tp_mla_mtp_refusal(local_tp_size, remote_tp_size),
+        )
     if (
         (model.use_mla and not (plain_mla(model) or sparse_mla(model)))
         or model.is_hybrid

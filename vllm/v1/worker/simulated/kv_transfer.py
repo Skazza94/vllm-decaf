@@ -35,6 +35,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
     unequal_tp_mtp_layout,
     unequal_tp_mla_mtp_refusal,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.v4_unequal_tp import (
+    CAPABILITY_FAMILY as V4_CAPABILITY_FAMILY,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.v4_unequal_tp import (
+    Registration,
+    v4_model,
+    v4_peer_refusal,
+)
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
@@ -386,6 +394,7 @@ def dcp_peer_refusal(
         f"the peer's {problem}"
         for problem in scope or ()
         if problem not in UNEQUAL_TP_MTP_CAPABILITIES
+        and not problem.startswith(V4_CAPABILITY_FAMILY)
     )
     if problems:
         return dcp_pair_refusal(local_dcp_size, remote_dcp, problems)
@@ -709,6 +718,22 @@ def validate_dcp_peer(worker) -> None:
             raise ValueError(
                 "Simulated NIXL with split MLA kernel blocks requires equal P/D "
                 f"logical block sizes (local {local_tokens}, remote {remote_tokens})."
+            )
+        if v4_model(worker.vllm_config.model_config):
+            if refusal := v4_peer_refusal(
+                worker.vllm_config,
+                Registration.of_worker(worker),
+                remote_tp_size,
+                metadata,
+            ):
+                raise ValueError(refusal)
+            return add(
+                metadata,
+                remote_tp_rank,
+                remote_tp_size,
+                remote_dcp_size,
+                *args,
+                **kwargs,
             )
         if refusal := mtp_peer_refusal(worker, local_page, remote_tp_size, metadata):
             raise ValueError(refusal)

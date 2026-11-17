@@ -67,6 +67,13 @@ from vllm.v1.worker.simulated.kv_transfer import (
     layer_specs,
     requested_reads,
 )
+from vllm.v1.worker.simulated.v4_reads import (
+    Member,
+    RowAccount,
+    expected_rows,
+    owner_rank,
+    read_problems,
+)
 from vllm.v1.worker.simulated import state_layout as sl
 
 if TYPE_CHECKING:
@@ -77,6 +84,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 SENTINEL = 0
+_NO_BYTES = np.empty(0, dtype=np.int64)
 
 
 def dcp_page(place: int, dcp_size: int, dcp_rank: int) -> int:
@@ -385,6 +393,7 @@ def head_map(
     tp_size: int,
     layer_totals: Mapping[str, int] | None = None,
     packed_latent: bool = False,
+    replicated_mla: bool = False,
 ) -> dict[str, tuple[tuple[int, ...], int]]:
     """Each attention layer's global KV heads and slab, from its own spec:
     one slot per KV head of plain states (`num_kv_heads`, `head_size`), the
@@ -401,6 +410,12 @@ def head_map(
 
     heads = {}
     for layer, spec in specs.items():
+        if replicated_mla:
+            # DeepSeek-V4: every cache layer is one replicated shard, packed
+            # content, compressed states and windows alike.
+            if isinstance(spec, AttentionSpec) and spec.num_kv_heads == 1:
+                heads[layer] = ((0,), spec.real_page_size_bytes)
+            continue
         if (
             not isinstance(spec, AttentionSpec)
             or spec.num_head_slots is not None
@@ -2345,6 +2360,10 @@ class NativeChecker(_ConsumerPages):
     # through its own prepared list, completion), by producer request.
     records: dict[str, list] = field(default_factory=dict)
     prepared: NixlPreparedReads | None = None
+    v4: "Sequence[Sequence[Member]] | None" = None
+    """DeepSeek-V4's packed rows: each group's layers' registered slices. Its
+    READ is then checked by `v4_reads.read_problems` and a row's bad bytes
+    are classified (`RowAccount`)."""
 
     def _write_block(self, req_id, group, logical, block, identity) -> None:
         _write_selected(
@@ -2377,6 +2396,7 @@ class NativeChecker(_ConsumerPages):
             getattr(self.selection, "layout", None) is not None
             or getattr(self.selection, "factor", 1) > 1
             or getattr(self.selection, "layer_names", None) is not None
+            or self.v4 is not None
         ):
             self.prepared = NixlPreparedReads(
                 worker, producer_request, self.selection.piece
@@ -2895,6 +2915,48 @@ class NativeChecker(_ConsumerPages):
             **({"cold_k3_sources": source} if source is not None else {}),
         }
 
+    def _v4_coverage(self, expected: "_Expected", records: list) -> dict:
+        """The one READ a DeepSeek-V4 request pulls, against what the request
+        allocated and the registered rows (`v4_reads.read_problems`): the
+        owner is the native rule of the two TP sizes, the engine the
+        handoff's, neither read from the connector's plan."""
+        s = self.selection
+        w = s.worker
+        topo = w.transfer_topo
+        engine = getattr(expected, "remote_engine_id", None)
+        rank = -1
+        if engine is not None:
+            info = topo.get_engine_info(engine)
+            rank = owner_rank(self.tp_rank, topo.tp_size, info.remote_tp_size)
+        held = {
+            g.group: [b for b in g.block_ids if b != NULL_BLOCK_ID]
+            for g in expected.groups
+        }
+        regions = {g: sorted(s.members[g]) for g in held}
+        region_bytes = {
+            r: w.block_len_per_layer[r] * s.factor
+            for rs in regions.values()
+            for r in rs
+        }
+        pieces = expected_rows(held, regions, region_bytes)
+        problems = read_problems(engine, rank, pieces, records)
+        return {
+            "problems": problems[:8],
+            "problem_count": len(problems),
+            "owner_rank": rank,
+            "expected_rows": len(pieces),
+            "reads": [
+                {
+                    "rank": r.rank,
+                    "engine": r.engine,
+                    "completed": r.done,
+                    "descriptors": len(r.pieces or ()),
+                    "bytes": sum(p[3] for p in r.pieces or ()),
+                }
+                for r in records
+            ],
+        }
+
     def _uses_kernel_rows(self, expected: _Expected) -> bool:
         s = self.selection
         if getattr(s, "factor", 1) > 1:
@@ -2938,6 +3000,7 @@ class NativeChecker(_ConsumerPages):
         self._check_geometry()
         ratio = self._ratio(expected)
         split = self._uses_kernel_rows(expected)
+        account = RowAccount(self.v4) if self.v4 is not None else None
         groups = []
         mismatched_blocks = []
         for group in expected.groups:
@@ -3023,6 +3086,14 @@ class NativeChecker(_ConsumerPages):
                         expected_zero += due
                 differs = view[block] != want
                 wrong = int(differs.sum())
+                if account is not None:
+                    account.add(
+                        group.group,
+                        r.region,
+                        block,
+                        view.shape[1],
+                        differs.nonzero().flatten().numpy() if wrong else _NO_BYTES,
+                    )
                 payload += view.shape[1]
                 if r.region not in s.members[group.group]:
                     transfer_only += view.shape[1]
@@ -3118,7 +3189,19 @@ class NativeChecker(_ConsumerPages):
             else self.records.pop(expected.remote_request_id, [])
         )
         coverage = None
-        if getattr(s, "layout", None) is not None or split:
+        v4_report = None
+        if account is not None:
+            coverage = self._v4_coverage(expected, records)
+            pieces = [p for r in records for p in r.pieces or ()]
+            v4_report = account.report(pieces)
+            if not v4_report["reconciled"]:
+                coverage["problems"].append("a row's layer slices exceed the row")
+                coverage["problem_count"] += 1
+            posted_ok = not coverage["problems"] and (
+                posted == checked
+                or (bool(reads) and all(read == checked for read in reads))
+            )
+        elif getattr(s, "layout", None) is not None or split:
             # A page may come from several producers in several READs, each
             # carrying part of the blocks (an attention READ, then a state
             # one): the union of the READs must be what ownership says, once,
@@ -3133,6 +3216,13 @@ class NativeChecker(_ConsumerPages):
             )
         return {
             **({"coverage": coverage} if coverage is not None else {}),
+            **(
+                {"rows": v4_report, "draft": v4_report.pop("draft")}
+                if v4_report is not None and "draft" in v4_report
+                else {"rows": v4_report}
+                if v4_report is not None
+                else {}
+            ),
             "req_id": req_id,
             "remote_request_id": expected.remote_request_id,
             "blocks": sum(g["blocks"] for g in groups),

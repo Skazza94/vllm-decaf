@@ -3716,6 +3716,45 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
         self.assertTrue(any("bytes" in s for s in pd._plan_problems(*args,max_descriptors=None)))
 
 
+class PackedGroupPagesTests(unittest.TestCase):
+    """What one descriptor moves of a group's block: a packed group (DeepSeek-V4's) its whole row, any
+    other group its pages."""
+
+    ROW = 1002240
+
+    def group(self, **changes) -> dict:
+        return {"kind": "UniformTypeKVCacheSpecs", "block_bytes": 37440, "real_page_bytes": 37376,
+                "block_stride": self.ROW,
+                "kinds": [{"page_bytes": 8640, "real_page_bytes": 8448},
+                          {"page_bytes": 37440, "real_page_bytes": 37376}],
+                "transfer": {"descriptors_per_block": 1, "bytes_per_block": self.ROW}, **changes}
+
+    def test_a_packed_group_moves_its_whole_row(self):
+        self.assertEqual(pd._group_pages(self.group()), [self.ROW])
+
+    def test_other_groups_keep_their_pages(self):
+        plain = self.group(block_stride=37440, transfer={"descriptors_per_block": 1, "bytes_per_block": 37440})
+        self.assertEqual(pd._group_pages(plain), [37376, 8448])
+        two = self.group(transfer={"descriptors_per_block": 2, "bytes_per_block": self.ROW})
+        self.assertEqual(pd._group_pages(two), [37376, 8448])
+        other = self.group(transfer={"descriptors_per_block": 1, "bytes_per_block": 1000})
+        self.assertEqual(pd._group_pages(other), [37376, 8448])
+        self.assertEqual(pd._group_pages({"block_bytes": 64, "real_page_bytes": 60}), [60])
+
+    def test_a_read_of_whole_rows_is_checked_against_the_row(self):
+        heads = {"prefill": {0: [[0]], 2: [[0]]}, "decode": {0: [[0]], 1: [[0]]}}
+        sender = [{(0, 0): 0, (0, 1): 2}]
+        sources = {0: [0], 1: [2]}
+        slab = [self.ROW]
+        plan = [0, 26, 4, 26 * self.ROW, {str(self.ROW): 26}]
+        entry = [26 * self.ROW, 0.01, 0, 4, 1, 2, plan]
+        self.assertEqual(pd._plan_problems((2, 1), entry, plan, True, heads, sender, sources, slab,
+                                           max_descriptors=None), [])
+        entry[0] = 26 * self.ROW - 64
+        self.assertTrue(any("bytes" in s for s in pd._plan_problems(
+            (2, 1), entry, plan, True, heads, sender, sources, slab, max_descriptors=None)))
+
+
 class LibfabricBackendTests(NixlTcpBackendTests):
     backend = "libfabric"
 
