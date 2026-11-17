@@ -544,17 +544,26 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           page for a prefix-cached hybrid;
       and not for DeepSeek-V4's caches, another MLA hybrid, Kimi-K3 at
       other TP sizes, or other forms of speculative decoding. On the simulated
-      CPU MLA path, NIXL pull also pairs DeepSeek-V3's native MTP at depth 1
-      (TP 2 and TP 4 in either direction, BF16 KV, whole 32-token pages,
-      H200 AISimulate, without prefix caching or other parallel axes).
-      The draft's latent is replicated like the target's: each decode rank
-      reads all payload layers from one mapped producer. Both endpoints must
-      qualify before NIXL posts a READ. The same NIXL pull scope includes
-      DeepSeek-V3.2 (H200 AISimulate, BF16 latent) and GLM-5-NVFP4 (B200
-      AISimulate, NVFP4 weights and packed FP8 latent), on whole 64-token
-      pages. Each sparse MLA layer's indexer cache is replicated beside its
-      latent, including the native draft layer. Byte checks reconcile the
-      source rank and report the draft's latent and indexer separately.
+      CPU MLA path, NIXL pull also pairs native single-module MTP of
+      DeepSeek-V3, DeepSeek-V3.2 and GLM-5-NVFP4 at depths 1 to 5, with unequal
+      TP sizes from 1, 2, 4 and 8 in either direction. Both instances must
+      agree on depth, prefix caching, logical page size, KV layout and precision;
+      DCP and other parallel axes remain 1. Dense V3 uses whole 16-, 32-, 64-
+      or 128-token BF16 pages. Sparse V3.2 uses BF16 latents and GLM-5-NVFP4
+      packed FP8 latents, each with byte indexer keys: logical pages hold 64
+      or 128 tokens, the latter two native 64-token kernel pages. Both actual
+      registrations must agree before a READ, including without byte checks.
+      Each decode rank reads every target and draft region from the producer
+      selected by native replicated-MLA mapping. Byte checks cover every moved
+      byte and exact destination intervals, producer identity and completion;
+      they report draft latent/indexer totals separately. They do not
+      independently audit remote source addresses. Prefix hits are checked
+      without rewriting them, including pages completed by accepted drafts.
+      Timing remains the explicit published AISimulate deployment, with its
+      documented MTP approximations. Compute-small fixtures preserving published
+      KV geometry are checked as that KV layout, not timed as a smaller model.
+      Unequal logical page sizes, DCP and custom kernel declarations stay
+      outside this MTP scope; native checks and pairings remain unchanged.
       Mooncake still refuses unequal-TP MTP: its native layout exchange
       does not qualify both endpoints' speculative configuration.
       A NIXL decode instance refuses, as

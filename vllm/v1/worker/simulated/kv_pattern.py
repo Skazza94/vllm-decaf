@@ -1493,8 +1493,9 @@ class PatternChecker(_ConsumerPages):
             remote = self._nixl.transfer_topo.get_engine_info(expected.remote_engine_id)
             if layout is not None and remote.remote_tp_size != self._nixl.world_size:
                 expected, mtp_audit = self._check_mtp_read(expected, records, remote)
-            if remote.remote_physical_blocks_per_logical > 1 or (
-                self._nixl._physical_blocks_per_logical_kv_block > 1
+            if mtp_audit is None and (
+                remote.remote_physical_blocks_per_logical > 1
+                or self._nixl._physical_blocks_per_logical_kv_block > 1
             ):
                 # The same logical-page oracle also covers dense MLA at DCP1.
                 written, coverage = self._prepared_dcp(expected, records)
@@ -1555,6 +1556,13 @@ class PatternChecker(_ConsumerPages):
         if mtp_audit is not None:
             coverage, draft_read = mtp_audit
             evidence["coverage"] = coverage
+            evidence["target"] = {
+                "checked_bytes": sum(g["bytes"] for g in groups)
+                - sum(draft_checked.values()),
+                "read_bytes": sum(r["bytes"] for r in coverage["reads"])
+                - sum(draft_read.values()),
+                "mismatched_bytes": mismatched_bytes - sum(draft_bad.values()),
+            }
             draft_stats = {
                 layer: {
                     "layer": layer,
@@ -1593,10 +1601,13 @@ class PatternChecker(_ConsumerPages):
         assert layout is not None
         pages = -(-(expected.remote_num_tokens or 0) // layout.page_size)
         producer = self.tp_rank * remote.remote_tp_size // self._nixl.world_size
-        # The handoff names the payload at logical page zero. Decode-only
-        # lookahead may allocate more pages but may not be written by a READ.
+        # Views resolve prepared kernel intervals into logical pages. Cached
+        # prefix and decode-only lookahead may not be written by a READ.
         groups = [
-            replace(group, block_ids=group.block_ids[:pages])
+            replace(
+                group,
+                block_ids=group.block_ids[: max(0, pages - group.first_logical_block)],
+            )
             for group in expected.groups
         ]
         wanted = {
@@ -1609,14 +1620,30 @@ class PatternChecker(_ConsumerPages):
             ]
         }
         coverage = mtp_read_coverage(wanted, records, expected.remote_engine_id)
+        coverage["destination_pieces"] = [r.pieces for r in records]
         if (
             pages < 1
             or len(groups) != 1
-            or groups[0].first_logical_block != 0
-            or len(set(groups[0].block_ids) - {NULL_BLOCK_ID}) != pages
+            or not 0 <= groups[0].first_logical_block < pages
+            or len(groups[0].block_ids) != pages - groups[0].first_logical_block
+            or len(set(groups[0].block_ids) - {NULL_BLOCK_ID})
+            != len(groups[0].block_ids)
         ):
             coverage["problems"] = [
                 "Scheduler blocks do not cover the MLA MTP handoff.",
+                *coverage["problems"][:7],
+            ]
+            coverage["problem_count"] += 1
+        lookahead_bad = sum(
+            int((view[block] != SENTINEL).sum())
+            for group in expected.groups
+            for block in group.block_ids[max(0, pages - group.first_logical_block) :]
+            if block != NULL_BLOCK_ID
+            for view in self._groups[group.group].values()
+        )
+        if lookahead_bad:
+            coverage["problems"] = [
+                "An MLA MTP READ changed decode-only lookahead bytes.",
                 *coverage["problems"][:7],
             ]
             coverage["problem_count"] += 1

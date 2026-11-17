@@ -403,24 +403,32 @@ def _matches_mtp_regions(
     layout: UnequalTpMtpLayout, page, names, lengths, group_ids, strides
 ) -> bool:
     return (
-        page == (layout.page_size, 1)
+        page == (layout.kernel_block_size, layout.physical_per_logical)
         and names == layout.names
         and lengths == layout.page_bytes
         and group_ids == [0] * len(names)
-        and (not layout.indexer_page_bytes or strides == lengths)
+        and strides == lengths
     )
 
 
 def _matches_mtp_peer(layout: UnequalTpMtpLayout, metadata) -> bool:
-    return UNEQUAL_TP_MTP_CAPABILITIES.intersection(metadata.simulated_scope or ()) == {
-        layout.capability
-    } and _matches_mtp_regions(
-        layout,
-        (metadata.block_size, metadata.physical_blocks_per_logical_kv_block),
-        metadata.region_names,
-        metadata.block_lens,
-        metadata.region_group_ids,
-        metadata.block_strides,
+    capabilities = {
+        cap
+        for cap in metadata.simulated_scope or ()
+        if cap.startswith("simulated/nixl/unequal-tp-")
+    }
+    return (
+        capabilities == {layout.peer_capability}
+        and layout.peer_capability in UNEQUAL_TP_MTP_CAPABILITIES
+        and metadata.dcp_size == metadata.pcp_size == 1
+        and _matches_mtp_regions(
+            layout,
+            (metadata.block_size, metadata.physical_blocks_per_logical_kv_block),
+            metadata.region_names,
+            metadata.block_lens,
+            metadata.region_group_ids,
+            metadata.block_strides,
+        )
     )
 
 
@@ -431,8 +439,10 @@ def mtp_peer_refusal(worker, local_page, remote_tp, metadata) -> str | None:
         return None
     layout = unequal_tp_mtp_layout(worker.vllm_config)
     if (
-        {local_tp, remote_tp} == {2, 4}
+        local_tp in (1, 2, 4, 8)
+        and remote_tp in (1, 2, 4, 8)
         and layout is not None
+        and not layout.producer
         and _matches_mtp_peer(layout, metadata)
         and _matches_mtp_regions(
             layout,
@@ -445,6 +455,33 @@ def mtp_peer_refusal(worker, local_page, remote_tp, metadata) -> str | None:
     ):
         return None
     return unequal_tp_mla_mtp_refusal(local_tp, remote_tp)
+
+
+def _mtp_split_peer_matches(
+    config, local_page, remote_tp, metadata, local_regions
+) -> bool:
+    """A sparse MTP pair's native indexer splits equal logical B128 pages."""
+    local_tp = config.parallel_config.tensor_parallel_size
+    layout = unequal_tp_mtp_layout(config)
+    return (
+        local_tp != remote_tp
+        and local_tp in (1, 2, 4, 8)
+        and remote_tp in (1, 2, 4, 8)
+        and config.parallel_config.decode_context_parallel_size
+        == metadata.dcp_size
+        == 1
+        and layout is not None
+        and not layout.producer
+        and layout.indexer_page_bytes > 0
+        and layout.page_size == 128
+        and layout.physical_per_logical == 2
+        and _matches_mtp_peer(layout, metadata)
+        and _matches_mtp_regions(
+            layout,
+            local_page,
+            *local_regions,
+        )
+    )
 
 
 def _kimi_k3_regions(
@@ -638,6 +675,18 @@ def validate_dcp_peer(worker) -> None:
         if (
             remote_factor > 1
             and worker.vllm_config.simulation_config.kv_kernel_backend is None
+            and not _mtp_split_peer_matches(
+                worker.vllm_config,
+                local_page,
+                remote_tp_size,
+                metadata,
+                (
+                    worker.region_names,
+                    worker.block_len_per_layer,
+                    worker.region_group_ids,
+                    worker.block_stride_per_layer,
+                ),
+            )
         ):
             # Without a declaration this instance's blocks are whole kernel
             # blocks; the checks pair a split peer's rows only on a declared one.

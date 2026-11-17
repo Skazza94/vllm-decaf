@@ -8,7 +8,7 @@ sizes real transfers pair."""
 
 import ipaddress
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from vllm import envs
 from vllm.config import KVTransferConfig, VllmConfig
@@ -481,15 +481,14 @@ def _qualifies_unequal_tp_mtp_endpoint(config: VllmConfig, page_size: int) -> bo
         or transfer.get_from_extra_config("bidirectional_kv_xfer", False)
         or not transfer.get_from_extra_config("enforce_handshake_compat", True)
         or spec is None
-        or spec.num_speculative_tokens != 1
+        or not 1 <= spec.num_speculative_tokens <= 5
         or spec.uses_dynamic_speculative_decoding()
         or spec.enable_adaptive_verification
         or sim.timing != "aisimulate"
         or sim.timing_args.get("quant_modes")
         or sim.kv_kernel_backend is not None
         or cache.block_size != page_size
-        or cache.enable_prefix_caching
-        or pc.tensor_parallel_size not in (2, 4)
+        or pc.tensor_parallel_size not in (1, 2, 4, 8)
         or any(
             size != 1
             for size in (
@@ -518,7 +517,9 @@ def _qualifies_unequal_tp_mtp_endpoint(config: VllmConfig, page_size: int) -> bo
 
 def qualifies_unequal_tp_mla_mtp(config: VllmConfig) -> bool:
     """An endpoint in the verified whole-page DeepSeek-V3 MTP scope."""
-    if not _qualifies_unequal_tp_mtp_endpoint(config, UNEQUAL_TP_MLA_MTP_PAGE):
+    if config.cache_config.block_size not in (16, 32, 64, 128) or not (
+        _qualifies_unequal_tp_mtp_endpoint(config, config.cache_config.block_size)
+    ):
         return False
     sim, cache = config.simulation_config, config.cache_config
     spec = config.speculative_config
@@ -551,13 +552,11 @@ def qualifies_unequal_tp_mla_mtp(config: VllmConfig) -> bool:
             or quant.get("quant_method") != "fp8"
             or quant.get("weight_block_size") != [128, 128]
             or hf.num_hidden_layers != 61
-            or hf.hidden_size != 7168
-            or hf.q_lora_rank != 1536
-            or hf.n_routed_experts != 256
-            or hf.num_experts_per_tok != 8
             or hf.num_nextn_predict_layers != 1
             or hf.num_attention_heads != 128
             or hf.kv_lora_rank != 512
+            or hf.qk_nope_head_dim != 128
+            or hf.v_head_dim != 128
             or hf.qk_rope_head_dim != 64
         ):
             return False
@@ -573,6 +572,16 @@ class UnequalTpMtpLayout:
     target_layers: int
     latent_page_bytes: int
     indexer_page_bytes: int = 0
+    physical_per_logical: int = 1
+    producer: bool = False
+
+    @property
+    def kernel_block_size(self) -> int:
+        return self.page_size // self.physical_per_logical
+
+    @property
+    def peer_capability(self) -> str:
+        return self.capability.rsplit("/", 1)[0] + "/producer"
 
     def layer_regions(self, layer: int) -> tuple[str, ...]:
         prefix = f"model.layers.{layer}.self_attn"
@@ -598,7 +607,9 @@ class UnequalTpMtpLayout:
         per_layer = [self.latent_page_bytes]
         if self.indexer_page_bytes:
             per_layer.append(self.indexer_page_bytes)
-        return per_layer * (self.target_layers + 1)
+        return [n // self.physical_per_logical for n in per_layer] * (
+            self.target_layers + 1
+        )
 
 
 _DENSE_MTP_LAYOUT = UnequalTpMtpLayout(
@@ -622,9 +633,38 @@ _GLM5_MTP_LAYOUT = UnequalTpMtpLayout(
     64 * 132,
 )
 UNEQUAL_TP_MTP_CAPABILITIES = frozenset(
-    layout.capability
-    for layout in (_DENSE_MTP_LAYOUT, _V32_MTP_LAYOUT, _GLM5_MTP_LAYOUT)
+    f"{layout.capability}/k{k}/b{block}/prefix{int(prefix)}/f{factor}/{role}"
+    for layout, sizes in (
+        (_DENSE_MTP_LAYOUT, (16, 32, 64, 128)),
+        (_V32_MTP_LAYOUT, (64, 128)),
+        (_GLM5_MTP_LAYOUT, (64, 128)),
+    )
+    for block in sizes
+    for factor in (block // 64 if layout.indexer_page_bytes else 1,)
+    for k in range(1, 6)
+    for prefix in (False, True)
+    for role in ("producer", "consumer")
 )
+
+
+def _mtp_scope_identity(layout: UnequalTpMtpLayout, config) -> UnequalTpMtpLayout:
+    block = config.cache_config.block_size
+    factor = block // 64 if layout.indexer_page_bytes else 1
+    producer = config.kv_transfer_config.kv_role == "kv_producer"
+    k = config.speculative_config.num_speculative_tokens
+    prefix = config.cache_config.enable_prefix_caching
+    role = "producer" if producer else "consumer"
+    return replace(
+        layout,
+        capability=(
+            f"{layout.capability}/k{k}/b{block}/prefix{int(prefix)}/f{factor}/{role}"
+        ),
+        page_size=block,
+        latent_page_bytes=layout.latent_page_bytes * block // layout.page_size,
+        indexer_page_bytes=layout.indexer_page_bytes * block // layout.page_size,
+        physical_per_logical=factor,
+        producer=producer,
+    )
 
 
 def _sparse_mtp_layout(config: VllmConfig) -> UnequalTpMtpLayout | None:
@@ -633,7 +673,10 @@ def _sparse_mtp_layout(config: VllmConfig) -> UnequalTpMtpLayout | None:
         config.simulation_config,
         config.model_config,
     )
-    if not _qualifies_unequal_tp_mtp_endpoint(config, 64) or not sparse_mla(model):
+    if cache.block_size not in (64, 128) or not (
+        _qualifies_unequal_tp_mtp_endpoint(config, cache.block_size)
+        and sparse_mla(model)
+    ):
         return None
     spec = config.speculative_config
     draft = spec.draft_model_config
@@ -677,23 +720,14 @@ def _sparse_mtp_layout(config: VllmConfig) -> UnequalTpMtpLayout | None:
     geometry = {
         "num_hidden_layers": layout.target_layers,
         "num_nextn_predict_layers": 1,
-        "hidden_size": 6144 if glm else 7168,
-        "intermediate_size": 12288 if glm else 18432,
-        "moe_intermediate_size": 2048,
-        "first_k_dense_replace": 3,
-        "n_shared_experts": 1,
-        "n_routed_experts": 256,
-        "num_experts_per_tok": 8,
         "num_attention_heads": 64 if glm else 128,
         "kv_lora_rank": 512,
-        "q_lora_rank": 2048 if glm else 1536,
         "qk_rope_head_dim": 64,
         "qk_nope_head_dim": 192 if glm else 128,
         "v_head_dim": 256 if glm else 128,
         "index_head_dim": 128,
         "index_n_heads": 32 if glm else 64,
         "index_topk": 2048,
-        "vocab_size": 154880 if glm else 129280,
     }
     for endpoint in (model, draft):
         hf = endpoint.hf_text_config
@@ -716,18 +750,18 @@ def _sparse_mtp_layout(config: VllmConfig) -> UnequalTpMtpLayout | None:
                 or sidecar.get("group_size") != 16
             ):
                 return None
-        elif (
-            quant.get("quant_method") != "fp8"
-            or quant.get("weight_block_size") != [128, 128]
-        ):
+        elif quant.get("quant_method") != "fp8" or quant.get("weight_block_size") != [
+            128,
+            128,
+        ]:
             return None
-    return layout
+    return _mtp_scope_identity(layout, config)
 
 
 def unequal_tp_mtp_layout(config: VllmConfig) -> UnequalTpMtpLayout | None:
     """The layout an endpoint may offer to an unequal-TP NIXL peer."""
     if qualifies_unequal_tp_mla_mtp(config):
-        return _DENSE_MTP_LAYOUT
+        return _mtp_scope_identity(_DENSE_MTP_LAYOUT, config)
     return _sparse_mtp_layout(config)
 
 
@@ -977,8 +1011,9 @@ def simulated_tp_mismatch(
     local_dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     if local_dcp_size > 1 or remote_dcp_size > 1:
         problems = dcp_scope_problems(vllm_config, transfers=True)
-        larger, smaller = max(local_tp_size, remote_tp_size), min(
-            local_tp_size, remote_tp_size
+        larger, smaller = (
+            max(local_tp_size, remote_tp_size),
+            min(local_tp_size, remote_tp_size),
         )
         if larger % smaller:
             problems.append(f"local TP {local_tp_size} and remote TP {remote_tp_size}")
@@ -988,9 +1023,15 @@ def simulated_tp_mismatch(
     if local_tp_size == remote_tp_size:
         return None
     sizes = f"local TP {local_tp_size} and remote TP {remote_tp_size}"
-    larger, smaller = max(local_tp_size, remote_tp_size), min(local_tp_size, remote_tp_size)
+    larger, smaller = (
+        max(local_tp_size, remote_tp_size),
+        min(local_tp_size, remote_tp_size),
+    )
     if larger % smaller:
-        return f"Simulated real KV transfers pair TP sizes one dividing the other, not {sizes}."
+        return (
+            "Simulated real KV transfers pair TP sizes one dividing the other, "
+            f"not {sizes}."
+        )
     model = vllm_config.model_config
     # Layers of different KV heads (Gemma4's global layers beside its
     # sliding ones): the connectors count one head total, so only sizes that
@@ -1000,10 +1041,13 @@ def simulated_tp_mismatch(
     per_layer = getattr(model.hf_text_config, "per_layer_config", None) or ()
     totals = [getattr(layer, "num_key_value_heads", None) for layer in per_layer]
     if len(set(totals)) > 1:
-        if not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in totals):
+        if not all(
+            isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in totals
+        ):
             return (
                 "Simulated real KV transfers pair unequal TP sizes for layers of "
-                f"valid KV head counts only (this model's layers differ: {sorted(map(str, set(totals)))}), "
+                "valid KV head counts only (this model's layers differ: "
+                f"{sorted(map(str, set(totals)))}), "
                 f"not {sizes}."
             )
         if any(n < larger or n % local_tp_size or n % remote_tp_size for n in totals):
@@ -1031,7 +1075,8 @@ def simulated_tp_mismatch(
     ):
         if (
             nixl_consumer
-            and {local_tp_size, remote_tp_size} == {2, 4}
+            and local_tp_size in (1, 2, 4, 8)
+            and remote_tp_size in (1, 2, 4, 8)
             and local_tp_size == vllm_config.parallel_config.tensor_parallel_size
             and unequal_tp_mtp_layout(vllm_config) is not None
         ):

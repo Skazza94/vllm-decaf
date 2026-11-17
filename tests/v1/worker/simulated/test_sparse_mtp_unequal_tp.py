@@ -248,15 +248,16 @@ def _registrations(path, target, role, tp):
     return rows
 
 
-def _marker(target):
+def _marker(target, producer=False):
     suffix = PROFILES[target][-1]
-    return f"simulated/nixl/unequal-tp-dsa-{suffix}-mtp/v1"
+    role = "producer" if producer else "consumer"
+    return f"simulated/nixl/unequal-tp-dsa-{suffix}-mtp/v1/k1/b64/prefix0/f1/{role}"
 
 
 def _assert_transferred(path, target, p_tp, d_tp, code, *, checked=True, corrupt=None):
     for role, count in (("prefill", p_tp), ("decode", d_tp)):
         for row in _registrations(path, target, role, count):
-            assert _marker(target) in row["scope"]
+            assert _marker(target, producer=role == "prefill") in row["scope"]
     log = (path / "decode.log").read_text()
     assert REFUSAL not in log, log[-6000:]
     assert code == 0, log[-6000:]
@@ -433,7 +434,7 @@ def test_sparse_mtp_admission_and_dcp_order(tmp_path, target):
     assert simulated_tp_mismatch(config, 2, 4, nixl_consumer=True) is None
     assert simulated_tp_mismatch(config, 2, 2, nixl_consumer=True) is None
     assert REFUSAL in simulated_tp_mismatch(config, 2, 4)
-    assert REFUSAL in simulated_tp_mismatch(config, 2, 8, nixl_consumer=True)
+    assert simulated_tp_mismatch(config, 2, 8, nixl_consumer=True) is None
     assert "one dividing the other" in simulated_tp_mismatch(
         config,
         2,
@@ -507,6 +508,22 @@ def test_sparse_mtp_outside_scope_is_refused(tmp_path, target, options):
     )
 
     config = _config(tmp_path, target, **options)
+    if options in (
+        {"tp": 1},
+        {"depth": 2},
+        {"enable_prefix_caching": True},
+        {"block_size": 128},
+    ):
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+            unequal_tp_mtp_layout,
+        )
+
+        assert unequal_tp_mtp_layout(config) is not None
+        assert (
+            simulated_tp_mismatch(config, options.get("tp", 2), 4, nixl_consumer=True)
+            is None
+        )
+        return
     assert _marker(target) not in simulated_dcp_scope(config)
     local = options.get("tp", 2)
     nixl = (
@@ -549,8 +566,8 @@ def test_sparse_mtp_matches_actual_peer_registration(tmp_path, damage):
     strides = list(lengths)
     scopes = {
         "missing-scope": [],
-        "foreign-scope": [_marker(GLM)],
-        "both-scopes": [_marker(V32), _marker(GLM)],
+        "foreign-scope": [_marker(GLM, producer=True)],
+        "both-scopes": [_marker(V32, producer=True), _marker(GLM, producer=True)],
     }
     if damage == "order":
         names[-2], names[-1] = names[-1], names[-2]
@@ -567,7 +584,7 @@ def test_sparse_mtp_matches_actual_peer_registration(tmp_path, damage):
         block_lens=lengths,
         region_group_ids=groups,
         block_strides=strides,
-        simulated_scope=scopes.get(damage, [_marker(V32)]),
+        simulated_scope=scopes.get(damage, [_marker(V32, producer=True)]),
     )
     assert _matches_mtp_peer(layout, peer) == (damage == "clean")
 
