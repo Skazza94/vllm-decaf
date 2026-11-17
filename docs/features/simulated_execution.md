@@ -530,6 +530,18 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           original producer block IDs independently of the byte check; the
           raw registration carries geometry, not the producer's fill
           or prefix settings;
+        * other cold unequal TP pairs within 1, 2, 4 and 8 use the same
+          published Kimi-K3 and checked CPU NIXL scope. Each side uses
+          its whole attention page sized for its TP-sharded state.
+          Native NIXL pairs attention rows in the greatest common
+          unit and keeps each producer's original state-page stride.
+          The checker validates every source separately, with KDA
+          spans matched by global columns and heads. It distinguishes
+          copied patterned attention padding from any uncovered decode
+          rows that NIXL zeroes. The route keeps native transport limits
+          for each READ. Reverse TP 4 to TP 8 with prefix caching stays
+          refused: NIXL needs matching physical blocks per logical
+          page for a prefix-cached hybrid;
       and not for DeepSeek-V4's caches, another MLA hybrid, Kimi-K3 at
       other TP sizes, or other forms of speculative decoding. On the simulated
       CPU MLA path, NIXL pull also pairs DeepSeek-V3's native MTP at depth 1

@@ -837,8 +837,44 @@ def _published_kimi_k3(model) -> bool:
     )
 
 
+def kimi_k3_cold_pair(config: VllmConfig, remote_tp: int) -> tuple[int, int] | None:
+    """Resolved whole pages for a checked CPU pull at the published precision."""
+    from math import gcd
+
+    local_tp = config.parallel_config.tensor_parallel_size
+    sizes = (remote_tp, local_tp)
+    # The existing TP8 producer / TP4 consumer path keeps its own scope.
+    if sizes == (8, 4) or remote_tp == local_tp or any(
+        tp not in (1, 2, 4, 8) for tp in sizes
+    ):
+        return None
+    if max(sizes) % min(sizes):
+        return None
+    # KDA: 221,184 BF16 convolution bytes and 6,291,456 FP32
+    # recurrent bytes globally. One replicated MLA row is 1,152 B/token.
+    alignment = 128
+    p_page, d_page = (
+        alignment * -(-6_512_640 // (tp * alignment * 1152)) for tp in sizes
+    )
+    unit = gcd(p_page, d_page)
+    if max(p_page, d_page) // unit > 128:
+        return None
+    admitted = (
+        qualifies_kimi_k3_cold(config) if sizes == (4, 8)
+        else _qualifies_kimi_k3_cold_consumer(config, d_page)
+    )
+    return (p_page, d_page) if admitted else None
+
+
 def qualifies_kimi_k3_cold(config: VllmConfig) -> bool:
     """The checked TP8 consumer of a whole-page TP4 Kimi-K3 NIXL pull."""
+    return (
+        config.parallel_config.tensor_parallel_size == 8
+        and _qualifies_kimi_k3_cold_consumer(config, 768)
+    )
+
+
+def _qualifies_kimi_k3_cold_consumer(config: VllmConfig, page: int) -> bool:
     from vllm.platforms import current_platform
 
     model = config.model_config
@@ -860,7 +896,7 @@ def qualifies_kimi_k3_cold(config: VllmConfig) -> bool:
         and model.use_mla
         and str(model.dtype) == "torch.bfloat16"
         and config.speculative_config is None
-        and pc.tensor_parallel_size == pc.world_size == 8
+        and pc.tensor_parallel_size == pc.world_size
         and pc.data_parallel_size == pc.pipeline_parallel_size == 1
         and pc.decode_context_parallel_size == pc.prefill_context_parallel_size == 1
         and pc.nnodes == 1
@@ -881,7 +917,7 @@ def qualifies_kimi_k3_cold(config: VllmConfig) -> bool:
         and not cache.enable_prefix_caching
         and cache.cache_dtype in ("auto", "bfloat16")
         and cache.mamba_cache_mode == "none"
-        and cache.block_size == 768
+        and cache.block_size == page
         and cache.mamba_block_size == model.max_model_len
         and cache.mamba_cache_dtype in ("auto", "bfloat16")
         and cache.mamba_ssm_cache_dtype in ("auto", "float32")

@@ -205,7 +205,7 @@ def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
     """Why a hybrid of this model cannot pair these TP sizes over NIXL, None
     when it can: a Mamba2 or GDN layout that splits over both sizes, no
     speculative decoding, no MLA (but Kimi-K3's, at decode TP4 from prefill
-    TP8, and the published cold reverse pair), and attention KV heads
+    TP8, or the published checked cold pairs), and attention KV heads
     that split or replicate evenly on each side as NIXL maps them (the
     replicated-producer refusal of pure attention does not apply: a hybrid's
     mapping separates attention sources from state sources)."""
@@ -213,18 +213,19 @@ def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
     if model.use_mla:
         # Kimi-K3 (KDA beside a replicated MLA latent): the ordinary
         # direction reads two producer blocks per decode attention block.
-        # Only the checked cold reverse case can split a producer block.
+        # The other directions require explicit checked cold geometries.
         # Kimi-K3's text model is Kimi-Linear's (`kimi_linear`); real
         # transfers admit its KDA class only (`check_real_kv_layers`).
         if getattr(model.hf_text_config, "model_type", None) != "kimi_linear":
             return "an MLA hybrid other than Kimi-K3"
         if (local_tp, remote_tp) != (4, 8):
             from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
-                qualifies_kimi_k3_cold,
+                kimi_k3_cold_pair,
             )
 
-            if (local_tp, remote_tp) != (8, 4) or not qualifies_kimi_k3_cold(
-                vllm_config
+            if (
+                local_tp != vllm_config.parallel_config.tensor_parallel_size
+                or not kimi_k3_cold_pair(vllm_config, remote_tp)
             ):
                 return "Kimi-K3 at TP sizes other than prefill TP8 to decode TP4"
         if vllm_config.cache_config.enable_prefix_caching:
@@ -554,3 +555,21 @@ def paired_read_problems(
         if source != expected[dest]:
             return [f"wrong paired source for destination {dest}"]
     return []
+
+
+def paired_k3_read_problems(
+    expected: Mapping[int, Mapping[Piece, tuple[int, int]]],
+    reads: Sequence[ReadRecord],
+    engine: str,
+) -> list[str]:
+    """One exact paired READ per source, with no extra READ or rank."""
+    ranks = [read.rank for read in reads]
+    if len(ranks) != len(expected) or set(ranks) != expected.keys():
+        return [f"expected one READ from each producer {list(expected)}, got {ranks}"]
+    problems = []
+    for rank, intervals in expected.items():
+        problems.extend(
+            paired_read_problems(intervals, [r for r in reads if r.rank == rank],
+                                 engine, rank)
+        )
+    return problems

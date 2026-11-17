@@ -2559,84 +2559,148 @@ class NativeChecker(_ConsumerPages):
         # Count any copied allocator padding separately from unreceived rows.
         return max(0, min(tokens, handoff_end - start))
 
-    def _cold_k3_source_audit(self, expected, records, engine_id, remote_tp):
-        """Expected source coordinates in the producer's original allocation."""
-        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
-            qualifies_kimi_k3_cold,
-        )
-
-        s = self.selection
-        w = s.worker
-        config = getattr(w, "vllm_config", None)
-        if remote_tp != 4 or config is None or not qualifies_kimi_k3_cold(config):
-            return None
-        peer = getattr(w, "kimi_k3_cold_peers", {}).get(engine_id)
+    @staticmethod
+    def _cold_k3_aperture(expected, peers, pages, unit, heads, num_blocks):
+        """Check the original apertures, independent of native descriptor IDs."""
         handoff = expected.remote_num_tokens
         exported = expected.remote_block_ids
         if (
-            peer is None
-            or handoff is None
+            handoff is None
             or handoff <= 0
             or exported is None
-            or len(exported) != len(expected.groups) or len(exported) != 4
-            or self._split_attention_rows(expected) != (768, 1536, 768, 768)
+            or len(exported) != len(expected.groups)
+            or len(exported) != 4
         ):
-            return {"problems": ["missing or incompatible cold Kimi-K3 handoff"]}
-        want = {}
-        remote_spans = {
-            span.component: span for span in s.layout.spans(peer.rank, 4)
-        }
+            raise ValueError("missing or incompatible cold Kimi-K3 handoff")
+        p_page, d_page = pages
+        p_blocks = -(-handoff // p_page)
+        d_blocks = -(-handoff // d_page)
         for group, remote in zip(expected.groups, exported, strict=True):
             local = group.block_ids
-            state = not _group_heads(self.heads, group.group)
-            npages = 1 if state else -(-handoff // 1536)
-            nlocal = 1 if state else -(-handoff // 768)
+            state = not _group_heads(heads, group.group)
             if not (
-                len(remote) == len(set(remote)) == npages
-                and all(0 < b < peer.num_blocks for b in remote)
-                and len(local) == len(set(local)) == nlocal
-                and all(0 < b < s.num_blocks for b in local)
+                len(remote) == len(set(remote)) == (1 if state else p_blocks)
+                and all(0 < b < peer.num_blocks for peer in peers.values()
+                        for b in remote)
+                and len(local) == len(set(local)) == (1 if state else d_blocks)
+                and all(0 < b < num_blocks for b in local)
                 and (state or group.first_logical_block == 0)
             ):
-                return {"problems": [f"invalid cold Kimi-K3 page lists: {group.group}"]}
-            for row, block, position in s.select(group.group, local):
-                entry = s.rows[row]
-                length = entry.view.shape[1]
-                if state:
-                    span = entry.span
-                    parent = remote_spans[span.component]
-                    pblock = remote[0]
-                    offset = parent.offset + (
-                        span.first - parent.first
-                    ) * span.unit_bytes
-                else:
-                    pblock = remote[position // 2]
-                    offset = (position % 2) * 768 * 576 * 2
-                dest = (entry.region, block, entry.offset, length)
-                if dest in want:
-                    return {"problems": ["duplicate cold Kimi-K3 requested range"]}
-                want[dest] = (
-                    peer.bases[entry.region] + pblock * peer.stride + offset, length
-                )
-        problems = sl.paired_read_problems(want, records, engine_id, peer.rank)
-        report = {
-            "problems": problems,
-            "rank": peer.rank,
-            "handoff_tokens": handoff,
-            "raw_producer_page": 1536,
-            "read_unit": 768,
-            "producer_factor": 2,
-            "producer_blocks": exported,
-            "consumer_blocks": [group.block_ids for group in expected.groups],
-        }
-        if not problems:
-            # Decode the actual paired source addresses in the original P page.
-            report["pairs"] = [
+                raise ValueError(f"invalid cold Kimi-K3 page lists: {group.group}")
+        return min(p_blocks * p_page, d_blocks * d_page) // unit
+
+    @staticmethod
+    def _cold_k3_pairs(
+        expected, peers, remote_tp, pages, unit, copied,
+        *, local_tp, local_rank, layout, heads, members,
+    ):
+        """Expected paired spans from registration and request positions."""
+        p_page, d_page = pages
+        p_factor, d_factor = p_page // unit, d_page // unit
+        width = unit * 1152
+        want = {}
+        for rank, peer in sorted(peers.items()):
+            pairs = want.setdefault(rank, {})
+            parent_spans = {
+                span.component: span for span in layout.spans(rank, remote_tp)
+            }
+            for group, remote in zip(
+                expected.groups, expected.remote_block_ids, strict=True
+            ):
+                state = not _group_heads(heads, group.group)
+                for region in sorted(members[group.group]):
+                    if state:
+                        for child in layout.spans(local_rank, local_tp):
+                            parent = parent_spans[child.component]
+                            first = max(parent.first, child.first)
+                            end = min(parent.first + parent.count,
+                                      child.first + child.count)
+                            if first >= end:
+                                continue
+                            size = (end - first) * child.unit_bytes
+                            p_offset = parent.offset + (
+                                first - parent.first
+                            ) * parent.unit_bytes
+                            d_offset = child.offset + (
+                                first - child.first
+                            ) * child.unit_bytes
+                            dest = (region, group.block_ids[0], d_offset, size)
+                            addr = peer.bases[region] + remote[0] * peer.stride
+                            pairs[dest] = (addr + p_offset, size)
+                    elif rank == min(peers):
+                        for j in range(copied):
+                            pblock = remote[j // p_factor]
+                            dest = (
+                                region, group.block_ids[j // d_factor],
+                                (j % d_factor) * width, width,
+                            )
+                            addr = peer.bases[region] + pblock * peer.stride
+                            pairs[dest] = (addr + (j % p_factor) * width, width)
+        return want
+
+    def _cold_k3_source_audit(self, expected, records, engine_id, remote_tp):
+        """Reconcile actual READ pairs against original physical block IDs."""
+        from math import gcd
+
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+            kimi_k3_cold_pair,
+        )
+
+        w = self.selection.worker
+        config = getattr(w, "vllm_config", None)
+        pages = config and kimi_k3_cold_pair(config, remote_tp)
+        if pages is None:
+            return None
+        peers = getattr(w, "kimi_k3_cold_peers", {}).get(engine_id, {})
+        local_tp = w.world_size
+        first = self.tp_rank * remote_tp // local_tp
+        ranks = set(range(first, first + max(1, remote_tp // local_tp)))
+        p_page, d_page = pages
+        unit = gcd(p_page, d_page)
+        try:
+            if peers.keys() != ranks or self._split_attention_rows(expected) != (
+                d_page, p_page, d_page, unit
+            ):
+                raise ValueError("missing cold Kimi-K3 producer or normalized geometry")
+            s = self.selection
+            copied = self._cold_k3_aperture(
+                expected, peers, pages, unit, self.heads, s.num_blocks
+            )
+            want = self._cold_k3_pairs(
+                expected, peers, remote_tp, pages, unit, copied,
+                local_tp=local_tp, local_rank=self.tp_rank, layout=s.layout,
+                heads=self.heads, members=s.members,
+            )
+        except ValueError as error:
+            return {"problems": [str(error)]}
+
+        def observed(read):
+            peer = peers[read.rank]
+            return [
                 (*dest, *divmod(source - peer.bases[dest[0]], peer.stride))
                 for dest, (source, _) in zip(
-                    records[0].pieces, records[0].source_ranges, strict=True
+                    read.pieces, read.source_ranges, strict=True
                 )
             ]
+
+        problems = sl.paired_k3_read_problems(want, records, engine_id)
+        report = {
+            "problems": problems,
+            "handoff_tokens": expected.remote_num_tokens,
+            "raw_producer_page": p_page,
+            "read_unit": unit,
+            "producer_factor": p_page // unit,
+            "producer_blocks": expected.remote_block_ids,
+            "consumer_blocks": [group.block_ids for group in expected.groups],
+        }
+        if (remote_tp, local_tp) == (4, 8):
+            # Preserve the reviewed single-source evidence for this pair.
+            report["rank"] = first
+            if not problems:
+                report["pairs"] = observed(records[0])
+        elif not problems:
+            report["consumer_factor"] = d_page // unit
+            report["pairs_by_rank"] = {r.rank: observed(r) for r in records}
         return report
 
     def _coverage(self, expected: "_Expected", records: list) -> dict:

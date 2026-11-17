@@ -6773,7 +6773,7 @@ def test_published_kimi_k3_cold_pairing_scope(tmp_path, ds_conv_layout):
     admit = simulated_tp_mismatch
     assert admit(config, 8, 4, nixl_consumer=True) is None
     old_scope = "other than prefill TP8 to decode TP4"
-    assert old_scope in admit(config, 8, 2, nixl_consumer=True)
+    assert admit(config, 8, 2, nixl_consumer=True) is None
     assert "one dividing the other" in admit(config, 8, 3, nixl_consumer=True)
     assert admit(config, 8, 4, nixl_consumer=False) is not None
     for section, field, value in (
@@ -7134,3 +7134,160 @@ def test_published_kimi_k3_cold_detects_corruption_after_native_read(
     assert p["released"]
     records = json.loads((tmp_path / "consumer.json.corruption").read_text())
     assert len(records["coverage"]) == 9 and len(records["bytes"]) == 8
+
+
+@pytest.mark.parametrize(
+    "ptp, dtp, pp, dp, n, descriptors, moved, zero, padding",
+    [
+        (1, 8, 5760, 768, 1008, (372,), 98_638_848, 0, 4_875_264),
+        (8, 1, 768, 5760, 1008, (372,) + (276,) * 7,
+         491_839_488, 116_785_152, 8_478_720),
+    ],
+    ids=["eight-consumers", "eight-sources"],
+)
+def test_published_kimi_k3_cold_common_unit_native_read(
+    tmp_path, monkeypatch, ptp, dtp, pp, dp, n, descriptors, moved, zero, padding
+):
+    """Native READs with distinct whole pages, including zeros and release."""
+    import sys
+
+    from tests.v1.worker.simulated.test_aisimulate_timing import bundled_config
+
+    controls = r"""
+    if not producer:
+        def instrument(worker, output):
+            from dataclasses import replace
+            from pathlib import Path
+
+            from vllm.distributed.kv_transfer import get_kv_transfer_group
+
+            connector = get_kv_transfer_group().connector_worker
+            checker = worker.model_runner._kv_checker
+            native_peer = connector.add_remote_agent
+            path = Path(output + ".controls.tp" + str(worker.rank))
+            rejected = {}
+            mistakes = {}
+
+            def add(meta, rank, size, *args, **kwargs):
+                snapshot = dict(connector.dst_num_blocks)
+                agent_count = sum(len(a) for a in connector._remote_agents.values())
+                mutations = {
+                    "factor": {"physical_blocks_per_logical_kv_block": 2},
+                    "stride": {"block_strides": [n + 1 for n in meta.block_strides]},
+                    "members": {"region_group_ids": [0] * 24},
+                    "ssm": {"ssm_sizes": (1, 1)},
+                }
+                invalid = [(name, replace(meta, **fields), rank)
+                           for name, fields in mutations.items()]
+                invalid += [("rank", meta, size)]
+                for name, item, bad_rank in invalid:
+                    try:
+                        native_peer(item, bad_rank, size, *args, **kwargs)
+                    except ValueError as err:
+                        assert "matching whole-page" in str(err), str(err)
+                        rejected.setdefault(str(rank), {})[name] = str(err)
+                    else:
+                        raise AssertionError(name)
+                    assert connector.dst_num_blocks == snapshot
+                    assert sum(len(a) for a in connector._remote_agents.values()) == (
+                        agent_count
+                    )
+                return native_peer(meta, rank, size, *args, **kwargs)
+
+            connector.add_remote_agent = add
+
+            baseline = checker._compare
+            def compare(req, expected, *args, **kwargs):
+                if worker.rank == 0:
+                    selection = checker.selection
+                    cases = []
+                    for group in expected.groups:
+                        rows = selection.select(group.group, group.block_ids)
+                        if not rows or selection.rows[rows[0][0]].state:
+                            continue
+                        values = {}
+                        for i, block, place in rows:
+                            values.setdefault(place, selection.rows[i].view[block])
+                        if connector.world_size == 8:
+                            # H=1007: token 255 in the second D page is in
+                            # its partially filled row; token 384 is in the
+                            # next entirely patterned row.
+                            cases = [("partial-tail", values[1], 255 * 1152),
+                                     ("whole-tail", values[1], 384 * 1152)]
+                        else:
+                            # H=1007: eight-rank P supplied 1,536 tokens.
+                            cases = [("zero", values[0], 1536 * 1152)]
+                    assert cases
+                    prepared = checker.prepared
+                    take = prepared.take
+                    prepared.take = lambda key: list(prepared.records[key])
+                    try:
+                        for name, view, offset in cases:
+                            view[offset] ^= 1
+                            try:
+                                wrong = baseline(req, expected, *args, **kwargs)
+                                assert not wrong["ok"], wrong
+                                assert wrong["mismatched_bytes"] == 1, wrong
+                                assert wrong["posted_matches_checked"], wrong
+                                mistakes[name] = wrong["mismatched_blocks"]
+                            finally:
+                                view[offset] ^= 1
+                    finally:
+                        prepared.take = take
+                path.write_text(json.dumps({"header": rejected, "bytes": mistakes}))
+                return baseline(req, expected, *args, **kwargs)
+
+            checker._compare = compare
+        llm.collective_rpc(instrument, args=(out,))
+"""
+    module = sys.modules[__name__]
+    marker = "    ranks = llm.collective_rpc(geometry)"
+    monkeypatch.setattr(module, "DCP_PEER", DCP_PEER.replace(marker, controls + marker))
+
+    options = {
+        "language_model_only": True,
+        "timing": "aisimulate",
+        "timing_args": {"gpu": "b200", "target_model": "moonshotai/Kimi-K3"},
+        "max_model_len": 6144,
+        "prompt_len": n,
+    }
+    p, d = run_dcp_peers(
+        bundled_config("moonshotai/Kimi-K3"),
+        {**options, "tensor_parallel_size": ptp, "block_size": pp},
+        {**options, "tensor_parallel_size": dtp, "block_size": dp},
+        tmp_path,
+        memory=(5 << 28, 5 << 28),
+    )
+    assert d.get("tokens") == [2], d["log"][-5000:]
+    assert p["released"], p["log"][-5000:]
+    assert "Releasing expired KV blocks" not in p["log"]
+    for rank, rows in d["logs"].items():
+        (check,) = [row["kv_check"] for row in rows if "kv_check" in row]
+        assert check["ok"] and check["bytes"] == moved + zero, check
+        cover = check["coverage"]
+        assert cover["problems"] == [], cover
+        reads = sorted(cover["reads"], key=lambda r: r["rank"])
+        ranks = list(range(rank * ptp // dtp, rank * ptp // dtp + len(descriptors)))
+        assert [r["rank"] for r in reads] == ranks
+        assert [r["descriptors"] for r in reads] == list(descriptors)
+        assert sum(r["bytes"] for r in reads) == moved
+        assert all(r["completed"] for r in reads)
+        audit = cover["cold_k3_sources"]
+        assert audit["handoff_tokens"] == n - 1
+        assert [len(audit["pairs_by_rank"][str(r)]) for r in ranks] == list(descriptors)
+        assert sum(g["padding_bytes"] for g in check["groups"]) == padding
+        assert sum(g["zeroed_bytes"] for g in check["groups"]) == zero
+        if ptp == 1:
+            assert sum(g["moved_attention_padding_bytes"] for g in check["groups"]) == (
+                10_616_832
+            )
+
+        controls = json.loads(
+            (tmp_path / f"consumer.json.controls.tp{rank}").read_text()
+        )
+        assert sorted(map(int, controls["header"])) == ranks
+        assert all(len(errors) == 5 for errors in controls["header"].values())
+        if rank == 0:
+            assert set(controls["bytes"]) == (
+                {"partial-tail", "whole-tail"} if ptp == 1 else {"zero"}
+            )

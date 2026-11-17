@@ -29,8 +29,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
     UnequalTpMtpLayout,
     dcp_pair_refusal,
     dcp_scope_problems,
+    kimi_k3_cold_pair,
     plain_mla,
-    qualifies_kimi_k3_cold,
     qualifies_kimi_k3_prefix,
     unequal_tp_mtp_layout,
     unequal_tp_mla_mtp_refusal,
@@ -698,7 +698,9 @@ class NixlPreparedReads:
         registered = worker.src_xfer_handles_by_block_size.get(worker.block_size)
         tables = {registered: np.asarray(worker.src_blocks_data, dtype=np.int64)}
         config = getattr(worker, "vllm_config", None)
-        capture_sources = config is not None and qualifies_kimi_k3_cold(config)
+        capture_sources = config is not None and any(
+            kimi_k3_cold_pair(config, remote_tp) for remote_tp in (1, 2, 4, 8)
+        )
         self.records = {}
         pending = {}
 
@@ -822,35 +824,39 @@ class KimiK3ColdPeer:
     rank: int
     bases: tuple[int, ...]
     num_blocks: int
+    page: int
 
     @property
     def stride(self) -> int:
-        return 1536 * 576 * 2
+        return self.page * 576 * 2
 
 
 def checked_kimi_k3_cold_peer(
-    worker, metadata: NixlAgentMetadata, rank: int, dcp: int
+    worker, metadata: NixlAgentMetadata, rank: int, dcp: int, remote_tp: int,
+    pages: tuple[int, int],
 ) -> KimiK3ColdPeer:
-    """Reject any reverse pairing outside the reviewed raw registration."""
+    """Reject any cold pairing outside the reviewed raw registration."""
+    p_page, d_page = pages
+    local_tp = worker.world_size
+    first = worker.tp_rank * remote_tp // local_tp
     peer = KimiK3ColdPeer(
-        rank, tuple(metadata.kv_caches_base_addr), metadata.num_blocks
+        rank, tuple(metadata.kv_caches_base_addr), metadata.num_blocks, p_page
     )
     if not (
-        worker.world_size == 8
-        and worker.dcp_size == worker.pcp_size == dcp == 1
+        worker.dcp_size == worker.pcp_size == dcp == 1
         and worker.enforce_compat_hash
-        and worker.block_size == 768
+        and worker.block_size == d_page
         and worker._physical_blocks_per_logical_kv_block == 1
-        and metadata.block_size == 1536
+        and metadata.block_size == p_page
         and metadata.physical_blocks_per_logical_kv_block == 1
         and metadata.dcp_size == metadata.pcp_size == 1
-        and rank == worker.tp_rank // 2
+        and first <= rank < first + max(1, remote_tp // local_tp)
         and metadata.attn_backend_name == worker.backend_name
         and metadata.kv_cache_layout == worker.kv_cache_layout
         and metadata.region_names == worker.region_names
         and metadata.region_group_ids == worker.region_group_ids
         and metadata.block_lens == metadata.block_strides == [peer.stride] * 24
-        and metadata.ssm_sizes == (55296, 1572864)
+        and metadata.ssm_sizes == (221184 // remote_tp, 6291456 // remote_tp)
         and metadata.region_mem_types == ["DRAM"] * 24
         and peer.num_blocks > 0
         and metadata.region_num_blocks == [peer.num_blocks] * 24
@@ -859,11 +865,12 @@ def checked_kimi_k3_cold_peer(
         and not metadata.packed_member_layouts
         and not metadata.region_members
         and metadata.ple_block_len is None
-        and _kimi_k3_regions(worker, tp=8, page=768, state_mode="none")
+        and _kimi_k3_regions(worker, tp=local_tp, page=d_page, state_mode="none")
     ):
         raise ValueError(
-            "Kimi-K3 cold TP4 to TP8 NIXL requires the matching whole-page "
-            "1536-to-768 MLA/KDA registration and the mapped producer rank."
+            f"Kimi-K3 cold TP{remote_tp} to TP{local_tp} NIXL requires the matching "
+            f"whole-page {p_page}-to-{d_page} MLA/KDA registration and the mapped "
+            "producer rank."
         )
     return peer
 
@@ -889,17 +896,23 @@ def validate_state_peer(worker, layout) -> None:
             # The inner pre-registration guard checks these same fields and
             # the exact K3 layout, preserving the original prefix refusal.
             return add(metadata, remote_tp_rank, remote_tp_size, *args, **kwargs)
-        if (
-            layout.family == "kda"
-            and remote_tp_size == 4
-            and qualifies_kimi_k3_cold(worker.vllm_config)
-        ):
+        pages = (
+            kimi_k3_cold_pair(worker.vllm_config, remote_tp_size)
+            if layout.family == "kda"
+            else None
+        )
+        if pages is not None:
             dcp = args[0] if args else kwargs.get("remote_dcp_size", 1)
-            peer = checked_kimi_k3_cold_peer(worker, metadata, remote_tp_rank, dcp)
+            peer = checked_kimi_k3_cold_peer(
+                worker, metadata, remote_tp_rank, dcp, remote_tp_size, pages
+            )
+            engines = getattr(worker, "kimi_k3_cold_peers", {})
+            registered = engines.get(metadata.engine_id, {})
+            if any(old.num_blocks != peer.num_blocks for old in registered.values()):
+                raise ValueError("Kimi-K3 cold producer ranks disagree on pool size.")
             result = add(metadata, remote_tp_rank, remote_tp_size, *args, **kwargs)
-            if not hasattr(worker, "kimi_k3_cold_peers"):
-                worker.kimi_k3_cold_peers = {}
-            worker.kimi_k3_cold_peers[metadata.engine_id] = peer
+            engines.setdefault(metadata.engine_id, {})[remote_tp_rank] = peer
+            worker.kimi_k3_cold_peers = engines
             return result
         # Equal block sizes, or the producer's a divisor of this instance's
         # (NIXL's block-size ratio: each attention block read as several, the
