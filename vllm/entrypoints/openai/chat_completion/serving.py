@@ -318,9 +318,19 @@ class OpenAIServingChat(GenerateBaseServing):
 
         conversation, engine_inputs = result
 
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-        )
+        base_id = self._base_request_id(raw_request, request.request_id)
+        request_id = f"chatcmpl-{base_id}"
+        if (
+            kvp := getattr(self.engine_client, "kv_frontend_profiler", None)
+        ) is not None:
+            kvp.api_request(
+                base_id,
+                None
+                if raw_request is None
+                else raw_request.headers.get("X-Request-Id"),
+                request_id,
+                "request_id" in request.model_fields_set,
+            )
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
@@ -346,6 +356,10 @@ class OpenAIServingChat(GenerateBaseServing):
             sub_request_id = (
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
+            if sub_request_id is not request_id and (
+                kvp := getattr(self.engine_client, "kv_frontend_profiler", None)
+            ):
+                kvp.parent_item(request_id, sub_request_id)
 
             max_tokens = get_max_tokens(
                 max_model_len,

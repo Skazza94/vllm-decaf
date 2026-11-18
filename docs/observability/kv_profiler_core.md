@@ -1,8 +1,9 @@
-# KV profiler core (experimental, unattached)
+# KV profiler (experimental)
 
-This library is the core of the KV network profiler. It does not yet attach to
-a connector, frontend or scheduler. Setting connector extra configuration alone
-does **not** start capture. The adapter checkpoint follows separately.
+This library is the core of the KV network profiler. The NIXL pull connector
+and the frontend attach to it at level L1 (see "NIXL adapter" below); nothing
+else does. Without `kv_connector_extra_config["network_profiler"]` nothing is
+imported, started or recorded.
 
 The native recorder requires Linux tmpfs and GIL-enabled CPython. GPU/RDMA
 execution, real-node overhead and exact socket/QP attribution are not qualified
@@ -184,3 +185,66 @@ They do not validate connector attachment, forwarding through vectorcall and
 ordinary calls, native stats serialization under an observer, data transfer,
 or production overhead. Keep the separately pinned timing/image baseline for
 later serving A/B tests. No connector behavior or pairing is changed here.
+
+## NIXL adapter (L1)
+
+Enable it on both the prefill and the decode instance with the same run ID:
+
+```json
+{"kv_connector_extra_config": {"network_profiler": {
+  "level": "l1", "run_id": "<UUID shared by P and D>", "output_dir": "/profiles",
+  "transport": "tcp", "clock_port_offset": 1000}}}
+```
+
+`transport` is the configured transport (`tcp`, `rdma` or `unknown`) and the
+backend list comes from the connector's `backends`; both are recorded as
+configured, never as observed. Invalid options, and the push connector, are
+refused when the connector is built. The key is not part of the NIXL compatibility
+hash, so a profiled instance pairs with an unprofiled one.
+
+Each scheduler, worker and frontend process owns one recorder and writes its own
+`events.jsonl`. One worker and one scheduler record per rank; the frontend
+profiler is owned by the `AsyncLLM` or `LLMEngine` that builds the input
+processor and is closed with it.
+
+Recorded at control points that already run once per request or transfer (the
+polling of unfinished transfers is untouched): the prefill handoff and its
+block count, the handshake (begin, per-peer end, each waiting request, the
+listener's served reply and NIXL's own signed clock offset in nanoseconds as a
+cross-check), each READ (`transfer_bind` with the descriptors vLLM selected,
+`post_return`, `complete_observed` with NIXL's bytes, merged descriptors and its
+own post/transfer microseconds, `transfer_retire`, one per handle including the
+legs of mixed-memory reads), every notification sent or observed, all-consumers
+done, the scheduler's aggregated receive-finished and release permission, and
+every failure (request-scoped from the connector's `failure_type` constants,
+transfer-scoped with the handle). Native durations (`aux0`/`aux1` of
+`complete_observed`) are NIXL's; the interval between `post_return` and
+`complete_observed` timestamps is the first poll that saw DONE, not a NIXL
+timestamp.
+
+Not recorded: socket or queue-pair identity, the return of blocks to the pool
+(only the scheduler's permission to free them), push-mode transfers, requests of
+endpoints other than completions and chat (their router ID is unknown).
+
+Request identity is bound where it exists: the frontend records the exact
+`X-Request-Id` header (or whether the body supplied the ID or it was generated),
+the API parent and item IDs, the engine ID with its random suffix, and the child
+engine ID of a `n > 1` request; the connectors record the P and D engine IDs and
+the handoff between them. Joins are exact equality of recorded IDs, never a parse
+of an ID's text, and repeated IDs stay separate occurrences.
+
+Clocks: a producer's scheduler starts a clock server at its NIXL side-channel
+port plus `clock_port_offset`; a consumer's scheduler calibrates each new peer
+(first seen in a handoff) on one background thread, with a bounded peer table
+(`clock_max_peers`), and takes end anchors at shutdown under one budget
+(`clock_end_budget_s`, capped by `shutdown_timeout_s`). Peers that cannot be
+reached or finish after the budget are listed with their status in
+`calibration.json`. The exporter treats processes with the same boot ID, time
+namespace and clock source as one clock; endpoints spanning hosts stay unaligned.
+
+Hooks never raise into the connector: a hook error disables the profiler and is
+counted (`hook_errors`, `first_error` and any `shutdown_failures` in
+`profiler.json`; no log handler is called from a hook or from shutdown); a full ring
+is counted loss.
+Hooks build at most a few small transient integers (a length, a sum) and
+retain nothing; formatting, I/O and waiting stay out of them.

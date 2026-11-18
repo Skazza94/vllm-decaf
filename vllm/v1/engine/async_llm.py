@@ -58,6 +58,7 @@ from vllm.v1.engine import CheckpointState, EngineCoreRequest, PauseMode
 from vllm.v1.engine.admission_control import SharedAdmissionStats
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.kv_profiling import attach_frontend as attach_kv_frontend_profiler
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import (
     OutputProcessor,
@@ -93,6 +94,8 @@ class InputStreamError(Exception):
 
 class AsyncLLM(EngineClient):
     """An asynchronous wrapper for the vLLM engine."""
+
+    kv_frontend_profiler = None
 
     def __init__(
         self,
@@ -247,6 +250,8 @@ class AsyncLLM(EngineClient):
                     "processes share an engine."
                 )
 
+        self.kv_frontend_profiler = attach_kv_frontend_profiler(self.vllm_config)
+
     @classmethod
     def from_vllm_config(
         cls,
@@ -316,6 +321,10 @@ class AsyncLLM(EngineClient):
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+
+        if (kvp := getattr(self, "kv_frontend_profiler", None)) is not None:
+            self.kv_frontend_profiler = None
+            kvp.close()
 
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()
@@ -533,6 +542,8 @@ class AsyncLLM(EngineClient):
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
 
         self.input_processor.assign_request_id(request)
+        if (kvp := self.kv_frontend_profiler) is not None:
+            kvp.external_engine(request.external_req_id, request.request_id)
 
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us
@@ -557,6 +568,8 @@ class AsyncLLM(EngineClient):
         child_requests: list[EngineCoreRequest] = []
         for idx in range(parent_params.n):
             request_id, child_params = parent_request.get_child_info(idx)
+            if (kvp := self.kv_frontend_profiler) is not None:
+                kvp.child_parent(request_id, parent_request.request_id)
             child_request = request if idx == parent_params.n - 1 else copy(request)
             child_request.request_id = request_id
             child_request.sampling_params = child_params
@@ -642,6 +655,8 @@ class AsyncLLM(EngineClient):
             **inputs,  # type: ignore[arg-type]
         )
         self.input_processor.assign_request_id(final_req)
+        if (kvp := self.kv_frontend_profiler) is not None:
+            kvp.external_engine(final_req.external_req_id, final_req.request_id)
         internal_req_id = final_req.request_id
 
         queue = StreamingInputOutputCollector(

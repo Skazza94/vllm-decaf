@@ -60,7 +60,9 @@ class ProcessRecorder:
             "pid": os.getpid(),
             "context": config.context,
             "byteorder": sys.byteorder,
-            "capabilities": {"attached": False, "socket": False, "qp": False},
+            "capabilities": config.context.get(
+                "capabilities", {"attached": False, "socket": False, "qp": False}
+            ),
         }
         self.writer = None
         self._result = None

@@ -54,6 +54,50 @@ VALUE_NAMES = (
 )
 
 
+class Subject(IntEnum):
+    """The event-specific ``subject`` word; meaning depends on the kind."""
+
+    # FAILED: scope of the failure.
+    REQUEST = 0
+    TRANSFER = 1
+    # COMPLETE_OBSERVED, SENDERS_DONE, RELEASE_REQUESTED: who observed it.
+    WORKER = 1
+    SCHEDULER = 2
+    # HANDSHAKE_END: a per-peer summary carrying NIXL's own offset sample.
+    OFFSET_SAMPLE = 65535
+    # Frontend REQUEST_BIND edges.
+    HEADER_TO_BASE = 1
+    BASE_TO_PARENT = 2
+    PARENT_TO_ITEM = 3
+    EXTERNAL_TO_ENGINE = 4
+    CHILD_TO_PARENT_ENGINE = 5
+
+
+class Failure(IntEnum):
+    """FAILED ``status`` codes; ``failure_type`` constants of the connector."""
+
+    UNKNOWN = 1
+    HANDSHAKE_FAILED = 2
+    HANDSHAKE_SETUP_FAILED = 3
+    TRANSFER_SETUP_FAILED = 4
+    TRANSFER_FAILED = 5
+    TRANSFER_EXCEPTION = 6
+    TRANSFER_RELEASE_FAILED = 7
+    NOTIFICATION_FAILED = 8
+    LEASE_EXPIRED = 9
+    LATE_NOTIFICATION = 10
+    CLOCK_PEER_TABLE_FULL = 11
+
+
+class IdSource(IntEnum):
+    """Frontend header binding ``status``: where the base request ID came from."""
+
+    HEADER = 1
+    BODY = 2
+    GENERATED = 3
+    UNKNOWN = 4
+
+
 def decode_record(raw: bytes) -> dict[str, Any]:
     """Decode in the sink, never in a recording callback."""
     if len(raw) != RECORD.size:

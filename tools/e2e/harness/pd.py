@@ -36,6 +36,7 @@ import json
 import math
 from pathlib import Path
 import time
+import uuid
 
 import yaml
 
@@ -64,6 +65,7 @@ DP_ROUTINGS = ("instance", "rank")
 DP_SUPERVISOR_PORT = 9256  # a per-rank instance's aggregated health (vLLM's default)
 WORK = "/e2e"
 STEP_LOG = f"{WORK}/steps.jsonl"
+PROFILES = f"{WORK}/profiles"
 TENT_METRICS_PORT = 9100  # rank r of the host serves on TENT_METRICS_PORT + r
 DISABLED_TENT_TRANSPORTS = ("tcp", "rdma", "shm", "gds", "ascend_direct")
 
@@ -226,6 +228,13 @@ class Server:
 
 @dataclass
 class Workload:
+    endpoint: str = "completions"
+    """The OpenAI endpoint the benchmark uses: ``completions`` or ``chat``."""
+    measure: bool = False
+    """Report p50/p95/p99 of TTFT, TPOT, ITL and end-to-end latency, and each
+    server node's CPU (serving processes, the profiler's writers and clock
+    server apart) over the servers' own workload window, with setup and
+    shutdown costs apart (``cpu.json``)."""
     input_len: int = 1024
     output_len: int = 16
     num_prompts: int = 40
@@ -281,6 +290,18 @@ class Router:
     that one, which the verdict then reports as uncalibrated."""
 
 
+@dataclass(frozen=True)
+class Profiler:
+    """The KV network profiler at L1 on both servers (NIXL only): the servers'
+    ``kv_connector_extra_config.network_profiler``, one run ID for both. Each
+    server closes its recorders when it is stopped; the harness stops them,
+    then copies the profile directories to ``profiles/<role>/<node>/``."""
+
+    transport: str = "tcp"
+    clock_port_offset: int = 1000
+    flush: str = "end"
+
+
 @dataclass
 class Run:
     name: str
@@ -312,6 +333,7 @@ class Run:
     server: Server = field(default_factory=Server)
     workload: Workload = field(default_factory=Workload)
     startup_timeout: float = 600.0
+    profiler: Profiler | None = None
 
 
 def load(path: str | Path, *, fetch: bool = False) -> Run:
@@ -327,7 +349,7 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
 
     known = {"name", "topology", "model", "prefill", "decode", "client", "control_network", "kv_check",
              "expect_fragmentation", "expect_prefill_hit_requests", "expect_decode_prefix_hits", "server", "workload", "router",
-             "startup_timeout", "kv_pattern_grain"}
+             "startup_timeout", "kv_pattern_grain", "profiler"}
     if unknown := set(raw) - known:
         raise ValueError(f"unknown run key(s): {', '.join(sorted(unknown))}")
     router_raw = raw.get("router")
@@ -352,6 +374,7 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
             kv_pattern_grain=raw.get("kv_pattern_grain"),
             server=Server(**(raw.get("server") or {})), workload=Workload(**(raw.get("workload") or {})),
             startup_timeout=float(raw.get("startup_timeout", 600)),
+            profiler=None if raw.get("profiler") is None else Profiler(**raw["profiler"]),
         )
     except KeyError as missing:
         raise ValueError(f"run config needs {missing}") from None
@@ -365,6 +388,16 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         raise ValueError(f"server.trust_remote_code is true or false, not {run.server.trust_remote_code!r}")
     if run.server.connector not in CONNECTORS:
         raise ValueError(f"server.connector is one of {', '.join(CONNECTORS)}, not {run.server.connector!r}")
+    if run.workload.endpoint not in ("completions", "chat"):
+        raise ValueError(f"workload.endpoint is completions or chat, not {run.workload.endpoint!r}")
+    if (profiler := run.profiler) is not None:
+        if run.server.connector != "nixl":
+            raise ValueError("profiler needs server.connector nixl")
+        if profiler.transport not in ("tcp", "unknown") or profiler.flush not in ("end", "background"):
+            raise ValueError("profiler.transport is tcp or unknown, profiler.flush end or background")
+        if (not isinstance(profiler.clock_port_offset, int) or isinstance(profiler.clock_port_offset, bool)
+                or not 1 <= profiler.clock_port_offset <= 65535):
+            raise ValueError("profiler.clock_port_offset is a port offset in 1..65535")
     _check_backend(run.server)
     for side in (run.prefill, run.decode):
         if side.kv_kernel_backend is not None and (
@@ -800,10 +833,13 @@ def bench_command(run: Run, base_url: str) -> list[str]:
         "--prefix-repetition-num-prefixes", str(repetition["num_prefixes"]),
         "--prefix-repetition-output-len", str(w.output_len)]
     return [
-        VLLM, "bench", "serve", "--backend", "openai", "--endpoint", "/v1/completions",
+        VLLM, "bench", "serve", *(("--backend", "openai-chat", "--endpoint", "/v1/chat/completions")
+                                  if w.endpoint == "chat" else
+                                  ("--backend", "openai", "--endpoint", "/v1/completions")),
         "--base-url", base_url, "--model", MODEL_NAME, "--tokenizer", MODEL_DIRECTORY,
         *(["--trust-remote-code"] if run.server.trust_remote_code else []),
-        *dataset, "--num-prompts", str(w.num_prompts),
+        *dataset, *(["--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", "50,95,99"]
+                    if w.measure else []), "--num-prompts", str(w.num_prompts),
         "--max-concurrency", str(w.concurrency), "--seed", str(w.seed), "--ignore-eos", "--disable-tqdm",
         "--save-result", "--save-detailed", "--result-dir", f"{WORK}/results", "--result-filename", "bench.json",
     ]
@@ -833,7 +869,7 @@ def kv_events_topic(control: str, endpoint_port: int) -> str:
 
 
 def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SERVER_PORT,
-                   endpoint: tuple[str, int] | None = None) -> list[str]:
+                   endpoint: tuple[str, int] | None = None, profile_id: str | None = None) -> list[str]:
     """``vllm serve`` for ``role`` (prefill or decode) on HTTP ``port``, TP
     rank r's KV on ``kv_addresses[r]`` in every DP rank (their own:
     ``rank_addresses``, DP rank by TP rank). ``endpoint``: the control
@@ -868,6 +904,13 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
                    "kv_connector_extra_config": {"backends": [nixl_backend(run.server)]} if nixl else {"mooncake_protocol": "tcp"}}
     if non_tent or len(set(kv_addresses)) > 1:
         kv_transfer["kv_connector_extra_config"]["rank_addresses"] = kv_addresses * side.data_parallel_size
+    if run.profiler is not None:
+        if profile_id is None:
+            raise ValueError("a profiled run needs one profile ID for both servers")
+        kv_transfer["kv_connector_extra_config"]["network_profiler"] = {
+            "level": "l1", "run_id": profile_id, "output_dir": PROFILES,
+            "transport": run.profiler.transport, "clock_port_offset": run.profiler.clock_port_offset,
+            "flush": run.profiler.flush, "shutdown_timeout_s": 10}
     connector_env = {
         # NIXL's handshake and its Mooncake backend's segment on the KV network.
         "VLLM_NIXL_SIDE_CHANNEL_HOST": kv_address, "NIXL_MOONCAKE_IP_ADDR": kv_address,
@@ -959,19 +1002,21 @@ def execute(run: Run, output: Path | None = None) -> dict:
     for name in container.values():
         # A previous run's servers would answer this run's requests.
         stop_services(name)
-        topology.exec_in(name, ["sh", "-c", f"rm -rf {WORK}/logs {WORK}/results {WORK}/steps*.jsonl "
+        topology.exec_in(name, ["sh", "-c", f"rm -rf {WORK}/logs {WORK}/results {WORK}/profiles {WORK}/steps*.jsonl "
                                             f"&& mkdir -p {WORK}/logs"])
         # Only this run's model: a file the previous run's had and this
         # one's lacks (a quantization sidecar) would be read as its own.
         topology.exec_in(name, ["sh", "-c", f"rm -rf {MODEL_DIRECTORY} && mkdir -p {MODEL_DIRECTORY}"])
         shell.run(["docker", "cp", f"{run.model}/.", f"{name}:{MODEL_DIRECTORY}"])
     front.prepare(container)
+    profile_id = str(uuid.uuid4()) if run.profiler is not None else None
 
     commands: dict[str, dict[str, list[str]]] = {}
     for role, side in roles:
         for node in side.nodes:
             command = server_command(run, role, instances[role][node]["kv"], front.server_port(role),
-                                     (instances[role][node]["control"], front.endpoint_port(role)))
+                                     (instances[role][node]["control"], front.endpoint_port(role)),
+                                     profile_id)
             commands.setdefault(role, {})[node] = command
             _background(container[node], command, f"{WORK}/logs/{role}.log")
     # Each server as it was started: its environment and flags.
@@ -992,7 +1037,11 @@ def execute(run: Run, output: Path | None = None) -> dict:
         routers_before = router_bytes(state)
         ports_before = router_ports(state)
         bench = bench_command(run, base_url)
+        if run.workload.measure:
+            _start_samplers(run, container)
         (output / "bench.log").write_text(topology.exec_in(container[run.client], bench, timeout=3600))
+        if run.workload.measure:
+            _stop_samplers(run, container, output)
         # The servers' step logs settle shortly after the last response.
         time.sleep(2)
         routers_after = router_bytes(state)
@@ -1003,6 +1052,17 @@ def execute(run: Run, output: Path | None = None) -> dict:
         try:
             _collect(run, container, output)
             front.collect(container, output)
+            if run.profiler is not None:
+                # The servers close their recorders on SIGTERM, which flushes and
+                # completes each process's trace; only then is it copied.
+                stop_orderly(run, container, output)
+                _collect_profiles(run, container, output, profile_id)
+            if run.workload.measure:
+                # From the servers' own step logs, the samplers' files and (profiled)
+                # the writers' manifests: setup, workload and shutdown apart.
+                report = cpu_report_for(output, run)
+                (output / "cpu.json").write_text(json.dumps(
+                    report if report is not None else {"error": "no samples or no priced step"}, indent=2) + "\n")
         finally:
             front.stop(container)
             for name in container.values():
@@ -1075,7 +1135,8 @@ def saved_run(output: str | Path) -> Run:
         router.epp_plugins = Path(router.epp_plugins)
     return Run(**{**raw, "model": Path(raw["model"]), "router": router,
                   "prefill": Side(**raw["prefill"]), "decode": Side(**raw["decode"]),
-                  "server": Server(**raw["server"]), "workload": Workload(**raw["workload"])})
+                  "server": Server(**raw["server"]), "workload": Workload(**raw["workload"]),
+                  "profiler": None if raw.get("profiler") is None else Profiler(**raw["profiler"])})
 
 
 def saved_peak_prefill_throughput(output: str | Path) -> dict:
@@ -3543,6 +3604,65 @@ sys.exit(f"still running: {ours()}")
 """
 
 
+STOP_OWNERS = inspect.getsource(is_service) + """
+import json, os, signal, sys, time
+
+timeout = float(sys.argv[1])
+me = os.getpid()
+
+
+def processes():
+    found = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            raw = open(f"/proc/{pid}/cmdline", "rb").read()
+            comm = open(f"/proc/{pid}/comm", "rb").read()
+        except OSError:
+            continue
+        if int(pid) == me or not is_service(raw, comm):
+            continue
+        argv = raw.split(b"\\0")
+        helper = len(argv) > 2 and argv[1] == b"-m" and argv[2].startswith(b"vllm.kv_profiling.")
+        owner = not helper and b"serve" in argv[1:4] and any(a.endswith(b"vllm") for a in argv[:3])
+        found.append((int(pid), "helper" if helper else "owner" if owner else "child"))
+    return found
+
+
+started = time.monotonic()
+owners = [pid for pid, kind in processes() if kind == "owner"]
+for pid in owners:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+while processes() and time.monotonic() - started < timeout:
+    time.sleep(0.25)
+left = processes()
+print(json.dumps({"signalled": owners, "graceful": not left, "remaining": left,
+                  "seconds": round(time.monotonic() - started, 2)}))
+"""
+
+
+def stop_orderly(run: Run, container: dict[str, str], output: Path, timeout: float = 60.0) -> list[dict]:
+    """Shut the servers down so their recorders complete: SIGTERM only each
+    node's ``vllm serve`` (never the profiler's helpers, which finish their own
+    flush as their owner closes), decode first so prefill's clock server is
+    still there for decode's end calibration, each node waited for until every
+    process of it, helpers included, has exited. A node that does not finish
+    in time gets the broad forced stop, and the record says so
+    (``shutdown.json``)."""
+    steps = []
+    for node in (*run.decode.nodes, *run.prefill.nodes):
+        text = topology.exec_in(container[node], [PYTHON, "-c", STOP_OWNERS, str(timeout)], timeout=timeout + 30)
+        result = json.loads(text.strip().splitlines()[-1])
+        if not result["graceful"]:
+            result["forced"] = True
+            stop_services(container[node])
+        steps.append({"node": node, **result})
+    (output / "shutdown.json").write_text(json.dumps(steps, indent=2) + "\n")
+    return steps
+
+
 def stop_services(container: str) -> None:
     """Stop the vLLM servers and their workers in ``container``."""
 
@@ -3686,6 +3806,231 @@ def _records(text: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
+CPU_SAMPLER = r"""
+import json, os, sys, time
+interval, path = float(sys.argv[1]), sys.argv[2]
+tick = os.sysconf("SC_CLK_TCK")
+me = os.getpid()
+
+
+def sample():
+    found = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        if int(pid) == me:
+            continue
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+            comm = open(f"/proc/{pid}/comm", "rb").read().decode().strip()
+            stat = open(f"/proc/{pid}/stat").read().rpartition(")")[2].split()
+            status = open(f"/proc/{pid}/status").read()
+        except OSError:
+            continue
+        helper = len(argv) > 2 and argv[1] == b"-m" and argv[2].startswith(b"vllm.kv_profiling.")
+        serving = not helper and (comm.startswith("VLLM") or
+                                  (b"serve" in argv[1:4] and any(a.endswith(b"vllm") for a in argv[:3])))
+        if not (helper or serving):
+            continue
+        kind = "serving" if serving else "writer" if argv[2].endswith(b".sink") else "clock"
+        fields = {f.split(":")[0]: int(f.split()[1]) for f in status.splitlines()
+                  if f.startswith(("VmHWM:", "VmRSS:"))}
+        found.append({"pid": int(pid), "start": int(stat[19]), "kind": kind,
+                      "cpu_s": (int(stat[11]) + int(stat[12])) / tick,
+                      "rss_kb": fields.get("VmRSS", 0), "hwm_kb": fields.get("VmHWM", 0)})
+    return found
+
+
+with open(path, "a", buffering=1) as out:
+    while True:
+        out.write(json.dumps({"t": time.monotonic(), "processes": sample()}) + "\n")
+        if os.path.exists(path + ".stop"):
+            break
+        time.sleep(interval)
+"""
+SAMPLE_INTERVAL = 0.5
+
+
+def workload_window(step_logs: list[str]) -> tuple[float, float] | None:
+    """The servers' own workload window, in the monotonic seconds their step
+    logs and the samplers share: from the first priced step that ran a request
+    to the last such step's deadline, over every rank of both instances."""
+    starts, ends = [], []
+    for text in step_logs:
+        for line in text.splitlines():
+            record = json.loads(line)
+            if (record.get("step") or {}).get("requests") and "t_start" in record:
+                starts.append(record["t_start"])
+                ends.append(record.get("t_deadline", record["t_start"]))
+    return (min(starts), max(ends)) if starts else None
+
+
+def _series(samples: list[dict]) -> dict[tuple[int, int], dict]:
+    found: dict[tuple[int, int], dict] = {}
+    for sample in samples:
+        for p in sample["processes"]:
+            entry = found.setdefault((p["pid"], p["start"]), {"kind": p["kind"], "points": []})
+            entry["points"].append((sample["t"], p["cpu_s"]))
+    return found
+
+
+def _value(points: list[tuple[float, float]], t: float) -> float:
+    if t <= points[0][0]:
+        return points[0][1]
+    for (t1, v1), (t2, v2) in zip(points, points[1:]):
+        if t <= t2:
+            return v1 + (v2 - v1) * (t - t1) / (t2 - t1) if t2 > t1 else v2
+    return points[-1][1]
+
+
+def cpu_over(samples: list[dict], start: float, end: float) -> dict:
+    """CPU seconds by process kind between two monotonic instants, from a node's
+    samples, per process identity (pid and start time) and interpolated linearly
+    between samples: a process present at ``start`` counts what it used since, one
+    born inside the window all it used. A process that vanished before ``end`` is
+    listed in ``lost`` (its CPU is unaccounted); ``covered`` says the samples
+    reach both instants; ``max_gap_s`` the longest gap between samples."""
+    by_identity = _series(samples)
+    last_t = samples[-1]["t"]
+    totals = {"serving": 0.0, "writer": 0.0, "clock": 0.0}
+    at_start = {"writer": 0.0}
+    at_end = {"writer": 0.0}
+    lost, new = [], []
+    for key, entry in by_identity.items():
+        points = entry["points"]
+        if points[-1][0] < end and points[-1][0] < last_t:
+            lost.append(f"{key[0]}:{key[1]}")
+        if points[0][0] > start:
+            new.append(f"{key[0]}:{key[1]}")
+            before = 0.0
+        else:
+            before = _value(points, start)
+        totals[entry["kind"]] += _value(points, end) - before
+        if entry["kind"] == "writer":
+            at_start["writer"] += _value(points, start)
+            at_end["writer"] += _value(points, end)
+    times = [s["t"] for s in samples if start <= s["t"] <= end]
+    edges = [max((s["t"] for s in samples if s["t"] <= start), default=start), *times,
+             min((s["t"] for s in samples if s["t"] >= end), default=end)]
+    gaps = [b - a for a, b in zip(edges, edges[1:])]
+    return {"serving_s": totals["serving"], "writers_s": totals["writer"], "clock_s": totals["clock"],
+            "helpers_s": totals["writer"] + totals["clock"], "writers_at_start_s": at_start["writer"],
+            "writers_at_end_s": at_end["writer"], "lost": sorted(lost), "new": sorted(new),
+            "covered": samples[0]["t"] <= start and last_t >= end, "samples": len(times),
+            "max_gap_s": max(gaps) if gaps else 0.0}
+
+
+WRITER_TICK_S = 0.01  # /proc's CPU counters tick at 100 Hz
+
+
+def cpu_report(samples: dict[str, list[dict]], window: tuple[float, float],
+               manifests: dict[str, list[float | None]], interval: float) -> dict[str, dict]:
+    """Each node's CPU, setup, workload and shutdown apart. ``setup``: from the first
+    sample to the workload's start; ``workload``: the servers' own window;
+    ``flush_s``: the writers' lifetime CPU from their manifests (``manifests[node]``:
+    one value per manifest, None when it has none) minus what they had used when the
+    workload ended (the end flush and every later shutdown cost; it is never inside
+    the workload numbers, so a total adds the two without double counting). A
+    manifest value that is missing, not finite or negative, or fewer manifests than
+    writers the samples saw, or a lifetime CPU less than the sampled writers' CPU
+    beyond the counters' resolution, leaves the lifetime and ``flush_s`` None: they
+    are unmeasured, never zero. A node with no writers and no manifests (profiler
+    off) has an explicit zero. RSS is the last sample's: ``rss_kb`` now and
+    ``lifetime_rss_hwm_kb``, the sum of lifetime high-water marks, neither a peak
+    over the workload."""
+    start, end = window
+    report = {}
+    for node, series in samples.items():
+        work = cpu_over(series, start, end)
+        setup = cpu_over(series, series[0]["t"], start) if series[0]["t"] < start else None
+        serving = [p for p in series[-1]["processes"] if p["kind"] == "serving"]
+        seen = sum(1 for entry in _series(series).values() if entry["kind"] == "writer")
+        values = manifests.get(node, [])
+        valid = len(values) == seen and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and 0 <= v < float("inf")
+            for v in values)
+        lifetime = sum(values) if valid else None
+        # CPU read from /proc ticks and from the process's own clock agree to a couple of
+        # ticks per writer; interpolation between samples adds at most a sampling interval of idle polling.
+        tolerance = seen * (2 * WRITER_TICK_S) + interval * 0.2
+        consistent = valid and lifetime + tolerance >= work["writers_at_end_s"]
+        report[node] = {
+            **work, "workload_s": end - start, "interval_s": interval, "window": [start, end],
+            "first_sample": series[0]["t"], "last_sample": series[-1]["t"],
+            "setup_serving_s": None if setup is None else setup["serving_s"],
+            "setup_helpers_s": None if setup is None else setup["helpers_s"],
+            "writers_seen": seen, "writer_manifests": len(values),
+            "writer_manifests_with_cpu": sum(1 for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
+                                              and v == v and 0 <= v < float("inf")),
+            "writer_tolerance_s": tolerance,
+            "writer_lifetime_cpu_s": lifetime if consistent else None,
+            "flush_s": max(0.0, lifetime - work["writers_at_end_s"]) if consistent else None,
+            "rss_kb": sum(p["rss_kb"] for p in serving),
+            "lifetime_rss_hwm_kb": sum(p["hwm_kb"] for p in serving)}
+    return report
+
+
+def cpu_report_for(output: Path, run: Run) -> dict[str, dict] | None:
+    """``cpu_report`` from a result directory: the samplers' files, the step logs
+    of both instances and, for a profiled run, the writers' manifests."""
+    files = {node: output / "cpu-samples" / f"{node}.jsonl" for side in (run.prefill, run.decode)
+             for node in side.nodes}
+    if not all(path.is_file() for path in files.values()):
+        return None
+    steps = [(output / getattr(run, role).step_log(role, dp, tp)).read_text()
+             for role in ("prefill", "decode")
+             for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
+    window = workload_window(steps)
+    if window is None:
+        return None
+    samples = {node: [json.loads(line) for line in path.read_text().splitlines() if line] for node, path in files.items()}
+    manifests = {}
+    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+        for node in side.nodes:
+            found = sorted((output / "profiles" / role / node).glob("*/*/manifest.json"))
+            values = []
+            for path in found:
+                try:
+                    values.append(json.loads(path.read_text()).get("writer_cpu_s"))
+                except ValueError:
+                    values.append(None)
+            manifests[node] = values
+    return cpu_report(samples, window, manifests, SAMPLE_INTERVAL)
+
+
+SAMPLES = f"{WORK}/cpu-samples.jsonl"
+
+
+def _start_samplers(run: Run, container: dict[str, str]) -> None:
+    """A CPU sampler on every server node, running before the benchmark starts
+    (each waited for until it has written two samples)."""
+    for side in (run.prefill, run.decode):
+        for node in side.nodes:
+            topology.exec_in(container[node], ["sh", "-c", f"rm -f {SAMPLES} {SAMPLES}.stop"])
+            _background(container[node], [PYTHON, "-c", CPU_SAMPLER, str(SAMPLE_INTERVAL), SAMPLES],
+                        f"{WORK}/logs/cpu-sampler.log")
+    for side in (run.prefill, run.decode):
+        for node in side.nodes:
+            for _ in range(40):
+                if topology.exec_in(container[node], ["sh", "-c", f"wc -l < {SAMPLES} 2>/dev/null || echo 0"]
+                                    ).strip() not in ("0", "1", ""):
+                    break
+                time.sleep(0.25)
+            else:
+                raise RuntimeError(f"the CPU sampler on {node} wrote no samples")
+
+
+def _stop_samplers(run: Run, container: dict[str, str], output: Path) -> None:
+    """Stop each sampler after the benchmark and copy its file."""
+    for side in (run.prefill, run.decode):
+        for node in side.nodes:
+            topology.exec_in(container[node], ["sh", "-c", f"touch {SAMPLES}.stop"])
+    time.sleep(2 * SAMPLE_INTERVAL + 0.5)
+    for side in (run.prefill, run.decode):
+        for node in side.nodes:
+            local = output / "cpu-samples" / f"{node}.jsonl"
+            local.parent.mkdir(parents=True, exist_ok=True)
+            shell.run(["docker", "cp", f"{container[node]}:{SAMPLES}", str(local)])
+
+
 def _background(container: str, command: list[str], log: str) -> None:
     script = " ".join(_quote(part) for part in command)
     shell.run(["docker", "exec", "-d", container, "sh", "-c", f"exec {script} > {log} 2>&1"])
@@ -3765,6 +4110,18 @@ def _tent_delta(before: str | None, after: str | None) -> dict | None:
     start, end = totals(before), totals(after)
     return {name: value if name == "tent_registered_buffer_bytes" else value - start.get(name, 0.0)
             for name, value in end.items()}
+
+
+def _collect_profiles(run: Run, container: dict[str, str], output: Path, profile_id: str | None) -> None:
+    """Each server node's profile directory under ``profiles/<role>/<node>/``,
+    and the run's profile ID."""
+
+    (output / "profiler.json").write_text(json.dumps({"run_id": profile_id, **asdict(run.profiler)}, indent=2) + "\n")
+    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+        for node in side.nodes:
+            local = output / "profiles" / role / node
+            local.mkdir(parents=True, exist_ok=True)
+            shell.run(["docker", "cp", f"{container[node]}:{PROFILES}/.", str(local)], check=False)
 
 
 def _collect(run: Run, container: dict[str, str], output: Path) -> None:

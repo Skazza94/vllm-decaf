@@ -47,6 +47,80 @@ def _load(path: Path):
     return meta, events, decoder, rows, missing
 
 
+def _domain(meta):
+    return meta.get("boot_id"), meta.get("time_namespace"), meta.get("clock_source")
+
+
+def _clock_aliases(metas, group):
+    """Clocks of one domain (boot, time namespace, source) are one clock.
+
+    A process that is neither the group's reference nor calibrated takes the
+    projection of a loaded clock of its own domain that the group can project.
+    """
+    if group is None:
+        return {}
+    known = {
+        meta["clock_id"]: _domain(meta)
+        for meta in metas
+        if meta["clock_id"] == group.reference or meta["clock_id"] in group.mappings
+    }
+    alias = {}
+    for meta in metas:
+        clock = meta["clock_id"]
+        if clock in known:
+            continue
+        for other, domain in known.items():
+            if domain == _domain(meta):
+                alias[clock] = other
+                break
+    return alias
+
+
+def _tagged_transport(transport, meta):
+    """Backend and transport as configured for the process, never as observed."""
+    backend = (meta.get("context") or {}).get("backend")
+    if not backend:
+        return transport
+    return {
+        **transport,
+        "backend": backend[0] if len(backend) == 1 else "mixed",
+        "provenance": "configured",
+    }
+
+
+def _signed64(value):
+    return value - (1 << 64) if value >= 1 << 63 else value
+
+
+def _semantics(row):
+    """Name the event-specific words; units stay as recorded."""
+    kind, subject = row["kind"], row["subject"]
+    aux0, aux1 = row["aux0"], row["aux1"]
+    if kind == "complete_observed" and subject == 1:
+        return {"nixl_post_duration_us": aux0, "nixl_xfer_duration_us": aux1}
+    if kind == "handshake_end" and subject == 65535:
+        return {"nixl_offset_ns": None if aux0 is None else _signed64(aux0)}
+    if kind == "handshake_end":
+        return {"remote_pp_rank": aux0}
+    if kind == "transfer_bind":
+        return {"leg": {0: "single", 1: "device", 2: "dram"}.get(aux0), "notif": aux1}
+    if kind == "handoff":
+        return {"registration_generation": aux0, "handoff_blocks": aux1}
+    if kind == "notify_observed":
+        return {"notifications": aux0, "expected": aux1}
+    return {}
+
+
+def _event_name(row):
+    if row["kind"] in ("complete_observed", "senders_done", "release_requested"):
+        scope = {1: "worker", 2: "scheduler"}.get(row["subject"])
+        if scope and row["kind"] == "complete_observed":
+            return "complete_observed" if scope == "worker" else "recv_finished_all"
+        if scope and row["kind"] == "release_requested":
+            return "release_requested_all"
+    return row["kind"]
+
+
 def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
     """Use one origin per aligned group; export unaligned clocks separately.
 
@@ -59,15 +133,17 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
     captures = {}
     run_id = None
     calibrations = {}
-    for path in paths:
-        meta, rows, decoder, raw, missing = _load(Path(path))
+    loaded = [_load(Path(path)) for path in paths]
+    alias = _clock_aliases([item[0] for item in loaded], group)
+    for meta, rows, decoder, raw, missing in loaded:
         if run_id is not None and run_id != meta["run_id"]:
             raise ValueError("cannot merge different runs")
         run_id = meta["run_id"]
         if group and group.run_id is not None and group.run_id != run_id:
             raise ValueError("calibration belongs to another run")
-        if group and meta["clock_id"] in group.mappings:
-            calibrations[meta["clock_id"]] = group.mappings[meta["clock_id"]].to_json()
+        known = alias.get(meta["clock_id"], meta["clock_id"])
+        if group and known in group.mappings:
+            calibrations[known] = group.mappings[known].to_json()
         loss = any(
             row.get("type") == "end" and not row.get("complete", False) for row in raw
         ) or not any(row.get("type") == "end" for row in raw)
@@ -92,7 +168,9 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
         for row in rows:
             modeled = row["kind"] == "model_step"
             projection = (
-                group.project(meta["clock_id"], row["time_ns"])
+                group.project(
+                    alias.get(meta["clock_id"], meta["clock_id"]), row["time_ns"]
+                )
                 if group is not None and not modeled
                 else None
             )
@@ -109,6 +187,7 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
             aligned = group is not None and (
                 meta["clock_id"] == group.reference
                 or meta["clock_id"] in group.mappings
+                or meta["clock_id"] in alias
             )
             buckets.add(
                 ("modeled", meta["clock_id"])
@@ -145,6 +224,8 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
         }
         pending = {}
         requests = {}
+        flow_starts = {}
+        flow_ends = {}
         for capture in captures[bucket]:
             pid = processes[capture["process_id"]]
             if pid in requests:
@@ -191,11 +272,13 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                 "status": row["status"],
                 "unbound_handle": row["unbound_handle"],
                 **{name: row[name] for name in VALUE_NAMES},
-                "transport": row["transport"],
+                **_semantics(row),
+                "transport": _tagged_transport(row["transport"], meta),
                 "loss": loss,
                 "uncertainty_ns": projected.uncertainty_ns if projected else None,
                 "drift_known": projected.drift_known if projected else False,
                 "extrapolated": projected.extrapolated if projected else False,
+                "clock_alias": alias.get(meta["clock_id"]),
                 "clock_model": (
                     "modeled_elapsed"
                     if bucket[0] == "modeled"
@@ -211,7 +294,7 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                     "pid": pid,
                     "tid": tid,
                     "ts": ts,
-                    "name": row["kind"],
+                    "name": _event_name(row),
                     "args": args,
                 }
             )
@@ -227,10 +310,20 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                         "args": args,
                     }
                 )
-            handshake = (pid, "handshake", row["subject"], row["peer_ref"])
+            if row["kind"] == "notify_observed" and request_ref:
+                producer = (meta.get("context") or {}).get("engine_id")
+                if isinstance(request, str) and isinstance(producer, str):
+                    flow_ends.setdefault((producer, request), []).append(
+                        (pid, tid, ts)
+                    )
+            handshake = (pid, "handshake", row["peer_ref"])
             if row["kind"] == "handshake_begin":
                 pending[handshake] = ts
-            elif row["kind"] == "handshake_end" and handshake in pending:
+            elif (
+                row["kind"] == "handshake_end"
+                and not request_ref
+                and handshake in pending
+            ):
                 start = pending.pop(handshake)
                 if ts >= start:
                     events.append(
@@ -245,10 +338,18 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                         }
                     )
             key = pid, row["transfer"]
+            if row["transfer"] and row["kind"] == "transfer_bind":
+                pending[key] = ts, row["kind"]
+                producer = decoder.resolve(row["peer_ref"])
+                handoff = decoder.resolve(row["handoff_ref"])
+                if isinstance(handoff, str) and isinstance(producer, str):
+                    flow_starts.setdefault((producer, handoff), []).append(
+                        (pid, tid, ts)
+                    )
             if row["transfer"] and row["kind"] in ("post_begin", "post_return"):
                 if row["kind"] == "post_return" and key in pending:
                     start, name = pending.pop(key)
-                    if name == "post_begin":
+                    if name in ("post_begin", "transfer_bind"):
                         events.append(
                             {
                                 "ph": "X",
@@ -256,7 +357,11 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                                 "tid": tid,
                                 "ts": start,
                                 "dur": ts - start,
-                                "name": "post call",
+                                "name": (
+                                    "post call"
+                                    if name == "post_begin"
+                                    else "prepared to posted"
+                                ),
                                 "args": args,
                             }
                         )
@@ -276,6 +381,33 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                         "args": args,
                     }
                 )
+        flows = 0
+        omitted = 0
+        for name, starts in flow_starts.items():
+            ends = flow_ends.get(name, [])
+            if not ends:
+                continue
+            if len(starts) != 1 or len(ends) != 1 or starts[0][0] == ends[0][0]:
+                # Several reads or notifications of one (producer, request) are
+                # repeated occurrences or an unresolved fan-in: no arrow rather
+                # than a guess.
+                omitted += 1
+                continue
+            start, end = starts[0], ends[0]
+            flows += 1
+            for phase, (fpid, ftid, fts) in (("s", start), ("f", end)):
+                events.append(
+                    {
+                        "ph": phase,
+                        "bp": "e",
+                        "cat": "kv_handoff",
+                        "name": "handoff",
+                        "id": flows,
+                        "pid": fpid,
+                        "tid": ftid,
+                        "ts": fts,
+                    }
+                )
         document = {
             "traceEvents": events,
             "displayTimeUnit": "ms",
@@ -284,7 +416,10 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                 "origin_ns": str(origin) if origin is not None else None,
                 "captures": captures[bucket],
                 "calibrations": calibrations if bucket[0] == "wall" else {},
-                "cross_process_flows": "not_inferred_without_qualified_adapter",
+                "cross_process_flows": (
+                    "exact_recorded_handoff_ids" if flows else "none_matched"
+                ),
+                "flows_omitted_ambiguous": omitted,
             },
         }
         name = f"{bucket[0]}-{len(documents)}.perfetto.json"

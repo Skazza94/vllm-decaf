@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+    attach_profiler,
     kv_lease_duration,
     side_channel_port,
     zmq_ctx,
@@ -60,6 +61,7 @@ class NixlBaseConnectorScheduler:
     # pull (READ) producer from a push (WRITE) one. Overridden by the push
     # scheduler.
     _TRANSFER_MODE: str = "pull"
+    _kvp = None
 
     def __init__(
         self,
@@ -193,17 +195,32 @@ class NixlBaseConnectorScheduler:
                 self.decoder_kv_blocks_ttl,
             )
 
+        self._kvp = attach_profiler(
+            vllm_config,
+            "scheduler",
+            engine_id,
+            0,
+            self._TRANSFER_MODE,
+            (self.side_channel_host, self.side_channel_port),
+            {"dp_rank": parallel_config.data_parallel_index},
+        )
+
     def shutdown(self):
         self._stop_event.set()
         if self._nixl_handshake_listener_t is not None:
             self._nixl_handshake_listener_t.join()
             self._nixl_handshake_listener_t = None
+        if (p := self._kvp) is not None:
+            self._kvp = None
+            p.close()
 
     def on_new_request(self, request: "Request") -> None:
         """Track a request that may need heartbeats."""
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_decode"):
             self._truncate_request_for_prefill(request)
+            if (p := self._kvp) is not None:
+                p.request_bound(request.request_id)
 
         # NOTE (NickLucche) This excludes request meant for P, ie heartbeats are
         # effectively disabled for Bidirectional KV transfer.
@@ -239,6 +256,10 @@ class NixlBaseConnectorScheduler:
             remote_engine_id,
             remote_request_id,
         )
+        if (p := self._kvp) is not None:
+            p.handoff_in(
+                request.request_id, remote_request_id, remote_engine_id, host, port
+            )
 
     def _stop_heartbeat(self, req_id: ReqId) -> None:
         """Remove *req_id* from heartbeat tracking (if tracked)."""
@@ -332,6 +353,7 @@ class NixlBaseConnectorScheduler:
                     self._stop_event,
                     self.side_channel_host,
                     self.side_channel_port,
+                    self._kvp,
                 ),
                 daemon=True,
                 name="nixl_handshake_listener",
@@ -346,6 +368,7 @@ class NixlBaseConnectorScheduler:
         stop_event: threading.Event,
         host: str,
         port: int,
+        profiler=None,
     ):
         """Background thread for getting new NIXL handshakes."""
         # NOTE(rob): this is a simple implementation. We will move
@@ -377,6 +400,8 @@ class NixlBaseConnectorScheduler:
                 # perf_counter is only comparable within a process, so this
                 # listener must run in the same process that stamps the block
                 # expiry deadline (`_reqs_need_send`).
+                if profiler is not None:
+                    profiler.handshake_served(identity, target_pp_rank, target_tp_rank)
                 ts = msgspec.msgpack.encode(time.perf_counter())
                 sock.send_multipart(
                     (identity, b"", encoded_data[(target_pp_rank, target_tp_rank)], ts)
@@ -538,6 +563,10 @@ class NixlBaseConnectorScheduler:
         """Stop heartbeating for requests whose KV transfer completed."""
         for req_id in connector_output.finished_recving or ():
             self._stop_heartbeat(req_id)
+            if (p := self._kvp) is not None:
+                p.recv_finished(req_id)
+        if (p := self._kvp) is not None:
+            p.releases_requested(connector_output.finished_sending)
 
     def has_pending_push_work(self) -> bool:
         return False

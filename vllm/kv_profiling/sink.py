@@ -159,6 +159,11 @@ def writer_main(ring_dir: str, output_dir: str, mode: str, batch: int):
                                 else "loss_or_unknown"
                             ),
                             "stats": state,
+                            # The helper's lifetime CPU up to this manifest:
+                            # startup, background drains and the end flush. A run's
+                            # accounting subtracts what it had used when its
+                            # workload ended to get the shutdown share.
+                            "writer_cpu_s": time.process_time(),
                         },
                     )
                     sink.ring.set_writer_state(FINISHED)

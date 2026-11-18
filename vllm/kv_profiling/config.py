@@ -19,6 +19,12 @@ class NetworkProfilerConfig:
     id_bytes: int = 8 << 20
     handle_slots: int = 4096
     flush: str = "end"
+    transport: str = "unknown"
+    clock: bool = True
+    clock_port_offset: int = 1000
+    clock_samples: int = 7
+    clock_max_peers: int = 64
+    clock_end_budget_s: float = 2
     batch_records: int = 256
     shutdown_timeout_s: float = 2
     context: dict[str, Any] = field(default_factory=dict)
@@ -30,6 +36,18 @@ class NetworkProfilerConfig:
             raise ValueError("level must be off or l1")
         if self.flush not in ("end", "background"):
             raise ValueError("flush must be end or background")
+        if self.transport not in ("tcp", "rdma", "unknown"):
+            raise ValueError("transport must be tcp, rdma or unknown")
+        if type(self.clock) is not bool:
+            raise ValueError("clock must be a boolean")
+        for name, low, high in (
+            ("clock_port_offset", 1, 65535),
+            ("clock_samples", 1, 32),
+            ("clock_max_peers", 1, 256),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError(f"{name} must be an integer in {low}..{high}")
         for name, maximum in (
             ("ring_records", 1 << 20),
             ("id_slots", 65536),
@@ -55,6 +73,12 @@ class NetworkProfilerConfig:
             raise ValueError("shutdown_timeout_s must be finite in (0, 10]")
         import json
 
+        if (
+            type(self.clock_end_budget_s) not in (int, float)
+            or not math.isfinite(self.clock_end_budget_s)
+            or not 0 < self.clock_end_budget_s <= 10
+        ):
+            raise ValueError("clock_end_budget_s must be finite in (0, 10]")
         if len(json.dumps(self.context).encode()) > 2048:
             raise ValueError("context exceeds 2 KiB")
         if self.level == "l1":
@@ -67,4 +91,8 @@ class NetworkProfilerConfig:
     @classmethod
     def from_extra_config(cls, extra: dict[str, Any]):
         """Parse the reserved namespace without changing the connector config."""
-        return cls(**extra.get("network_profiler", {}))
+        values = dict(extra.get("network_profiler", {}))
+        unknown = sorted(set(values) - set(cls.__dataclass_fields__))
+        if unknown:
+            raise ValueError(f"unknown network_profiler keys: {unknown}")
+        return cls(**values)

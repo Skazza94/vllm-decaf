@@ -35,6 +35,7 @@ from vllm.tracing import init_tracer
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.core_client import EngineCoreClient
+from vllm.kv_profiling import attach_frontend as attach_kv_frontend_profiler
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -53,6 +54,8 @@ _R = TypeVar("_R", default=Any)
 
 class LLMEngine:
     """Legacy LLMEngine for backwards compatibility."""
+
+    kv_frontend_profiler = None
 
     def __init__(
         self,
@@ -152,6 +155,12 @@ class LLMEngine:
 
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
+
+        self.kv_frontend_profiler = attach_kv_frontend_profiler(self.vllm_config)
+        if self.kv_frontend_profiler is not None:
+            from vllm.kv_profiling.nixl import close_with_owner
+
+            close_with_owner(self, self.kv_frontend_profiler)
 
     @classmethod
     def from_vllm_config(
@@ -284,6 +293,8 @@ class LLMEngine:
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
         self.input_processor.assign_request_id(request)
+        if (kvp := self.kv_frontend_profiler) is not None:
+            kvp.external_engine(request.external_req_id, request.request_id)
 
         req_id = request.request_id
 
@@ -303,6 +314,8 @@ class LLMEngine:
         parent_req = ParentRequest(request)
         for idx in range(n):
             request_id, child_params = parent_req.get_child_info(idx)
+            if (kvp := self.kv_frontend_profiler) is not None:
+                kvp.child_parent(request_id, parent_req.request_id)
             child_request = request if idx == n - 1 else copy(request)
             child_request.request_id = request_id
             child_request.sampling_params = child_params

@@ -61,6 +61,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     _NIXL_SUPPORTED_DEVICE,
+    attach_profiler,
     get_dcp_replicated_group_ids,
     get_representative_spec_type,
     kv_lease_extension,
@@ -233,6 +234,7 @@ class NixlBaseConnectorWorker:
     # (WRITE) connector and a pull (READ) connector never handshake together.
     # Overridden by NixlPushConnectorWorker.
     _TRANSFER_MODE: str = "pull"
+    _kvp = None
 
     # Only NixlPushConnector supports PP with HMA or packed KV caches.
     _supports_pp_hma = False
@@ -1191,6 +1193,19 @@ class NixlBaseConnectorWorker:
             "enforce_handshake_compat", True
         )
 
+        self._kvp = attach_profiler(
+            vllm_config,
+            "worker",
+            engine_id,
+            self.tp_rank,
+            self._TRANSFER_MODE,
+            context={
+                "backends": list(self.nixl_backends),
+                "tp_rank": self.tp_rank,
+                "dp_rank": vllm_config.parallel_config.data_parallel_index,
+            },
+        )
+
     def _validate_remote_parallel_config(
         self, agent_metadata: NixlAgentMetadata
     ) -> None:
@@ -1408,6 +1423,13 @@ class NixlBaseConnectorWorker:
                     remote_agent_name = self.add_remote_agent(
                         metadata, remote_rank, remote_tp_size, metadata.dcp_size
                     )
+                if (p := self._kvp) is not None:
+                    p.handshake_peer_done(
+                        expected_engine_id,
+                        remote_rank,
+                        remote_pp_rank,
+                        remote_agent_name,
+                    )
                 setup_agent_time = time.perf_counter()
                 logger.debug(
                     "NIXL handshake: add agent took: %s (notif_agents_only=%s)",
@@ -1507,6 +1529,8 @@ class NixlBaseConnectorWorker:
         **extra_context,
     ):
         """Log transfer failure with structured context for easier debugging."""
+        if (p := self._kvp) is not None:
+            p.failure(failure_type, req_id, extra_context)
         context: dict[str, Any] = {
             "failure_type": failure_type,
             "request_id": req_id,
@@ -1572,6 +1596,8 @@ class NixlBaseConnectorWorker:
             fut = self._handshake_futures.get(engine_id)
             if fut is not None:
                 return fut
+            if (p := self._kvp) is not None:
+                p.handshake_begin(engine_id)
             fut = self._handshake_initiation_executor.submit(
                 self._nixl_handshake,
                 host,
@@ -1594,6 +1620,8 @@ class NixlBaseConnectorWorker:
                         remote_agents, clock_offset = f.result()
                         self._remote_agents[eid] = remote_agents
                         self._engine_clock_offset[eid] = clock_offset
+                        if (p := self._kvp) is not None:
+                            p.handshake_offset(eid, clock_offset)
                         self._engine_last_active[eid] = time.perf_counter()
                         self._track_remote_engine_replacement(eid, host, port)
                     except Exception as e:
@@ -1631,8 +1659,12 @@ class NixlBaseConnectorWorker:
         def request_ready(f: Future[Any], entry=(req_id, meta)):
             try:
                 f.result()
+                if (p := self._kvp) is not None:
+                    p.handshake_waiter(req_id, remote_engine_id, True)
                 self._ready_requests.put(entry)
             except Exception as e:
+                if (p := self._kvp) is not None:
+                    p.handshake_waiter(req_id, remote_engine_id, False)
                 self._log_failure(
                     failure_type="handshake_failed",
                     req_id=req_id,
@@ -3525,6 +3557,8 @@ class NixlBaseConnectorWorker:
             count = self.consumer_notification_counts_by_req.pop(req_id, 0)
             self.expected_consumer_notifications_by_req.pop(req_id, None)
             self.xfer_stats.record_kv_expired_req()
+            if (p := self._kvp) is not None:
+                p.lease_expired(req_id, count)
             logger.warning(
                 "Releasing expired KV blocks for request %s which were "
                 "retrieved by %d remote worker(s) before lease expired.",
@@ -3580,7 +3614,11 @@ class NixlBaseConnectorWorker:
                     if xfer_state == "DONE":
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
+                        if (p := self._kvp) is not None:
+                            p.transfer_done(handle, res)
                         self.nixl_wrapper.release_xfer_handle(handle)
+                        if (p := self._kvp) is not None:
+                            p.transfer_retired(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
                     else:
@@ -3613,6 +3651,8 @@ class NixlBaseConnectorWorker:
         """Release a handle, returning False if the caller must retain it."""
         try:
             self.nixl_wrapper.release_xfer_handle(handle)
+            if (p := self._kvp) is not None:
+                p.transfer_retired(handle)
         except Exception as e:
             # A status error does not guarantee that the backend stopped DMA.
             self._log_failure(
@@ -3644,6 +3684,8 @@ class NixlBaseConnectorWorker:
                 transport failures) pass False.
 
         """
+        if handle is not None and (p := self._kvp) is not None:
+            p.transfer_failed(handle)
         if record_failed_transfer:
             self.xfer_stats.record_failed_transfer()
             if (
@@ -3661,6 +3703,8 @@ class NixlBaseConnectorWorker:
         for agent_name, notif_id in self._pending_recv_notifs.pop(req_id, []):
             try:
                 self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+                if (p := self._kvp) is not None:
+                    p.notify_sent(req_id, agent_name)
             except Exception as e:
                 self._log_failure(
                     failure_type="notification_failed",
@@ -4327,5 +4371,10 @@ class NixlBaseConnectorWorker:
         for handles in self._recving_transfers.values():
             for handle in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
+                if (p := self._kvp) is not None:
+                    p.transfer_retired(handle)
         self._recving_transfers.clear()
         self._finish_shutdown()
+        if (p := self._kvp) is not None:
+            self._kvp = None
+            p.close()

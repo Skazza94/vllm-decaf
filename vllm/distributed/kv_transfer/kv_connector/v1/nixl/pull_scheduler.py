@@ -291,6 +291,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
 
             remote_num_tokens = request.num_computed_tokens
 
+        if delay_free_blocks and (p := self._kvp) is not None:
+            p.handoff_out(
+                request.request_id, self._registration_generation, block_ids
+            )
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,
             do_remote_decode=is_d_node,
