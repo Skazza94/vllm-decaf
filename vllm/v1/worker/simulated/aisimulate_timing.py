@@ -244,6 +244,7 @@ MTP_TARGETS = {
     "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeMTP",
     "DeepseekV32ForCausalLM": "DeepseekV32MTPModel",
     "GlmMoeDsaForCausalLM": "DeepseekV32MTPModel",
+    "NemotronHForCausalLM": "NemotronHMTPModel",
 }
 # Each draft's model type as the speculative config builds it.
 MTP_DRAFT_TYPES = {
@@ -252,6 +253,7 @@ MTP_DRAFT_TYPES = {
     "Qwen3_5MTP": "qwen3_5_mtp",
     "Qwen3_5MoeMTP": "qwen3_5_mtp",
     "DeepseekV32MTPModel": "deepseek_mtp",
+    "NemotronHMTPModel": "nemotron_h_mtp",
 }
 MTP_MAX_DEPTH = 5
 MTP_APPROXIMATIONS = [
@@ -272,8 +274,10 @@ MTP_APPROXIMATIONS = [
     "acceptance does not enter the cost",
     "graph-based kernel tables: an off-graph deployment is not modeled",
 ]
-# A hybrid target's MTP (Qwen3.5): its native drafter is one full-attention
-# layer, priced as k layers of the target's mix of attention and delta-nets.
+# A hybrid target's MTP (Qwen3.5, Nemotron-H): Qwen3.5's native drafter is
+# one full-attention layer, Nemotron-H's draft module reuses the target's
+# attention-plus-MoE stack; both are priced as k layers of the target's own
+# layer mix.
 # Plain-MLA context steps over a cached prefix (request 236's probe): in
 # DeepSeek-V3 and Kimi-K3 the estimates fall as a positive prefix grows with
 # the new tokens fixed, while generation estimates rise. Not corrected.
@@ -291,9 +295,12 @@ MTP_DCP_INTERLEAVE_APPROXIMATION = (
     "kernel selection for the verified rows) are not modeled"
 )
 HYBRID_MTP_APPROXIMATION = (
-    "the MTP drafter, a full-attention layer, is priced as the hybrid target's "
-    "layers ((L + k) / L of its graph): its attention and delta-net mix, not "
-    "the drafter's own"
+    "the MTP drafter is priced as the hybrid target's layers ((L + k) / L of "
+    "its graph), not the drafter's own: Qwen3.5's draft module, a full-"
+    "attention layer, is priced as the hybrid target's attention and "
+    "delta-net mix, and Nemotron-H's draft module reuses the target's "
+    "attention-plus-MoE stack; AISimulate's nextn=k prices k more layers of "
+    "each target's own mix"
 )
 GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
     **dict.fromkeys(
@@ -1204,7 +1211,7 @@ class AisimulateTimingProvider:
         qualified_mtp_dcp: bool = False,
     ) -> tuple[int, dict[str, Any] | None]:
         """AISimulate's MTP depth for the speculative configuration: DeepSeek-V3's,
-        DeepSeek-V4's or Qwen3.5's native single-module MTP (its own
+        DeepSeek-V4's, Qwen3.5's or Nemotron-H's native single-module MTP (its own
         checkpoint's one MTP layer, the target's parallelism and precision)
         only."""
         spec = vllm_config.speculative_config
@@ -1272,7 +1279,8 @@ class AisimulateTimingProvider:
         if problems:
             raise ValueError(
                 "The aisimulate timing provider times DeepSeek-V3's, "
-                "DeepSeek-V4's or Qwen3.5's native single-module MTP only, not "
+                "DeepSeek-V4's, Qwen3.5's or Nemotron-H's native single-module "
+                "MTP only, not "
                 f"{', '.join(problems)}."
             )
         return k, {

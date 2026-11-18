@@ -26,6 +26,7 @@ REAL_KV_MTP_DRAFTS = {
     "qwen3_5_moe": "Qwen3_5MoeMTP",
     "deepseek_v32": "DeepseekV32MTPModel",
     "glm_moe_dsa": "DeepseekV32MTPModel",
+    "nemotron_h": "NemotronHMTPModel",
 }
 REAL_KV_MTP_MAX_DEPTH = 5
 # Those Mooncake moves too: its draft one more MLA layer of the target's
@@ -304,8 +305,9 @@ class SimulationConfig:
             return []
         return [
             "speculative decoding only as a native single-module MTP (DeepSeek-V3, "
-            f"DeepSeek-V3.2, GLM-5, DeepSeek-V4, Qwen3.5; 1 to {REAL_KV_MTP_MAX_DEPTH} "
-            "tokens) over NIXL, or DeepSeek-V3's, DeepSeek-V3.2's or GLM-5's over "
+            f"DeepSeek-V3.2, GLM-5, DeepSeek-V4, Qwen3.5, Nemotron-H; 1 to "
+            f"{REAL_KV_MTP_MAX_DEPTH} tokens) over NIXL, or DeepSeek-V3's, "
+            "DeepSeek-V3.2's or GLM-5's over "
             f"Mooncake, not {', '.join(mismatches)}"
         ]
 

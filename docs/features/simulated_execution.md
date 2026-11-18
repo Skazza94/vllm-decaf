@@ -219,7 +219,8 @@ block demand. Its cache contributes to the engine's virtual memory plan even
 though the timing model omits draft KV.
 
 Speculative decoding is timed for the native single-module MTP of
-DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 and Qwen3.5 only (`method: mtp`, the checkpoint's one MTP layer,
+DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4, Qwen3.5 and
+Nemotron-H only (`method: mtp`, the checkpoint's one MTP layer,
 1 to 5 tokens, the draft at the target's parallelism and precision), as
 AISimulate's MTP depth: a decode step
 verifies k + 1 tokens a request and runs k target-shaped draft layers, the
@@ -446,7 +447,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   bounded window replay on (a cache whose SWA spec sets `bounded_replay`,
   DeepSeek-V4.1's), NIXL loads N - 1 and decode computes the last.
 * Speculative decoding only as the native single-module MTP of
-  DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4 or Qwen3.5 (`method: mtp`, the checkpoint's one MTP layer, 1 to 5
+  DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4, Qwen3.5 or Nemotron-H
+  (`method: mtp`, the checkpoint's one MTP layer, 1 to 5
   tokens, the draft at the target's parallelism and precision) over
   `NixlConnector` (or `NixlPullConnector`), whose handshake checks the
   instances' transfer compatibility, the draft among it (a peer without
@@ -455,7 +457,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   layer the consumer lacks, not a consumer-only draft or another depth):
   both instances must run the same speculative configuration. The MTP
   layer's KV is a layer of the target's KV cache groups and moves with
-  them. Qwen3.5's MTP stays NIXL's: Mooncake would also move each state's
+  them. Qwen3.5's and Nemotron-H's MTP stay NIXL's: Mooncake would also
+  move each state's
   k scratch slots, which NIXL leaves. Drafts are not computed; their
   acceptance follows `spec_acceptance_rates`.
 * One rank per instance, or:
@@ -475,11 +478,11 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           larger size and divisible by both (Gemma4's 8 and 2: TP 1 with 2);
         * over NIXL only, a hybrid of Mamba2 or gated delta-net states
           whose state splits over both sizes and whose KV heads split or
-          replicate evenly on each side (with Qwen3.5's native MTP too: the
-          conv state widened to `conv_kernel - 1 + k` rows, as vLLM
-          allocates it, and the draft's attention layer read with the
-          target's; decode refuses a producer of another depth before any
-          READ, its state sizes differing); where the two sizes give it
+          replicate evenly on each side (with Qwen3.5's and Nemotron-H's
+          native MTP too: the conv state widened to `conv_kernel - 1 + k`
+          rows, as vLLM allocates it, and the draft's attention layer read
+          with the target's; decode refuses a producer of another depth
+          before any READ, its state sizes differing); where the two sizes give it
           different attention block sizes (Nemotron-3-Nano: 1056 tokens at
           TP 4, 2112 at TP 2; Qwen3.5-27B: 800 at TP 1, 2 and 4, 416 at
           TP 8, a requested 400 kept at TP 8 and aligned to 800 below it;

@@ -1160,12 +1160,11 @@ def check_real_kv_layers(model: torch.nn.Module) -> None:
     Qwen's gated delta-net (`QwenGatedDeltaNetAttention` itself), Kimi-K3's
     delta attention (`KimiK3DeltaAttention`, packed like Qwen's: its q, k
     and v convolutions in one conv state, without RecoverSSM or speculative
-    state) or Mamba2 (`MambaMixer2` itself, without ReplaySSM or speculative
-    state): Kimi-Linear's and OLMo's delta-nets share their KV cache groups
-    but not their states' rules. Each recurrent mixer must be the only one of
-    its decoder layer (an element of the one module list holding them all),
-    without attention beside it (Falcon-H1's parallel hybrid, Zamba2's shared
-    transformer)."""
+    state) or Mamba2 (`MambaMixer2` itself, without ReplaySSM): Kimi-Linear's
+    and OLMo's delta-nets share their KV cache groups but not their states'
+    rules. Each recurrent mixer must be the only one of its decoder layer (an
+    element of the one module list holding them all), without attention
+    beside it (Falcon-H1's parallel hybrid, Zamba2's shared transformer)."""
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.model_executor.layers.mamba.abstract import MambaBase
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -1200,13 +1199,8 @@ def check_real_kv_layers(model: torch.nn.Module) -> None:
             "Real KV transfers move Kimi-K3's delta attention states "
             "without RecoverSSM or speculative state only."
         )
-    if any(
-        type(m) is MambaMixer2 and (m.use_replayssm or m.num_spec) for m in mixers
-    ):
-        raise ValueError(
-            "Real KV transfers move Mamba2 states without ReplaySSM or "
-            "speculative state only."
-        )
+    if any(type(m) is MambaMixer2 and m.use_replayssm for m in mixers):
+        raise ValueError("Real KV transfers move Mamba2 states without ReplaySSM only.")
     # The decoder layers: the elements of the one module list whose
     # elements hold every recurrent mixer (a layer's modules taken whole,
     # shared ones included).

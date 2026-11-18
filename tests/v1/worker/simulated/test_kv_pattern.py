@@ -1144,7 +1144,6 @@ def test_real_transfers_take_one_mamba2_mixer_a_decoder_layer_without_attention(
             recurrent_model([decoder(mixer=mamba2_mixer(use_replayssm=True))]),
             "ReplaySSM",
         ),
-        (recurrent_model([decoder(mixer=mamba2_mixer(num_spec=1))]), "speculative"),
         # Falcon-H1: attention and a mixer in each layer.
         (
             recurrent_model([
@@ -1189,6 +1188,9 @@ def test_real_transfers_take_one_mamba2_mixer_a_decoder_layer_without_attention(
     ):
         with pytest.raises(ValueError, match=message):
             check_real_kv_layers(model)
+    # Nemotron-H's native MTP widens the mixer's states; that stays
+    # admitted (the pairing gates own it).
+    check_real_kv_layers(recurrent_model([decoder(mixer=mamba2_mixer(num_spec=3))]))
 
 
 def test_packed_blocks_check_each_layers_real_page_at_its_offset():

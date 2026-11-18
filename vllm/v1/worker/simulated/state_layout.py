@@ -205,8 +205,9 @@ def layout_for(vllm_config) -> StateLayout | None:
 def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
     """Why a hybrid of this model cannot pair these TP sizes over NIXL, None
     when it can: a Mamba2 or GDN layout that splits over both sizes,
-    speculative decoding only with a GDN state (Qwen3.5's native MTP, the
-    model gate being `REAL_KV_MTP_DRAFTS`), no MLA (but Kimi-K3's, at
+    speculative decoding only with a GDN or Mamba2 state (Qwen3.5's and
+    Nemotron-H's native MTP, the model gate being `REAL_KV_MTP_DRAFTS`),
+    no MLA (but Kimi-K3's, at
     decode TP4 from prefill TP8, or the published checked cold pairs), and
     attention KV heads that split or replicate evenly on each side as NIXL
     maps them (the
@@ -242,8 +243,8 @@ def pairing_problem(vllm_config, local_tp: int, remote_tp: int) -> str | None:
     layout = layout_for(vllm_config)
     if layout is None:
         return "a recurrent state that is neither Mamba2 nor GDN (or has no known layout)"
-    if vllm_config.speculative_config is not None and layout.family != "gdn":
-        return f"speculative decoding with a {layout.family} state"
+    if vllm_config.speculative_config is not None and layout.family == "kda":
+        return "speculative decoding with a kda state"
     for tp in (local_tp, remote_tp):
         if not layout.divides(tp):
             return (

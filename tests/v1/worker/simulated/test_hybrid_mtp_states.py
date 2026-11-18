@@ -6,6 +6,10 @@ the checker's append-only block tables follow the scheduler's relocation of
 speculative state blocks."""
 
 import json
+import os
+import subprocess
+import sys
+import time
 from dataclasses import dataclass, field, replace
 
 import pytest
@@ -26,6 +30,13 @@ from vllm.v1.worker.simulated.kv_pattern import (
 )
 
 BLOCK = 16
+
+def free_port():
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def chains(endpoint_states=True, **kwargs):
@@ -179,24 +190,30 @@ def test_the_checker_tables_follow_the_scheduler_through_relocation(accepted):
 CONV_COLUMNS, SSM_BYTES, HEAD_PAGE = 128, 4 * 16 * 16 * 2, 16 * 2 * 32 * 2 * 2
 
 
-def run_tiny_mtp_peers(tmp_path, p_tp, d_tp, k, consumer=None, **common):
+def run_tiny_mtp_peers(tmp_path, p_tp, d_tp, k, consumer=None, config=None, **common):
     from tests.v1.worker.simulated.test_real_kv_transfer import (
         QWEN3_5_MOE_MTP,
         run_dcp_peers,
     )
 
+    config = QWEN3_5_MOE_MTP if config is None else config
+
     def side(tp, depth):
-        return {
+        options = {
             "speculative_config": {"method": "mtp", "num_speculative_tokens": depth},
             "simulation": {"spec_acceptance_rates": [0.5] * depth},
-            "language_model_only": True,
             "prompt_len": 40,
             "tensor_parallel_size": tp,
             **common,
         }
+        # Qwen3.5 is a multimodal wrapper served as its language model; the
+        # plain text hybrids need no such override.
+        if "text_config" in config:
+            options["language_model_only"] = True
+        return options
 
     return run_dcp_peers(
-        QWEN3_5_MOE_MTP, side(p_tp, k), {**side(d_tp, k), **(consumer or {})}, tmp_path
+        config, side(p_tp, k), {**side(d_tp, k), **(consumer or {})}, tmp_path
     )
 
 
@@ -364,34 +381,372 @@ def test_unequal_tp_peers_of_other_mtp_depths_are_refused_before_a_read(
     assert c["posted"] == [0] * d_tp
 
 
-def test_only_a_gdn_hybrids_mtp_pairs_unequal_tp(tmp_path, ds_conv_layout):
-    """The widened layout is shared, MTP's qualification is not: a Mamba2
-    hybrid's native MTP (tiny Nemotron-H with one MTP layer) keeps the state
-    gate's refusal at unequal TP, and real transfers refuse its MTP outright
-    (`REAL_KV_MTP_DRAFTS`)."""
-    from tests.v1.worker.simulated.test_real_kv_transfer import (
-        NEMOTRON_3,
-        engine_config,
-    )
-    from vllm import EngineArgs
-    from vllm.v1.worker.simulated import state_layout as sl
+# #33's Nemotron-H: the same native MTP on a Mamba2 hybrid. The tiny
+# Nemotron-3 plus one attention + MoE MTP module; its Mamba2 states' conv
+# columns x·B·C are 64 + 32 + 32 of `kernel - 1 + k` rows (kernel 4, bf16),
+# four 8x16 FP32 SSM heads (NemotronH's `mamba_ssm_cache_dtype` resolves
+# float32), 2 KV heads of 16 dims, and 48-token attention blocks at depth 1.
+NEMOTRON_CONV_COLUMNS, NEMOTRON_SSM_BYTES, NEMOTRON_HEAD_PAGE = (
+    128,
+    8 * 8 * 16 * 4,
+    48 * 2 * 16 * 2 * 2,
+)
 
-    config = {
+
+def nemotron_mtp_config():
+    from tests.v1.worker.simulated.test_real_kv_transfer import NEMOTRON_3
+
+    return {
         **NEMOTRON_3,
         "num_nextn_predict_layers": 1,
         "mtp_hybrid_override_pattern": "*E",
     }
-    (tmp_path / "config.json").write_text(json.dumps(config))
+
+
+@pytest.mark.parametrize("k", [1, 5])
+@pytest.mark.parametrize("p_tp,d_tp", [(1, 2), (2, 1)])
+def test_a_mamba2_hybrids_mtp_states_re_shard_at_unequal_tp(
+    tmp_path, ds_conv_layout, p_tp, d_tp, k
+):
+    """Nemotron-H's native MTP pairs unequal TP like Qwen3.5's: every decode
+    rank reads its columns and heads of the producer's widened Mamba2 states
+    (`kernel - 1 + k` conv rows, as `mamba2_state_shape` allocates them) and
+    the draft's attention layer beside the target's; each byte checks."""
+    p, c = run_tiny_mtp_peers(tmp_path, p_tp, d_tp, k, config=nemotron_mtp_config())
+    assert c["tokens"] == [2], c["log"][-4000:]
+    assert c["posted"] and all(c["posted"]), c["posted"]
+    conv = NEMOTRON_CONV_COLUMNS // d_tp * (3 + k) * 2
+    for rank in range(d_tp):
+        groups = layout_groups(c["logs"][rank])
+        states = [g for g in groups if g["kind"] == "MambaSpec"]
+        (attention,) = [g for g in groups if g["kind"] == "FullAttentionSpec"]
+        assert [g["state"]["conv_rows"] for g in states] == [3 + k] * len(states)
+        assert [g["speculative_blocks"] for g in states] == [k] * len(states)
+        assert attention["layers"] == 2
+        (check,) = checks(c["logs"][rank])
+        assert check["ok"] and check["mismatched_bytes"] == 0, check
+        assert check["coverage"]["problems"] == [], check["coverage"]
+        by_pattern = {}
+        for group in check["groups"]:
+            by_pattern.setdefault(group["pattern"], []).append(group)
+        # Each state group's regions: its layers', the layers per group the
+        # engine picked (attention and Mamba2 layers beside each other's).
+        state_bytes = conv + NEMOTRON_SSM_BYTES // d_tp
+        for pattern, members in by_pattern.items():
+            if pattern != "state-v1":
+                continue
+            for group in members:
+                assert group["bytes"] == group["layers"] * state_bytes, group
+        (pulled,) = by_pattern["head-v1"]
+        # The attention group's two layers (the target's and the draft's),
+        # each one 48-token page of both heads, K and V beside each other.
+        assert pulled["bytes"] == 2 * NEMOTRON_HEAD_PAGE // d_tp, pulled
+
+
+@pytest.mark.parametrize("mode", ["conv-spec", "ssm"])
+@pytest.mark.parametrize("p_tp,d_tp", [(1, 2), (2, 1)])
+def test_a_flipped_mamba2_widened_state_byte_fails_its_reader_only(
+    tmp_path, ds_conv_layout, p_tp, d_tp, mode
+):
+    """Mamba2's, like Qwen3.5's: a byte of a re-sharded state flipped after
+    NIXL wrote it, in a conv row only MTP adds or in the SSM state, fails
+    exactly the rank that reads it."""
+    target = d_tp - 1
+    p, c = run_tiny_mtp_peers(
+        tmp_path,
+        p_tp,
+        d_tp,
+        2,
+        consumer={"corrupt": [mode, target]},
+        config=nemotron_mtp_config(),
+    )
+    assert "corrupted" in c, c["log"][-4000:]
+    (corrupted,) = [x for x in c["corrupted"] if x]
+    _, group, _ = corrupted
+    for rank in range(d_tp):
+        (check,) = checks(c["logs"][rank])
+        if rank != target:
+            assert check["ok"], check
+            continue
+        assert not check["ok"], check
+        bad = [g["group"] for g in check["groups"] if g["mismatched_bytes"]]
+        assert bad == [group], check
+
+
+@pytest.mark.parametrize("p_tp,d_tp", [(1, 2), (2, 1)])
+def test_a_mamba2_hybrids_mtp_prefix_hits_at_unequal_tp(
+    tmp_path, ds_conv_layout, p_tp, d_tp
+):
+    """Mamba2 blocks, with prefix caching: Nemotron-3's tiny states key at
+    48-token blocks, and a prefix must reach past MTP's drop. B shares 150
+    of A's 170 tokens; both directions hit 3 attention and 3 state blocks,
+    minus the last (MTP's), and every check passes: the pulls and the hit
+    among decode's, one hit of prefill's."""
+    a = [(7 * i) % 120 + 1 for i in range(170)]
+    p, c = run_tiny_mtp_peers(
+        tmp_path,
+        p_tp,
+        d_tp,
+        1,
+        config=nemotron_mtp_config(),
+        prompts=[a, a[:150] + [3] * 10],
+        enable_prefix_caching=True,
+        prefix_cache_retention_interval=None,
+        max_model_len=512,
+    )
+    assert c["tokens"] == [2, 2], c["log"][-4000:]
+    for rank in range(p_tp):
+        (hit,) = checks(p["logs"][rank], "hit")
+        assert hit["ok"], hit
+        # The one state block B's shared prefix reaches (its 150 short
+        # tokens of 48 x 3, MTP dropping the last), both Mamba2 layers; and
+        # two of the three attention blocks, both attention layers.
+        want = (10240, 24576) if p_tp == 1 else (5120, 12288)
+        assert [g["bytes"] for g in hit["groups"]] == list(want), hit
+        assert [(g["blocks"], g["logical_blocks"]) for g in hit["groups"]] == [
+            (1, [1]),
+            (2, [0, 1]),
+        ]
+    for rank in range(d_tp):
+        pulls = checks(c["logs"][rank])
+        assert len(pulls) == 2 and all(x["ok"] for x in pulls), pulls
+        (hit,) = checks(c["logs"][rank], "hit")
+        assert hit["ok"], hit
+        # Decode's hit covers what its pulls left: the attention group's two
+        # blocks below MTP's dropped third, both layers; its state groups
+        # the pulls filled have no hit of decode's own (#6's rule).
+        assert 2 * 2 * NEMOTRON_HEAD_PAGE // d_tp == hit["bytes"], hit
+        assert [(g["blocks"], g["logical_blocks"]) for g in hit["groups"]] == [
+            (2, [0, 1]),
+        ]
+
+
+@pytest.mark.parametrize("check", [True, False], ids=["checked", "unchecked"])
+@pytest.mark.parametrize("p_tp,d_tp", [(1, 2), (2, 1), (1, 1)])
+def test_mamba2_mtp_peers_of_other_depths_are_refused_before_a_read(
+    tmp_path, ds_conv_layout, p_tp, d_tp, check
+):
+    """Nemotron-H at unequal TP and at equal: a producer of depth 2 against
+    a consumer of depth 3 holds states of other byte sizes; the
+    state-size comparison refuses it before any READ, checked or not."""
+    p, c = run_tiny_mtp_peers(
+        tmp_path,
+        p_tp,
+        d_tp,
+        2,
+        config=nemotron_mtp_config(),
+        consumer={
+            "speculative_config": {"method": "mtp", "num_speculative_tokens": 3},
+            "simulation": {"spec_acceptance_rates": [0.5] * 3},
+            "check": check,
+        },
+    )
+    assert "holds its states otherwise" in c["log"]
+    assert c["posted"] == [0] * d_tp
+
+
+
+
+def test_a_mamba2_hybrids_mtp_pairs_unequal_tp_its_kda_and_replayssm_do_not(
+    tmp_path, tmp_path_factory, ds_conv_layout
+):
+    """The widened layout is shared, MTP's pairing is not arbitrary: the
+    Nemotron-H Mamba2 hybrid's native MTP pairs as its without-MTP rule
+    pairs (NIXL on, Mooncake off); Kimi-K3's KDA carries no draft the
+    connector knows (`REAL_KV_MTP_DRAFTS` refuses the configuration) and its
+    `pairing_problem` keeps MTP refused where the state layout is reached;
+    and ReplaySSM stays outside real transfers."""
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from tests.v1.worker.simulated.test_real_kv_transfer import (
+        KIMI_K3_8_HEADS,
+        engine_config,
+        write_model_dir,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+    from vllm.v1.worker.simulated import state_layout as sl
+
     mtp = {"method": "mtp", "num_speculative_tokens": 2}
-    plain = EngineArgs(
-        model=str(tmp_path),
-        skip_tokenizer_init=True,
-        dtype="bfloat16",
-        max_model_len=256,
-        enforce_eager=True,
-        speculative_config=mtp,
-    ).create_engine_config()
+    model_dir = write_model_dir(
+        tmp_path_factory, "tiny-nemotron-mtp-scope", nemotron_mtp_config()
+    )
+    plain = engine_config(str(model_dir), dtype="bfloat16", speculative_config=mtp)
     assert sl.layout_for(plain).conv_rows == 3 + 2
-    assert sl.pairing_problem(plain, 2, 1) == "speculative decoding with a mamba2 state"
-    with pytest.raises(ValueError, match="native single-module MTP"):
-        engine_config(str(tmp_path), dtype="bfloat16", speculative_config=mtp)
+    # The Mamba2 hybrid pairs by the rule its without-MTP pairing uses.
+    assert sl.pairing_problem(plain, 2, 1) is None
+    assert simulated_tp_mismatch(plain, 2, 1, nixl_consumer=True) is None
+    # Mooncake's connector re-shards no hybrid state, MTP or not.
+    assert "unequal TP sizes" in simulated_tp_mismatch(plain, 2, 1)
+    # Kimi-K3: the configuration gate still refuses its MTP (its KDA state
+    # has no draft the connector knows), and the pairing gate's own KDA
+    # line keeps the rule for the layout reached behind it.
+    k3 = write_model_dir(tmp_path_factory, "tiny-kimi-k3-mtp-scope", KIMI_K3_8_HEADS)
+    # Kimi-Linear has no native MTP drafter, so the configuration itself is
+    # unsupported; the pairing gate's own KDA line keeps the rule for the
+    # layout reached behind such a configuration.
+    with pytest.raises(NotImplementedError, match="speculative method"):
+        engine_config(str(k3), dtype="bfloat16", speculative_config=mtp)
+    config = engine_config(str(k3), dtype="bfloat16", tensor_parallel_size=8)
+    assert sl.layout_for(config).family == "kda"
+    with_spec = deepcopy(config)
+    with_spec.speculative_config = SimpleNamespace(
+        method="mtp", num_speculative_tokens=1
+    )
+    assert (
+        sl.pairing_problem(with_spec, 4, 8) == "speculative decoding with a kda state"
+    )
+    # ReplaySSM: native Mamba2 replay state beside MTP, over a connector.
+    with pytest.raises(ValueError, match="ReplaySSM|replayssm|Replay"):
+        engine_config(
+            str(model_dir),
+            dtype="bfloat16",
+            speculative_config=mtp,
+            use_replayssm=True,
+        )
+    from tests.v1.worker.simulated.test_kv_pattern import (
+        decoder,
+        mamba2_mixer,
+        recurrent_model,
+    )
+    from vllm.v1.worker.simulated.kv_transfer import check_real_kv_layers
+
+    with pytest.raises(ValueError, match="ReplaySSM only"):
+        check_real_kv_layers(
+            recurrent_model([decoder(mixer=mamba2_mixer(use_replayssm=True))])
+        )
+
+
+@pytest.mark.parametrize(
+    "acceptance, corrupt",
+    [(1.0, False), (0.0, False), (1.0, True)],
+    ids=["accepted", "rejected", "corrupt-state"],
+)
+def test_nixl_peers_check_a_mamba2_hybrids_decode_written_state_hit_with_mtp(
+    tmp_path_factory, tmp_path, ds_conv_layout, acceptance, corrupt
+):
+    """#6 for Nemotron-H (tiny, MTP k 1, 48-token blocks): A (100 tokens) is
+    pulled, its state keyed by its endpoint whichever slot NIXL writes, and
+    decode generates 96 tokens, every state checkpoint kept (retention
+    None). B, A's prompt, decode's 96 generated tokens and 10 more, runs on
+    decode alone: its native hit (four matched blocks, the last dropped for
+    MTP) reaches the state at 144 tokens, two blocks decode's own steps
+    wrote past A's handoff, and compares equal with drafts accepted or
+    rejected; with that state's block (logical 2) flipped after A, B's hit
+    fails exactly there."""
+    from tests.v1.worker.simulated.test_real_kv_transfer import (
+        NIXL_PREFIX_PEER,
+        write_model_dir,
+    )
+
+    model = write_model_dir(
+        tmp_path_factory, "tiny-nemotron-mtp-prefix", nemotron_mtp_config()
+    )
+    a = [(7 * i) % 120 + 1 for i in range(100)]
+    b = a + [0] * 96 + [3] * 10
+    prompts, max_tokens = json.dumps([a, b]), json.dumps([96, 2])
+    spec = {
+        "speculative_config": {"method": "mtp", "num_speculative_tokens": 1},
+        "simulation": {"spec_acceptance_rates": [acceptance]},
+        "prefix_cache_retention_interval": None,
+    }
+    consumer_kwargs = {
+        **spec,
+        "local_prompts": [1],
+        **({"corrupt_state_block": 2} if corrupt else {}),
+    }
+    script = tmp_path / "peer.py"
+    script.write_text(NIXL_PREFIX_PEER)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "NIXL_MOONCAKE_IP_ADDR": "127.0.0.1",
+        "VLLM_NIXL_SIDE_CHANNEL_HOST": "127.0.0.1",
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+    }
+    produced, consumed = tmp_path / "producer.json", tmp_path / "consumer.json"
+    producer = subprocess.Popen(
+        [
+            sys.executable,
+            str(script),
+            "producer",
+            model,
+            json.dumps(spec),
+            str(produced),
+            str(64 * 1024**2),
+            json.dumps([a]),
+        ],
+        env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+    )
+    try:
+        deadline = time.monotonic() + 600
+        while not produced.exists():
+            assert producer.poll() is None, "the producer exited"
+            assert time.monotonic() < deadline, "no producer output"
+            time.sleep(0.5)
+        handoffs = json.loads(produced.read_text())
+        # B has no handoff: decode serves it from its own cache.
+        remote = tmp_path / "remote.json"
+        remote.write_text(json.dumps({"params": handoffs["params"] + [None]}))
+        consumer = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "consumer",
+                model,
+                json.dumps(consumer_kwargs),
+                str(consumed),
+                str(64 * 1024**2),
+                prompts,
+                str(remote),
+                max_tokens,
+            ],
+            env={**env, "VLLM_NIXL_SIDE_CHANNEL_PORT": str(free_port())},
+            timeout=600,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert consumer.returncode == 0, consumer.stdout[-4000:]
+    finally:
+        (tmp_path / "producer.json.done").touch()
+        try:
+            producer.wait(timeout=60)
+        finally:
+            producer.kill()
+    result = json.loads(consumed.read_text())
+    assert result["outputs"][0] == [0] * 96
+    steps = [json.loads(line) for line in (tmp_path / "consumer.json.steps").open()]
+    (layout,) = [r["kv_layout"] for r in steps if "kv_layout" in r][:1]
+    states = {i for i, g in enumerate(layout["groups"]) if g["kind"] == "MambaSpec"}
+    assert states
+    assert all(layout["groups"][g]["speculative_blocks"] == 1 for g in states)
+    drafts = [r["spec_acceptance"] for r in steps if "spec_acceptance" in r]
+    assert drafts, "no draft verified"
+    # Each admission's events name the step record that scheduled it.
+    scheduled = {
+        r["step"]["step_index"]: {q["req_id"] for q in r["step"]["requests"]}
+        for r in steps
+        if "step" in r
+    }
+    admitted = [r for r in steps if (r.get("kv_events") or {}).get("admitted")]
+    assert len(admitted) == 2
+    for record in admitted:
+        assert set(record["kv_events"]["admitted"]) <= scheduled[record["step_index"]]
+    c_checks = json.loads((tmp_path / "consumer.json.checks").read_text())
+    pulls = [c for c in c_checks if "kind" not in c]
+    assert len(pulls) == 1 and pulls[0]["ok"], pulls
+    (hit,) = [c for c in c_checks if c.get("kind") == "hit"]
+    by_group = {g["group"]: g for g in hit["groups"]}
+    # The hit reaches a state block decode's own step wrote past A's
+    # handoff (A's 100 tokens close block 1: 48 x 2), and covers it whole.
+    for group in states:
+        assert by_group[group]["logical_blocks"][-1] == 2, hit
+    if corrupt:
+        assert not hit["ok"], hit
+        assert {m[2] for m in hit["mismatched_blocks"]} == {result["corrupted"]}
+    else:
+        assert all(c["ok"] for c in c_checks), c_checks

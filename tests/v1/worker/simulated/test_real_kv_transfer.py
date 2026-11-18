@@ -1999,6 +1999,328 @@ def test_qwen3_5s_mtp_pairs_unequal_tp_as_it_pairs_without(
     } | {(8, d, k) for d in (1, 2, 4) for k in (1, 2, 3)}
 
 
+NEMOTRON_3_ULTRA_LAYERS = (
+    ["mamba", "moe"] * 3
+    + ["mamba"]
+    + ["attention"]
+    + ["moe", "mamba"] * 3
+    + ["attention"]
+    + ["moe", "mamba"] * 4
+    + ["attention"]
+    + ["moe", "mamba"] * 4
+    + ["attention"]
+    + ["moe", "mamba"] * 3
+    + ["attention"]
+    + ["moe", "mamba"] * 4
+    + ["attention"]
+    + ["moe", "mamba"] * 4
+    + ["attention"]
+    + ["moe", "mamba"] * 3
+    + ["attention"]
+    + ["moe", "mamba"] * 4
+    + ["attention"]
+    + ["moe", "mamba"] * 4
+    + ["attention"]
+    + ["moe", "mamba"] * 3
+    + ["attention"]
+    + ["moe", "mamba"] * 4
+    + ["attention"]
+    + ["moe", "mamba"] * 4
+    + ["moe"]
+)
+
+
+# The published Nemotron-3-Ultra-550B-A55B config (BF16), pinned at
+# sha256 8f92735a43afae0d94b73fb9e658910ed548818a188eb2fc51513e88c9e689cd
+# (48 Mamba2, 12 attention and 48 MoE layers, and one attention + MoE
+# MTP module, `num_nextn_predict_layers: 1`).
+NEMOTRON_3_ULTRA = {
+    "architectures": ["NemotronHForCausalLM"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "bos_token_id": 1,
+    "chunk_size": 128,
+    "conv_kernel": 4,
+    "dtype": "bfloat16",
+    "eos_token_id": 2,
+    "expand": 2,
+    "head_dim": 128,
+    "hidden_dropout": 0.0,
+    "hidden_size": 8192,
+    "initializer_range": 0.02,
+    "intermediate_size": 5120,
+    "layer_norm_epsilon": 1e-05,
+    "layers_block_type": NEMOTRON_3_ULTRA_LAYERS,
+    "mamba_head_dim": 64,
+    "mamba_hidden_act": "silu",
+    "mamba_num_heads": 256,
+    "mamba_proj_bias": False,
+    "mamba_ssm_cache_dtype": "float32",
+    "max_position_embeddings": 262144,
+    "mlp_bias": False,
+    "mlp_hidden_act": "relu2",
+    "model_type": "nemotron_h",
+    "moe_intermediate_size": 5120,
+    "moe_latent_size": 2048,
+    "moe_shared_expert_intermediate_size": 10240,
+    "moe_shared_expert_overlap": False,
+    "mtp_layers_block_type": ["attention", "moe"],
+    "n_group": 1,
+    "n_groups": 8,
+    "n_routed_experts": 512,
+    "n_shared_experts": 1,
+    "norm_eps": 1e-05,
+    "norm_topk_prob": True,
+    "num_attention_heads": 64,
+    "num_experts_per_tok": 22,
+    "num_key_value_heads": 2,
+    "num_logits_to_keep": 1,
+    "num_nextn_predict_layers": 1,
+    "pad_token_id": 0,
+    "partial_rotary_factor": 1.0,
+    "rescale_prenorm_residual": True,
+    "residual_in_fp32": False,
+    "rope_theta": 10000,
+    "routed_scaling_factor": 5.0,
+    "sliding_window": None,
+    "ssm_state_size": 128,
+    "tie_word_embeddings": False,
+    "time_step_floor": 0.0001,
+    "time_step_max": 0.1,
+    "time_step_min": 0.001,
+    "topk_group": 1,
+    "transformers_version": "4.57.6",
+    "use_bias": False,
+    "use_cache": True,
+    "use_conv_bias": True,
+    "use_mamba_kernels": True,
+    "vocab_size": 131072,
+}
+
+
+@pytest.fixture(scope="module")
+def nemotron_ultra_model_dir(tmp_path_factory):
+    """The published Nemotron-3-Ultra-550B-A55B configuration, the published
+    Nemotron-H checkpoint whose MTP module and timing AISimulate has."""
+    return write_model_dir(tmp_path_factory, "nemotron-3-ultra", NEMOTRON_3_ULTRA)
+
+
+@pytest.fixture(scope="module")
+def nemotron_ultra_mtp_block_sizes(nemotron_ultra_model_dir, tmp_path_factory):
+    """The attention block each TP size picks for the published Ultra at
+    each MTP depth 1-5 (the depth widens Mamba2's conv state, so the page a
+    block must cover), its engine, AISimulate timing and platform
+    initialization for real."""
+    import subprocess
+    import sys
+
+    work = tmp_path_factory.mktemp("nemotron-ultra-mtp-sizes")
+    script = work / "sizes.py"
+    script.write_text(ENGINE_BLOCK_SIZES)
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_HOST_IP": "127.0.0.1",
+        "GLOO_SOCKET_IFNAME": "lo",
+        "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+    }
+    target = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+    out = {}
+    for tp, k in itertools.product((1, 2, 4, 8), range(1, 6)):
+        extra = {
+            "kv_cache_memory_bytes": 8 << 30,
+            "speculative_config": {"method": "mtp", "num_speculative_tokens": k},
+            "simulation_config": {
+                "simulate_forward": True,
+                "timing": "aisimulate",
+                "timing_args": {"gpu": "h100", "target_model": target},
+                "spec_acceptance_rates": [0.5] * k,
+            },
+        }
+        result = work / f"sizes-{tp}-{k}.json"
+        done = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                nemotron_ultra_model_dir,
+                str(tp),
+                "auto",
+                str(result),
+                target,
+                json.dumps(extra),
+            ],
+            env=env,
+            timeout=900,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        assert done.returncode == 0, done.stdout[-4000:]
+        out[(tp, k)] = json.loads(result.read_text())
+    return out
+
+
+NEMOTRON_MTP_BLOCK_SIZES = _mtp_sizes(
+    {
+        1: [8352, 8384, 8416, 8448, 8480],
+        2: [8352, 8384, 8416, 8448, 8480],
+        4: [4192, 4192, 4224, 4224, 4256],
+        8: [2112, 2112, 2112, 2112, 2144],
+    }
+)
+# (prefill TP, decode TP, depth) whose prefill block does not divide the
+# decode block, both prefix modes.
+NEMOTRON_MTP_REFUSED = {
+    (p, d, k)
+    for p, d in itertools.permutations((1, 2, 4, 8), 2)
+    for k in range(1, 6)
+    if NEMOTRON_MTP_BLOCK_SIZES[(d, k)] % NEMOTRON_MTP_BLOCK_SIZES[(p, k)]
+}
+
+
+def test_nemotron_hs_mtp_pairs_unequal_tp_as_it_pairs_without(
+    nemotron_ultra_model_dir, nemotron_ultra_mtp_block_sizes, ds_conv_layout
+):
+    """#33, offline over the published Nemotron-3-Ultra: at every TP size
+    1-8 and MTP depth 1-5 the state layout is the native allocation's
+    (`mamba2_state_shape`, its conv rows widened by the depth); the two KV
+    heads of 128 split at TP 2 and count one per rank at TP 4 and 8 (each
+    rank's attention page 1,024 or 512 bytes a token of BF16 k and v),
+    attention and state reconciled separately. Over the 12 directed pairs x
+    5 depths x prefix caching off and on (120 rows) the state-side gate
+    admits each; the handshake's block-size rule, on the sizes the engine
+    picks at each depth (TP 1 and 2 raise their block with the state page,
+    TP 4 and TP 8 halve it), pairs a decode block that is a multiple of the
+    prefill's and names the others."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateShapeCalculator,
+    )
+    from vllm.v1.worker.simulated import state_layout as sl
+
+    types = NEMOTRON_3_ULTRA["layers_block_type"]
+    assert (
+        types.count("mamba"),
+        types.count("attention"),
+        types.count("moe"),
+    ) == (48, 12, 48)
+    assert NEMOTRON_3_ULTRA["mtp_layers_block_type"] == ["attention", "moe"]
+
+    configs = {}
+    for tp in (1, 2, 4, 8):
+        for k in range(1, 6):
+            for prefix in (False, True):
+                configs[(tp, k, prefix)] = engine_config(
+                    nemotron_ultra_model_dir,
+                    dtype="bfloat16",
+                    tensor_parallel_size=tp,
+                    enable_prefix_caching=prefix,
+                    kv_cache_memory_bytes=1 << 30,
+                    speculative_config={
+                        "method": "mtp",
+                        "num_speculative_tokens": k,
+                    },
+                )
+            layout = sl.layout_for(configs[(tp, k, False)])
+            conv, ssm = MambaStateShapeCalculator.mamba2_state_shape(
+                tp,
+                NEMOTRON_3_ULTRA["mamba_num_heads"]
+                * NEMOTRON_3_ULTRA["mamba_head_dim"],
+                NEMOTRON_3_ULTRA["n_groups"],
+                NEMOTRON_3_ULTRA["mamba_num_heads"],
+                NEMOTRON_3_ULTRA["mamba_head_dim"],
+                NEMOTRON_3_ULTRA["ssm_state_size"],
+                NEMOTRON_3_ULTRA["conv_kernel"],
+                num_spec=k,
+            )
+            assert layout.family == "mamba2" and layout.conv_rows == conv[1], (
+                tp,
+                k,
+                conv,
+            )
+            assert layout.local_sizes(tp) == (
+                conv[0] * conv[1] * layout.conv_itemsize,
+                math.prod(ssm) * layout.ssm_itemsize,
+            ), (tp, k)
+    # The attention page a rank prices, from the constructed configurations
+    # themselves (`ModelConfig.get_num_kv_heads`): 2 KV heads of 128 at TP 1
+    # and 2 (1,024 and 512 bytes a token of BF16 k and v), one per rank at
+    # TP 4 and TP 8 (their weights replicated, 512 bytes) - separate from
+    # the Mamba2 states' spans above.
+    head_dim = NEMOTRON_3_ULTRA["head_dim"]
+    heads = {
+        tp: configs[(tp, 1, False)].model_config.get_num_kv_heads(
+            configs[(tp, 1, False)].parallel_config
+        )
+        for tp in (1, 2, 4, 8)
+    }
+    assert heads == {1: 2, 2: 1, 4: 1, 8: 1}, heads
+    assert [heads[tp] * head_dim * 2 * 2 for tp in (1, 2, 4, 8)] == [
+        1024,
+        512,
+        512,
+        512,
+    ]
+
+    sizes = {
+        (tp, k): nemotron_ultra_mtp_block_sizes[(tp, k)]
+        for tp, k in itertools.product((1, 2, 4, 8), range(1, 6))
+    }
+    ledger = {}
+    for (decode, k, prefix), config in configs.items():
+        for prefill in (1, 2, 4, 8):
+            if prefill == decode:
+                continue
+            assert sl.pairing_problem(config, decode, prefill) is None, (
+                prefill,
+                decode,
+                k,
+                prefix,
+            )
+            assert (
+                simulated_tp_mismatch(config, decode, prefill, nixl_consumer=True)
+                is None
+            )
+            # Mooncake's connector re-shards no hybrid state.
+            assert "unequal TP sizes" in simulated_tp_mismatch(config, decode, prefill)
+            block, peer = sizes[(decode, k)], sizes[(prefill, k)]
+            ledger[(prefill, decode, k, prefix)] = (
+                None
+                if block % peer == 0
+                else f"prefill block {peer} not dividing decode's {block}"
+            )
+    assert len(ledger) == 120
+    # The engine's sizes, pinned: the depths widen TP 1's and 2's state page
+    # past 8,352 tokens (both keep the same attention block), TP 4's past
+    # 4,192 (depth 3) and TP 8's past 2,112 (depth 5).
+    assert sizes == NEMOTRON_MTP_BLOCK_SIZES
+    refused = {row for row, why in ledger.items() if why}
+    assert {(p, d, k) for p, d, k, _ in refused} == NEMOTRON_MTP_REFUSED
+    assert all((p, d, k, not x) in refused for p, d, k, x in refused)
+    # The pairing map, pinned: TP 1 and 2 are one and the same block at
+    # every depth; TP 4's halves of them only where its block divides
+    # (4,192 into 8,384 at depth 2, 4,224 into 8,448 at depth 4), TP 8's
+    # quarter into TP 1's and 2's 8,448 at depth 4 and into TP 4's 4,224 at
+    # depths 3 and 4; nothing else pairs.
+    admitted = {
+        (1, 2): range(1, 6),
+        (2, 1): range(1, 6),
+        (4, 1): (2, 4),
+        (4, 2): (2, 4),
+        (8, 1): (4,),
+        (8, 2): (4,),
+        (8, 4): (3, 4),
+    }
+    assert NEMOTRON_MTP_REFUSED == {
+        (p, d, k)
+        for p, d in itertools.permutations((1, 2, 4, 8), 2)
+        for k in range(1, 6)
+        if k not in admitted.get((p, d), ())
+    }
+
+
 def test_kimi_k3s_kda_state_dtypes_follow_kdas_own_rule(
     tmp_path_factory, ds_conv_layout
 ):
