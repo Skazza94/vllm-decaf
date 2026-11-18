@@ -6,25 +6,34 @@ frontend) but replaces the model forward pass with a timing model. It predicts
 a deployment's TTFT, TPOT and throughput without its hardware or weights, and
 exercises scheduler and KV cache behavior deterministically on CPU-only hosts.
 
+| Page | Content |
+| --- | --- |
+| This page | How it works, configuration, timing providers, offline runs, parallelism, CPU hosts |
+| [AISimulate timing](simulated_execution/aisimulate.md) | GPU step times from AISim's performance model: targets, precision, layouts, DCP, MTP |
+| [Real KV transfers](simulated_execution/real_kv_transfers.md) | Disaggregated prefill/decode with real KV over NIXL or Mooncake, TCP or RDMA, byte checks |
+
 ## How it works
 
-* The model is built on the `meta` device, so KV cache specs, attention
+- The model is built on the `meta` device, so KV cache specs, attention
   metadata and hybrid layouts are vLLM's own, with no parameters in memory.
-* The KV cache is virtual: blocks are accounted as usual within
-  `--kv-cache-memory-bytes`, but no tensors are allocated.
-* Output tokens come from `SamplingParams.trace_decode_token_ids` (see
+- The KV cache is virtual: blocks are accounted as usual within
+  `--kv-cache-memory-bytes`, but no tensors are allocated (except with
+  [real KV transfers](#real-kv-transfers)).
+- Output tokens come from `SamplingParams.trace_decode_token_ids` (see
   [trace replay](../serving/online_serving/trace_replay.md)) or, without a
   trace, are `fallback_token_id`; such requests end by `max_tokens`.
-* A *timing provider* prices each step: its device time (`device_s`) runs on
-  a modeled device queue, overlapping the next step's scheduling as under
-  async scheduling, and its optional host time (`host_s`, spent in
-  `execute_model` and `sample_tokens`) holds the engine thread. The rest of
-  the engine loop is the real code and takes its real time.
+- A *timing provider* prices each step: its device time (`device_s`) runs on a
+  modeled device queue, overlapping the next step's scheduling as under async
+  scheduling, and its optional host time (`host_s`, spent in `execute_model`
+  and `sample_tokens`) holds the engine thread. The rest of the engine loop is
+  the real code and takes its real time.
 
 Simulation runs on CUDA-alike hosts and on the CPU platform (see
 [Running without a GPU](#running-without-a-gpu)).
 
-## Usage
+## Quick start
+
+### Online
 
 ```bash
 vllm serve Qwen/Qwen3-0.6B \
@@ -37,7 +46,9 @@ vllm serve Qwen/Qwen3-0.6B \
                         "log_path": "/tmp/sim_steps.jsonl"}'
 ```
 
-Any client works unchanged, including `vllm bench serve`. Offline:
+Any client works unchanged, including `vllm bench serve`.
+
+### Offline
 
 ```python
 from vllm import LLM, SamplingParams
@@ -54,202 +65,68 @@ out = llm.generate(
 )
 ```
 
-Set `--kv-cache-memory-bytes` to the KV budget of the modeled deployment, as
-its startup log reports it: prefix-cache hit rates and preemption depend on it.
+!!! tip
+    Set `--kv-cache-memory-bytes` to the KV budget of the modeled deployment,
+    as its startup log reports it: prefix-cache hit rates and preemption depend
+    on it.
 
-### Timing providers
+## Configuration
 
-| `timing` | behavior | `timing_args` |
+`--simulate-forward` turns simulation on; `--simulation-config` (or
+`simulation_config` offline) takes:
+
+| Key | Default | Description |
 | --- | --- | --- |
-| `zero` | steps take no device time (default) | none |
-| `linear` | `fixed_us + prefill_us_per_token * P + decode_us_per_req * D + decode_us_per_kv_token * K` | those four, plus `host_us` or `host_fit_log` |
-| `table` | nearest-neighbor interpolation over a step log | `path`, `k` |
-| `replay` | exact match on the step's batch composition, else `fallback` | `path`, `fallback` (`knn`/`zero`), `k`, `miss_fallback_s` |
-| `aisimulate` | AISimulate's forward-pass estimate of the published model (below) | `gpu`, `target_model`, `backend_version`, `quant_modes`, `host_us` |
-| `module.Class` | a `vllm.v1.worker.simulated.timing.TimingProvider` | its keyword arguments |
+| `simulate_forward` | `false` | Simulate the forward pass (what `--simulate-forward` sets). |
+| `timing` | `zero` | The [timing provider](#timing-providers). |
+| `timing_args` | `{}` | The provider's arguments. |
+| `log_path` | none | The step log (JSONL) the run writes. |
+| `clock` | `real` | The time base of [offline runs](#offline-runs-in-simulated-time). |
+| `record_step_timing` | `false` | On a real deployment, record step times with CUDA events (see [Recording](#recording-a-real-deployment)). |
+| `spec_acceptance_rates` | none | Draft acceptance per position, or a recorded step log (see [Speculative decoding](#speculative-decoding)). |
+| `kv_pattern_fill`, `kv_pattern_check`, `kv_pattern_grain` | off | Byte checks of [real KV transfers](simulated_execution/real_kv_transfers.md#byte-checks). |
+| `kv_kernel_backend` | none | GPU kernel block rules for [real KV transfers](simulated_execution/real_kv_transfers.md#block-sizes-and-kernel-geometry). |
+| `fallback_token_id` | `0` | Output token of requests without `trace_decode_token_ids`. |
 
-A provider receives a `StepDescriptor`: per request, the tokens scheduled in
-the step, the KV length before it, the prompt length, prefix-cache hits at
-admission, draft tokens, whether it is prefilling and, in an MoE-DP joint
-step, its DP rank; plus batch totals, common-prefix blocks and the parallel
-configuration. It returns a `StepCost`.
+## Timing providers
 
-For a GPU's step times without a recording, `aisimulate` asks
-[AISim](https://github.com/ai-dynamo/aisim)'s
-forward-pass performance model for each step. It needs the optional
-`aisim==0.15.0.dev202611140000000105` package and prices the scheduler's
-actual batch, one workload per attention data-parallel rank, from kernel timings measured on that GPU
-under a vLLM release, with no analytical fallback. Automatic table selection
-with this pin resolves to vLLM 0.30.0 for H100, H200 and B200; A100 keeps
-its 0.14.0 override. The qualified DCP queries below retain explicit 0.24.0
-tables. A table change can substantially change estimates; it does not
-establish improved GPU timing accuracy.
+| `timing` | Behavior | `timing_args` |
+| --- | --- | --- |
+| `zero` | Steps take no device time (default). | none |
+| `linear` | `fixed_us + prefill_us_per_token * P + decode_us_per_req * D + decode_us_per_kv_token * K` | Those four, plus `host_us` or `host_fit_log` |
+| `table` | Nearest-neighbor interpolation over a step log. | `path`, `k` |
+| `replay` | Exact match on the step's batch composition, else `fallback`. | `path`, `fallback` (`knn`/`zero`), `k`, `miss_fallback_s` |
+| `aisimulate` | AISimulate's forward-pass estimate of a published model on a GPU. | `gpu`, `target_model`, `backend_version`, `quant_modes`, `host_us` ([details](simulated_execution/aisimulate.md)) |
+| `module.Class` | A `vllm.v1.worker.simulated.timing.TimingProvider`. | Its keyword arguments |
 
-`docker/Dockerfile.aisim` adds the pinned package to the CPU image (see
-[Running without a GPU](#running-without-a-gpu) for `vllm:cpu`). From the
-repository root:
+A provider receives a `StepDescriptor` and returns a `StepCost`. The
+descriptor holds, per request, the tokens scheduled in the step, the KV length
+before it, the prompt length, prefix-cache hits at admission, draft tokens,
+whether it is prefilling and, in an MoE-DP joint step, its DP rank; plus batch
+totals, common-prefix blocks and the parallel configuration.
 
-```bash
-docker build -f docker/Dockerfile.aisim -t vllm:cpu-aisim .
-```
+### Step tables
 
-The deployment it times is the published model `target_model`, with that
-model's published weight precision. The model's own Hugging Face id or a
-`<org>--<name>/<commit>` directory names the target; a derived copy (a
-directory with `DERIVED.md`) must name it explicitly. The local model only
-holds the KV cache and serves the scheduler, so its KV and state geometry
-must match the target's bundled config, and the local KV cache precision is
-the one timed. The published precision is read from the target's full
-config, a ModelOpt checkpoint's `hf_quant_config.json` included: block FP8
-and MXFP4 experts by a fixed mapping; NVFP4, per-tensor FP8,
-compressed-tensors and mixed per-layer precision as AISimulate itself reads
-the checkpoint; any other is refused. Layers the server quantizes itself
-are not the published weights. Of an unquantized checkpoint,
-`--quantization fp8` (or `fp8_per_tensor`: per-tensor weights, dynamic
-activations) and `fp8_per_block` are timed as AISimulate's `fp8` and
-`fp8_block` precision of the published model, the target recorded as
-modified with its `online_quantization`. The shorthand is taken alone, as
-vLLM resolves it: every linear layer and every expert quantized its way.
-A `--quantization-config` beside it that changes anything (layers ignored,
-per-layer `targets`, another weight or activation precision) is refused
-before the model is built, and the built layers must be that method's. Any
-other online quantization (another method, `--quantization online` with a
-config, layers quantized beside a quantized checkpoint) is refused at
-startup rather than timed as another deployment. `quant_modes` overrides the published
-precision, which
-records the target as modified. DeepSeek-V4 is timed with its packed FP8
-cache (`auto`, `fp8`, `fp8_e4m3` or `fp8_ds_mla`; others are rejected)
-and its FP4 experts. A DSA model's FP8 cache (DeepSeek-V3.2's, GLM-5's),
-under any of those FP8 names, is timed and recorded as the packed one too
-(`kv_cache_format: fp8_ds_mla`, the configured dtype beside it). GLM-5 on
-B200 has to name its cache (`fp8`, the GPU's default there, or `bfloat16`):
-`auto` is FP8 on that GPU and BF16 on a CPU host. The SDK reads
-MiMo-V2-Flash's published `hybrid_layer_pattern` directly; its sliding layers
-are marked 1. Bundled configs and quantization sidecars are read offline,
-using a private copy when the SDK needs a local model path. Startup also
-times one prefill and one decode step: a target AISimulate lacks data
-for at those shapes fails before serving,
-but a later batch of another shape can still lack data and fail then.
+`table` and `replay` read a recorded step log (see
+[Recording](#recording-a-real-deployment)). A `table` can also be written by
+hand, as JSONL records of
+`{"num_reqs", "num_tokens", "sum_past_kv", "device_s"[, "host_s"]}`: the step's
+requests and scheduled tokens, and the sum of their KV lengths before the step.
 
-Supported layouts are tensor parallelism within one node (TP 1, 2, 4
-or 8) and an MoE model's local data-parallel attention with expert
-parallelism (each rank of TP 1, 2 or 4, timed as vLLM lays it out: attention
-on a rank's GPUs, the experts over all of them; up to 8 GPUs, all on one
-host: launched by one server,
-or a server each by a multi-port supervisor,
-`--data-parallel-multi-port-external-lb`; ranks on other hosts are
-rejected). AISimulate times decode context parallelism (DCP) within a
-tensor-parallel group for dense MLA (for example, DeepSeek-V3) and for
-DeepSeek-V3.2-style sparse MLA (DeepSeek-V3.2 and GLM-5). It takes global
-context lengths and prices each rank's share of the decode KV and the merge
-of partial outputs. It requires `dcp_comm_backend` set to `ag_rs` and
-effective Q replication off: `VLLM_DCP_Q_REPLICATE`, when set, overrides
-`dcp_q_replicate`. GLM-5's native `a2a` with Q replication is not timed
-([issue #28](https://github.com/Skazza94/vllm-decaf/issues/28)).
-On CPU the simulator preserves vLLM's DCP cache bookkeeping and runs no
-attention kernels: the scheduler's blocks span DCP times the local pages.
-Dense MLA can also use real NIXL transfers (see
-[Real KV transfers](#real-kv-transfers)). Sparse MLA DCP is limited to one
-simulated CPU instance with the packed FlashMLA cache (`fp8_ds_mla`) and
-the default FP8 indexer. FlashMLA requires fewer than 32 local query heads,
-the same padded head count before and after gathering, and HiSparse off.
-For GLM-5 on B200 this represents an explicit packed-cache deployment:
-native `auto` instead uses standard FP8 with FlashInfer. Standalone CPU
-simulation also models GQA for Qwen3-30B-A3B and Qwen3-235B-A22B at TP8/DCP2
-(the only layout vLLM allows for their four KV heads at TP up to 8) on H100 or
-H200 with BF16, KV interleave 1, 16 or 32 and the same merge requirements. The
-native reference
-is FlashAttention 3; AISimulate uses its default attention selector and
-vLLM 0.24.0 tables. It models prefill over cached context with a KV gather;
-native FlashAttention gathers Q and merges the ranks' partial outputs.
-KV page size determines cache geometry; changing it did not change the
-estimates in the qualified queries, and AISimulate takes no interleave
-(the estimates are the same at each). GQA models whose layouts need more
-than eight GPUs (Qwen3-8B, MiniMax-M2.5), FP8 KV cache and B200 are not
-qualified. GQA DCP with KV transfers, compressed
-MLA, hybrids, and pipeline, prefill context, data and expert parallelism
-are outside this scope.
+### Host time
 
-With DCP greater than one, speculative decoding is limited to standalone
-CPU simulation of the native single-module MTP of DeepSeek-V3, DeepSeek-V3.2
-and GLM-5 at depth 1 to 5 and AISimulate vLLM 0.24.0 tables,
-at the layouts AISimulate was qualified for: DeepSeek-V3 on H200 (published
-block-FP8 weights, BF16 model and KV, 16-token pages) at TP/DCP 2/2, 4/2, 4/4,
-8/2, 8/4 and 8/8; DeepSeek-V3.2 on H200 (published block-FP8 weights, packed
-`fp8_ds_mla` cache, 64-token pages) at TP8 with DCP 2 or 4; GLM-5 on B200
-(published NVFP4 weights, packed cache, 64-token pages, explicit `ag_rs` and
-Q replication off) at TP4 with DCP 2 or 4. DeepSeek-V3.2 at TP8 with DCP 8
-stays refused: AISimulate times it, but with the qualified FP8 FlashMLA path
-vLLM refuses it natively, since the backend requires the local (16) and the
-DCP-gathered (128) query heads to pad to the same decode kernel envelope (64
-against 128). The sparse models' pages are FlashMLA's and the indexer's 64
-tokens. DeepSeek-V3 requires KV interleave 1: its CPU MLA backend does not
-declare MTP support above it, and vLLM refuses it. The sparse models also take
-any interleave vLLM allows for their 64-token page (1, 2, 4, 8, 16, 32 or 64),
-the sparse backend declaring MTP support at them; the deprecated
-`dcp_kv_cache_interleave_size` counts only as 1 or equal to
-`cp_kv_cache_interleave_size`. The interleave decides which DCP rank holds
-which token inside a scheduler block (the page size times DCP); the pages,
-capacity and lookahead do not depend on it. AISimulate takes no interleave: the
-estimates at an interleave above 1 are the interleave-1 estimates with the
-decode-width classification. The sparse backend's batch metadata classifies
-verified rows differently above interleave 1; its interleave-dependent GPU
-costs are not modeled, and the timing assumptions record this. The merge and Q
-replication follow the settings above.
-Prefix caching is qualified for these cells with the default MTP lookahead
-hashes: a hit lands on a scheduler block (the page size times DCP), and its
-hash also proves the next token. Divergence exactly at a boundary can
-invalidate the preceding block. The single module's prefill/hash lookahead
-is one token; depth k still reserves k slots beyond the target's scheduled
-tokens. Cached context steps keep the documented plain-MLA timing
-approximation; no pricing correction is applied. Overrides that disable
-lookahead hashes or EAGLE block dropping remain unqualified. KV offloading
-and KV transfers stay outside this combined scope. Over NIXL with DCP,
-vLLM resolves the
-interleave to the block size when the engine starts, and its compatibility
-check refuses MTP at an interleave above 1 on the simulated dense CPU MLA
-backend, which does not declare support for it (the sparse backend does;
-sparse MTP with DCP and transfers is outside the qualified scope). An instance with DCP above
-1 refuses speculative transfers when its configuration is checked; an
-instance at DCP 1 refuses at the handshake, once it learns the peer's DCP,
-before any READ. The single draft layer's sharded KV (a sparse model's
-latent and indexer caches) belongs to the target's cache groups and shares
-their scheduler block span; each depth's lookahead enters the scheduler's
-block demand. Its cache contributes to the engine's virtual memory plan even
-though the timing model omits draft KV.
+`HostTimeModel` prices host time as
+`fixed_us + per_req_us * R + per_prefill_token_us * P`, fitted to a step log
+(`HostTimeModel.from_log`, or `host_fit_log` for `linear`), for providers that
+model only the device.
 
-Speculative decoding is timed for the native single-module MTP of
-DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4, Qwen3.5 and
-Nemotron-H only (`method: mtp`, the checkpoint's one MTP layer,
-1 to 5 tokens, the draft at the target's parallelism and precision), as
-AISimulate's MTP depth: a decode step
-verifies k + 1 tokens a request and runs k target-shaped draft layers, the
-full width even when a step drafted fewer; draft weights and KV, prefill
-draft work and host glue are omitted. Acceptance comes from
-`spec_acceptance_rates` and does not change a step's cost. The pinned
-AISimulate version has a cached-prefix timing limitation for plain-MLA context
-steps (not sparse MLA): in DeepSeek-V3 and Kimi-K3 probes, estimates decrease
-over some already-positive prefix intervals with the new-token count fixed. Prefix-cache hits, later prefill chunks and
-decode's resumed context step take this path; other plain-MLA models (Kimi-K2)
-likely share it, unmeasured. No timing correction is applied. The `timing`
-record lists such approximations, and names the target, the resolved
-estimator configuration and its data's vLLM version.
+- Under async scheduling host time matters only where it exceeds device time,
+  mostly in prefills, so it mainly affects TTFT.
+- Fit it to a recording of the same parallel layout and speculative decoding
+  setup, made under async scheduling; terms the recording does not determine
+  stay zero.
 
-`table` and `replay` read a recorded step log (see below). A `table` can also
-be written by hand, as JSONL records of
-`{"num_reqs", "num_tokens", "sum_past_kv", "device_s"[, "host_s"]}`: the
-step's requests and scheduled tokens, and the sum of their KV lengths before
-the step.
-
-`HostTimeModel` prices host time as `fixed_us + per_req_us * R +
-per_prefill_token_us * P`, fitted to a step log (`HostTimeModel.from_log`, or
-`host_fit_log` for `linear`), for providers that model only the device. Under
-async scheduling host time matters only where it exceeds device time, mostly
-in prefills, so it mainly affects TTFT. Fit it to a recording of the same
-parallel layout and speculative decoding setup, made under async scheduling;
-terms the recording does not determine stay zero.
-
-### Recording a real deployment
+## Recording a real deployment
 
 A real deployment writes the same step log, timed with CUDA events:
 
@@ -258,15 +135,16 @@ vllm serve Qwen/Qwen3-0.6B \
   --simulation-config '{"record_step_timing": true, "log_path": "/tmp/real_steps.jsonl"}'
 ```
 
-`replay` with this log reproduces the recorded step times wherever the
-simulated scheduler forms the same batches; `table` interpolates them for
-other workloads. Both return the recorded device and host times. Host time
-matters: large prefills are often host-bound, and pricing them by device time
-alone underestimates TTFT. The recorded host time spans the engine thread
-from `execute_model` to the end of `sample_tokens`, so it includes engine core
-work between the two calls, such as structured-output bitmasks.
+- `replay` with this log reproduces the recorded step times wherever the
+  simulated scheduler forms the same batches; `table` interpolates them for
+  other workloads. Both return the recorded device and host times.
+- Host time matters: large prefills are often host-bound, and pricing them by
+  device time alone underestimates TTFT. The recorded host time spans the
+  engine thread from `execute_model` to the end of `sample_tokens`, so it
+  includes engine core work between the two calls, such as structured-output
+  bitmasks.
 
-### Offline runs in simulated time
+## Offline runs in simulated time
 
 `vllm.v1.worker.simulated.offline` drives an in-process engine with timed
 arrivals of requests and multi-turn sessions, and timestamps every output
@@ -296,31 +174,31 @@ result = simulate(
 print(result.summary())  # as vllm bench serve reports them
 ```
 
-`simulation_config.clock` selects the time base:
+### Clocks
 
-| `clock` | waits (device time, idle gaps) | engine host loop | use |
+| `clock` | Waits (device time, idle gaps) | Engine host loop | Use |
 | --- | --- | --- | --- |
 | `real` (default) | slept | real time | serving |
 | `fast_forward` | skipped | real time | sweeps: the latencies of `real`, faster |
 | `virtual` | skipped | free | deterministic runs; underestimates host-bound workloads |
 
-Predicted `host_s` holds the engine thread under every clock. The non-real
-clocks need an engine from `make_engine()` (which `simulate()` uses), and a
-run then takes as long as the engine's host work. `make_engine()` and `run()`
-also drive a real engine on the real clock, to produce a reference run.
-[`vllm bench sweep simulate`](../benchmarking/sweeps.md#simulated-sweep) runs a
-`vllm bench sweep serve` experiment this way.
+- Predicted `host_s` holds the engine thread under every clock.
+- The non-real clocks need an engine from `make_engine()` (which `simulate()`
+  uses), and a run then takes as long as the engine's host work.
+  `make_engine()` and `run()` also drive a real engine on the real clock, to
+  produce a reference run.
+- [`vllm bench sweep simulate`](../benchmarking/sweeps.md#simulated-sweep)
+  runs a `vllm bench sweep serve` experiment this way.
+- Only the engine core runs, so `frontend_latency_s` (of `run()` and
+  `simulate()`) adds the server's latency outside it (HTTP, API server, IPC)
+  to each request's arrival.
 
-Only the engine core runs, so `frontend_latency_s` (of `run()` and
-`simulate()`) adds the server's latency outside it (HTTP, API server, IPC) to
-each request's arrival.
+### Multi-turn sessions
 
 A `TimedSession` is a multi-turn conversation: each `Turn` appends its tokens
 to the previous turn's prompt and output, and arrives `think_time` seconds
 after the previous turn finished, so later turns reuse the conversation's KV
-cache. Results have one timing per turn, in input order. Prompts are
-concatenated token ids, so chat-template tokens belong in each turn's
-`new_token_ids`, and `max_model_len` must fit a whole conversation.
+cache.
 
 ```python
 from vllm.v1.worker.simulated.offline import TimedSession, Turn
@@ -333,7 +211,11 @@ session = TimedSession(
 )
 ```
 
-### Speculative decoding
+- Results have one timing per turn, in input order.
+- Prompts are concatenated token ids, so chat-template tokens belong in each
+  turn's `new_token_ids`, and `max_model_len` must fit a whole conversation.
+
+## Speculative decoding
 
 The scheduler schedules draft tokens as usual, and the simulated runner
 decides how many are accepted. The draft model is built on the meta device
@@ -353,453 +235,50 @@ simulation_config={
 }
 ```
 
-A provider's `StepCost.num_accepted` overrides the rates. Acceptance is
-sampled independently per step, so per-request acceptance, and with it P99
-TPOT, varies less than on a real deployment. Trace replay is not available
-with speculative decoding.
+- A provider's `StepCost.num_accepted` overrides the rates.
+- Acceptance is sampled independently per step, so per-request acceptance, and
+  with it P99 TPOT, varies less than on a real deployment.
+- Trace replay is not available with speculative decoding.
+- AISimulate times native MTP only (see
+  [AISimulate timing](simulated_execution/aisimulate.md#speculative-decoding)).
 
-### Parallelism
+## Parallelism
 
 Tensor, pipeline, data and context (prefill and decode) parallelism run as
 deployed: one simulated worker per rank builds its shard of the model, so
-per-rank KV capacity is vLLM's own; `--kv-cache-memory-bytes` is per rank.
-No collective runs in a step: every rank derives the same timing from the
-same scheduler output.
+per-rank KV capacity is vLLM's own; `--kv-cache-memory-bytes` is per rank. No
+collective runs in a step: every rank derives the same timing from the same
+scheduler output.
 
-* **Pipeline parallelism**: `device_s` is a step's time through the pipeline,
-  split evenly over the stages, so consecutive microbatches overlap. Steps
-  recorded under pipeline parallelism carry the same through-pipeline time.
-  The last stage's host time includes receiving intermediate tensors, which
-  can bound the step rate under load; fit host time to a recording of the
-  same layout.
-* **Data parallelism**: dense models run independent engines, and DP rank
-  `i > 0` logs to `<log_path>.dp<i>`. MoE models run their DP ranks in
-  lockstep: wherever the real runner synchronizes them, the ranks gather
-  their step descriptors into one joint step, priced once and logged by DP
-  rank 0, busy or idle; each request keeps its DP rank. Joint steps do not
-  record accepted drafts.
+| Parallelism | Behavior |
+| --- | --- |
+| Pipeline | `device_s` is a step's time through the pipeline, split evenly over the stages, so consecutive microbatches overlap. Steps recorded under pipeline parallelism carry the same through-pipeline time. The last stage's host time includes receiving intermediate tensors, which can bound the step rate under load; fit host time to a recording of the same layout. |
+| Data, dense models | Independent engines; DP rank `i > 0` logs to `<log_path>.dp<i>`. |
+| Data, MoE models | DP ranks run in lockstep: wherever the real runner synchronizes them, the ranks gather their step descriptors into one joint step, priced once and logged by DP rank 0, busy or idle; each request keeps its DP rank. Joint steps do not record accepted drafts. |
 
 Only the output rank (last pipeline stage, first tensor-parallel rank) writes
 the step log. On CUDA hosts each rank binds its own device, using a few MB of
 its memory.
 
-### Real KV transfers
+## Real KV transfers
 
-Prefill and decode instances run as simulated servers behind any proxy. With
-a KV connector, compute stays simulated but the KV cache is real: CPU tensors
-that a native connector (`NixlConnector`, `NixlPullConnector` or
-`MooncakeConnector`) registers and moves between the instances, so transfers
-take their actual time over the actual network. It
-needs an explicit `kv_cache_memory_bytes`. Supported layouts:
+With a KV connector, prefill and decode instances run as simulated servers
+whose KV caches are real CPU tensors, moved by vLLM's own `NixlConnector`,
+`NixlPullConnector` or `MooncakeConnector` over the actual network, over TCP
+(TENT's `hp_tcp`, UCX, libfabric) or RDMA (UCX, TENT). Compute stays
+simulated; transfers take their actual time, and every received byte can be
+checked against a pattern the producer wrote.
 
-* Full-attention models, dense or MoE (experts hold no KV), and dense MLA
-  models (one latent per token and layer); sliding-window attention too,
-  alone or beside full attention (each layer kind a KV cache group, groups
-  sharing memory, a block being one group's at a time, of different block
-  sizes when their pages are equal: Gemma4's and MiMo-V2-Flash's full and
-  sliding layers at most TP sizes): either connector moves each window's
-  last blocks only, and says where they start among the request's blocks
-  (NIXL: `local_first_block_indices`). Over NIXL a model of several groups
-  is checked through NIXL's own selection: a group's block in each layer
-  slot NIXL selects for it, the slots of its own layers only (NIXL pairs
-  regions by layer); and hybrid
-  models of Qwen's gated delta-net (Qwen3.5, served
-  as its language model), of Kimi-K3's delta attention (KDA beside MLA,
-  served as its language model; its SiTU experts the CPU platform builds
-  only for a simulation) or of Mamba2 (`MambaMixer2`: Nemotron-H,
-  Nemotron-3, whose non-gated relu^2 experts the CPU platform builds only
-  for a simulation): each request's state is one block of its recurrent
-  groups (`mamba_cache_mode` none), padded to the attention page, and
-  prefill computes the prompt but its last token, which decode computes.
-  With prefix caching vLLM keeps a state a block instead (`mamba_cache_mode`
-  align): the state after the tokens up to the block's end, which a later
-  prompt sharing them reuses, earlier states' places null; the connector
-  moves the request's running state. The native runner copies a state from
-  block to block around the forward; a simulated step computes none and
-  copies none.
-  `MooncakeConnector` moves the padded state pages. NIXL needs the DS
-  conv-state layout (`VLLM_SSM_CONV_STATE_LAYOUT=DS`, set before startup)
-  and moves each state as it selects it: the conv sub-projections and the
-  SSM state of each state region of the group's layers, the page's padding
-  not; the pattern
-  checks follow that selection. Each
-  decoder layer holds one recurrent mixer at most, without attention beside
-  it. Not other recurrent layers (Mamba, Kimi-Linear's or OLMo's
-  delta-nets), a mixer beside attention (Falcon-H1, Zamba2), ReplaySSM or
-  RecoverSSM, attention-free,
-  other sparse-MLA (but DeepSeek-V4's, below), chunked local or RSWA
-  attention models.
-* DeepSeek-V3.2's and GLM-5's sparse MLA (DSA), over either connector, its
-  latent cache BF16 (`auto` or `bfloat16`) or FlashMLA's packed FP8
-  (`fp8`, `fp8_e4m3` or `fp8_ds_mla`: 656 bytes a token): each attention
-  layer's latent (576 wide in BF16) and, on the layers
-  holding an indexer (GLM-5's every few, by its config), the indexer's FP8
-  keys and scales (132 bytes a token), pages of two sizes in one group, each
-  layer its own region; the pattern checks cover each layer's page.
-* DeepSeek-V4 over `NixlConnector` (or `NixlPullConnector`), on one rank,
-  with tensor parallelism, alone or inside data-parallel attention with
-  expert parallelism, each TP rank holding and moving the whole caches,
-  with prefix caching or without, its cache the packed FP8 one (`fp8_ds_mla`): its
-  sliding windows, compressed latents, indexer keys and compressor states
-  are KV cache groups packed into one allocation, each block all of one
-  group's layers; NIXL moves whole blocks. Decode loads all N prompt
-  tokens and computes the last one again to sample; with
-  bounded window replay on (a cache whose SWA spec sets `bounded_replay`,
-  DeepSeek-V4.1's), NIXL loads N - 1 and decode computes the last.
-* Speculative decoding only as the native single-module MTP of
-  DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4, Qwen3.5 or Nemotron-H
-  (`method: mtp`, the checkpoint's one MTP layer, 1 to 5
-  tokens, the draft at the target's parallelism and precision) over
-  `NixlConnector` (or `NixlPullConnector`), whose handshake checks the
-  instances' transfer compatibility, the draft among it (a peer without
-  the MTP draft is refused), or, for DeepSeek-V3, DeepSeek-V3.2 and GLM-5,
-  over `MooncakeConnector`, which has no such check (it refuses a producer
-  layer the consumer lacks, not a consumer-only draft or another depth):
-  both instances must run the same speculative configuration. The MTP
-  layer's KV is a layer of the target's KV cache groups and moves with
-  them. Qwen3.5's and Nemotron-H's MTP stay NIXL's: Mooncake would also
-  move each state's
-  k scratch slots, which NIXL leaves. Drafts are not computed; their
-  acceptance follows `spec_acceptance_rates`.
-* One rank per instance, or:
-    * tensor parallelism of the same size on both instances: each rank moves
-      its own KV heads to its peer, or the whole MLA latent, which every rank
-      holds;
-    * tensor parallelism of different sizes, one dividing the other, for:
-        * plain attention, sliding-window layers beside full ones included:
-          the connector re-shards the KV heads either way, and each head's
-          pattern is its own;
-        * plain MLA (one latent a layer: DeepSeek-V3, Kimi-K2), the same
-          page on every rank;
-        * sparse MLA (DeepSeek-V3.2, GLM-5), BF16 or packed FP8: the latent's
-          and the indexer's pages, each the same on every rank;
-        * layers of different KV head counts (Gemma4's global layers beside
-          its sliding ones), only where every layer's count is at least the
-          larger size and divisible by both (Gemma4's 8 and 2: TP 1 with 2);
-        * over NIXL only, a hybrid of Mamba2 or gated delta-net states
-          whose state splits over both sizes and whose KV heads split or
-          replicate evenly on each side (with Qwen3.5's and Nemotron-H's
-          native MTP too: the conv state widened to `conv_kernel - 1 + k`
-          rows, as vLLM allocates it, and the draft's attention layer read
-          with the target's; decode refuses a producer of another depth
-          before any READ, its state sizes differing); where the two sizes give it
-          different attention block sizes (Nemotron-3-Nano: 1056 tokens at
-          TP 4, 2112 at TP 2; Qwen3.5-27B: 800 at TP 1, 2 and 4, 416 at
-          TP 8, a requested 400 kept at TP 8 and aligned to 800 below it;
-          416 and 800 pair with neither), only a decode block size that is
-          a multiple of the prefill's, as NIXL supports: each decode block
-          read as several prefill blocks, the states one to one, each
-          attention page read whole from one producer, including pages
-          holding several KV heads. Coverage combines that producer's head
-          intervals only when they own the complete page exactly once,
-          before comparing the native wire chunks. NIXL's refusal of
-          head-sharded reads from several producers at unequal kernel block
-          sizes stays in place. With prefix caching, byte checks at unequal
-          attention block sizes need `kv_pattern_grain` (the prefill's
-          block size, on both instances): attention content is keyed in
-          pieces of that many tokens and a state by its endpoint, so a
-          decode block holds the same bytes whether pulled, computed or
-          hit. NIXL pairs the two sides' sub-blocks from the handoff's last
-          token backwards (decode blocks split into producer-sized
-          sub-blocks, each side's past that token dropped; it needs the
-          producer's `remote_num_tokens`, which a proxy forwards with the
-          rest of its `kv_transfer_params`) and zeroes the part of a decode
-          block it did not write. The byte check derives that part from the
-          handoff and the producer's retained blocks, not from NIXL's lists.
-          Without a kernel geometry declaration each attention block stays
-          whole. With a declaration such as `FLASHINFER`, NIXL uses the
-          registered kernel block sizes and the physical-to-logical ratios.
-          Non-dividing or reverse logical sizes can use equal declared
-          kernel blocks; this is separate from NIXL's common-unit
-          normalization, which is limited to MLA hybrids. Whole GQA blocks
-          that fail NIXL's directional size rule remain refused.
-          Native NIXL refuses hybrid pairs with different ratios when
-          prefix caching is enabled;
-        * over NIXL only, Kimi-K3 from prefill TP 8 to decode TP 4,
-          without prefix caching: its delta-attention states (Q, K and V
-          conv components, the recurrent state FP32 unless
-          `--mamba-ssm-cache-dtype` says otherwise) split as the states
-          above, each decode rank's half of every component from its two
-          producers; its MLA latent, the same on every rank, from one of
-          them, each decode attention block (twice the prefill's tokens)
-          read as two prefill blocks, the uncovered half of a request's
-          last block zero, as NIXL leaves it. A narrow prefix-cached variant
-          admits the published text-only BF16-KV Kimi-K3 configuration with
-          AISimulate's B200 target, whole 768-token prefill and 1,536-token decode
-          pages, align-mode KDA, producer fill, decode byte checks, and
-          `kv_pattern_grain=768` on both sides. Before a READ, decode checks
-          each actual producer's advertised scope, registration, and the
-          layers of its regions and their cache groups. This keeps native
-          NIXL pairing, by token from the handoff's last token, which the
-          byte check verifies with a decode prefix hit and an incomplete
-          final page;
-        * the reverse Kimi-K3 pair (prefill TP 4 to decode TP 8), only
-          for the published text-only MXFP4 model with BF16 KV, FP32
-          recurrent state, CPU NIXL pull, AISimulate's B200 target,
-          prefix caching off, whole 1,536-token prefill and 768-token
-          decode pages, and KDA cache mode `none` on both sides. Enable
-          producer pattern fill and decode pattern checks. Decode
-          rank `r` reads from producer `r // 2`. The checker verifies
-          the sources and destinations of the native READ against the
-          original producer block IDs independently of the byte check; the
-          raw registration carries geometry, not the producer's fill
-          or prefix settings;
-        * other cold unequal TP pairs within 1, 2, 4 and 8 use the same
-          published Kimi-K3 and checked CPU NIXL scope. Each side uses
-          its whole attention page sized for its TP-sharded state.
-          Native NIXL pairs attention rows in the greatest common
-          unit and keeps each producer's original state-page stride.
-          The checker validates every source separately, with KDA
-          spans matched by global columns and heads. It distinguishes
-          copied patterned attention padding from any uncovered decode
-          rows that NIXL zeroes. The route keeps native transport limits
-          for each READ. Reverse TP 4 to TP 8 with prefix caching stays
-          refused: NIXL needs matching physical blocks per logical
-          page for a prefix-cached hybrid;
-      and not for another MLA hybrid, Kimi-K3 at
-      other TP sizes, or other forms of speculative decoding. On the simulated
-      CPU MLA path, NIXL pull also pairs native single-module MTP of
-      DeepSeek-V3, DeepSeek-V3.2 and GLM-5-NVFP4 at depths 1 to 5, with unequal
-      TP sizes from 1, 2, 4 and 8 in either direction. Both instances must
-      agree on depth, prefix caching, logical page size, KV layout and precision;
-      DCP and other parallel axes remain 1. Dense V3 uses whole 16-, 32-, 64-
-      or 128-token BF16 pages. Sparse V3.2 uses BF16 latents and GLM-5-NVFP4
-      packed FP8 latents, each with byte indexer keys: logical pages hold 64
-      or 128 tokens, the latter two native 64-token kernel pages. Both actual
-      registrations must agree before a READ, including without byte checks.
-      Each decode rank reads every target and draft region from the producer
-      selected by native replicated-MLA mapping. Byte checks cover every moved
-      byte and exact destination intervals, producer identity and completion;
-      they report draft latent/indexer totals separately. They do not
-      independently audit remote source addresses. Prefix hits are checked
-      without rewriting them, including pages completed by accepted drafts.
-      Timing remains the explicit published AISimulate deployment, with its
-      documented MTP approximations. Compute-small fixtures preserving published
-      KV geometry are checked as that KV layout, not timed as a smaller model.
-      Unequal logical page sizes, DCP and custom kernel declarations stay
-      outside this MTP scope; native checks and pairings remain unchanged.
-      DeepSeek-V4 (the published V4-Flash on AISimulate's B200 target, packed
-      FP8 cache, NIXL pull, tensor parallelism of 1, 2, 4 or 8 alone,
-      prefix caching on or off on both sides, no MTP or native MTP of any
-      depth from 1 to 5 on each side, equal in presence) pairs one size
-      dividing the other: every cache layer is one replicated shard, so
-      each decode rank reads whole packed rows from the producer rank
-      `rank * producer TP // decode TP`, and the producer ranks it does not
-      read still complete their sends. Each endpoint states its
-      qualification as one scope entry (role, prefix mode, MTP presence,
-      cache format, geometry digest, GPU target and TP size; never the MTP
-      depth); before registering a peer of another TP size the decode side
-      requires the producer's entry, its own and the peer's registered
-      geometry to agree, with byte checks on or off, and NIXL's own
-      compatibility hash still applies (MTP on one side only is refused by
-      it). Each layer's page is checked as the global head's pattern, so
-      any producer rank gives the same bytes; the READ itself is checked
-      apart: exactly one completed record of the handoff's producer engine
-      and the owner rank, delivering each expected row once, and the
-      draft's payload, alignment and the row's tail reported apart from the
-      target's, the whole row still compared.
-      Mooncake still refuses unequal-TP MTP: its native layout exchange
-      does not qualify both endpoints' speculative configuration.
-      A NIXL decode instance refuses, as
-      NIXL does, a larger prefill instance whose KV heads are replicated
-      (more ranks than KV heads); MLA's latent is exempt. A refused pair
-      fails at the handshake;
-    * an MoE model's data-parallel attention with expert parallelism
-      (`--data-parallel-size N --enable-expert-parallel`): each DP rank holds
-      its own requests' KV; a request's prefill DP rank (pinned by
-      Mooncake's proxy, else prefill's load balancer) names itself in its
-      transfer parameters (NIXL: its engine id and side-channel port), and
-      decode's load balancer picks its own, so the instances' DP sizes may
-      differ. A DP rank may be tensor-parallel itself (equal TP sizes on
-      both instances): each of its TP ranks moves its own KV, as above. With `--data-parallel-multi-port-external-lb` each rank has an
-      API server of its own (the port plus its rank) and an external router
-      picks the rank on both instances; this needs NIXL, as
-      `MooncakeConnector`'s bootstrap server is one an instance.
-* No pipeline or prefill context parallelism, nor data parallelism of dense
-  models (independent engines).
-* Decode context parallelism for a dense MLA model over NIXL's pull
-  connector, each instance's DCP 1 or its TP size, the TP sizes one dividing
-  the other. A decode rank reads the producer ranks NIXL
-  maps to its DCP slice: a replicated producer's one rank, or each sharded
-  rank whose pages fall in its slice (one, several, or all of them for a
-  replicated consumer); a mapped rank holding none of its pages is only
-  notified. A DCP rank's blocks are the global pages vLLM gives it (rank
-  r every DCP-th page from r, the interleave NIXL resolves to the page), and
-  are filled and checked as those pages. The pages under the producer's
-  handoff are the payload; a later page (allocation padding) is moved by
-  NIXL or left untouched. Which blocks were moved is taken from the READs
-  NIXL posts, not from their contents: each block a READ wrote must hold its
-  page's pattern, and every other block the sentinel. The check counts each
-  kind apart (`payload_blocks`, `padding_blocks`, `untouched_blocks`). A
-  rank with an empty native READ selection takes NIXL's notify-only path
-  and reads nothing; a rank whose blocks all lie past the handoff may still
-  read allocation padding. Each rank's `kv_layout` record holds its resolved DCP
-  geometry. With prefix caching, a hit is credited per scheduler block
-  (DCP pages) and a decode rank pulls only its pages past its hit, NIXL
-  offsetting its slice by it. Pages are then checked by their content, and
-  a page past the prompt (padding) by its place and the content it follows;
-  the byte checks need the same prefix-caching setting on both instances.
-  NIXL's handshake checks the peer's DCP, TP and page size. With DCP on
-  either side, NIXL transfers under simulated compute require matching P/D logical block
-  sizes even when a logical block holds several kernel blocks. The simulator
-  checks logical sizes during the handshake, as upstream vLLM's NIXL connector
-  does. Native NIXL still checks kernel sizes and region layout. When either
-  side has DCP, the simulator checks both instances' scope, including the
-  side of DCP 1: this instance's from its config, the producer's from its
-  NIXL metadata (`simulated_scope`). Refused with DCP: Mooncake's connector
-  (which slices no page by DCP rank), NIXL's push connector,
-  speculative decoding, pipeline, prefill context or data parallelism,
-  expert parallelism and TP sizes neither of which divides the other, on
-  either side.
-* Blocks of any multiple of 16 tokens, as on a GPU; MLA blocks are not
-  forced to the CPU MLA kernel's 16.
+| Topic | Where |
+| --- | --- |
+| Supported models (attention, MLA, sparse MLA, hybrids, DeepSeek-V4) | [Supported models](simulated_execution/real_kv_transfers.md#supported-models) |
+| MTP speculative decoding | [Speculative decoding](simulated_execution/real_kv_transfers.md#speculative-decoding) |
+| Equal and unequal TP, DP, DCP | [Parallel layouts](simulated_execution/real_kv_transfers.md#parallel-layouts) |
+| Byte checks | [Byte checks](simulated_execution/real_kv_transfers.md#byte-checks) |
+| Per-rank addresses, TCP and RDMA | [Transports](simulated_execution/real_kv_transfers.md#transports) |
+| Step-log records | [Logs](simulated_execution/real_kv_transfers.md#logs) |
 
-For CPU simulations with NIXL pull and AISimulate, set
-`simulation_config.kv_kernel_backend` to a built-in GPU attention backend to
-take its kernel block sizes from vLLM's backend source. The selected rule,
-its source and the registered logical and kernel sizes are in `kv_layout`.
-The CPU backend and AISimulate's timing profile stay as configured.
-An unset declaration keeps the previous CPU block rules, one kernel block a
-block, and such an instance refuses at the NIXL handshake, before any READ, a
-peer whose blocks hold several kernel blocks.
-For dense MLA, if either peer subdivides its blocks, the two peers must
-have the same logical block size, even without decode context parallelism
-or byte checking. Their kernel block sizes can still differ where native
-NIXL allows it.
-The initial rule reader is for plain BF16 KV without drafts: FlashInfer's
-Hopper rule, Triton attention, and the qualified dense MLA rules from
-FlashMLA, FlashInfer MLA, FlashAttention MLA and Triton MLA.
-
-`kv_pattern_fill` (prefill instance) writes a pattern into each request's KV
-blocks, derived from the request, the TP rank, the layer and the block's
-place among the request's blocks of its KV cache group, and
-`kv_pattern_check` (decode instance) checks every byte it receives, logging
-one `kv_check` record per request, each group's result nested in it (it
-needs `log_path`). With prefix caching on, a block may hold KV computed for
-another request, so its pattern is its content's instead: the tokens up to
-the block's end, as prefix caching keys a full block. Prefix hits are then
-compared too, read-only, on both instances (`kind` hit, apart from the
-transferred blocks). Such a run takes token prompts only (no LoRA adapter,
-`cache_salt`, prompt embeddings or multimodal inputs), and speculative
-decoding: decode writes a block's content once its tokens are known and
-their KV computed, a draft's only once accepted, at the end of the step
-that accepted it (each such write a `kv_write` record, apart from the
-checks). A hybrid's state is its block's content too: the tokens it has
-absorbed, which stop one short of the prompt on a prefill instance (decode
-expects that). With a hybrid's MTP (over NIXL only) each state is keyed by
-its endpoint alone, so a pulled state is the producer's at the handoff
-whichever slot the read names: vLLM's scheduler moves it to the running
-slot when it admits the request, and relocates speculative state blocks as
-drafts are accepted or rejected. A state group the pull fills has no hit
-of decode's own. MTP drops the last matched block of a prefix hit, so a
-shared prefix reaches a hit only past its first block. A hit ending inside a block is
-reported as outside the checks. Decode reuses a cached prefix of its own
-only where its pulls left one: not a sliding window's (the connector moves
-a window's last blocks only: DeepSeek-V4, Gemma4), and for a hybrid its
-attention blocks over NIXL, nothing over Mooncake. A group's blocks
-are its layers' only, each block the page the connector moves (a state's
-padding included; in DeepSeek-V4's packed blocks, each layer's real page,
-its padding unchecked), and the null block that pads a window's head is
-neither filled nor checked. The `kv_layout` record describes each group (its page,
-the state's real bytes, the stride between blocks) and counts each storage
-once, as the connector registers it.
-
-`MooncakeConnector` takes one KV address per rank in its extra config,
-`"rank_addresses": [...]` (IPv4), so each rank can use a NIC of its own: its
-handshakes, TENT's RPC server and `hp_tcp` bind there. So does
-`NixlConnector` over NIXL's Mooncake backend alone (`"backends":
-["Mooncake"]`): each rank's backend segment and `hp_tcp` bind to its
-address, while NIXL's handshake stays on the instance's side channel
-(`VLLM_NIXL_SIDE_CHANNEL_HOST`). The list holds the
-ranks of an engine, by TP rank; an MoE model's DP engines on one host share
-it, host-local DP rank by TP rank (`local_kv_rank`), and so must be launched
-together: by one server, or by one multi-port supervisor, which tells each
-server it launches its place among the host's ranks
-(`VLLM_DP_SUPERVISED_RANK_LOCAL`, `VLLM_DP_SUPERVISED_SIZE_LOCAL`; not to be
-set by hand). Each rank's transfer engine serves TENT's metrics on the base
-port (`MC_TENT_CONF`'s `metrics/http_port`, else `TENT_METRICS_HTTP_PORT`,
-else 9100) plus its host-local DP rank times the TP size plus its TP rank.
-
-NIXL can also select exactly `["UCX"]` or `["LIBFABRIC"]` for CPU TCP
-transfers. Both require `rank_addresses` even for TP1; the selected IPv4
-address must identify one non-loopback interface without IPv4 aliases.
-UCX uses `tcp,self` and that interface. LIBFABRIC uses the direct `tcp`
-provider, IPv4 only, and requires its interface to be UP and RUNNING.
-Use the CPU image built with the corresponding plugins; the harness in
-`tools/e2e` selects them with `server.nixl_backend: ucx` or `libfabric`
-while retaining `mooncake` as its default.
-
-Managed LIBFABRIC sets provider/interface policy before loading the native
-library. It requires `/opt/libfabric/etc/libfabric.conf` to be absent or
-empty and refuses configuration/provider overrides and rebinding a process
-to another interface. `FI_LOG_LEVEL`, `FI_LOG_PROV` and `FI_LOG_SUBSYS` are
-allowed for diagnostics. Its agent config uses four posting threads and
-background progress; these configured values do not independently observe
-live threads or provider/rail selection. Backend options and policy are
-logged separately. TENT accounting applies to Mooncake, while UCX and
-LIBFABRIC use NIXL telemetry, byte checks and network counters. For both,
-the logged binding is the environment set before the agent is created;
-the native transport and device selection is not observed
-(`native_transport_observed: false` for UCX).
-
-The ranks move KV over TCP by default. With `"kv_transport": "rdma"` they
-move it over RDMA instead, each on its own device:
-`"rank_rdma_devices": [...]` lists one `device[:port]` per rank (port 1 by
-default, 1-255), ordered like `rank_addresses`, which RDMA still requires:
-the handshakes and TENT's RPC stay on each rank's address. Ranks may share a
-device. Each binding is set before the native engine is created, and
-settings that would move it are refused rather than overridden:
-
-* NIXL's `["UCX"]` backend uses `rc,self` on the rank's `device:port` (RC
-  connects its endpoints over UD, which UCX adds for wireup). No TCP
-  transport is allowed, so a missing RDMA path fails instead of falling
-  back. The overrides refused for managed UCX/TCP are refused here too.
-* NIXL's `["Mooncake"]` backend and `MooncakeConnector` use TENT
-  (`MC_USE_TENT`): its RDMA transport alone, on the bare device name
-  (`topology/rdma_whitelist`) and port (`transports/rdma/device/port`), its
-  TCP, `hp_tcp`, SHM and io_uring transports disabled, in `MC_TENT_CONF`
-  (inline or a file; other settings kept). `MC_IB_PORT`, `MC_TE_FILTERS`,
-  `MC_TE_FILTERS_EXCLUDE`, `MC_FORCE_TCP`, a different
-  `MOONCAKE_LOCAL_HOSTNAME` and `MC_TENT_CONF` values contradicting the
-  binding are refused. `MooncakeConnector` takes `mooncake_protocol` `rdma`
-  (its default) and no `device_name`.
-* NIXL's `["LIBFABRIC"]` backend is refused over RDMA: the pinned managed
-  path has no verbs support (NIXL selects libfabric's CXI, EFA, TCP or
-  sockets providers).
-
-Managed TCP keeps TENT's RDMA transport disabled (TENT enables it on any
-RDMA NIC it sees) and refuses an `MC_TENT_CONF` that enables it. The
-image's RDMA support (verbs providers, `librdmacm`, UCX built with verbs,
-rdmacm and mlx5) is used only when a run selects RDMA and its containers
-are given the RDMA devices, `IPC_LOCK` and an unlimited memlock limit. Each
-rank's `kv_layout` record holds its binding (`nixl_transport`, or
-`mooncake_transport` for `MooncakeConnector` over RDMA).
-
-A managed UCX or LIBFABRIC `add_remote_agent` can block indefinitely
-when the peer's side channel answers but its KV address is unreachable
-(a wrong `rank_addresses` entry, a missing route, a dead peer). The call
-cannot be interrupted and holds NIXL's single handshake thread: later
-handshakes wait behind it and the process does not exit until it is
-killed. After 30 seconds an error names the backend and the likely
-cause; check the peer's KV address and routes, then restart both
-instances.
-
-Every rank of the last pipeline stage logs its own KV (`kv_layout`,
-`kv_transfers`, `kv_check`, `kv_events` and `threads` records), and with
-speculative decoding its own requests' drafts and accepted drafts each
-step (`spec_acceptance`), into
-`<log_path>[.dp<i>][.tp<r>]`, for its global DP rank `i` and TP rank `r`
-when not 0; its `kv_layout` record names both and its host-local DP rank.
-A `kv_transfers` record names each transfer's peer rank and its plan (for a
-NIXL read, the descriptors selected and the count NIXL merges them into).
-Under MoE DP the timing record and the joint steps stay in DP rank 0's logs,
-also when a multi-port supervisor launched each rank's server. With
-several KV cache groups or a sliding window, `kv_events` also lists each
-request's new blocks by group (`allocated_groups`: the group, the place of
-the first block among the request's blocks of that group, and the blocks,
-null ones in place), the connector's pulls included.
-
-### Running without a GPU
+## Running without a GPU
 
 A CPU build of vLLM (`VLLM_TARGET_DEVICE=cpu`, which installs Triton's CPU
 backend) runs simulations on any x86-64 host:
@@ -812,7 +291,7 @@ TRITON_CPU_BACKEND=1 vllm serve Qwen/Qwen3-235B-A22B --simulate-forward \
 ```
 
 The CPU image the examples here and the harness use is built from the
-repository root:
+repository root (it needs Python 3.11 or newer):
 
 ```bash
 docker build -f docker/Dockerfile.cpu --target vllm-openai \
@@ -820,60 +299,66 @@ docker build -f docker/Dockerfile.cpu --target vllm-openai \
   -t vllm:cpu .
 ```
 
-Ranks need no devices, so a layout larger than any one GPU host runs on a
-CPU host. Simulated workers share the host's cores instead of each taking a
-NUMA node (nor does a `NixlConnector` worker pin itself to each node's last
-core for its transfers), and keep the modeled GPU deployment's settings (async scheduling,
-the in-process executor) rather than the CPU platform's: an MLA model keeps
-its chunked prefill and prefix caching, and its blocks are not forced to the
-CPU MLA kernel's 16 tokens. The KV block size must be a multiple of 16, a
-GPU's smallest: pass `--block-size` to match the deployment.
-Layers still pick the CPU platform's attention backends and kernels:
-`--decode-context-parallel-size` above 1 builds for a dense MLA model only,
-whose CPU backend keeps vLLM's DCP bookkeeping in a simulation.
-Weight formats do not: a checkpoint published with quantized weights (FP8,
-MXFP4, MXFP8 or NVFP4, ModelOpt's or compressed-tensors': DeepSeek-V3's,
-DeepSeek-V3.2's, MiniMax-M2.5's, gpt-oss's, Kimi-K3's, the `-NVFP4` checkpoints) builds
-as published: serve it by its name, with no edited copy of its config. And
-`--quantization` (`fp8`, `fp8_per_tensor`, `fp8_per_block`,
-`fp8_per_channel`, `mxfp8`, `int8_per_channel_weight_only`) quantizes
-the layers as they load, as on a GPU: they load on the meta device, so the
-layers end with the deployment's weight dtypes and no data (not `mxfp4`,
-whose emulation kernel needs the `amd-quark` package, nor `nvfp4_per_token`
-on an MoE model, which vLLM takes on a Blackwell GPU only). A format the CPU
-has no kernel for is built and never run: its linear layers take vLLM's
-device-independent emulation kernel, NVFP4 experts the backend a GPU
-deployment tries first (or `--moe-backend`), per-tensor FP8 experts the
-Triton one, and MXFP4 experts the CPU's MXFP4 backend, which takes Kimi-K3's
-SiTU activation and grouped sigmoid routing in a simulation only. Weight quantization changes neither the KV cache nor what a
-transfer moves. A checkpoint that also declares a quantized KV cache takes
-that cache dtype as on its GPU: dense MLA keeps an FP8 cache (a byte an
-element), DSA sparse MLA FlashMLA's packed one (`fp8_ds_mla`, 656 bytes a
-token), whichever FP8 dtype is given. DSA sparse MLA
-(DeepSeek-V3.2, GLM-5) builds in a simulation only, keeping the GPU
-deployment's FlashMLA sparse backend for its caches (no kernel runs). The CPU build needs Python 3.11 or newer.
+### What the CPU platform keeps from the GPU deployment
+
+- **Ranks need no devices**, so a layout larger than any one GPU host runs on
+  a CPU host.
+- **Scheduling settings**: simulated workers share the host's cores instead of
+  each taking a NUMA node (nor does a `NixlConnector` worker pin itself to
+  each node's last core for its transfers), and keep the modeled GPU
+  deployment's settings (async scheduling, the in-process executor) rather
+  than the CPU platform's.
+- **MLA** keeps its chunked prefill and prefix caching, and its blocks are not
+  forced to the CPU MLA kernel's 16 tokens.
+- **Block size**: the KV block size must be a multiple of 16, a GPU's
+  smallest: pass `--block-size` to match the deployment.
+- **Attention backends**: layers still pick the CPU platform's backends and
+  kernels. `--decode-context-parallel-size` above 1 builds for a dense MLA
+  model only, whose CPU backend keeps vLLM's DCP bookkeeping in a simulation.
+  DSA sparse MLA (DeepSeek-V3.2, GLM-5) builds in a simulation only, keeping
+  the GPU deployment's FlashMLA sparse backend for its caches (no kernel
+  runs).
+
+### Weight formats
+
+Weight formats build as on the GPU; weight quantization changes neither the KV
+cache nor what a transfer moves.
+
+| Case | Behavior |
+| --- | --- |
+| A checkpoint published with quantized weights (FP8, MXFP4, MXFP8 or NVFP4, ModelOpt's or compressed-tensors': DeepSeek-V3, DeepSeek-V3.2, MiniMax-M2.5, gpt-oss, Kimi-K3, the `-NVFP4` checkpoints) | Builds as published: serve it by its name, with no edited copy of its config. |
+| `--quantization` `fp8`, `fp8_per_tensor`, `fp8_per_block`, `fp8_per_channel`, `mxfp8`, `int8_per_channel_weight_only` | Quantizes the layers as they load, as on a GPU: they load on the meta device and end with the deployment's weight dtypes and no data. |
+| `--quantization mxfp4`; `nvfp4_per_token` on an MoE model | Not supported: the first's emulation kernel needs the `amd-quark` package; vLLM takes the second on a Blackwell GPU only. |
+| A format the CPU has no kernel for | Built and never run: linear layers take vLLM's device-independent emulation kernel, NVFP4 experts the backend a GPU deployment tries first (or `--moe-backend`), per-tensor FP8 experts the Triton one, MXFP4 experts the CPU's MXFP4 backend (which takes Kimi-K3's SiTU activation and grouped sigmoid routing in a simulation only). |
+| A checkpoint that also declares a quantized KV cache | Takes that cache dtype as on its GPU: dense MLA keeps an FP8 cache (a byte an element), DSA sparse MLA FlashMLA's packed one (`fp8_ds_mla`, 656 bytes a token), whichever FP8 dtype is given. |
 
 ## Testing end to end
 
-`tools/e2e` holds a local harness for simulated prefill/decode serving: it
-builds a topology of Docker containers joined by separate control and KV
-networks, serves a run behind [llm-d](https://llm-d.ai)'s router (Envoy, its
-endpoint picker and its disaggregation sidecar, without Kubernetes), and
-checks the result: every transferred byte, each rank's transfers and the
-router's choices against what the engines ran. `tools/e2e/topologies/example.yaml`
-and `tools/e2e/runs/example.yaml` document its options.
+`tools/e2e` holds a local harness for simulated prefill/decode serving:
+
+- it builds a topology of Docker containers joined by separate control and KV
+  networks;
+- serves a run behind [llm-d](https://llm-d.ai)'s router (Envoy, its endpoint
+  picker and its disaggregation sidecar, without Kubernetes);
+- checks the result: every transferred byte, each rank's transfers and the
+  router's choices against what the engines ran.
+
+`tools/e2e/topologies/example.yaml` and `tools/e2e/runs/example.yaml` document
+its options. The harness runs over TCP; RDMA runs on real nodes, outside it.
 
 ## Limitations
 
-* On CUDA hosts each rank needs its own device (but little of its memory);
-  the CPU platform has no such limit.
-* Pipeline stages are assumed balanced.
-* No LoRA, pooling or diffusion models, and speculative decoding without
+- On CUDA hosts each rank needs its own device (but little of its memory); the
+  CPU platform has no such limit.
+- Pipeline stages are assumed balanced.
+- No LoRA, pooling or diffusion models, and speculative decoding without
   adaptive verification only.
-* KV connectors are the native NIXL pull connector and the Mooncake
-  connector, moving real KV between served instances (see
+- KV connectors are the native NIXL pull connector and the Mooncake connector,
+  moving real KV between served instances (see
   [Real KV transfers](#real-kv-transfers)); no KV offloading and no other
   connector.
-* The `fast_forward` and `virtual` clocks need a single process with one
-  rank; served and multi-rank simulations run on the real clock.
-* Token ids are not meaningful; only their counts are.
+- The `fast_forward` and `virtual` clocks need a single process with one rank;
+  served and multi-rank simulations run on the real clock.
+- Token ids are not meaningful; only their counts are.
+- What AISimulate cannot time is rejected, not approximated (see
+  [AISimulate timing](simulated_execution/aisimulate.md)).
