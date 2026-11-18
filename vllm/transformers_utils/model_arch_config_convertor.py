@@ -312,6 +312,7 @@ class ModelArchConfigConvertorBase:
             "kimi_k2",
             "kimi_linear",
             "longcat_flash",
+            "mistral_large_4",
             "pangu_ultra_moe",
             "pangu_ultra_moe_mtp",
             "bailing_hybrid",
@@ -651,19 +652,6 @@ class Qwen3_5ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         super().__init__(hf_config, hf_text_config, revision)
 
 
-class Qwen3ASRModelArchConfigConvertor(ModelArchConfigConvertorBase):
-    def __init__(
-        self,
-        hf_config: PreTrainedConfig,
-        hf_text_config: PreTrainedConfig,
-        revision: str | None = None,
-    ):
-        thinker_config = getattr(hf_config, "thinker_config", None)
-        if getattr(thinker_config, "model_type", None) == "qwen3_forced_aligner":
-            hf_config.architectures = ["Qwen3ASRForcedAlignerForTokenClassification"]
-        super().__init__(hf_config, hf_text_config, revision)
-
-
 class Qwen3OmniMoeModelArchConfigConvertor(ModelArchConfigConvertorBase):
     def __init__(
         self,
@@ -878,7 +866,6 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "pangu_ultra_moe_mtp": PanguUltraMoeMTPModelArchConfigConvertor,
     "qwen3_5": Qwen3_5ModelArchConfigConvertor,
     "qwen3_5_mtp": Qwen3_5MTPModelArchConfigConvertor,
-    "qwen3_asr": Qwen3ASRModelArchConfigConvertor,
     "qwen3_omni_moe": Qwen3OmniMoeModelArchConfigConvertor,
     "qwen3_next_mtp": Qwen3NextMTPModelArchConfigConvertor,
     "qwen4_exp_mtp": Qwen4ExpMTPModelArchConfigConvertor,

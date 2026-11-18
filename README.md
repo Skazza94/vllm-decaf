@@ -30,8 +30,8 @@ The result is a GPU-free environment for studying **disaggregated serving,
 KV transport, routing, and cache behaviour** on CPU-only machines.
 
 > vllm-decaf tries to follow upstream [vLLM](https://github.com/vllm-project/vllm)
-> and keeps its Apache-2.0 license. It is currently based on upstream `main`
-> at `v0.33.0rc0`.
+> and keeps its Apache-2.0 license. It is currently based on upstream
+> `v0.34.0`.
 
 ## How it works
 

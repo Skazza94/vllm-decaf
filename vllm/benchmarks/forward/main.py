@@ -66,10 +66,13 @@ def add_cli_args(parser: FlexibleArgumentParser) -> None:
     )
     parser.add_argument(
         "--routing",
-        choices=["auto", "real", "balanced"],
+        choices=["auto", "real", "balanced", "zipf"],
         default="auto",
         help="MoE routing. balanced: fixed routing with equal load per EP rank. "
-        "auto: balanced with dummy weights, else real.",
+        "zipf: fixed weighted sampling without replacement (alpha=1.25), "
+        "with expert popularity shuffled per layer. "
+        "auto: zipf with dummy weights, else real; falls back to real when "
+        "the synthetic fixture is unsupported.",
     )
     parser.add_argument(
         "--exclude-drafter",
@@ -93,7 +96,6 @@ def add_cli_args(parser: FlexibleArgumentParser) -> None:
 
 
 def _setup_env() -> None:
-    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     # Each case's eager pass compiles exactly the shapes it needs.
     os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
@@ -209,17 +211,17 @@ def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any
         profile_prefix,
         include_drafter=include_drafter,
     )
-    routing, balanced = install_routing(
+    routing, fixture = install_routing(
         runner, args.routing, args.load_format == "dummy", batch.num_tokens, args.seed
     )
     try:
         result = bench.run()
-        if balanced is not None:
-            balanced.check_applied()
+        if fixture is not None:
+            fixture.check_applied()
     finally:
         runner.execute_model(batch.finish())
-        if balanced is not None:
-            balanced.remove()
+        if fixture is not None:
+            fixture.remove()
     return {
         "num_tokens": batch.num_tokens,
         "kv_blocks": batch.num_blocks,

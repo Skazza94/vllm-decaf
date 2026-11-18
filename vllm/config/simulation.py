@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator
 
-from vllm.config.utils import config, hash_factors
+from vllm.config.utils import CompileFactors, config
 
 if TYPE_CHECKING:
     from vllm.config.vllm import VllmConfig
@@ -117,9 +117,9 @@ class SimulationConfig:
             raise ValueError("spec_acceptance_rates must be probabilities in [0, 1].")
         return rates
 
-    def compute_hash(self) -> str:
-        """Simulation never compiles a graph; only the mode enters the hash."""
-        return hash_factors({"simulate_forward": self.simulate_forward})
+    def compile_factors(self) -> CompileFactors:
+        """Simulation never compiles a graph; only the mode enters the factors."""
+        return {"simulate_forward": self.simulate_forward}
 
     def verify_and_update_config(self, vllm_config: "VllmConfig") -> None:
         """Check `vllm_config` against simulated execution or recording, and
