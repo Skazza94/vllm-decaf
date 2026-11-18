@@ -76,8 +76,8 @@ next scheduling decisions.
   real deployment.
 - **Real KV transfers for disaggregated prefill/decode.** KV caches are real
   CPU buffers with the model's geometry, moved between instances by vLLM's
-  own `NixlConnector` or `MooncakeConnector`, over TCP backends (Mooncake's
-  TENT, UCX, libfabric), one NIC per rank if you want.
+  own `NixlConnector` or `MooncakeConnector`, over TCP (Mooncake's TENT, UCX,
+  libfabric) or RDMA (UCX, TENT), one NIC per rank if you want.
 - **Byte-level verification.** Prefill can fill its KV blocks with a
   deterministic pattern and decode can check every byte it receives, with
   prefix caching on or off.
@@ -110,7 +110,7 @@ the README does not describe it.
 | **Compute time** | Per step, from the batch the scheduler formed: GPU performance model, formula or recorded steps | Replay of a recorded trace, or a latency model | Configured time to first token and inter-token latency, scaled with load |
 | **KV cache** | vLLM's allocator, prefix cache and eviction | — | Tracked usage |
 | **KV events** | vLLM's own | — | Published for allocation and eviction |
-| **Prefill/decode transfer** | Real bytes, vLLM's NIXL or Mooncake connector, several TCP backends | Simulated KV bytes over NIXL | Transfer latency only |
+| **Prefill/decode transfer** | Real bytes, vLLM's NIXL or Mooncake connector, over TCP or RDMA | Simulated KV bytes over NIXL | Transfer latency only |
 | **Transferred bytes checked** | Every byte, optionally | — | Not applicable |
 | **TP / DP / expert parallelism** | Yes, each rank with its own KV and NIC | — | — |
 | **Speculative decoding** | Native MTP | — | — |
@@ -295,9 +295,10 @@ llm-d's router.
   transfers run for real; compute time is an estimate. AISimulate covers the
   models, GPUs and single-node layouts listed above, and its own
   approximations apply.
-- **Real KV transfers currently focus on TCP stacks.** They run on the CPU
-  platform over TCP backends; RDMA is not covered yet, nor are pipeline and
-  context parallelism.
+- **Real KV transfers run over TCP or RDMA.** They run on the CPU platform;
+  RDMA needs the RDMA devices in each instance's container, and NIXL's
+  libfabric backend stays TCP-only (NIXL selects no verbs devices for it).
+  Pipeline and context parallelism are not covered.
 - **Per-model scope.** Each cache layout is supported for specific
   connectors and parallel layouts; unsupported combinations are refused at
   startup.
