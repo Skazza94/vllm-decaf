@@ -9,7 +9,7 @@ exercises scheduler and KV cache behavior deterministically on CPU-only hosts.
 | Page | Content |
 | --- | --- |
 | This page | How it works, configuration, timing providers, offline runs, parallelism, CPU hosts |
-| [AISimulate timing](simulated_execution/aisimulate.md) | GPU step times from AISim's performance model: targets, precision, layouts, DCP, MTP |
+| [AISim timing](simulated_execution/aisimulate.md) | GPU step times from AISim's performance model: targets, precision, layouts, DCP, MTP |
 | [Real KV transfers](simulated_execution/real_kv_transfers.md) | Disaggregated prefill/decode with real KV over NIXL or Mooncake, TCP or RDMA, byte checks |
 
 ## How it works
@@ -96,7 +96,7 @@ out = llm.generate(
 | `linear` | `fixed_us + prefill_us_per_token * P + decode_us_per_req * D + decode_us_per_kv_token * K` | Those four, plus `host_us` or `host_fit_log` |
 | `table` | Nearest-neighbor interpolation over a step log. | `path`, `k` |
 | `replay` | Exact match on the step's batch composition, else `fallback`. | `path`, `fallback` (`knn`/`zero`), `k`, `miss_fallback_s` |
-| `aisimulate` | AISimulate's forward-pass estimate of a published model on a GPU. | `gpu`, `target_model`, `backend_version`, `quant_modes`, `host_us` ([details](simulated_execution/aisimulate.md)) |
+| `aisimulate` | AISim's forward-pass estimate of a published model on a GPU. | `gpu`, `target_model`, `backend_version`, `quant_modes`, `host_us` ([details](simulated_execution/aisimulate.md)) |
 | `module.Class` | A `vllm.v1.worker.simulated.timing.TimingProvider`. | Its keyword arguments |
 
 A provider receives a `StepDescriptor` and returns a `StepCost`. The
@@ -239,8 +239,8 @@ simulation_config={
 - Acceptance is sampled independently per step, so per-request acceptance, and
   with it P99 TPOT, varies less than on a real deployment.
 - Trace replay is not available with speculative decoding.
-- AISimulate times native MTP only (see
-  [AISimulate timing](simulated_execution/aisimulate.md#speculative-decoding)).
+- AISim times native MTP only (see
+  [AISim timing](simulated_execution/aisimulate.md#speculative-decoding)).
 
 ## Parallelism
 
@@ -360,5 +360,5 @@ its options. The harness runs over TCP; RDMA runs on real nodes, outside it.
 - The `fast_forward` and `virtual` clocks need a single process with one rank;
   served and multi-rank simulations run on the real clock.
 - Token ids are not meaningful; only their counts are.
-- What AISimulate cannot time is rejected, not approximated (see
-  [AISimulate timing](simulated_execution/aisimulate.md)).
+- What AISim cannot time is rejected, not approximated (see
+  [AISim timing](simulated_execution/aisimulate.md)).

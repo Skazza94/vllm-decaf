@@ -1,10 +1,10 @@
-# AISimulate Timing
+# AISim Timing
 
 The `aisimulate` timing provider prices each simulated step with
 [AISim](https://github.com/ai-dynamo/aisim)'s forward-pass performance model:
 the scheduler's actual batch, one workload per attention data-parallel rank,
 from kernel timings measured on the chosen GPU under a vLLM release. There is
-no analytical fallback: what AISimulate cannot time is rejected, not
+no analytical fallback: what AISim cannot time is rejected, not
 approximated.
 
 See [Simulated Execution](../simulated_execution.md) for the simulator itself
@@ -35,7 +35,7 @@ vllm serve deepseek-ai/DeepSeek-V3 --simulate-forward \
 | --- | --- |
 | `gpu` | The GPU whose measured kernel timings price the steps (`h100`, `h200`, `b200`, `a100`). |
 | `target_model` | The published model timed (see [Target model](#target-model)). |
-| `backend_version` | The vLLM version of AISimulate's timing tables, when not automatic. |
+| `backend_version` | The vLLM version of AISim's timing tables, when not automatic. |
 | `quant_modes` | Overrides the published precision; the target is then recorded as modified. |
 | `host_us` | Host time added to each step. |
 
@@ -72,7 +72,7 @@ checkpoint's `hf_quant_config.json` included:
 | Published format | How it is read |
 | --- | --- |
 | Block FP8, MXFP4 experts | A fixed mapping |
-| NVFP4, per-tensor FP8, compressed-tensors, mixed per-layer precision | As AISimulate itself reads the checkpoint |
+| NVFP4, per-tensor FP8, compressed-tensors, mixed per-layer precision | As AISim itself reads the checkpoint |
 | Anything else | Refused |
 
 Layers the server quantizes itself are not the published weights. For an
@@ -80,8 +80,8 @@ unquantized checkpoint:
 
 | Server option | Timed as |
 | --- | --- |
-| `--quantization fp8` or `fp8_per_tensor` (per-tensor weights, dynamic activations) | AISimulate's `fp8` precision of the published model |
-| `--quantization fp8_per_block` | AISimulate's `fp8_block` precision |
+| `--quantization fp8` or `fp8_per_tensor` (per-tensor weights, dynamic activations) | AISim's `fp8` precision of the published model |
+| `--quantization fp8_per_block` | AISim's `fp8_block` precision |
 
 The target is then recorded as modified, with its `online_quantization`. The
 shorthand is taken alone, as vLLM resolves it: every linear layer and every
@@ -106,7 +106,7 @@ expert quantized its way. Refused before the model is built:
 
 ### Startup check
 
-Startup times one prefill and one decode step, so a target AISimulate lacks
+Startup times one prefill and one decode step, so a target AISim lacks
 data for at those shapes fails before serving. A later batch of another shape
 can still lack data and fail then.
 
@@ -120,7 +120,7 @@ can still lack data and fail then.
 
 ## Decode context parallelism
 
-AISimulate takes global context lengths and prices each rank's share of the
+AISim takes global context lengths and prices each rank's share of the
 decode KV and the merge of partial outputs. Every DCP configuration requires:
 
 - `dcp_comm_backend` set to `ag_rs`;
@@ -143,12 +143,12 @@ Notes:
 
 - **GLM-5 on B200** with DCP represents an explicit packed-cache deployment:
   native `auto` instead uses standard FP8 with FlashInfer.
-- **GQA**: the native reference is FlashAttention 3; AISimulate uses its
+- **GQA**: the native reference is FlashAttention 3; AISim uses its
   default attention selector and vLLM 0.24.0 tables. It models prefill over
   cached context with a KV gather, where native FlashAttention gathers Q and
   merges the ranks' partial outputs. KV page size determines cache geometry;
   changing it did not change the estimates in the qualified queries, and
-  AISimulate takes no interleave (the estimates are the same at each).
+  AISim takes no interleave (the estimates are the same at each).
 - **Not qualified**: GQA models whose layouts need more than eight GPUs
   (Qwen3-8B, MiniMax-M2.5), FP8 KV cache and B200 for GQA; GQA DCP with KV
   transfers, compressed MLA, hybrids, and pipeline, prefill context, data and
@@ -158,8 +158,8 @@ Notes:
 
 With DCP greater than one, speculative decoding is limited to standalone CPU
 simulation of the native single-module MTP of DeepSeek-V3, DeepSeek-V3.2 and
-GLM-5, at depth 1 to 5 and AISimulate vLLM 0.24.0 tables, at the layouts
-AISimulate was qualified for:
+GLM-5, at depth 1 to 5 and AISim vLLM 0.24.0 tables, at the layouts
+AISim was qualified for:
 
 | Model | GPU | Weights / cache | Pages | TP/DCP |
 | --- | --- | --- | --- | --- |
@@ -167,7 +167,7 @@ AISimulate was qualified for:
 | DeepSeek-V3.2 | H200 | Published block-FP8, packed `fp8_ds_mla` cache | 64 tokens | TP8 with DCP 2 or 4 |
 | GLM-5 | B200 | Published NVFP4, packed cache, explicit `ag_rs`, Q replication off | 64 tokens | TP4 with DCP 2 or 4 |
 
-- **DeepSeek-V3.2 at TP8 with DCP 8** stays refused: AISimulate times it, but
+- **DeepSeek-V3.2 at TP8 with DCP 8** stays refused: AISim times it, but
   on the qualified FP8 FlashMLA path vLLM refuses it natively, since the
   backend requires the local (16) and the DCP-gathered (128) query heads to
   pad to the same decode kernel envelope (64 against 128).
@@ -179,7 +179,7 @@ AISimulate was qualified for:
   `cp_kv_cache_interleave_size`.
 - The interleave decides which DCP rank holds which token inside a scheduler
   block (the page size times DCP); the pages, capacity and lookahead do not
-  depend on it. AISimulate takes no interleave: the estimates above interleave
+  depend on it. AISim takes no interleave: the estimates above interleave
   1 are the interleave-1 estimates with the decode-width classification. The
   sparse backend's batch metadata classifies verified rows differently above
   interleave 1; its interleave-dependent GPU costs are not modeled, and the
@@ -211,7 +211,7 @@ AISimulate was qualified for:
 Speculative decoding is timed for the native single-module MTP of
 DeepSeek-V3, DeepSeek-V3.2, GLM-5, DeepSeek-V4, Qwen3.5 and Nemotron-H only
 (`method: mtp`, the checkpoint's one MTP layer, 1 to 5 tokens, the draft at the
-target's parallelism and precision), as AISimulate's MTP depth:
+target's parallelism and precision), as AISim's MTP depth:
 
 - a decode step verifies k + 1 tokens a request and runs k target-shaped draft
   layers, the full width even when a step drafted fewer;
@@ -222,7 +222,7 @@ target's parallelism and precision), as AISimulate's MTP depth:
 ## Known approximations
 
 !!! warning "Plain-MLA cached-prefix steps"
-    The pinned AISimulate version has a cached-prefix timing limitation for
+    The pinned AISim version has a cached-prefix timing limitation for
     plain-MLA context steps (not sparse MLA): in DeepSeek-V3 and Kimi-K3
     probes, estimates decrease over some already-positive prefix intervals with
     the new-token count fixed. Prefix-cache hits, later prefill chunks and

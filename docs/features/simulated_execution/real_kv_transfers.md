@@ -211,8 +211,8 @@ pair fails at the handshake.
 | Pair | Scope |
 | --- | --- |
 | Prefill TP 8 → decode TP 4, no prefix caching | Its delta-attention states (Q, K and V conv components, the recurrent state FP32 unless `--mamba-ssm-cache-dtype` says otherwise) split as the states above, each decode rank's half of every component from its two producers; its MLA latent, the same on every rank, from one of them, each decode attention block (twice the prefill's tokens) read as two prefill blocks, the uncovered half of a request's last block zero, as NIXL leaves it. |
-| Prefill TP 8 → decode TP 4, prefix caching | The published text-only BF16-KV Kimi-K3 with AISimulate's B200 target, whole 768-token prefill and 1,536-token decode pages, align-mode KDA, producer fill, decode byte checks and `kv_pattern_grain=768` on both sides. Before a READ, decode checks each actual producer's advertised scope, registration, and the layers of its regions and their cache groups. Native NIXL pairing by token from the handoff's last token is kept; the byte check verifies it with a decode prefix hit and an incomplete final page. |
-| Prefill TP 4 → decode TP 8 | Only the published text-only MXFP4 model with BF16 KV, FP32 recurrent state, CPU NIXL pull, AISimulate's B200 target, prefix caching off, whole 1,536-token prefill and 768-token decode pages, KDA cache mode `none` on both sides, producer pattern fill and decode pattern checks. Decode rank `r` reads from producer `r // 2`. The checker verifies the sources and destinations of the native READ against the original producer block IDs independently of the byte check; the raw registration carries geometry, not the producer's fill or prefix settings. |
+| Prefill TP 8 → decode TP 4, prefix caching | The published text-only BF16-KV Kimi-K3 with AISim's B200 target, whole 768-token prefill and 1,536-token decode pages, align-mode KDA, producer fill, decode byte checks and `kv_pattern_grain=768` on both sides. Before a READ, decode checks each actual producer's advertised scope, registration, and the layers of its regions and their cache groups. Native NIXL pairing by token from the handoff's last token is kept; the byte check verifies it with a decode prefix hit and an incomplete final page. |
+| Prefill TP 4 → decode TP 8 | Only the published text-only MXFP4 model with BF16 KV, FP32 recurrent state, CPU NIXL pull, AISim's B200 target, prefix caching off, whole 1,536-token prefill and 768-token decode pages, KDA cache mode `none` on both sides, producer pattern fill and decode pattern checks. Decode rank `r` reads from producer `r // 2`. The checker verifies the sources and destinations of the native READ against the original producer block IDs independently of the byte check; the raw registration carries geometry, not the producer's fill or prefix settings. |
 | Other cold pairs within TP 1, 2, 4 and 8 | The same published Kimi-K3 and checked CPU NIXL scope; each side uses its whole attention page sized for its TP-sharded state. Native NIXL pairs attention rows in the greatest common unit and keeps each producer's original state-page stride. The checker validates every source separately, with KDA spans matched by global columns and heads, and distinguishes copied patterned attention padding from any uncovered decode rows NIXL zeroes. Native transport limits stay per READ. |
 
 Reverse TP 4 → TP 8 with prefix caching stays refused: NIXL needs matching
@@ -238,7 +238,7 @@ sizes from 1, 2, 4 and 8 in either direction:
   They do not independently audit remote source addresses. Prefix hits are
   checked without rewriting them, including pages completed by accepted
   drafts.
-- Timing remains the explicit published AISimulate deployment, with its
+- Timing remains the explicit published AISim deployment, with its
   documented MTP approximations. Compute-small fixtures preserving published KV
   geometry are checked as that KV layout, not timed as a smaller model.
 - Unequal logical page sizes, DCP and custom kernel declarations stay outside
@@ -246,7 +246,7 @@ sizes from 1, 2, 4 and 8 in either direction:
 
 #### DeepSeek-V4 at unequal TP
 
-The published V4-Flash on AISimulate's B200 target, packed FP8 cache, NIXL
+The published V4-Flash on AISim's B200 target, packed FP8 cache, NIXL
 pull, tensor parallelism of 1, 2, 4 or 8 alone, prefix caching on or off on
 both sides, no MTP or native MTP of any depth from 1 to 5 on each side (equal
 in presence), pairs one size dividing the other:
@@ -330,12 +330,12 @@ TP size, the TP sizes one dividing the other.
 Blocks take any multiple of 16 tokens, as on a GPU; MLA blocks are not forced
 to the CPU MLA kernel's 16.
 
-For CPU simulations with NIXL pull and AISimulate,
+For CPU simulations with NIXL pull and AISim,
 `simulation_config.kv_kernel_backend` names a built-in GPU attention backend
 whose kernel block sizes are taken from vLLM's backend source:
 
 - The selected rule, its source and the registered logical and kernel sizes
-  are in `kv_layout`. The CPU backend and AISimulate's timing profile stay as
+  are in `kv_layout`. The CPU backend and AISim's timing profile stay as
   configured.
 - Unset, the previous CPU block rules apply (one kernel block a block), and
   such an instance refuses at the NIXL handshake, before any READ, a peer whose
