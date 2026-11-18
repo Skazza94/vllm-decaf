@@ -59,7 +59,9 @@ def _worker(tp, rank, lengths=None, gap=0, gaps=None):
 def test_native_state_rows_are_the_layouts_spans_or_refused():
     for tp, rank in ((1, 0), (2, 1), (4, 3)):
         worker, caches = _worker(tp, rank)
-        selection = NativeSelection(worker, caches, [["L"], ["other"]], [0, 1], TOY)
+        selection = NativeSelection(
+            worker, caches, [["L"], ["other"]], [0, 1], TOY, pairs=([], [])
+        )
         spans = TOY.spans(rank, tp)
         assert [r.span for r in selection.rows] == spans
         assert all(r.state for r in selection.rows)
@@ -74,18 +76,26 @@ def test_native_state_rows_are_the_layouts_spans_or_refused():
         for gap in (6, 1, 64):
             worker, caches = _worker(tp, rank, gap=gap)
             with pytest.raises(ValueError, match="not the mamba2 layout's spans"):
-                NativeSelection(worker, caches, [["L"]], [0], TOY)
+                NativeSelection(
+            worker, caches, [["L"]], [0], TOY, pairs=([], [])
+        )
     # A transfer-only region (one the group holds no layer in) follows the same
     # rule: a correct two-region worker passes, the second shifted alone fails.
     worker, caches = _worker(2, 1, gaps=[0, 0])
-    NativeSelection(worker, caches, [["L"], ["other"]], [0, 1], TOY)
+    NativeSelection(
+            worker, caches, [["L"], ["other"]], [0, 1], TOY, pairs=([], [])
+        )
     worker, caches = _worker(2, 1, gaps=[0, 6])
     with pytest.raises(ValueError, match="region 1"):
-        NativeSelection(worker, caches, [["L"], ["other"]], [0, 1], TOY)
+        NativeSelection(
+            worker, caches, [["L"], ["other"]], [0, 1], TOY, pairs=([], [])
+        )
     # A native decomposition of other lengths (components cut elsewhere) is refused.
     worker, caches = _worker(2, 0, lengths=[24, 6, 6, 8])
     with pytest.raises(ValueError, match="not the mamba2 layout's spans"):
-        NativeSelection(worker, caches, [["L"]], [0], TOY)
+        NativeSelection(
+            worker, caches, [["L"]], [0], TOY, pairs=([], [])
+        )
 
 
 def test_a_state_group_of_the_wrong_layout_is_not_eligible():
@@ -282,7 +292,9 @@ def test_watched_reads_resolve_pieces_through_their_handles_and_completion():
     from vllm.v1.worker.simulated.kv_pattern import NativeChecker
 
     worker, caches = _worker(2, 1)
-    selection = NativeSelection(worker, caches, [["L"]], [0], TOY)
+    selection = NativeSelection(
+            worker, caches, [["L"]], [0], TOY, pairs=([], [])
+        )
     worker.block_size = 64
     worker.src_xfer_handles_by_block_size = {64: "local-h"}
     worker.dst_xfer_side_handles = {"remote-engine": {3: "remote-h"}}
@@ -327,11 +339,13 @@ def test_a_requests_coverage_reports_bytes_by_group_component_and_class():
     )
     rows = len(worker.src_blocks_data)
     # Every group's blocks in every state region, row by row (as NIXL selects them).
-    worker._compute_desc_ids = lambda lists, num_blocks, *a: np.array(
+    worker._compute_desc_ids = lambda lists, num_blocks, *a, **kw: np.array(
         [4 * r + b for r in range(rows) for blocks in lists for b in blocks],
         dtype=np.int64,
     )
-    selection = NativeSelection(worker, caches, [["L"], ["other"]], [0, 1], TOY)
+    selection = NativeSelection(
+            worker, caches, [["L"], ["other"]], [0, 1], TOY, pairs=([], [])
+        )
     checker = NativeChecker(selection, tp_rank=1, heads=((), ()))
     expected = SimpleNamespace(
         groups=[
@@ -386,11 +400,13 @@ def test_coverage_follows_the_requests_producer_among_several_engines():
         get_engine_info=lambda engine: SimpleNamespace(remote_tp_size=1),
     )
     rows = len(worker.src_blocks_data)
-    worker._compute_desc_ids = lambda lists, num_blocks, *a: np.array(
+    worker._compute_desc_ids = lambda lists, num_blocks, *a, **kw: np.array(
         [4 * r + b for r in range(rows) for blocks in lists for b in blocks],
         dtype=np.int64,
     )
-    selection = NativeSelection(worker, caches, [["L"], ["other"]], [0, 1], TOY)
+    selection = NativeSelection(
+            worker, caches, [["L"], ["other"]], [0, 1], TOY, pairs=([], [])
+        )
     checker = NativeChecker(selection, tp_rank=1, heads=((), ()))
     expected = SimpleNamespace(
         groups=[

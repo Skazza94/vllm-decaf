@@ -2958,25 +2958,25 @@ NEMOTRON_3_UNEQUAL = {
 
 
 @pytest.mark.parametrize(
-    "config, kwargs, transfer_only",
+    "config, kwargs",
     [
-        (NEMOTRON_3_UNEQUAL, {}, True),
-        (NEMOTRON_3, {}, False),
-        (QWEN3_5_MOE, {"language_model_only": True}, False),
-        (KIMI_K3, {}, False),
+        (NEMOTRON_3_UNEQUAL, {}),
+        (NEMOTRON_3, {}),
+        (QWEN3_5_MOE, {"language_model_only": True}),
+        (KIMI_K3, {}),
     ],
     ids=["nemotron-3-unequal", "nemotron-3", "qwen3.5", "kimi-k3"],
 )
 def test_nixl_checks_cover_a_hybrids_native_selection(
-    config, kwargs, transfer_only, tmp_path, monkeypatch, ds_conv_layout
+    config, kwargs, tmp_path, monkeypatch, ds_conv_layout
 ):
     """Over NIXL a hybrid's blocks move as the native worker selects them:
-    deduplicated regions (a slot of each group's layers), every region of a
-    group's kind for each of its blocks (one holding none of its layers
-    included: transfer-only), a state as its conv sub-projections then its
-    SSM state, not its page's padding. The filler and the checker cover
-    exactly that selection, in its order, and catch a changed conv or SSM
-    byte, an unmoved transfer-only span, a written or copied padding byte."""
+    deduplicated regions (a slot of each group's layers), each group's blocks
+    in the regions of its own layers only, a state as its conv
+    sub-projections then its SSM state, not its page's padding. The filler
+    and the checker cover exactly that selection, in its order, and catch a
+    changed conv or SSM byte, an unmoved span, a written or copied padding
+    byte."""
     from vllm import LLM, SamplingParams
     from vllm.distributed.kv_transfer import get_kv_transfer_group
     from vllm.v1.kv_cache_interface import MambaSpec
@@ -3051,8 +3051,9 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
             assert sum(row.state and row.region == region for row in s.rows) == 4
 
         # Each group's spans a block, from its own spec: attention its page in
-        # every region; a state, in every state region, contiguous conv
-        # spans then the SSM state, together its real page.
+        # each region of its layers; a state, in each state region of its
+        # layers, contiguous conv spans then the SSM state, together its real
+        # page.
         for index, group in enumerate(groups):
             spec = group.kv_cache_spec
             spans = [
@@ -3065,6 +3066,8 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
                 ssm_bytes = spec.real_page_size_bytes - conv_bytes
                 want = []
                 for region in state_regions:
+                    if region not in s.members[index]:
+                        continue
                     mine = [span for span in spans if span[0] == region]
                     assert [span[1] for span in mine[:3]] == [
                         0,
@@ -3075,15 +3078,14 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
                     want += mine[:3] + [(region, conv_bytes, ssm_bytes)]
                 assert spans == want
             else:
-                assert spans == [(r, 0, spec.page_size_bytes) for r in range(slots)]
-            # A region holds the group's layers or is transfer-only.
+                assert spans == [
+                    (r, 0, spec.page_size_bytes) for r in sorted(s.members[index])
+                ]
+            # A group moves in the regions of its own layers, and no other.
             assert len(s.members[index]) == len(group.layer_names)
-        has_transfer_only = any(
-            {s.rows[row].region for row, _, _ in s.select(index, [1])}
-            - s.members[index]
-            for index in range(len(groups))
-        )
-        assert has_transfer_only == transfer_only
+            assert {s.rows[row].region for row, _, _ in s.select(index, [1])} == (
+                s.members[index]
+            )
 
         # A request's ordered, paired descriptors: the native ids over the
         # native local descriptors, block by block, duplicates included.
@@ -3096,7 +3098,9 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
             lists[index] = blocks
             native = [
                 (int(rows[r][0] + (d - s.starts[r]) * rows[r][3]), int(rows[r][1]))
-                for d in worker._compute_desc_ids(lists, worker.num_blocks, None, 1)
+                for d in worker._compute_desc_ids(
+                    lists, worker.num_blocks, None, 1, pairs=s.pairs
+                )
                 for r in [int(np.searchsorted(s.starts, d, side="right") - 1)]
             ]
             ours = [
@@ -3141,7 +3145,9 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
             (`extra`: of other blocks besides, e.g. a state's scratch slot)."""
             checker.posted["cmpl-a-0"] = [
                 int(d)
-                for d in worker._compute_desc_ids(blocks, worker.num_blocks, None, 1)
+                for d in worker._compute_desc_ids(
+                    blocks, worker.num_blocks, None, 1, pairs=s.pairs
+                )
             ] + list(extra)
             posted_ids["ids"] = list(checker.posted["cmpl-a-0"])
 
@@ -3182,9 +3188,7 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
             assert g["layers"] == len(groups[index].layer_names)
             if isinstance(groups[index].kv_cache_spec, MambaSpec):
                 assert g["padding_bytes"] > 0
-        assert (sum(g["transfer_only_bytes"] for g in result["groups"]) > 0) == (
-            transfer_only
-        )
+        assert sum(g["transfer_only_bytes"] for g in result["groups"]) == 0
 
         state = next(
             i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)
@@ -3223,16 +3227,14 @@ def test_nixl_checks_cover_a_hybrids_native_selection(
                 worker.num_blocks,
                 None,
                 1,
+                pairs=s.pairs,
             )
         )
         stray = read(extra=[spare])
         assert stray["mismatched_bytes"] == 0 and not stray["posted_matches_checked"]
         assert not stray["ok"]
-        if transfer_only:
-            unmoved = read(
-                skip=lambda index, row: s.rows[row].region not in s.members[index]
-            )
-            assert not unmoved["ok"]
+        unmoved = read(skip=lambda index, row: row == s.select(index, [1])[0][0])
+        assert not unmoved["ok"]
         # Two reads pending into disjoint blocks of the same storages: the
         # second's initialization and a producer's fill of other blocks leave
         # the first's landed payload and its padding untouched.
@@ -3544,7 +3546,7 @@ def main():
         def post_process(ratio, block_ids_list, *args, **kw):
             zero(ratio, block_ids_list, *args, **kw)
             for group, ids, covered in block_ids_list:
-                whole, part = divmod(covered, ratio)
+                whole, part = divmod(covered.stop, ratio)
                 if not part:
                     continue
                 for name in worker.kv_cache_config.transfer_groups[group].layer_names:
@@ -4035,7 +4037,8 @@ def test_nixl_checks_cover_unequal_attention_groups(tmp_path, monkeypatch):
     assert isinstance(filler, NativeFiller)
     s = filler.selection
 
-    # A region a slot; each group's block in every one, a whole page.
+    # A region a slot; each group's block, a whole page, in the regions of
+    # its own layers.
     slots = max(len(group.layer_names) for group in groups)
     assert sorted(len(group.layer_names) for group in groups) == [1, 2, 2]
     assert worker.num_regions == slots
@@ -4045,10 +4048,11 @@ def test_nixl_checks_cover_unequal_attention_groups(tmp_path, monkeypatch):
             (s.rows[row].region, s.rows[row].offset, s.rows[row].view.shape[1])
             for row, _, _ in s.select(index, [1])
         ]
-        assert spans == [(region, 0, page) for region in range(slots)]
+        assert spans == [(region, 0, page) for region in sorted(s.members[index])]
         assert len(s.members[index]) == len(group.layer_names)
     short = next(i for i, group in enumerate(groups) if len(group.layer_names) < slots)
     (spare,) = set(range(slots)) - s.members[short]
+    assert spare not in {s.rows[row].region for row, _, _ in s.select(short, [1])}
 
     # A producer's blocks after a null head: each span's pattern is of its
     # place among the request's blocks, nulls counted.
@@ -4073,7 +4077,11 @@ def test_nixl_checks_cover_unequal_attention_groups(tmp_path, monkeypatch):
         checker.posted["cmpl-a-0"] = [
             int(d)
             for d in worker._compute_desc_ids(
-                [blocks[2:] for blocks in target], worker.num_blocks, None, 1
+                [blocks[2:] for blocks in target],
+                worker.num_blocks,
+                None,
+                1,
+                pairs=s.pairs,
             )
         ]
         for index in range(len(groups)):
@@ -4087,16 +4095,19 @@ def test_nixl_checks_cover_unequal_attention_groups(tmp_path, monkeypatch):
     result = read()
     assert result["ok"], result
     for index, g in enumerate(result["groups"]):
+        layers = len(groups[index].layer_names)
         assert (g["blocks"], g["descriptors"], g["bytes"]) == (
             2,
-            2 * slots,
-            2 * slots * page,
+            2 * layers,
+            2 * layers * page,
         )
-        assert g["layers"] == len(groups[index].layer_names)
-        # The slot of none of its layers: moved and checked, counted apart.
-        assert g["transfer_only_bytes"] == (2 * page if index == short else 0)
+        assert g["layers"] == layers
+        # The slot of none of its layers is not moved.
+        assert g["transfer_only_bytes"] == 0
     unmoved = read(
-        skip=lambda index, row: index == short and s.rows[row].region == spare
+        skip=lambda index, row: (
+            index == short and s.rows[row].region in s.members[short]
+        )
     )
     assert not unmoved["ok"]
     assert not read(shift=True)["ok"]
@@ -4191,9 +4202,9 @@ def test_nixl_peers_pair_a_hybrids_native_descriptors(config, kwargs, tmp_path):
         assert sum(g["descriptors"] for g in check["groups"]) == len(c["native"])
     assert check["bytes"] == sum(d[1] for d in c["native"])
     # Unequal attention groups: the slot holding none of the short group's
-    # layers is moved, checked and counted apart.
+    # layers is not moved for it.
     if config is MIMO_V2_FLASH_UNEQUAL:
-        assert sum(g["transfer_only_bytes"] for g in check["groups"]) > 0
+        assert sum(g["transfer_only_bytes"] for g in check["groups"]) == 0
 
 
 @pytest.mark.parametrize("dirty", [False, True], ids=["zeroed", "dirty"])
@@ -4386,8 +4397,9 @@ def test_nixl_peers_check_a_hybrids_decode_written_state_hit_with_mtp(
     (40 tokens) is pulled, its state keyed by its endpoint whichever slot NIXL
     writes, and decode generates 48 tokens, every state checkpoint kept
     (retention None). B, A's prompt, its 48 generated tokens and 10 more, runs
-    on decode alone: its native hit (five matched blocks, the last dropped
-    for MTP) reaches the state at 64 tokens, one decode computed after A's
+    on decode alone: its native hit (five matched blocks, none dropped for
+    MTP: the connector's lookahead block hashes make the trailing block
+    stable) reaches the state at 80 tokens, one decode computed after A's
     handoff, and compares equal with drafts accepted or rejected; with that
     state's byte flipped after A, B's hit fails exactly there."""
     import socket
@@ -4417,7 +4429,7 @@ def test_nixl_peers_check_a_hybrids_decode_written_state_hit_with_mtp(
     consumer_kwargs = {
         **spec,
         "local_prompts": [1],
-        **({"corrupt_state_block": 3} if corrupt else {}),
+        **({"corrupt_state_block": 4} if corrupt else {}),
     }
     script = tmp_path / "peer.py"
     script.write_text(NIXL_PREFIX_PEER)
@@ -4505,10 +4517,11 @@ def test_nixl_peers_check_a_hybrids_decode_written_state_hit_with_mtp(
     assert len(pulls) == 1 and pulls[0]["ok"], pulls
     (hit,) = [c for c in c_checks if c.get("kind") == "hit"]
     by_group = {g["group"]: g for g in hit["groups"]}
-    # The hit reaches the state at 64 tokens (logical block 3), past A's
-    # handoff (39 tokens): a state decode computed and wrote.
+    # A computed 87 of its 88 tokens: five full blocks, so the hit reaches the
+    # state at 80 tokens (logical block 4), past A's handoff (39 tokens): a
+    # state decode computed and wrote.
     for group in states:
-        assert by_group[group]["logical_blocks"][-1] == 3, hit
+        assert by_group[group]["logical_blocks"][-1] == 4, hit
     if corrupt:
         assert not hit["ok"], hit
         assert {m[2] for m in hit["mismatched_blocks"]} == {result["corrupted"]}
@@ -6663,7 +6676,9 @@ def test_nixl_two_attention_groups_are_seeded_by_their_global_heads(
     def read(corrupt=False):
         checker.expect("cmpl-b-0", "cmpl-a-0", [0] * len(groups), target)
         ids = [
-            int(d) for d in worker._compute_desc_ids(target, worker.num_blocks, None, 1)
+            int(d) for d in worker._compute_desc_ids(
+                target, worker.num_blocks, None, 1, pairs=s.pairs
+            )
         ]
         checker.posted["cmpl-a-0"] = ids
         checker.reads["cmpl-a-0"] = [ids]
@@ -7727,9 +7742,9 @@ def test_published_kimi_k3_cold_detects_corruption_after_native_read(
 @pytest.mark.parametrize(
     "ptp, dtp, pp, dp, n, descriptors, moved, zero, padding",
     [
-        (1, 8, 5760, 768, 1008, (372,), 98_638_848, 0, 4_875_264),
-        (8, 1, 768, 5760, 1008, (372,) + (276,) * 7,
-         491_839_488, 116_785_152, 8_478_720),
+        (1, 8, 5760, 768, 1008, (348,), 88_022_016, 10_616_832, 4_875_264),
+        (8, 1, 768, 5760, 1008, (348,) + (276,) * 7,
+         481_222_656, 127_401_984, 8_478_720),
     ],
     ids=["eight-consumers", "eight-sources"],
 )
@@ -7763,6 +7778,17 @@ def test_published_kimi_k3_cold_common_unit_native_read(
                     "factor": {"physical_blocks_per_logical_kv_block": 2},
                     "stride": {"block_strides": [n + 1 for n in meta.block_strides]},
                     "members": {"region_group_ids": [0] * 24},
+                    "layers": {
+                        "region_members": [
+                            list(m) for m in reversed(meta.region_members)
+                        ]
+                    },
+                    "layer groups": {
+                        "layer_group_ids": {
+                            name: group + 1
+                            for name, group in meta.layer_group_ids.items()
+                        }
+                    },
                     "ssm": {"ssm_sizes": (1, 1)},
                 }
                 invalid = [(name, replace(meta, **fields), rank)
@@ -7798,13 +7824,15 @@ def test_published_kimi_k3_cold_common_unit_native_read(
                             values.setdefault(place, selection.rows[i].view[block])
                         if connector.world_size == 8:
                             # H=1007: token 255 in the second D page is in
-                            # its partially filled row; token 384 is in the
-                            # next entirely patterned row.
+                            # its partially filled row, the last one NIXL
+                            # copies (it pairs up to the sub-block holding
+                            # the last token, 1,152 in all); token 384 is in
+                            # the next row, zeroed.
                             cases = [("partial-tail", values[1], 255 * 1152),
-                                     ("whole-tail", values[1], 384 * 1152)]
+                                     ("zero", values[1], 384 * 1152)]
                         else:
-                            # H=1007: eight-rank P supplied 1,536 tokens.
-                            cases = [("zero", values[0], 1536 * 1152)]
+                            # H=1007: eight-rank P supplied 1,152 tokens.
+                            cases = [("zero", values[0], 1152 * 1152)]
                     assert cases
                     prepared = checker.prepared
                     take = prepared.take
@@ -7865,10 +7893,6 @@ def test_published_kimi_k3_cold_common_unit_native_read(
         assert [len(audit["pairs_by_rank"][str(r)]) for r in ranks] == list(descriptors)
         assert sum(g["padding_bytes"] for g in check["groups"]) == padding
         assert sum(g["zeroed_bytes"] for g in check["groups"]) == zero
-        if ptp == 1:
-            assert sum(g["moved_attention_padding_bytes"] for g in check["groups"]) == (
-                10_616_832
-            )
 
         controls = json.loads(
             (tmp_path / f"consumer.json.controls.tp{rank}").read_text()
@@ -7877,5 +7901,5 @@ def test_published_kimi_k3_cold_common_unit_native_read(
         assert all(len(errors) == 5 for errors in controls["header"].values())
         if rank == 0:
             assert set(controls["bytes"]) == (
-                {"partial-tail", "whole-tail"} if ptp == 1 else {"zero"}
+                {"partial-tail", "zero"} if ptp == 1 else {"zero"}
             )

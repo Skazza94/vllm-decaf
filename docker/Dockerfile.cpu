@@ -528,8 +528,9 @@ FROM base-arch AS kv-transfer-build
 
 # v0.3.14-rc1: the first Mooncake with TENT and its hp_tcp transport.
 ARG MOONCAKE_REVISION=cfacafca9594788e53558ddf74d7a2e8ad4f2140
-# v1.5.0: the NIXL this vLLM requires (strided descriptors).
-ARG NIXL_REVISION=1683cf3b7f3d11674c03c5e861cea22339876c96
+# v1.5.2: the NIXL this vLLM pins (requirements/kv_connectors.txt; strided
+# descriptors since 1.5.0).
+ARG NIXL_REVISION=e72c52c78478d2e1ca9e9c57b872114e113ad767
 ARG max_jobs=32
 
 # g++-13 (from the toolchain PPA set up in base-common) builds both projects;
@@ -613,7 +614,7 @@ COPY --from=libfabric-build /opt/libfabric /opt/libfabric
 COPY --from=kv-transfer-build /opt/nixl-python /opt/nixl-python
 COPY --from=kv-transfer-build /opt/mooncake-python /opt/mooncake-python
 ARG MOONCAKE_REVISION=cfacafca9594788e53558ddf74d7a2e8ad4f2140
-ARG NIXL_REVISION=1683cf3b7f3d11674c03c5e861cea22339876c96
+ARG NIXL_REVISION=e72c52c78478d2e1ca9e9c57b872114e113ad767
 ARG UCX_VERSION=1.22.0
 ARG UCX_SHA256=258941cddd14ca60d38c0d31b9b09ec1052c901086841011a498da8b55a3cb24
 ARG LIBFABRIC_VERSION=2.7.0
@@ -632,7 +633,7 @@ RUN cp -a /opt/nixl-python/. /opt/mooncake-python/. "$(python -c 'import site; p
     rm -rf /opt/nixl-python /opt/mooncake-python && \
     python -c "from mooncake.engine import TransferEngine; TransferEngine()" && \
     ! ldd /opt/libfabric/lib/*.so* /opt/ucx/lib/*.so* /opt/ucx/lib/ucx/*.so* /opt/nixl/lib/*.so* /opt/nixl/lib/plugins/*.so /opt/mooncake/lib/*.so* | grep "not found" && \
-    python -c "from nixl._api import nixl_agent; import importlib.metadata as m; print('nixl', m.version('nixl'))" && \
+    python -c "from nixl._api import nixl_agent; import importlib.metadata as m; assert m.version('nixl') == '1.5.2', m.version('nixl'); print('nixl', m.version('nixl'))" && \
     ls /opt/nixl/lib/plugins | grep -q Mooncake && \
     /opt/ucx/bin/ucx_info -v && \
     test ! -s /opt/libfabric/etc/libfabric.conf && \

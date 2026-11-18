@@ -200,7 +200,7 @@ def test_geometry_does_not_change_fixed_work_aisimulate():
         num_spec_tokens=0,
         is_prefill=True,
     )
-    step = StepDescriptor(1, (one,), 128, 0, 1, 0, 0, 128)
+    step = StepDescriptor(1, (one,), 128, 0, 1, 0, 128)
     assert providers[0].config == providers[1].config
     assert providers[0].estimate(step) == providers[1].estimate(step)
 

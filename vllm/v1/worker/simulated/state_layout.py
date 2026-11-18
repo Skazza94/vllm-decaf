@@ -470,9 +470,10 @@ def attention_wire_prefix(
     offset: int,
     length: int,
     ratio: int,
-    covered: int,
+    covered: range,
 ) -> tuple[int, int]:
-    """Collapse complete row ownership to its received, chunk-major prefix."""
+    """Collapse complete row ownership to its received span of the page: the
+    `covered` of its `ratio` chunk-major sub-blocks."""
     end = offset
     for start, size in sorted(ranges):
         if start != end or size <= 0:
@@ -480,7 +481,10 @@ def attention_wire_prefix(
         end += size
     else:
         if end == offset + length:
-            return offset, length * covered // ratio
+            return (
+                offset + length * covered.start // ratio,
+                length * len(covered) // ratio,
+            )
     supplied = sum(size for _, size in ranges)
     raise ValueError(
         f"region {region}: a {supplied}-byte share of a {length}-byte "

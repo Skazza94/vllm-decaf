@@ -51,7 +51,6 @@ from vllm.v1.worker.simulated.kv_pattern import (
     group_pattern,
     head_map,
     layer_total_heads,
-    native_group_heads,
     native_state_heads,
     state_group_indices,
 )
@@ -74,6 +73,7 @@ from vllm.v1.worker.simulated.kv_transfer import (
     refuse_foreign_state_geometry,
     validate_state_peer,
     registered_block_bytes,
+    PreemptedRequests,
     scheduled_kv_events,
     validate_dcp_peer,
 )
@@ -159,6 +159,7 @@ class SimulatedModelRunner(GPUModelRunner):
         # Each request's blocks by KV cache group (several groups or a
         # sliding window), for those events.
         self._kv_allocations: GroupAllocations | None = None
+        self._preempted = PreemptedRequests()
         self._kv_events_scheduled_at = 0.0
         self._kv_events_step: int | None = None
         # Real KV transfers in flight on this consumer: request -> its blocks.
@@ -679,7 +680,9 @@ class SimulatedModelRunner(GPUModelRunner):
         if self._real_kv_transfer and self.step_log is not None:
             self._log_new_threads()
             self._kv_events = scheduled_kv_events(
-                scheduler_output, self._kv_allocations
+                scheduler_output,
+                self._kv_allocations,
+                resumed=self._preempted.step(scheduler_output),
             )
             self._kv_events_scheduled_at = t_entry
             # The step record this step's events belong to (a poll has none).
@@ -815,7 +818,6 @@ class SimulatedModelRunner(GPUModelRunner):
             )
         output = ModelRunnerOutput(
             req_ids=input_batch.req_ids,
-            req_id_to_index=row,
             sampled_token_ids=[
                 tokens[:n]
                 for tokens, n in zip(sampled.tolist(), num_sampled_np.tolist())

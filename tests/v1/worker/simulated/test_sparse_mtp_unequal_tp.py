@@ -64,7 +64,7 @@ def _inspect_profile(worker):
     provider = runner.timing_provider
     req = SimRequestStep("qualification", 2, 145, 145, 0, 1, False)
     step = StepDescriptor(
-        0, (req,), 0, 2, 0, 1, 0, 147, parallel_summary(worker.vllm_config)
+        0, (req,), 0, 2, 0, 1, 147, parallel_summary(worker.vllm_config)
     )
     model = worker.vllm_config.model_config
     draft = worker.vllm_config.speculative_config.draft_model_config

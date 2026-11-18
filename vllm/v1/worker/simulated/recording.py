@@ -28,7 +28,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector, KVConnector
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.simulated.timing import (
     StepCost,
@@ -88,7 +88,7 @@ def _num_accepted(
         return None
     return accepted_in_step_order(
         descriptor,
-        {r: max(len(sampled[i]) - 1, 0) for r, i in output.req_id_to_index.items()},
+        {r: max(len(sampled[i]) - 1, 0) for i, r in enumerate(output.req_ids)},
     )
 
 
@@ -119,7 +119,7 @@ class _TimedKVConnector(ActiveKVConnector):
         self.recorder._posted(time.perf_counter() - t)
 
 
-class _RecordingModelRunner(GPUModelRunnerV2):
+class _RecordingModelRunner(GPUModelRunner):
     def __init__(
         self, vllm_config: VllmConfig, device: torch.device, recorder: "RecordingWorker"
     ):
@@ -163,7 +163,7 @@ class RecordingWorker(Worker):
             logger.info("Recording per-step timing to %s", log_path)
 
     def _make_model_runner(self):  # type: ignore[override]
-        if self.use_v2_model_runner and not self.vllm_config.is_mm_encoder_only:
+        if not self.vllm_config.is_mm_encoder_only:
             return _RecordingModelRunner(self.vllm_config, self.device, self)
         return super()._make_model_runner()
 

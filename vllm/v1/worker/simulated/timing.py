@@ -86,7 +86,6 @@ class StepDescriptor:
     num_decode_tokens: int
     num_prefill_reqs: int
     num_decode_reqs: int
-    num_common_prefix_blocks: int
     num_kv_tokens: int
     """Sum over scheduled requests of KV length after this step."""
     parallel: ParallelSummary = field(default_factory=ParallelSummary)
@@ -152,9 +151,12 @@ def build_step_descriptor(
     computed: dict[str, int] = {}
     cached_at_admission: dict[str, int] = {}
     for req in scheduler_output.scheduled_new_reqs:
+        # A request the scheduler preempted returns as a new one: its prompt
+        # length is already known, and its hit now is not its first admission's.
+        if req.req_id not in prompt_lens:
+            cached_at_admission[req.req_id] = req.num_computed_tokens
         prompt_lens[req.req_id] = req.prompt_len
         computed[req.req_id] = req.num_computed_tokens
-        cached_at_admission[req.req_id] = req.num_computed_tokens
     cached = scheduler_output.scheduled_cached_reqs
     for req_id, num_computed in zip(cached.req_ids, cached.num_computed_tokens):
         computed[req_id] = num_computed
@@ -186,7 +188,6 @@ def build_step_descriptor(
             num_decode_tokens += scheduled
             num_decode_reqs += 1
         num_kv_tokens += num_computed + scheduled
-    common = scheduler_output.num_common_prefix_blocks
     return StepDescriptor(
         step_index=step_index,
         requests=tuple(requests),
@@ -194,7 +195,6 @@ def build_step_descriptor(
         num_decode_tokens=num_decode_tokens,
         num_prefill_reqs=num_prefill_reqs,
         num_decode_reqs=num_decode_reqs,
-        num_common_prefix_blocks=max(common) if common else 0,
         num_kv_tokens=num_kv_tokens,
         parallel=parallel,
     )
@@ -203,7 +203,7 @@ def build_step_descriptor(
 def empty_step_descriptor(step_index: int, parallel: ParallelSummary) -> StepDescriptor:
     """A rank's share of a lockstep step in which it has no requests (an idle
     data-parallel rank's dummy batch)."""
-    return StepDescriptor(step_index, (), 0, 0, 0, 0, 0, 0, parallel)
+    return StepDescriptor(step_index, (), 0, 0, 0, 0, 0, parallel)
 
 
 def merge_dp_descriptors(descriptors: list[StepDescriptor]) -> StepDescriptor:
@@ -220,7 +220,6 @@ def merge_dp_descriptors(descriptors: list[StepDescriptor]) -> StepDescriptor:
         num_decode_tokens=sum(d.num_decode_tokens for d in descriptors),
         num_prefill_reqs=sum(d.num_prefill_reqs for d in descriptors),
         num_decode_reqs=sum(d.num_decode_reqs for d in descriptors),
-        num_common_prefix_blocks=max(d.num_common_prefix_blocks for d in descriptors),
         num_kv_tokens=sum(d.num_kv_tokens for d in descriptors),
         parallel=own.parallel,
     )

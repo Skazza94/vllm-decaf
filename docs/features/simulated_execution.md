@@ -401,8 +401,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   last blocks only, and says where they start among the request's blocks
   (NIXL: `local_first_block_indices`). Over NIXL a model of several groups
   is checked through NIXL's own selection: a group's block in each layer
-  slot NIXL selects for it, a slot holding none of a shorter group's layers
-  moved and checked too (transfer-only, reported apart); and hybrid
+  slot NIXL selects for it, the slots of its own layers only (NIXL pairs
+  regions by layer); and hybrid
   models of Qwen's gated delta-net (Qwen3.5, served
   as its language model), of Kimi-K3's delta attention (KDA beside MLA,
   served as its language model; its SiTU experts the CPU platform builds
@@ -420,8 +420,8 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
   `MooncakeConnector` moves the padded state pages. NIXL needs the DS
   conv-state layout (`VLLM_SSM_CONV_STATE_LAYOUT=DS`, set before startup)
   and moves each state as it selects it: the conv sub-projections and the
-  SSM state of every state region, a region holding none of a group's
-  layers included (transfer-only), the page's padding not; the pattern
+  SSM state of each state region of the group's layers, the page's padding
+  not; the pattern
   checks follow that selection. Each
   decoder layer holds one recurrent mixer at most, without attention beside
   it. Not other recurrent layers (Mamba, Kimi-Linear's or OLMo's
@@ -499,10 +499,13 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           block size, on both instances): attention content is keyed in
           pieces of that many tokens and a state by its endpoint, so a
           decode block holds the same bytes whether pulled, computed or
-          hit. The pull planning is the pinned NIXL's (decode blocks split
-          into producer-sized sub-blocks, then the producer's list trimmed
-          from its end); where that pairs a sub-block with another producer
-          block than its tokens', its check fails.
+          hit. NIXL pairs the two sides' sub-blocks from the handoff's last
+          token backwards (decode blocks split into producer-sized
+          sub-blocks, each side's past that token dropped; it needs the
+          producer's `remote_num_tokens`, which a proxy forwards with the
+          rest of its `kv_transfer_params`) and zeroes the part of a decode
+          block it did not write. The byte check derives that part from the
+          handoff and the producer's retained blocks, not from NIXL's lists.
           Without a kernel geometry declaration each attention block stays
           whole. With a declaration such as `FLASHINFER`, NIXL uses the
           registered kernel block sizes and the physical-to-logical ratios.
@@ -525,10 +528,11 @@ needs an explicit `kv_cache_memory_bytes`. Supported layouts:
           AISimulate's B200 target, whole 768-token prefill and 1,536-token decode
           pages, align-mode KDA, producer fill, decode byte checks, and
           `kv_pattern_grain=768` on both sides. Before a READ, decode checks
-          each actual producer's advertised scope and registration. This
-          keeps native NIXL pairing: with a decode prefix hit and an
-          incomplete final page, it can put the producer's slabs in the
-          wrong positions, which the byte check reports;
+          each actual producer's advertised scope, registration, and the
+          layers of its regions and their cache groups. This keeps native
+          NIXL pairing, by token from the handoff's last token, which the
+          byte check verifies with a decode prefix hit and an incomplete
+          final page;
         * the reverse Kimi-K3 pair (prefill TP 4 to decode TP 8), only
           for the published text-only MXFP4 model with BF16 KV, FP32
           recurrent state, CPU NIXL pull, AISimulate's B200 target,

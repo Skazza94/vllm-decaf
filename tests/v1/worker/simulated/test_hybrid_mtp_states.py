@@ -258,8 +258,9 @@ def test_a_hybrids_mtp_states_re_shard_at_unequal_tp(
         # Each group's regions: its layers', vLLM's padding layer beside the
         # one-layer group's.
         assert [g["bytes"] for g in by_pattern["state-v1"]] == [
-            2 * (conv + SSM_BYTES // d_tp)
-        ] * 2
+            g["layers"] * (conv + SSM_BYTES // d_tp) for g in by_pattern["state-v1"]
+        ]
+        assert sorted(g["layers"] for g in by_pattern["state-v1"]) == [1, 2]
         (pulled,) = by_pattern["head-v1"]
         assert pulled["bytes"] == 3 * 2 * HEAD_PAGE // d_tp
 
@@ -291,17 +292,20 @@ def test_a_flipped_widened_state_byte_fails_its_reader_only(
 
 @pytest.mark.parametrize("p_tp,d_tp", [(1, 2), (2, 1)])
 def test_a_hybrids_mtp_prefix_hits_at_unequal_tp(tmp_path, ds_conv_layout, p_tp, d_tp):
-    """Prefix caching on both, retention None, 16-token blocks: B shares 64
-    of A's 70 tokens. Prefill's hit of B covers its state at logical block
-    2 and three attention blocks (MTP drops the fourth); decode's covers the
-    three attention blocks, its states pulled (#6's rules); every check ok."""
+    """Prefix caching on both, retention None, 16-token blocks: B shares 65
+    of A's 70 tokens, the 64 of four blocks and the token after them: the
+    connector's lookahead block hashes make a block's hash cover the next
+    token, so a prefix ending on a block boundary does not hit its last
+    block. Prefill's hit of B covers its state at logical block 3 and four
+    attention blocks; decode's covers the four attention blocks, its states
+    pulled (#6's rules); every check ok."""
     a = [(7 * i) % 120 + 1 for i in range(70)]
     p, c = run_tiny_mtp_peers(
         tmp_path,
         p_tp,
         d_tp,
         1,
-        prompts=[a, a[:64] + [3] * 10],
+        prompts=[a, a[:65] + [3] * 9],
         enable_prefix_caching=True,
         prefix_cache_retention_interval=None,
         max_model_len=512,
@@ -311,27 +315,27 @@ def test_a_hybrids_mtp_prefix_hits_at_unequal_tp(tmp_path, ds_conv_layout, p_tp,
         (hit,) = checks(p["logs"][rank], "hit")
         assert hit["ok"], hit
         assert [(g["blocks"], g["logical_blocks"]) for g in hit["groups"]] == [
-            (1, [2]),
-            (1, [2]),
-            (3, [0, 1, 2]),
+            (1, [3]),
+            (1, [3]),
+            (4, [0, 1, 2, 3]),
         ]
     for rank in range(d_tp):
         pulls = checks(c["logs"][rank])
         assert len(pulls) == 2 and all(x["ok"] for x in pulls), pulls
         (hit,) = checks(c["logs"][rank], "hit")
         assert hit["ok"] and [g["logical_blocks"] for g in hit["groups"]] == [
-            [0, 1, 2]
+            [0, 1, 2, 3]
         ], hit
 
 
 def test_a_grained_hybrid_mtp_pull_at_unequal_tp_and_blocks(tmp_path, ds_conv_layout):
     """`kv_pattern_grain` with MTP (#24's option): prefill TP1 at 16-token
     blocks, decode TP2 at 32 reading two producer blocks a block. B shares
-    64 of A's tokens on prefill, which hits them; decode pulls B alone, cold,
+    65 of A's tokens on prefill, which hits 64 of them; decode pulls B alone, cold,
     and every rank's check passes with the content keyed at 16 tokens."""
     a = [(7 * i) % 120 + 1 for i in range(70)]
     common = {
-        "prompts": [a, a[:64] + [3] * 10],
+        "prompts": [a, a[:65] + [3] * 9],
         "enable_prefix_caching": True,
         "prefix_cache_retention_interval": None,
         "max_model_len": 512,
@@ -349,7 +353,7 @@ def test_a_grained_hybrid_mtp_pull_at_unequal_tp_and_blocks(tmp_path, ds_conv_la
     )
     assert c["tokens"] == [2], c["log"][-4000:]
     (hit,) = checks(p["logs"][0], "hit")
-    assert hit["ok"] and hit["groups"][-1]["logical_blocks"] == [0, 1, 2], hit
+    assert hit["ok"] and hit["groups"][-1]["logical_blocks"] == [0, 1, 2, 3], hit
     for rank in range(2):
         assert checks(c["logs"][rank], "hit") == []
         (pull,) = checks(c["logs"][rank])
@@ -478,10 +482,10 @@ def test_a_mamba2_hybrids_mtp_prefix_hits_at_unequal_tp(
     tmp_path, ds_conv_layout, p_tp, d_tp
 ):
     """Mamba2 blocks, with prefix caching: Nemotron-3's tiny states key at
-    48-token blocks, and a prefix must reach past MTP's drop. B shares 150
-    of A's 170 tokens; both directions hit 3 attention and 3 state blocks,
-    minus the last (MTP's), and every check passes: the pulls and the hit
-    among decode's, one hit of prefill's."""
+    48-token blocks, and a prefix must reach past the lookahead hash's token.
+    B shares 150 of A's 170 tokens; both directions hit 3 attention blocks
+    and the state at the third, and every check passes: the pulls and the
+    hit among decode's, one hit of prefill's."""
     a = [(7 * i) % 120 + 1 for i in range(170)]
     p, c = run_tiny_mtp_peers(
         tmp_path,
@@ -498,26 +502,26 @@ def test_a_mamba2_hybrids_mtp_prefix_hits_at_unequal_tp(
     for rank in range(p_tp):
         (hit,) = checks(p["logs"][rank], "hit")
         assert hit["ok"], hit
-        # The one state block B's shared prefix reaches (its 150 short
-        # tokens of 48 x 3, MTP dropping the last), both Mamba2 layers; and
-        # two of the three attention blocks, both attention layers.
-        want = (10240, 24576) if p_tp == 1 else (5120, 12288)
+        # The one state block B's shared prefix reaches (its 150 tokens
+        # cover 48 x 3 and the token after), both Mamba2 layers; and the
+        # three attention blocks, both attention layers.
+        want = (10240, 36864) if p_tp == 1 else (5120, 18432)
         assert [g["bytes"] for g in hit["groups"]] == list(want), hit
         assert [(g["blocks"], g["logical_blocks"]) for g in hit["groups"]] == [
-            (1, [1]),
-            (2, [0, 1]),
+            (1, [2]),
+            (3, [0, 1, 2]),
         ]
     for rank in range(d_tp):
         pulls = checks(c["logs"][rank])
         assert len(pulls) == 2 and all(x["ok"] for x in pulls), pulls
         (hit,) = checks(c["logs"][rank], "hit")
         assert hit["ok"], hit
-        # Decode's hit covers what its pulls left: the attention group's two
-        # blocks below MTP's dropped third, both layers; its state groups
+        # Decode's hit covers what its pulls left: the attention group's
+        # three blocks, both layers; its state groups
         # the pulls filled have no hit of decode's own (#6's rule).
-        assert 2 * 2 * NEMOTRON_HEAD_PAGE // d_tp == hit["bytes"], hit
+        assert 3 * 2 * NEMOTRON_HEAD_PAGE // d_tp == hit["bytes"], hit
         assert [(g["blocks"], g["logical_blocks"]) for g in hit["groups"]] == [
-            (2, [0, 1]),
+            (3, [0, 1, 2]),
         ]
 
 
@@ -584,10 +588,11 @@ def test_a_mamba2_hybrids_mtp_pairs_unequal_tp_its_kda_and_replayssm_do_not(
     # has no draft the connector knows), and the pairing gate's own KDA
     # line keeps the rule for the layout reached behind it.
     k3 = write_model_dir(tmp_path_factory, "tiny-kimi-k3-mtp-scope", KIMI_K3_8_HEADS)
-    # Kimi-Linear has no native MTP drafter, so the configuration itself is
-    # unsupported; the pairing gate's own KDA line keeps the rule for the
-    # layout reached behind such a configuration.
-    with pytest.raises(NotImplementedError, match="speculative method"):
+    # vLLM builds Kimi-Linear a draft of its own architecture, not a native
+    # MTP module, so the simulated configuration refuses it; the pairing
+    # gate's own KDA line keeps the rule for the layout reached behind such
+    # a configuration.
+    with pytest.raises(ValueError, match="native single-module MTP.*kimi_linear"):
         engine_config(str(k3), dtype="bfloat16", speculative_config=mtp)
     config = engine_config(str(k3), dtype="bfloat16", tensor_parallel_size=8)
     assert sl.layout_for(config).family == "kda"
@@ -631,11 +636,12 @@ def test_nixl_peers_check_a_mamba2_hybrids_decode_written_state_hit_with_mtp(
     pulled, its state keyed by its endpoint whichever slot NIXL writes, and
     decode generates 96 tokens, every state checkpoint kept (retention
     None). B, A's prompt, decode's 96 generated tokens and 10 more, runs on
-    decode alone: its native hit (four matched blocks, the last dropped for
-    MTP) reaches the state at 144 tokens, two blocks decode's own steps
-    wrote past A's handoff, and compares equal with drafts accepted or
-    rejected; with that state's block (logical 2) flipped after A, B's hit
-    fails exactly there."""
+    decode alone: its native hit (four matched blocks, none dropped for MTP:
+    the connector's lookahead block hashes make the trailing block stable)
+    reaches the state at 192 tokens, two blocks decode's own steps wrote
+    past A's handoff, and compares equal with drafts accepted or rejected;
+    with that state's block (logical 3) flipped after A, B's hit fails
+    exactly there."""
     from tests.v1.worker.simulated.test_real_kv_transfer import (
         NIXL_PREFIX_PEER,
         write_model_dir,
@@ -655,7 +661,7 @@ def test_nixl_peers_check_a_mamba2_hybrids_decode_written_state_hit_with_mtp(
     consumer_kwargs = {
         **spec,
         "local_prompts": [1],
-        **({"corrupt_state_block": 2} if corrupt else {}),
+        **({"corrupt_state_block": 3} if corrupt else {}),
     }
     script = tmp_path / "peer.py"
     script.write_text(NIXL_PREFIX_PEER)
@@ -742,9 +748,10 @@ def test_nixl_peers_check_a_mamba2_hybrids_decode_written_state_hit_with_mtp(
     (hit,) = [c for c in c_checks if c.get("kind") == "hit"]
     by_group = {g["group"]: g for g in hit["groups"]}
     # The hit reaches a state block decode's own step wrote past A's
-    # handoff (A's 100 tokens close block 1: 48 x 2), and covers it whole.
+    # handoff (A's 100 tokens close block 1: 48 x 2): A computed 195 of its
+    # 196 tokens, four full blocks, so the state at 192 (block 3).
     for group in states:
-        assert by_group[group]["logical_blocks"][-1] == 2, hit
+        assert by_group[group]["logical_blocks"][-1] == 3, hit
     if corrupt:
         assert not hit["ok"], hit
         assert {m[2] for m in hit["mismatched_blocks"]} == {result["corrupted"]}

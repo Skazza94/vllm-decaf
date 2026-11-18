@@ -30,7 +30,6 @@ def sim_step(index: int, *reqs: SimRequestStep) -> StepDescriptor:
         num_decode_tokens=sum(r.num_scheduled_tokens for r in decode),
         num_prefill_reqs=len(prefill),
         num_decode_reqs=len(decode),
-        num_common_prefix_blocks=0,
         num_kv_tokens=sum(r.num_computed_tokens + r.num_scheduled_tokens for r in reqs),
     )
 

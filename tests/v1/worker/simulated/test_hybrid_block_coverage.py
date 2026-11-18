@@ -82,14 +82,25 @@ def test_head_ownership_and_native_conversion_keep_each_sub_block(heads, ratio):
     }
     pieces = sl.expected_pieces([row], [7], 0, 4 // len(heads), 1, layout, 4)
     ranges = [(off, length) for _, _, off, length in pieces[0]]
-    for covered in range(ratio + 1):
+    # Every span of sub-blocks a pull can cover: its head, its tail, or both
+    # clipped (the producer's retained blocks start inside the block, the
+    # handoff ends inside it).
+    spans = [
+        range(first, last)
+        for first in range(ratio + 1)
+        for last in range(first, ratio + 1)
+    ]
+    for covered in spans:
         offset, length = sl.attention_wire_prefix(
             0, list(reversed(ranges)), 0, size, ratio, covered
         )
-        assert (offset, length) == (0, covered * size // ratio)
+        assert (offset, length) == (
+            covered.start * size // ratio,
+            len(covered) * size // ratio,
+        )
         chunks = [
             row_pattern("request", "layer", 3 * ratio + k, size // ratio, heads=heads)
-            if k < covered
+            if k in covered
             else torch.zeros(size // ratio, dtype=torch.uint8)
             for k in range(ratio)
         ]
@@ -105,7 +116,7 @@ def test_head_ownership_and_native_conversion_keep_each_sub_block(heads, ratio):
         )
         assert torch.equal(cache.flatten(), expected)
         records = [sl.ReadRecord("r", 0, 1, [(0, 7, offset, length)], True)]
-        wanted = {0: [(0, 7, 0, length)]} if length else {}
+        wanted = {0: [(0, 7, offset, length)]} if length else {}
         if not length:
             records = []
         assert sl.coverage_problems(wanted, records) == []
@@ -125,7 +136,7 @@ def test_head_ownership_and_native_conversion_keep_each_sub_block(heads, ratio):
 )
 def test_wire_prefix_never_promotes_a_partial_or_duplicate_owner(ranges):
     with pytest.raises(ValueError, match="share of a 64-byte page"):
-        sl.attention_wire_prefix(0, ranges, 0, 64, 2, 1)
+        sl.attention_wire_prefix(0, ranges, 0, 64, 2, range(1))
 
 
 @pytest.mark.parametrize("fault", ["missing", "duplicate", "shift", "owner", "pending"])
@@ -194,7 +205,7 @@ def checker_controls(worker):
                             0,
                             view.numel(),
                             heads=heads,
-                            sub_blocks=(2, 1),
+                            sub_blocks=(2, range(1)),
                         )
                     )
                     pieces.append(

@@ -183,7 +183,6 @@ def test_build_step_descriptor_from_scheduler_output():
     ]
     so.num_scheduled_tokens = {"a": 100, "b": 8}
     so.total_num_scheduled_tokens = 108
-    so.num_common_prefix_blocks = [0]
     d0 = build_step_descriptor(so, prompt_lens, 0, parallel)
     assert [r.req_id for r in d0.requests] == ["a", "b"]
     assert d0.num_prefill_tokens == 108 and d0.num_prefill_reqs == 2
@@ -197,9 +196,7 @@ def test_build_step_descriptor_from_scheduler_output():
     so1 = SchedulerOutput.make_empty()
     so1.scheduled_cached_reqs = CachedRequestData(
         req_ids=["a", "b"],
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={},
         new_block_ids=[None, None],
         num_computed_tokens=[196, 8],
         num_output_tokens=[0, 1],
@@ -218,9 +215,7 @@ def test_build_step_descriptor_from_scheduler_output():
     so2.finished_req_ids = {"b"}
     so2.scheduled_cached_reqs = CachedRequestData(
         req_ids=["a"],
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={},
         new_block_ids=[None],
         num_computed_tokens=[300],
         num_output_tokens=[1],
@@ -230,6 +225,29 @@ def test_build_step_descriptor_from_scheduler_output():
     d2 = build_step_descriptor(so2, prompt_lens, 2, parallel)
     assert "b" not in prompt_lens
     assert d2.is_decode_only and d2.requests[0].num_computed_tokens == 300
+
+    # Step 3: "a" was preempted and returns as a new request (its blocks sent
+    # in full) with 64 tokens computed: not a first admission, so nothing is
+    # credited as cached at admission, and it prefills again from 64.
+    so3 = SchedulerOutput.make_empty()
+    so3.scheduled_new_reqs = [
+        NewRequestData(
+            req_id="a",
+            prompt_token_ids=list(range(300)),
+            mm_features=[],
+            sampling_params=SamplingParams(max_tokens=4),
+            pooling_params=None,
+            block_ids=([0, 1, 2],),
+            num_computed_tokens=64,
+            lora_request=None,
+            prefill_token_ids=list(range(301)),
+        )
+    ]
+    so3.num_scheduled_tokens = {"a": 237}
+    so3.total_num_scheduled_tokens = 237
+    d3 = build_step_descriptor(so3, prompt_lens, 3, parallel)
+    (a,) = d3.requests
+    assert (a.num_computed_tokens, a.num_cached_tokens, a.is_prefill) == (64, 0, True)
 
 
 def test_acceptance_rates_from_log(tmp_path):

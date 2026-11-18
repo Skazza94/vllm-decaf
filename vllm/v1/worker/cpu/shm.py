@@ -67,6 +67,7 @@ torch.cuda.current_stream = lambda *args, **kwargs: _StreamPlaceholder()
 torch.cuda.stream = lambda *args, **kwargs: _StreamPlaceholder()
 torch.accelerator.synchronize = noop
 torch.accelerator.empty_cache = empty_cache_noop
+torch.accelerator.current_device_index = lambda: 0
 torch.Tensor.pin_memory = fake_pin_memory
 torch.Tensor.record_stream = noop
 torch.accelerator.get_memory_info = get_memory_info

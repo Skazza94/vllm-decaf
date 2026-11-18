@@ -82,7 +82,7 @@ def nixl_merged_descriptors(
     skip_desc_merge: bool = False,
 ) -> int | None:
     """How many descriptors NIXL's `makeXferReq` makes of the selected
-    indices (pinned NIXL 1683cf3b, src/core/nixl_agent.cpp:831-901): a
+    indices (NIXL v1.5.0 and v1.5.2 alike, src/core/nixl_agent.cpp:831-901): a
     selection i merges with the following ones while both sides' indices
     advance by one, within the prepared run holding each side's index (it
     stops at either run's end, even where the next run's addresses
@@ -587,8 +587,29 @@ def _kimi_k3_regions(
     return all(
         set(layers) == (mla_groups | state_groups if i in shared else mla_groups)
         and worker.region_names[i] in layers.values()
+        and sorted(worker.region_members[i]) == sorted(layers.values())
         and worker.region_group_ids[i] == (-1 if i in shared else mla_group)
         for i, layers in enumerate(members)
+    )
+
+
+def advertised_layer_mapping(worker) -> tuple[list[list[str]], dict[str, int]]:
+    """The layers each registered region holds and the KV cache group of each
+    layer, as this worker's NIXL metadata advertises them."""
+    groups = worker.kv_cache_config.transfer_group_index_by_layer
+    return worker.region_members, {
+        name: groups[name] for names in worker.region_members for name in names
+    }
+
+
+def advertises_local_layer_mapping(worker, metadata: NixlAgentMetadata) -> bool:
+    """Whether a peer's regions hold the same layers, in the same cache
+    groups, as this worker's: Kimi-K3's peers share one KV plan at any TP."""
+    members, layer_groups = advertised_layer_mapping(worker)
+    return (
+        len(members) == len(metadata.region_members)
+        and metadata.region_members == members
+        and metadata.layer_group_ids == layer_groups
     )
 
 
@@ -643,7 +664,7 @@ def kimi_k3_prefix_peer_refusal(
         and len(set(metadata.kv_caches_base_addr)) == 24
         and all(addr > 0 for addr in metadata.kv_caches_base_addr)
         and not metadata.packed_member_layouts
-        and not metadata.region_members  # Native hybrid pull registers no member list.
+        and advertises_local_layer_mapping(worker, metadata)
         and metadata.ple_block_len is None
         and _kimi_k3_regions(worker)
     ):
@@ -940,7 +961,7 @@ def checked_kimi_k3_cold_peer(
         and len(peer.bases) == len(set(peer.bases)) == 24
         and all(addr > 0 for addr in peer.bases)
         and not metadata.packed_member_layouts
-        and not metadata.region_members
+        and advertises_local_layer_mapping(worker, metadata)
         and metadata.ple_block_len is None
         and _kimi_k3_regions(worker, tp=local_tp, page=d_page, state_mode="none")
     ):
@@ -1532,7 +1553,7 @@ class GroupAllocations:
         cached = scheduler_output.scheduled_cached_reqs
         for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
             if new_ids is not None:
-                extend(req_id, new_ids, replace=req_id in cached.resumed_req_ids)
+                extend(req_id, new_ids, replace=False)
         for read in reads:
             if read.blocks:
                 for index, (first, blocks) in enumerate(
@@ -1561,16 +1582,40 @@ def group_allocations(
     return GroupAllocations(kv_cache_config.transfer_group_ids)
 
 
+@dataclass
+class PreemptedRequests:
+    """The requests the scheduler preempted and has not admitted again. The
+    runner frees a preempted request, and the scheduler sends it again in
+    full as a new request when it resumes it: only this record, kept across
+    steps, tells a resumed request from a new one."""
+
+    waiting: set[str] = field(default_factory=set)
+
+    def step(self, scheduler_output: "SchedulerOutput") -> list[str]:
+        """Take a step in; the requests it resumes, sorted."""
+        resumed = sorted(
+            new.req_id
+            for new in scheduler_output.scheduled_new_reqs
+            if new.req_id in self.waiting
+        )
+        self.waiting.difference_update(resumed)
+        self.waiting.update(scheduler_output.preempted_req_ids or ())
+        # A preempted request may be aborted while it waits.
+        self.waiting.difference_update(scheduler_output.finished_req_ids)
+        return resumed
+
+
 def scheduled_kv_events(
     scheduler_output: "SchedulerOutput",
     allocations: GroupAllocations | None = None,
+    resumed: Sequence[str] = (),
 ) -> dict[str, object]:
     """A step's request lifecycle as the scheduler sent it, for a step log's
     `kv_events` record: blocks newly allocated to each request (every KV
     cache group's, but the null block; by group with `allocations`), the
-    requests
-    resumed after a preemption (their blocks replaced), the tokens each new
-    or resumed request was admitted with as computed (its prefix hit, or
+    requests `resumed` after a preemption (sent as new ones, their blocks
+    replacing the earlier), the tokens each new or resumed request was
+    admitted with as computed (its prefix hit, or
     with a pull its hit and the pulled tokens), the remote reads this
     step posts, the producer requests told to free their blocks without a
     read (by their remote id), and the requests finished (completed or
@@ -1596,17 +1641,12 @@ def scheduled_kv_events(
             # Aborted before decode allocated blocks: only frees prefill's.
             notified.append(read.remote_request_id)
     admitted = {new.req_id: new.num_computed_tokens for new in scheduler_output.scheduled_new_reqs}
-    admitted.update(
-        (req_id, computed)
-        for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens)
-        if req_id in cached.resumed_req_ids
-    )
     events: dict[str, object] = {"allocated": allocated, "admitted": admitted}
     if allocations is not None:
         events["allocated_groups"] = allocations.events(scheduler_output, requested)
     return {
         **events,
-        "resumed": sorted(cached.resumed_req_ids),
+        "resumed": sorted(resumed),
         "reads_posted": sorted(reads),
         "prefill_notified": sorted(notified),
         "finished": sorted(scheduler_output.finished_req_ids),

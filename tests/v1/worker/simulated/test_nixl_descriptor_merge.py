@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """How many descriptors NIXL makes of a READ's selected indices
-(`nixl_merged_descriptors`, pinned NIXL 1683cf3b), predicted from the
+(`nixl_merged_descriptors`, the image's NIXL v1.5.2), predicted from the
 prepared runs of both lists, and the READ hook's [slot, selected, predicted]
 plan: against hand-made runs and, where NIXL with its Mooncake backend is
 installed, against NIXL's own `make_prepped_xfer` and telemetry."""

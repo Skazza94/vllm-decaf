@@ -127,8 +127,9 @@ def test_one_wrong_byte_in_a_piece_is_detected(piece):
 
 
 def test_another_producer_block_in_a_sub_block_is_detected():
-    """The pinned planning's shift (a sub-block holding the producer block
-    one earlier) never matches the content expectation."""
+    """A sub-block holding the producer block one earlier (the shift the
+    pull planning before vLLM v0.34.0 made after a decode hit) never matches
+    the content expectation."""
     prompt = list(range(200, 200 + 25))
     producer, consumer = pair(prompt)
     end = len(prompt) - 1
@@ -200,15 +201,17 @@ def test_grain_admits_a_hybrid_consumer_with_prefix_caching(
 
 
 def test_zero_accounting_keeps_native_and_content_apart():
-    """A cold pull's uncovered last piece is both zeroed by NIXL and due
-    zero; the pinned pairing's shifted tail writes it (nothing zeroed)
-    while the content still expects zero; without a grain they agree."""
+    """A pull's uncovered last piece is both zeroed by NIXL and due zero;
+    a wider covered span than the content's would write the piece (nothing
+    zeroed) while the content still expects zero; without a grain they
+    agree."""
     size, pieces = 1024, ("content|x", None)
-    assert attention_zeros(size, 2, 1, pieces) == (512, 512)
-    assert attention_zeros(size, 2, 2, pieces) == (0, 512)
-    assert attention_zeros(size, 2, 2, ("a", "b")) == (0, 0)
-    assert attention_zeros(size, 2, 1, "content|whole") == (512, 512)
-    assert attention_zeros(size, 1, 1) == (0, 0)
+    assert attention_zeros(size, 2, range(1), pieces) == (512, 512)
+    assert attention_zeros(size, 2, range(2), pieces) == (0, 512)
+    assert attention_zeros(size, 2, range(2), ("a", "b")) == (0, 0)
+    assert attention_zeros(size, 2, range(1), "content|whole") == (512, 512)
+    assert attention_zeros(size, 2, range(1, 2), "content|whole") == (512, 512)
+    assert attention_zeros(size, 1, range(1)) == (0, 0)
 
 
 def test_published_kimi_k3s_hit_and_pull_use_the_same_content_coordinates():

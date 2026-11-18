@@ -25,6 +25,7 @@ from vllm.v1.worker.simulated.kv_pattern import (
     row_pattern,
 )
 from vllm.v1.worker.simulated.kv_transfer import (
+    PreemptedRequests,
     ReadsInFlight,
     kv_layout,
     scheduled_kv_events,
@@ -47,7 +48,7 @@ def new_request_step(req_id, block_ids):
             SimpleNamespace(req_id=req_id, block_ids=(block_ids,), num_computed_tokens=0)
         ],
         scheduled_cached_reqs=SimpleNamespace(
-            req_ids=[], new_block_ids=[], num_computed_tokens=[], resumed_req_ids=set()
+            req_ids=[], new_block_ids=[], num_computed_tokens=[]
         ),
         finished_req_ids=set(),
     )
@@ -140,7 +141,7 @@ def test_chunked_prefill_blocks_continue_the_request_pattern():
     chunk = new_request_step("unused", [])
     chunk.scheduled_new_reqs = []
     chunk.scheduled_cached_reqs = SimpleNamespace(
-        req_ids=[PREFILL_ID], new_block_ids=[([1, 6],)], resumed_req_ids=set()
+        req_ids=[PREFILL_ID], new_block_ids=[([1, 6],)]
     )
     filler.after_update(chunk)
     for layer, view in views.items():
@@ -253,17 +254,24 @@ def test_kv_events_follow_a_request_lifecycle():
         tp_size=1,
         remote=step.kv_connector_metadata.reqs_to_recv[DECODE_ID].remote,
     )
+    # A preempted request returns as a new one, its blocks sent in full.
     step.scheduled_new_reqs = [
-        SimpleNamespace(req_id=DECODE_ID, block_ids=([1, 2],), num_computed_tokens=7)
+        SimpleNamespace(req_id=DECODE_ID, block_ids=([1, 2],), num_computed_tokens=7),
+        SimpleNamespace(
+            req_id="cmpl-pre-0-1", block_ids=([4, 6],), num_computed_tokens=4
+        ),
     ]
     step.scheduled_cached_reqs = SimpleNamespace(
-        req_ids=["cmpl-old-0-1", "cmpl-pre-0-1"],
-        new_block_ids=[([7],), ([4, 6],)],
-        num_computed_tokens=[30, 4],
-        resumed_req_ids={"cmpl-pre-0-1"},
+        req_ids=["cmpl-old-0-1"],
+        new_block_ids=[([7],)],
+        num_computed_tokens=[30],
     )
     step.finished_req_ids = {"cmpl-done-0-1"}
-    assert scheduled_kv_events(step) == {
+    step.preempted_req_ids = None
+    preempted = PreemptedRequests(waiting={"cmpl-pre-0-1"})
+    resumed = preempted.step(step)
+    assert resumed == ["cmpl-pre-0-1"] and not preempted.waiting
+    assert scheduled_kv_events(step, resumed=resumed) == {
         "allocated": {DECODE_ID: [1, 2], "cmpl-old-0-1": [7], "cmpl-pre-0-1": [4, 6]},
         # Computed at admission: a new request's, a resumed one's (its hit).
         "admitted": {DECODE_ID: 7, "cmpl-pre-0-1": 4},
@@ -280,6 +288,32 @@ def test_kv_events_follow_a_request_lifecycle():
         KVConnectorOutput(finished_recving={DECODE_ID}, finished_sending={"cmpl-p-0-1"})
     ) == {"reads_done": [DECODE_ID], "reads_failed": [], "sends_done": ["cmpl-p-0-1"]}
     assert ReadsInFlight().events(None) == {}
+
+
+def test_a_preempted_request_is_resumed_when_it_returns_as_a_new_one():
+    """The scheduler tells the runner of a preemption and later sends the
+    request again in full as a new one: only the record across steps tells it
+    from a request new to the instance, and an abort while it waits clears it."""
+
+    def step(new=(), preempted=None, finished=()):
+        return SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id=r, block_ids=([1],), num_computed_tokens=0)
+                for r in new
+            ],
+            preempted_req_ids=preempted,
+            finished_req_ids=set(finished),
+        )
+
+    record = PreemptedRequests()
+    assert record.step(step(new=["a", "b"])) == []
+    assert record.step(step(preempted={"a", "b"})) == []
+    assert record.step(step(new=["a", "c"], finished=["b"])) == ["a"]
+    assert record.waiting == set()
+    # Preempted again: resumed again, once.
+    assert record.step(step(preempted={"a"})) == []
+    assert record.step(step(new=["a"])) == ["a"]
+    assert record.step(step(new=["a"])) == []
 
 
 def test_kv_events_records_leave_out_empty_events(tmp_path):
@@ -429,7 +463,7 @@ def test_mooncake_requests_are_lifecycle_events():
     step = mooncake_step(DECODE_ID, [1, 2])
     step.scheduled_new_reqs = []
     step.scheduled_cached_reqs = SimpleNamespace(
-        req_ids=[], new_block_ids=[], num_computed_tokens=[], resumed_req_ids=set()
+        req_ids=[], new_block_ids=[], num_computed_tokens=[]
     )
     step.finished_req_ids = set()
     events = scheduled_kv_events(step)
@@ -576,7 +610,6 @@ def groups_step(req_id, *block_ids, cached=False):
             req_ids=[req_id],
             new_block_ids=[tuple(block_ids)],
             num_computed_tokens=[0],
-            resumed_req_ids=set(),
         )
     else:
         step.scheduled_new_reqs[0].block_ids = tuple(block_ids)
@@ -606,7 +639,7 @@ def mooncake_pull(req_id, block_ids, first):
         kv_connector_metadata=metadata,
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
-            req_ids=[], new_block_ids=[], num_computed_tokens=[], resumed_req_ids=set()
+            req_ids=[], new_block_ids=[], num_computed_tokens=[]
         ),
         finished_req_ids=set(),
     )
@@ -771,9 +804,9 @@ def test_allocations_by_group_keep_places_through_chunks_resumption_and_pulls():
             {"group": 2, "first": 1, "blocks": [6]},
         ]
     }
-    # Resumed after a preemption: its blocks replaced, from the start.
-    resumed = groups_step(PREFILL_ID, [2], [5], [7], cached=True)
-    resumed.scheduled_cached_reqs.resumed_req_ids = {PREFILL_ID}
+    # Resumed after a preemption: sent as a new request, its blocks replaced,
+    # from the start.
+    resumed = groups_step(PREFILL_ID, [2], [5], [7])
     assert [e["first"] for e in events(resumed)[PREFILL_ID]] == [0, 0, 0]
     # A pull clipped to the window, before the request is scheduled: by its
     # KV cache groups, where the connector's blocks start.
@@ -1338,8 +1371,8 @@ BLOCK = 4  # tokens a block, as caches() holds them
 
 def step(new=(), cached=(), finished=(), metadata=None):
     """A scheduler output: new requests (req_id, block ids, prompt, computed,
-    scheduled), running ones (req_id, new block ids, computed, scheduled,
-    resumed)."""
+    scheduled), running ones (req_id, new block ids, computed, scheduled). A
+    resumed request is a new one again."""
     return SimpleNamespace(
         scheduled_new_reqs=[
             SimpleNamespace(
@@ -1350,11 +1383,10 @@ def step(new=(), cached=(), finished=(), metadata=None):
         scheduled_cached_reqs=SimpleNamespace(
             req_ids=[r for r, *_ in cached],
             new_block_ids=[None if ids is None else (ids,) for _, ids, *_ in cached],
-            num_computed_tokens=[c for _, _, c, _, _ in cached],
-            resumed_req_ids={r for r, *_, resumed in cached if resumed},
+            num_computed_tokens=[c for _, _, c, _ in cached],
         ),
         num_scheduled_tokens={r: n for r, *_, n in new}
-        | {r: n for r, _, _, n, _ in cached},
+        | {r: n for r, _, _, n in cached},
         finished_req_ids=set(finished),
         kv_connector_metadata=metadata,
     )
@@ -1527,7 +1559,7 @@ def test_a_page_completed_by_generation_is_reused_by_a_later_request():
     for token in generated:
         checker.sampled([DECODE_ID], [[token]])
         new_ids = [8] if computed == 12 else None
-        s = step(cached=[(DECODE_ID, new_ids, computed, 1, False)])
+        s = step(cached=[(DECODE_ID, new_ids, computed, 1)])
         checker.before_step(s)
         checker.after_update(s)
         assert checker.after_step(None) == []
@@ -1585,7 +1617,7 @@ def test_accepted_drafts_complete_a_page_written_before_the_request_ends():
     same page corrupted fails."""
     _, decode, _, checker = content_sides()
     spec_start(checker)
-    run_step(checker, step(cached=[("a", [8], 6, 3, False)]))
+    run_step(checker, step(cached=[("a", [8], 6, 3)]))
     assert zero(decode, 7)  # drafts at 7-8: not written before acceptance
     checker.sampled(["a"], [[21, 22, 23]])  # two accepted drafts and a bonus
     checker.completed({"a": 9})  # computed 6 + 3, nothing rejected
@@ -1610,12 +1642,12 @@ def test_accepted_drafts_complete_a_page_written_before_the_request_ends():
 def test_rejected_drafts_write_nothing_and_their_page_waits_for_accepted_tokens():
     _, decode, _, checker = content_sides()
     spec_start(checker)
-    run_step(checker, step(cached=[("a", [8], 6, 3, False)]))
+    run_step(checker, step(cached=[("a", [8], 6, 3)]))
     checker.sampled(["a"], [[21]])  # both drafts rejected, a new bonus
     checker.completed({"a": 7})  # computed 6 + 3 - 2 rejected
     assert checker.take_write_events() == [] and zero(decode, 7)
     # The next step computes the bonus at 7, completing page 1 with known tokens.
-    run_step(checker, step(cached=[("a", None, 7, 3, False)]))
+    run_step(checker, step(cached=[("a", None, 7, 3)]))
     events = checker.take_write_events()
     assert [(e["phase"], e["logical_block"]) for e in events] == [("step", 1)]
     assert holds(decode, 7, checker.chains, "a", 1, BLOCK)
@@ -1631,7 +1663,7 @@ def test_a_page_ending_at_the_new_bonus_token_waits_for_its_kv():
     checker.completed({"a": 7})
     assert [e["logical_block"] for e in checker.take_write_events()] == [0]
     assert zero(decode, 7)
-    run_step(checker, step(cached=[("a", None, 7, 1, False)]))
+    run_step(checker, step(cached=[("a", None, 7, 1)]))
     assert [e["logical_block"] for e in checker.take_write_events()] == [1]
     assert holds(decode, 7, checker.chains, "a", 1, BLOCK)
 
@@ -1656,11 +1688,11 @@ def test_an_optimistic_counter_writes_nothing_past_the_known_tokens():
     writes only what they complete."""
     _, decode, _, checker = content_sides()
     spec_start(checker)
-    run_step(checker, step(cached=[("a", [8], 6, 3, False)]))
+    run_step(checker, step(cached=[("a", [8], 6, 3)]))
     checker.sampled(["a"], [[21]])
     checker.completed({"a": 7})
     # The scheduler still counts 9 computed; the chain knows 8 tokens.
-    run_step(checker, step(cached=[("a", None, 9, 3, False)]))
+    run_step(checker, step(cached=[("a", None, 9, 3)]))
     assert [e["logical_block"] for e in checker.take_write_events()] == [1]
     assert zero(decode, 8) and checker.written["a"] == [2]
 
@@ -1674,7 +1706,7 @@ def test_a_completion_at_the_workers_endpoint_leaves_the_bonus_page():
     real runner (`test_real_kv_transfer.py`)."""
     _, decode, _, checker = content_sides()
     spec_start(checker)  # 6 computed, the bonus at 6 known
-    run_step(checker, step(cached=[("a", [8], 8, 3, False)]))
+    run_step(checker, step(cached=[("a", [8], 8, 3)]))
     assert checker.take_write_events() == []
     checker.sampled(["a"], [[21]])  # both rejected; the new bonus at 7
     checker.completed({"a": 7})
@@ -1689,12 +1721,13 @@ def test_a_resumed_request_restarts_its_watermark_at_its_new_table():
     write nothing until the worker computes them."""
     _, decode, _, checker = content_sides()
     spec_start(checker)
-    run_step(checker, step(cached=[("a", [8], 6, 3, False)]))
+    run_step(checker, step(cached=[("a", [8], 6, 3)]))
     checker.sampled(["a"], [[21, 22, 23]])
     checker.completed({"a": 9})
     checker.take_write_events()
-    # Resumed: blocks 1 (its hit page 0), 10, 11; two tokens recomputed.
-    run_step(checker, step(cached=[("a", [1, 10, 11], 4, 2, True)]))
+    # Resumed, sent as a new request: blocks 1 (its hit page 0), 10, 11; two
+    # tokens recomputed.
+    run_step(checker, step(new=[("a", [1, 10, 11], PROMPT_S, 4, 2)]))
     (hit,) = checker.after_step(None)
     assert hit["kind"] == "hit" and hit["ok"]
     assert checker.written["a"] == [1] and checker.take_write_events() == []
@@ -1746,12 +1779,12 @@ def test_a_decode_page_completed_and_adopted_in_the_same_step():
     assert checker.after_step(None)[0]["ok"]
     checker.sampled([DECODE_ID], [[50]])
     checker.sampled([DECODE_ID], [[51]])  # page 2's last token, sampled, not computed
-    s = step(cached=[(DECODE_ID, None, 10, 1, False)])
+    s = step(cached=[(DECODE_ID, None, 10, 1)])
     checker.before_step(s)
     checker.after_update(s)
     # Token 11 (sampled 51) completes page 2 as B adopts it.
     b = "cmpl-b-0-11111111"
-    together = step(cached=[(DECODE_ID, [8], 11, 1, False)],
+    together = step(cached=[(DECODE_ID, [8], 11, 1)],
                     new=[(b, [1, 2, 4, 9], PROMPT_A + [50, 51, 9, 9], 12, 2)])
     checker.before_step(together)
     checker.after_update(together)
@@ -1791,7 +1824,7 @@ def test_a_page_is_never_written_while_its_pull_waits():
     checker.chains.admit("other", PROMPT_A)
     checker.tables["other"] = [[2, 6, 7]]
     with pytest.raises(RuntimeError, match="not compared yet"):
-        checker.after_update(step(cached=[("other", None, 3, 2, False)]))
+        checker.after_update(step(cached=[("other", None, 3, 2)]))
 
 
 def test_requests_outside_the_lifecycle_fail_closed():
@@ -1853,7 +1886,6 @@ def native_output(scheduler_output, tokens):
     req_ids = list(scheduler_output.num_scheduled_tokens)
     return ModelRunnerOutput(
         req_ids=req_ids,
-        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
         sampled_token_ids=[[tokens[req_id]] for req_id in req_ids],
         logprobs=None,
         prompt_logprobs_dict={},
@@ -2202,7 +2234,6 @@ def test_a_delayed_decode_worker_holds_the_request():
     def output(finished):
         return ModelRunnerOutput(
             req_ids=[],
-            req_id_to_index={},
             kv_connector_output=KVConnectorOutput(finished_recving=finished),
         )
 
@@ -2399,28 +2430,64 @@ def test_native_head_patterns_check_reads_from_any_tp_size():
 def test_a_block_gathered_from_smaller_producer_blocks_is_their_heads_slabs():
     """NIXL's block-size ratio R: a consumer block of R producer blocks
     holds, head by head, the producer blocks' slabs in token order, and
-    zeros where the producer had no block (NIXL zeroes the uncovered tail)."""
-    from vllm.v1.worker.simulated.kv_pattern import NativeChecker
-
+    zeros where the producer had no block (NIXL zeroes what it did not write)."""
     heads, slab = (0, 1), 8
     producer = [row_pattern("cmpl-a-0", "L", b, 2 * slab, 0, None, heads) for b in (4, 5)]
-    gathered = row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (2, 2))
+    gathered = row_pattern(
+        "cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (2, range(2))
+    )
     for h in range(2):
         assert torch.equal(
             gathered[h * 2 * slab:(h + 1) * 2 * slab],
             torch.cat([producer[0][h * slab:(h + 1) * slab], producer[1][h * slab:(h + 1) * slab]]),
         )
-    tail = row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (2, 1))
+    tail = row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (2, range(1)))
     assert torch.equal(tail[:slab], producer[0][:slab]) and not tail[slab:2 * slab].any()
-    assert torch.equal(row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (1, 1)),
+    head = row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (2, range(1, 2)))
+    assert not head[:slab].any()
+    assert torch.equal(head[slab : 2 * slab], producer[1][:slab])
+    one = row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads, (1, range(1)))
+    assert torch.equal(one,
                        row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, heads))
     with pytest.raises(ValueError, match="needs head patterns"):
-        row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, None, (2, 2))
-    # The sub-blocks NIXL puts in a group's i-th block: b*R + k, clipped to
-    # the producer's blocks.
-    group = SimpleNamespace(remote_blocks=3)
-    assert [NativeChecker._sub_blocks(2, group, i) for i in range(3)] == [(2, 2), (2, 1), (2, 0)]
-    assert NativeChecker._sub_blocks(1, group, 5) == (1, 1)
+        row_pattern("cmpl-a-0", "L", 2, 4 * slab, 0, None, None, (2, range(2)))
+
+
+@pytest.mark.parametrize(
+    "start,tokens,handoff,sub,page,blocks,covered",
+    [
+        # Producer blocks of 16 tokens, consumer blocks of 32, a cold pull of
+        # 80 tokens: blocks 0 and 1 whole, block 2 up to the handoff.
+        (0, 32, 80, 16, 16, 5, range(32)),
+        (32, 32, 80, 16, 16, 5, range(32)),
+        (64, 32, 80, 16, 16, 5, range(16)),
+        # The handoff ends inside a producer block: its whole sub-block moves,
+        # and what follows it in the consumer's block is zeroed.
+        (64, 32, 70, 16, 16, 5, range(16)),
+        (64, 32, 65, 16, 16, 5, range(16)),
+        # A sliding-window producer retains its last two blocks: the head of
+        # the consumer block it starts in is zeroed, blocks before it unread.
+        (0, 32, 80, 16, 16, 2, range(0)),
+        (32, 32, 80, 16, 16, 2, range(16, 32)),
+        (64, 32, 80, 16, 16, 2, range(16)),
+        # A producer kernel block of 16 tokens, two a logical page: retained
+        # blocks end at the page holding the handoff, the sub-blocks at the
+        # kernel block.
+        (64, 64, 70, 16, 32, 3, range(16)),
+        (0, 64, 70, 16, 32, 3, range(64)),
+        (128, 64, 70, 16, 32, 3, range(0)),
+    ],
+)
+def test_a_pull_of_unequal_block_sizes_writes_the_overlap_up_to_the_handoff(
+    start, tokens, handoff, sub, page, blocks, covered
+):
+    """NIXL pairs the two sides' sub-blocks from the handoff's last token
+    backwards (it drops each side's past that token): a local block is
+    written where it overlaps the producer's retained tokens, up to the end
+    of the producer sub-block holding the last one. Hand-counted cases."""
+    from vllm.v1.worker.simulated.kv_pattern import pull_covered_tokens
+
+    assert pull_covered_tokens(start, tokens, handoff, sub, page, blocks) == covered
 
 
 def test_native_geometry_check_admits_other_tp_only_with_head_patterns():

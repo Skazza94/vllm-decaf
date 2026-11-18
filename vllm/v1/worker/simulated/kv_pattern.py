@@ -50,9 +50,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
+import msgspec
 import numpy as np
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    NixlAgentMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_base_request_id,
 )
@@ -316,15 +320,15 @@ def row_pattern(
     tp_rank: int = 0,
     identity: "str | tuple[str | None, ...] | None" = None,
     heads: Sequence[int] | None = None,
-    sub_blocks: tuple[int, int] = (1, 1),
+    sub_blocks: tuple[int, range] = (1, range(1)),
 ) -> torch.Tensor:
     """A selected span's expected bytes: with `heads` (the global heads every
     attention layer holds) its heads' slabs in order, each one's stream the
     same on any TP size, as a head-v1 layer's page; else (a state's span, or
     a span its heads do not divide) the rank's pattern. `sub_blocks` (R,
     covered): a block of R producer blocks (NIXL's block-size ratio), each
-    head's slab their R slabs in token order, those past the `covered` first
-    zero (NIXL zeroes what it did not transfer). An `identity` of pieces
+    head's slab their R slabs in token order, those outside the `covered`
+    range zero (NIXL zeroes what it did not transfer). An `identity` of pieces
     (`kv_pattern_grain`) gives each slab's R pieces their own content, a
     piece None zero, whatever `sub_blocks` says."""
     ratio, covered = sub_blocks
@@ -354,7 +358,7 @@ def row_pattern(
         return torch.cat(
             [
                 _stream(f"{base}|h{head}|{name}|{logical_block * ratio + k}", slab)
-                if k < covered
+                if k in covered
                 else torch.zeros(slab, dtype=torch.uint8)
                 for head in heads
                 for k in range(ratio)
@@ -498,7 +502,8 @@ class TokenChains:
         self._full: dict[tuple[str, int], list[bytes]] = {}
 
     def admit(self, req_id: str, prompt_token_ids: Sequence[int] | None) -> None:
-        """A request's first scheduling (a resumed one keeps its chain)."""
+        """A request's first scheduling (a resumed one keeps its chain: the
+        scheduler sends it as new again, after freeing it on preemption)."""
         if req_id in self.tokens:
             return
         self.tokens[req_id] = (
@@ -832,10 +837,10 @@ def group_views(
 
 
 def _after_update(filler, scheduler_output: "SchedulerOutput") -> None:
-    """A filler's step: each new or resumed request's blocks, a running
-    one's new blocks; with prefix caching, a request's prefix hits are not
-    written but compared, after every write of the step (a hit may be a page
-    another request of the step fills)."""
+    """A filler's step: each new request's blocks (a resumed one arrives as a
+    new request too), a running one's new blocks; with prefix caching, a
+    request's prefix hits are not written but compared, after every write of
+    the step (a hit may be a page another request of the step fills)."""
     chains = filler.chains
     for new in scheduler_output.scheduled_new_reqs:
         hits = None
@@ -845,17 +850,11 @@ def _after_update(filler, scheduler_output: "SchedulerOutput") -> None:
             hits = filler._prefix_hits(new.req_id, new.num_computed_tokens)
         filler._extend(new.req_id, new.block_ids, replace=True, hits=hits)
     cached = scheduler_output.scheduled_cached_reqs
-    for index, (req_id, new_ids) in enumerate(
-        zip(cached.req_ids, cached.new_block_ids)
-    ):
+    for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
         if new_ids is not None:
-            resumed = req_id in cached.resumed_req_ids
-            hits = None
             if chains is not None:
-                filler._track(req_id, new_ids, replace=resumed)
-                if resumed:
-                    hits = filler._prefix_hits(req_id, cached.num_computed_tokens[index])
-            filler._extend(req_id, new_ids, replace=resumed, hits=hits)
+                filler._track(req_id, new_ids, replace=False)
+            filler._extend(req_id, new_ids, replace=False, hits=None)
     if chains is not None:
         filler._verify_due()
     for req_id in scheduler_output.finished_req_ids:
@@ -1061,16 +1060,9 @@ class _ConsumerPages(_ContentPages):
             if (expected := self.awaiting.pop(new.req_id, None)) is not None:
                 self.results.append(self._compare_pull(new.req_id, expected))
         cached = scheduler_output.scheduled_cached_reqs
-        for index, (req_id, new_ids) in enumerate(
-            zip(cached.req_ids, cached.new_block_ids)
-        ):
-            if new_ids is None:
-                continue
-            resumed = req_id in cached.resumed_req_ids
-            self._track(req_id, new_ids, replace=resumed)
-            if resumed:
-                self._reset_written(req_id, cached.num_computed_tokens[index])
-                self._prefix_hits(req_id, cached.num_computed_tokens[index])
+        for req_id, new_ids in zip(cached.req_ids, cached.new_block_ids):
+            if new_ids is not None:
+                self._track(req_id, new_ids, replace=False)
         for req_id in scheduler_output.finished_req_ids:
             if (expected := self.awaiting.pop(req_id, None)) is not None:
                 self.results.append(
@@ -1813,9 +1805,10 @@ def _compare_dcp_reads(
 # blocks, not each layer's page. NIXL registers deduplicated regions (a
 # backing slot shared by one layer of each group), moves a state as its conv
 # sub-projections and SSM state (not the page's padding), and moves each of a
-# group's blocks in every region of its kind, a region holding no layer of
-# that group included (a transfer-only region). The filler and the checker
-# follow the native descriptor selection itself.
+# group's blocks in the regions of its own layers (it pairs regions by
+# layer; a pairing selecting a region of none of them is reported apart as
+# transfer-only). The filler and the checker follow the native descriptor
+# selection itself.
 
 STATE_ORIGIN = 0
 """Where a state page's conv and SSM bytes start in a region's page."""
@@ -1869,6 +1862,18 @@ def _byte_view(
     )
 
 
+def native_self_pairs(worker) -> tuple[list[int], list[int]]:
+    """The (regions, groups) `_compute_desc_ids` takes for this worker's own
+    regions: NIXL's pairing (`_pair_regions`) of the regions a peer holding
+    the same layers advertises, as this worker's metadata does."""
+    payload = worker.xfer_handshake_metadata
+    metadata = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(
+        payload.agent_metadata_bytes
+    )
+    pairs = worker._pair_regions(metadata)
+    return pairs.local, pairs.group
+
+
 class NativeSelection:
     """A native NIXL worker's selection of a request's blocks: its local
     strided descriptors (`src_blocks_data`) and the descriptor ids
@@ -1888,6 +1893,7 @@ class NativeSelection:
         layout: "sl.StateLayout | None" = None,
         *,
         layer_identity: bool = False,
+        pairs: tuple[list[int], list[int]] | None = None,
     ) -> None:
         if transfer_group_ids is not None and list(transfer_group_ids) != list(
             range(len(groups))
@@ -1899,6 +1905,7 @@ class NativeSelection:
             )
         self.factor = worker._physical_blocks_per_logical_kv_block
         self.worker = worker
+        self.pairs = native_self_pairs(worker) if pairs is None else pairs
         self.groups = [list(names) for names in groups]
         storages = list(
             {
@@ -2046,7 +2053,11 @@ class NativeSelection:
         lists[group] = list(block_ids)
         physical = self.physical_ids(lists)
         ids = self.worker._compute_desc_ids(
-            physical, self.worker.num_blocks, None, self.factor
+            physical,
+            self.worker.num_blocks,
+            None,
+            self.factor,
+            pairs=self.pairs,
         )
         rows = np.searchsorted(self.starts, ids, side="right") - 1
         selected = []
@@ -2077,7 +2088,11 @@ class NativeSelection:
         return [
             int(d)
             for d in self.worker._compute_desc_ids(
-                self.physical_ids(lists), self.worker.num_blocks, None, self.factor
+                self.physical_ids(lists),
+                self.worker.num_blocks,
+                None,
+                self.factor,
+                pairs=self.pairs,
             )
         ]
 
@@ -2151,7 +2166,7 @@ def _expected_bytes(
     tp_rank: int,
     identity: str | None,
     heads,
-    sub_blocks: tuple[int, int] = (1, 1),
+    sub_blocks: tuple[int, range] = (1, range(1)),
     block: int | None = None,
 ) -> torch.Tensor:
     """The expected bytes of a request's logical block in one selected span:
@@ -2187,21 +2202,40 @@ def _expected_bytes(
         request_id, s.name(group, row), 0 if endpoint else logical,
         r.view.shape[1], tp_rank, identity,
         None if r.state else _group_heads(heads, group),
-        (1, 1) if r.state else sub_blocks,
+        (1, range(1)) if r.state else sub_blocks,
     )
 
 
+def pull_covered_tokens(
+    start: int,
+    tokens: int,
+    handoff: int,
+    remote_sub: int,
+    remote_page: int,
+    remote_blocks: int,
+) -> range:
+    """The tokens of a local block of `tokens` tokens from token `start` that
+    a pull of unequal block sizes writes, relative to its start. The
+    producer's `remote_blocks` retained blocks of `remote_page` tokens end at
+    the last block holding the `handoff`'s tokens; its sub-blocks of
+    `remote_sub` tokens end with the one holding the last token. NIXL pairs
+    the two sides' sub-blocks from that last token backwards, so it writes
+    where they overlap; the rest of the block is zeroed."""
+    retained_start = (-(-handoff // remote_page) - remote_blocks) * remote_page
+    handoff_end = -(-handoff // remote_sub) * remote_sub
+    first = max(start, retained_start)
+    last = min(start + tokens, handoff_end)
+    return range(first - start, last - start) if first < last else range(0)
+
+
 def attention_zeros(
-    size: int, ratio: int, covered: int, identity=None
+    size: int, ratio: int, covered: range, identity=None
 ) -> tuple[int, int]:
     """A block's attention span of `size` bytes read as `ratio` producer
-    sub-blocks: (the bytes NIXL zeroes, past the `covered` sub-blocks its
+    sub-blocks: (the bytes NIXL zeroes, outside the `covered` sub-blocks its
     pairing wrote; the bytes its content expects zero, the pieces of a
-    `kv_pattern_grain` identity past the handoff, else the same). The two
-    differ where the pinned pairing writes a sub-block the content ends
-    before: transfer accounting keeps the first, the byte verdict uses the
-    second."""
-    native = size * (ratio - covered) // ratio
+    `kv_pattern_grain` identity past the handoff, else the same)."""
+    native = size * (ratio - len(covered)) // ratio
     if isinstance(identity, tuple):
         return native, size * identity.count(None) // len(identity)
     return native, native
@@ -2495,7 +2529,7 @@ class NativeChecker(_ConsumerPages):
         another block size) are refused, not assumed; with head patterns
         (`heads`) any TP size's reads are checked, and a remote block size
         dividing this instance's (NIXL's block-size ratio: each block
-        gathered from several remote ones, `_sub_blocks`) too, without
+        gathered from several remote ones, `_covered_sub_blocks`) too, without
         prefix caching."""
         w = self.selection.worker
         if self.heads is not None:
@@ -2534,11 +2568,13 @@ class NativeChecker(_ConsumerPages):
                 f"split reads {sorted(w.src_xfer_handles_by_tp_ratio)}."
             )
 
-    def _sub_block_pieces(self, by_producer, group, ratio, row_of) -> dict:
+    def _sub_block_pieces(
+        self, by_producer, expected, group, ratio, row_of
+    ) -> dict:
         """Ownership's pieces of a group's attention blocks read at a
         producer's smaller block size: NIXL writes block b's `covered`
-        sub-blocks (`_sub_blocks`) as the first covered/ratio of its page,
-        nothing to a block none covers; its states 1:1, as ownership says.
+        sub-blocks (`_covered_sub_blocks`) as that span of its page, nothing
+        to a block none covers; its states 1:1, as ownership says.
         Adjacent head pieces from one producer must first own the whole row
         exactly once; wire chunks precede the native head-major conversion."""
         index = {b: i for i, b in enumerate(group.block_ids) if b != NULL_BLOCK_ID}
@@ -2563,7 +2599,7 @@ class NativeChecker(_ConsumerPages):
                 _, ranges = rows.setdefault(key, (entry, []))
                 ranges.append((offset, length))
             for (region, block, offset), (entry, ranges) in rows.items():
-                covered = self._sub_blocks(ratio, group, index[block])[1]
+                covered = self._covered_sub_blocks(expected, group, index[block])[1]
                 offset, length = sl.attention_wire_prefix(
                     region, ranges, offset, entry["length"], ratio, covered
                 )
@@ -2591,20 +2627,28 @@ class NativeChecker(_ConsumerPages):
             )
         return local_page, remote_page, local_kernel, remote_kernel
 
-    def _attention_covered(self, expected, group, page, offset, tokens):
-        """Payload extent rounded only to the transfer's kernel grain."""
-        _, remote_page, _, _ = self._split_attention_rows(expected)
+    def _covered_tokens(self, expected, group, start: int, tokens: int) -> range:
+        """The tokens of a local block (or kernel row) of `tokens` tokens from
+        token `start` that a pull of unequal block sizes writes, relative to
+        its start. NIXL pairs the producer's retained sub-blocks and the
+        consumer's from the handoff's last token backwards, so it writes
+        where they overlap, up to the end of the last producer sub-block
+        holding a handoff token; the rest of the block is zeroed."""
         if group.remote_blocks is None or expected.remote_num_tokens is None:
-            raise ValueError("split attention READ is missing its handoff geometry")
-        handoff_end = -(-expected.remote_num_tokens // remote_page) * remote_page
-        remote_start = handoff_end - group.remote_blocks * remote_page
-        start = page + offset
-        if start < remote_start:
             raise ValueError(
-                "split attention READ starts before its producer's retained KV"
+                "a pull of unequal block sizes is missing its handoff geometry"
             )
-        # Count any copied allocator padding separately from unreceived rows.
-        return max(0, min(tokens, handoff_end - start))
+        info = self.selection.worker.transfer_topo.get_engine_info(
+            expected.remote_engine_id
+        )
+        return pull_covered_tokens(
+            start,
+            tokens,
+            expected.remote_num_tokens,
+            info.remote_block_size,
+            info.remote_block_size * info.remote_physical_blocks_per_logical,
+            group.remote_blocks,
+        )
 
     @staticmethod
     def _cold_k3_aperture(expected, peers, pages, unit, heads, num_blocks):
@@ -2634,7 +2678,9 @@ class NativeChecker(_ConsumerPages):
                 and (state or group.first_logical_block == 0)
             ):
                 raise ValueError(f"invalid cold Kimi-K3 page lists: {group.group}")
-        return min(p_blocks * p_page, d_blocks * d_page) // unit
+        # Both lists start at token 0: NIXL pairs the sub-blocks up to the one
+        # holding the handoff's last token.
+        return -(-handoff // unit)
 
     @staticmethod
     def _cold_k3_pairs(
@@ -2803,12 +2849,12 @@ class NativeChecker(_ConsumerPages):
                     r = s.rows[row]
                     logical_id, sub = divmod(block, s.factor)
                     page = (group.first_logical_block + places[place]) * lp
-                    covered = self._attention_covered(
-                        expected, group, page, sub * lk, lk
+                    covered = self._covered_tokens(
+                        expected, group, page + sub * lk, lk
                     )
                     off = r.offset + sub * r.view.stride(0)
                     size = r.view.shape[1]
-                    for k in range(0, covered, rk):
+                    for k in range(covered.start, covered.stop, rk):
                         # The prepared smaller-K handle is laid out in wire
                         # order before native receive conversion.
                         entry = {
@@ -2861,7 +2907,7 @@ class NativeChecker(_ConsumerPages):
             if ratio > 1 and not split:
                 try:
                     expected_by_producer = self._sub_block_pieces(
-                        expected_by_producer, group, ratio, row_of
+                        expected_by_producer, expected, group, ratio, row_of
                     )
                 except ValueError as error:
                     return {"problems": [f"group {group.group}: {error}"], "reads": []}
@@ -2986,14 +3032,21 @@ class NativeChecker(_ConsumerPages):
         info = topo.get_engine_info(engine)
         return topo.block_size_ratio(info.remote_block_size)
 
-    @staticmethod
-    def _sub_blocks(ratio: int, group: _ExpectedGroup, index: int) -> tuple[int, int]:
-        """The producer blocks the read put in the group's `index`-th block:
-        (ratio, how many of its ratio sub-blocks the producer's blocks
-        cover), as NIXL pairs them (local block b, remote b*ratio + k)."""
+    def _covered_sub_blocks(
+        self, expected: _Expected, group: _ExpectedGroup, index: int
+    ) -> tuple[int, range]:
+        """The producer sub-blocks the read put in the group's `index`-th
+        block (counting a window's null places): (ratio, the range of its
+        ratio sub-blocks NIXL wrote), by tokens (`_covered_tokens`)."""
+        ratio = self._ratio(expected)
         if ratio == 1 or group.remote_blocks is None:
-            return ratio, ratio
-        return ratio, max(0, min(ratio, group.remote_blocks - index * ratio))
+            return ratio, range(ratio)
+        page = self.selection.worker.block_size
+        tokens = self._covered_tokens(
+            expected, group, (group.first_logical_block + index) * page, page
+        )
+        sub = page // ratio
+        return ratio, range(tokens.start // sub, tokens.stop // sub)
 
     def _compare(self, req_id: str, expected: _Expected, identity_of=None) -> dict:
         s = self.selection
@@ -3020,7 +3073,7 @@ class NativeChecker(_ConsumerPages):
                 and all(s.rows[row].state for row, _, _ in selected)
                 else group.first_logical_block
             )
-            payload = transfer_only = wrong_total = zeroed = moved_padding = 0
+            payload = transfer_only = wrong_total = zeroed = 0
             expected_zero = 0
             # `kv_pattern_grain`: wrong bytes by logical block and piece.
             piece_wrong: dict[int, list[int]] = {}
@@ -3028,19 +3081,17 @@ class NativeChecker(_ConsumerPages):
                 r = s.rows[row]
                 view = r.view
                 logical = first + places[place]
-                sub_blocks = self._sub_blocks(ratio, group, places[place])
+                sub_blocks = self._covered_sub_blocks(expected, group, places[place])
                 identity = identity_of(group.group, logical) if identity_of else None
                 if split and not r.state:
                     lp, rp, lk, rk = self._split_attention_rows(expected)
                     token = logical * lp + block % s.factor * lk
-                    covered = self._attention_covered(
-                        expected, group, logical * lp, token % lp, lk
-                    )
+                    covered = self._covered_tokens(expected, group, token, lk)
                     mine = _group_heads(self.heads, group.group)
                     stride = view.shape[1] // lk
                     slices = []
                     for off in range(0, lk, rk):
-                        if off >= covered:
+                        if off not in covered:
                             data = torch.zeros(rk * stride, dtype=torch.uint8)
                         else:
                             src_page, start = divmod(token + off, rp)
@@ -3058,13 +3109,7 @@ class NativeChecker(_ConsumerPages):
                             )
                         slices.append(data.reshape(len(mine) if mine else 1, -1))
                     want = torch.cat(slices, dim=1).flatten()
-                    zeroed += (lk - covered) * stride
-                    # A partially filled kernel row moves with its payload.
-                    # Only rows entirely past the handoff are padding.
-                    handoff = -(-expected.remote_num_tokens // rk) * rk
-                    moved_padding += (
-                        max(0, token + covered - max(token, handoff)) * stride
-                    )
+                    zeroed += (lk - len(covered)) * stride
                 else:
                     want = _expected_bytes(
                         s,
@@ -3149,11 +3194,6 @@ class NativeChecker(_ConsumerPages):
                         {
                             "block_size_ratio": ratio,
                             "zeroed_bytes": zeroed,
-                            **(
-                                {"moved_attention_padding_bytes": moved_padding}
-                                if split
-                                else {}
-                            ),
                         }
                         if ratio > 1 or split
                         else {}

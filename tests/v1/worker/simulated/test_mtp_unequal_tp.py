@@ -659,7 +659,6 @@ def _direct_sdk_oracle(config, provider, direct_models, requests):
             0 if req.is_prefill else req.num_scheduled_tokens,
             int(req.is_prefill),
             int(not req.is_prefill),
-            0,
             req.num_computed_tokens + req.num_scheduled_tokens,
             parallel_summary(config),
         )
