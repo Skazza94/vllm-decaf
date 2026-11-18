@@ -383,6 +383,8 @@ Only the output rank (last pipeline stage, first tensor-parallel rank) writes
 the step log. On CUDA hosts each rank binds its own device, using a few MB of
 its memory.
 
+The [experimental profiler core](../observability/kv_profiler_core.md) provides standalone recorder, clock and offline export primitives. Connector attachment is a separate checkpoint.
+
 ### Real KV transfers
 
 Prefill and decode instances run as simulated servers behind any proxy. With
