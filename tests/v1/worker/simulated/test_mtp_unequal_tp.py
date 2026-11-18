@@ -1189,7 +1189,7 @@ def _assert_spec_pair(path, case):
     target, p_tp, d_tp, k, block, prefix, mode = case
     layers, latent, indexer, _ = SPEC_GRID_PROFILES[target]
     witness = mode in ("witness", "cached-corrupt")
-    pages = [3, 3] if witness else [6, 3] if prefix else [3]
+    pages = [3, 3] if witness else [6, 2] if prefix else [3]
     factor = block // 64 if indexer else 1
     region_count = (layers + 1) * (2 if indexer else 1)
     per_page = (layers + 1) * block * (latent + indexer)
@@ -1251,7 +1251,9 @@ def _assert_spec_pair(path, case):
                 "mismatched_bytes": 0,
             }
             assert check["bytes"] == moved * per_page
-            assert check["groups"][0]["first_logical_block"] == (3 if i else 0)
+            assert check["groups"][0]["first_logical_block"] == (
+                (3 if witness else 4) if i else 0
+            )
             corrupt = (
                 source == 0 and i == 0 and mode in ("latent-corrupt", "indexer-corrupt")
             )
@@ -1331,7 +1333,8 @@ def _assert_spec_pair(path, case):
             )
         hits = [c for c in _checks(rows) if c.get("kind") == "hit"]
         if prefix:
-            assert hits and any(c["blocks"] == 3 for c in hits), hits
+            hit_blocks = 3 if witness else 4
+            assert hits and any(c["blocks"] == hit_blocks for c in hits), hits
             assert all(not g["written_this_step"] for c in hits for g in c["groups"])
             if mode == "cached-corrupt":
                 assert any(not c["ok"] and c["mismatched_bytes"] == 1 for c in hits)

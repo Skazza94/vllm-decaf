@@ -6920,16 +6920,15 @@ def test_nixl_peers_pair_nemotron_3_nano_from_prefill_tp8_to_decode_tp4_at_1088(
         (check,) = [r["kv_check"] for r in c["logs"][rank] if "kv_check" in r]
         assert check["ok"] == (not dirty or rank != 0), check
         assert check["coverage"]["problems"] == [], check["coverage"]
-        assert check["bytes"] == 19488768, check["bytes"]
+        assert check["bytes"] == 18955264, check["bytes"]
         assert check["mismatched_bytes"] == (0 if not dirty or rank != 0 else 1), check
         assert [g["pattern"] for g in check["groups"]] == (
             ["state-v1"] * 4 + ["head-v1"]
         )
-        for state in check["groups"][:4]:
-            assert (state["zeroed_bytes"], state["padding_bytes"]) == (
-                0,
-                141312,
-            )
+        for state, padding in zip(
+            check["groups"][:4], (141312, 141312, 141312, 117760)
+        ):
+            assert (state["zeroed_bytes"], state["padding_bytes"]) == (0, padding)
         (attention,) = [g for g in check["groups"] if g["pattern"] == "head-v1"]
         assert (attention["blocks"], attention["block_size_ratio"]) == (2, 2)
         assert attention["zeroed_bytes"] == 1671168, attention
@@ -7898,7 +7897,7 @@ def test_published_kimi_k3_cold_common_unit_native_read(
             (tmp_path / f"consumer.json.controls.tp{rank}").read_text()
         )
         assert sorted(map(int, controls["header"])) == ranks
-        assert all(len(errors) == 5 for errors in controls["header"].values())
+        assert all(len(errors) == 7 for errors in controls["header"].values())
         if rank == 0:
             assert set(controls["bytes"]) == (
                 {"partial-tail", "zero"} if ptp == 1 else {"zero"}

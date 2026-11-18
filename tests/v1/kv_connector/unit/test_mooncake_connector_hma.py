@@ -250,6 +250,7 @@ def gdn_kv_cache_config(
 
     return KVCacheConfig(
         num_blocks=1000,
+        hash_block_size=block_size,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(

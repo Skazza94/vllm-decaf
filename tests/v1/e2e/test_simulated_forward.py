@@ -1577,13 +1577,14 @@ def test_simulate_forward_cpu_gqa_dcp(tmp_path, monkeypatch, target, interleave)
         assert timing["target_model"] == target
         assert (timing["source"], timing["readiness"]) == ("aic", "ready")
         assert timing["resolved_config"]["dcp"] == (2 if dcp == 2 else None)
-        assert timing["resolved_config"]["backend_version"] == "0.24.0"
+        table = "0.24.0" if dcp > 1 else "0.30.0"
+        assert timing["resolved_config"]["backend_version"] == table
         sdk = RustForwardPassPerfModel.best_available(
             ForwardPassPerfModelConfig(
                 model=target,
                 system="h200_sxm",
                 backend="vllm",
-                backend_version="0.24.0",
+                backend_version=table,
                 worker_type="aggregated",
                 tp=8,
                 dcp=2 if dcp == 2 else None,
@@ -1914,7 +1915,9 @@ def mtp_dcp_engine_cell(
     assert timing["resolved_config"]["nextn"] == k
     assert timing["resolved_config"]["dcp"] == (dcp if dcp > 1 else None)
     assert timing["speculation"]["verify_width"] == k + 1
-    assert timing["resolved_config"]["backend_version"] == "0.24.0"
+    assert timing["resolved_config"]["backend_version"] == (
+        "0.24.0" if dcp > 1 else "0.30.0"
+    )
     if dcp > 1:
         assert timing["decode_context_parallel"]["interleave"] == effective
     assert (MTP_DCP_INTERLEAVE_APPROXIMATION in timing["approximations"]) == (
@@ -2459,10 +2462,10 @@ def test_declared_geometry_moves_real_kernel_rows(tmp_path, case):
         reads = check["coverage"]["reads"]
         if hybrid:
             assert [r["rank"] for r in reads] == [2 * rank, 2 * rank + 1]
-            assert [r["bytes"] for r in reads] == [16_146_432, 12_804_096]
-            assert [r["descriptors"] for r in reads] == [198, 96]
+            assert [r["bytes"] for r in reads] == [15_612_928, 12_270_592]
+            assert [r["descriptors"] for r in reads] == [194, 92]
             assert sum(g.get("zeroed_bytes", 0) for g in check["groups"]) == 3_145_728
-            assert sum(g.get("padding_bytes", 0) for g in check["groups"]) == 344_064
+            assert sum(g.get("padding_bytes", 0) for g in check["groups"]) == 329_728
         else:
             assert [r["rank"] for r in reads] == [rank]
             assert reads[0]["bytes"] == check["bytes"] == (2 - rank) * 8_994_816
@@ -2737,7 +2740,7 @@ def _mtp_prefix_dcp_engine_cell(
         dcp if dcp > 1 else None,
         k,
     )
-    assert resolved["backend_version"] == "0.24.0"
+    assert resolved["backend_version"] == ("0.24.0" if dcp > 1 else "0.30.0")
     if not sparse:
         assert MLA_PREFIX_APPROXIMATION in timing["approximations"]
     if dcp > 1:

@@ -3654,15 +3654,18 @@ def test_mtp_dcp_refuses_other_timing_profiles(
 def test_mtp_dcp_sparse_page_size_left_to_the_backend_is_checked_by_the_provider(
     tmp_path,
 ):
-    """An unspecified page size passes the config check, the backend then sets
-    it; a provider built on any other size refuses."""
+    """An unspecified page size resolves to the default 64, the qualified one;
+    if the backend then sets another size, a provider built on it refuses."""
     from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import dcp_scope_problems
 
     unspecified = _mtp_dcp_engine_config(
         tmp_path, target=V32, tp=8, dcp=2, block_size=None
     )
     assert not unspecified.cache_config.user_specified_block_size
+    assert unspecified.cache_config.block_size == 64
     assert dcp_scope_problems(unspecified, transfers=False) == []
+    provider(unspecified, gpu="h200", target_model=V32)
+    unspecified.cache_config.block_size = 16
     with pytest.raises(ValueError, match="requires 64-token pages for DeepSeek-V3.2"):
         provider(unspecified, gpu="h200", target_model=V32)
 

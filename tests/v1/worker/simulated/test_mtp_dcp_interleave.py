@@ -289,8 +289,8 @@ def test_sparse_mtp_dcp_interleave_with_default_and_explicit_pages(
 def test_sparse_mtp_dcp_default_page_is_checked_by_the_provider_at_an_interleave(
     tmp_path, monkeypatch, target, tp, dcp
 ):
-    """A page size left to the backend passes the config check at any admitted
-    interleave; a provider built on another size still refuses."""
+    """A page size left to the backend resolves to the default 64 and passes at
+    any admitted interleave; a provider built on another size still refuses."""
     monkeypatch.setenv("VLLM_DCP_Q_REPLICATE", "0")
     config = _mtp_dcp_engine_config(
         tmp_path,
@@ -301,8 +301,12 @@ def test_sparse_mtp_dcp_default_page_is_checked_by_the_provider_at_an_interleave
         cp_kv_cache_interleave_size=16,
     )
     assert not config.cache_config.user_specified_block_size
+    assert config.cache_config.block_size == 64
+    gpu = MTP_DCP_PROFILES[target][0]
+    provider(config, gpu=gpu, target_model=target)
+    config.cache_config.block_size = 16
     with pytest.raises(ValueError, match="requires 64-token pages for"):
-        provider(config, gpu=MTP_DCP_PROFILES[target][0], target_model=target)
+        provider(config, gpu=gpu, target_model=target)
 
 
 @requires_mtp_dcp

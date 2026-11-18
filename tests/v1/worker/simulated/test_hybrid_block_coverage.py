@@ -451,8 +451,8 @@ def test_multi_head_real_peer_and_independent_corruption_controls(tmp_path, faul
     "target,ptp,dtp,pblock,dblock,prompt,moved,checked,zeroed,padding,sources",
     [
         (QWEN, 1, 2, 800, 1600, 1900, 155615232, 181829632, 26214400, 80314368, 1),
-        (NANO, 8, 4, 544, 1056, 1089, 16146432, 19292160, 3145728, 172032, 2),
-        (NANO, 4, 8, 1056, 544, 1057, 9646080, 9744384, 98304, 282624, 1),
+        (NANO, 8, 4, 544, 1056, 1089, 15612928, 18758656, 3145728, 164864, 2),
+        (NANO, 4, 8, 1056, 544, 1057, 9379328, 9477632, 98304, 270848, 1),
         (QWEN, 8, 4, 416, 800, 833, 52117504, 64700416, 12582912, 835584, 2),
     ],
     ids=["two-heads", "nemotron-forward", "nemotron-reverse", "qwen-kernel"],
