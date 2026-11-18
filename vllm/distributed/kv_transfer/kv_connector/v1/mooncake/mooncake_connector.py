@@ -25,6 +25,7 @@ from huggingface_hub.utils import httpx
 from vllm import envs
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.config.kv_transfer import KVCacheAccess
+from vllm.config.simulation import moves_real_kv
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     EngineId,
     TransferTopology,
@@ -47,8 +48,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
     bind_hp_tcp,
+    bind_tent_rdma,
+    keep_tent_tcp,
+    kv_transport,
     simulated_tp_mismatch,
     this_rank_kv_address,
+    this_rank_rdma_device,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
@@ -1435,8 +1440,21 @@ class MooncakeConnectorWorker:
 
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
         rank_address = this_rank_kv_address(vllm_config)
-        if rank_address is not None:
-            bind_hp_tcp(rank_address)
+        # Simulated execution's real transfers: TENT over RDMA on the rank's
+        # device, else TCP (hp_tcp on the rank's address when it has one),
+        # TENT's RDMA kept off. Ordinary execution keeps its own transports.
+        self.simulated_transport: dict | None = None
+        simulated = moves_real_kv(vllm_config)
+        if simulated and kv_transport(kv_transfer_config) == "rdma":
+            assert rank_address is not None  # required at configuration
+            self.simulated_transport = bind_tent_rdma(
+                rank_address, this_rank_rdma_device(vllm_config)
+            )
+        else:
+            if rank_address is not None:
+                bind_hp_tcp(rank_address)
+            if simulated:
+                keep_tent_tcp()
         self.engine = TransferEngine()
         self.hostname = rank_address or get_ip()
 

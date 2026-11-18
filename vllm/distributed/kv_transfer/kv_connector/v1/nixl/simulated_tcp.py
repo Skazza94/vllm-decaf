@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Managed CPU TCP binding, before NIXL initializes its selected backend."""
+"""Managed CPU TCP and RDMA bindings, before NIXL initializes its selected
+backend."""
 
 import os
 import socket
@@ -48,10 +49,19 @@ def bind_ucx_tcp(address: str, extra: dict) -> dict:
     source address. NIXL's device_list parameter appends ':1' and overrides
     NET_DEVICES unconditionally; it must never enter this CPU TCP path.
     """
+    interface = tcp_interface(address, "UCX")
+    expected = {"UCX_TLS": "tcp,self", "UCX_NET_DEVICES": interface}
+    set_ucx_environment(expected, extra, "UCX/TCP")
+    return {"address": address, "interface": interface, **expected}
+
+
+def set_ucx_environment(expected: dict[str, str], extra: dict, label: str) -> None:
+    """Set the managed UCX transport and device before NIXL creates its UCX
+    backend, refusing the overrides that would change them."""
     forbidden = {"device_list", "engine_config", "backend_params", "backend_options"}
     if forbidden.intersection(extra):
         raise ValueError(
-            "Managed UCX/TCP does not accept backend/device_list overrides"
+            f"Managed {label} does not accept backend/device_list overrides"
         )
     # The pinned Python agent forwards only num_threads during construction.
     # Reject plugin/environment override names too, rather than silently
@@ -60,18 +70,31 @@ def bind_ucx_tcp(address: str, extra: dict) -> dict:
         k.startswith("NIXL_UCX_") and k != "NIXL_UCX_WARNING_TIMEOUT"
         for k in os.environ
     ):
-        raise ValueError("Managed UCX/TCP does not accept NIXL_UCX overrides")
-    interface = tcp_interface(address, "UCX")
-    expected = {"UCX_TLS": "tcp,self", "UCX_NET_DEVICES": interface}
+        raise ValueError(f"Managed {label} does not accept NIXL_UCX overrides")
     for key, value in expected.items():
         if key in os.environ and os.environ[key] != value:
             raise ValueError(
-                f"Managed UCX/TCP needs {key}={value}, not {os.environ[key]}"
+                f"Managed {label} needs {key}={value}, not {os.environ[key]}"
             )
     if "UCX_CONFIG_FILE" in os.environ:
-        raise ValueError("Managed UCX/TCP does not accept UCX_CONFIG_FILE")
+        raise ValueError(f"Managed {label} does not accept UCX_CONFIG_FILE")
     os.environ.update(expected)
-    return {"address": address, "interface": interface, **expected}
+
+
+def bind_ucx_rdma(address: str, device, extra: dict) -> dict:
+    """Select UCX's RC transport on the rank's RDMA device only (``rc``
+    connects its endpoints over UD, which UCX adds for wireup); no TCP
+    transport, so a missing RDMA path fails instead of falling back.
+    `address` stays the rank's control address (NIXL's side channel)."""
+    expected = {"UCX_TLS": "rc,self", "UCX_NET_DEVICES": device.ucx}
+    set_ucx_environment(expected, extra, "UCX/RDMA")
+    return {
+        "transport": "rdma",
+        "address": address,
+        "device": device.name,
+        "port": device.port,
+        **expected,
+    }
 
 
 def agent_evidence(agent, requested: list[str], binding: dict | None) -> dict:
@@ -101,11 +124,19 @@ def agent_evidence(agent, requested: list[str], binding: dict | None) -> dict:
                 "native_provider_observed": False,
                 "native_threads_observed": False,
             }
+        if requested == ["Mooncake"]:
+            # TENT's transports are its MC_TENT_CONF, set before the backend
+            # existed; they are not observed from Python.
+            return {
+                "backends": sorted(initialized),
+                "binding": binding,
+                "native_transport_observed": False,
+            }
         # Config and engine_config modifications defer to UCX_*; device_list
         # alone bypasses them. Check observed options for that override too.
         options = agent.get_backend_params("UCX")
         if options.get("device_list"):
-            raise ValueError("Managed UCX/TCP agent has a device_list override")
+            raise ValueError("Managed UCX agent has a device_list override")
         # The binding is the environment set before construction; UCX's own
         # transport and device selection is not observed from Python.
         return {

@@ -558,12 +558,21 @@ class SimulatedModelRunner(GPUModelRunner):
                         {"pattern": STATE_PATTERN, "global_heads": None,
                          "state": state_layout_record(state_layout, tp.rank_in_group, tp.world_size)}
                     )
+            # The rank's managed transport binding, by its connector.
+            transport_key = (
+                "nixl_transport"
+                if self.vllm_config.kv_transfer_config.kv_connector in NIXL_CONNECTORS
+                else "mooncake_transport"
+            )
             # This rank's KV heads: its memory and bytes are its own.
             self.step_log.write_kv_layout(
                 {
                     **layout,
-                    **({"nixl_transport": nixl_worker.simulated_transport}
-                       if getattr(nixl_worker, "simulated_transport", None) is not None else {}),
+                    **(
+                        {transport_key: nixl_worker.simulated_transport}
+                        if getattr(nixl_worker, "simulated_transport", None) is not None
+                        else {}
+                    ),
                     "tp_rank": tp.rank_in_group,
                     "tp_size": tp.world_size,
                     "decode_context_parallel": getattr(self, "_dcp_geometry", None),

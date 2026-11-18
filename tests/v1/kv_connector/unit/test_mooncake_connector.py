@@ -4171,6 +4171,26 @@ def test_hp_tcp_binds_the_rank_address_only(monkeypatch, existing):
         assert (hp_tcp["enable"], hp_tcp["connections_per_peer"]) == (True, 4)
 
 
+@pytest.mark.parametrize(
+    "conf",
+    [{"transports": {"rdma": {"enable": True}}}, {"transports/rdma/enable": True}],
+)
+def test_tcp_runs_refuse_a_tent_configuration_enabling_rdma(monkeypatch, conf):
+    monkeypatch.setenv(tent_config.ENV, json.dumps(conf))
+    with pytest.raises(ValueError, match="keep TENT's RDMA transport off"):
+        rank_kv.keep_tent_tcp()
+
+
+def test_tcp_runs_keep_tents_rdma_off_and_its_other_settings(monkeypatch):
+    # TENT would enable RDMA on any RDMA NIC it sees.
+    monkeypatch.setenv(
+        tent_config.ENV, json.dumps({"transports": {"hp_tcp": {"enable": True}}})
+    )
+    rank_kv.keep_tent_tcp()
+    conf = json.loads(os.environ[tent_config.ENV])
+    assert conf["transports"] == {"hp_tcp": {"enable": True}, "rdma": {"enable": False}}
+
+
 def test_a_worker_uses_its_rank_address(monkeypatch):
     """TP rank 1 of 2 with its own address: its host and TENT's hp_tcp."""
     monkeypatch.setenv(tent_config.ENV, json.dumps({"rpc_server_hostname": "10.100.0.1"}))
@@ -4211,6 +4231,138 @@ def test_a_worker_uses_its_rank_address(monkeypatch):
             assert conf["rpc_server_hostname"] == "10.101.0.1"
         finally:
             worker.shutdown()
+
+
+def test_a_worker_binds_tent_rdma_on_its_device_before_the_engine(monkeypatch):
+    """TP rank 1 of 2 over RDMA (simulated execution's real transfers): TENT
+    selected and its RDMA transport alone on the rank's device, set before
+    the transfer engine is created; the binding is the worker's record."""
+    names = ("MC_USE_TENT", "MC_USE_TEV1", "MOONCAKE_LOCAL_HOSTNAME", tent_config.ENV)
+    for name in names:
+        # Restored after the test even when absent: the binding sets them.
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        block_size=maybe_update_block_size(16),
+        kv_connector_extra_config={
+            "kv_transport": "rdma",
+            "rank_addresses": ["10.100.0.1", "10.101.0.1"],
+            "rank_rdma_devices": ["mlx5_0", "mlx5_1"],
+        },
+    )
+    config.simulation_config.simulate_forward = True
+    seen: list[tuple] = []
+
+    class RecordingEngine(FakeMooncakeWrapper):
+        def __init__(self, *args, **kwargs):
+            conf = json.loads(os.environ[tent_config.ENV])
+            seen.append(("created", os.environ.get("MC_USE_TENT"), conf))
+            super().__init__(*args, **kwargs)
+
+        def initialize(self, local_hostname, *args):
+            seen.append(("initialized", local_hostname, args[1]))
+            return 0
+
+    module = "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector"
+    with (
+        set_current_vllm_config(config),
+        patch_worker_dependencies(),
+        patch(f"{module}.TransferEngine", RecordingEngine),
+        patch(f"{module}.get_tensor_model_parallel_rank", return_value=1),
+        patch(f"{module}.get_tensor_model_parallel_world_size", return_value=2),
+        patch.object(rank_kv, "get_tensor_model_parallel_rank", return_value=1),
+        patch.object(rank_kv, "get_tensor_model_parallel_world_size", return_value=2),
+        patch.object(MooncakeConnectorWorker, "_sync_block_size_with_kernel"),
+    ):
+        worker = MooncakeConnector(
+            config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        ).connector_worker
+        try:
+            (created, use_tent, conf), initialized = seen
+            assert (created, use_tent) == ("created", "1")
+            assert conf["topology"]["rdma_whitelist"] == ["mlx5_1"]
+            assert conf["transports"]["rdma"]["enable"] is True
+            assert conf["transports"]["hp_tcp"]["enable"] is False
+            assert conf["rpc_server_hostname"] == "10.101.0.1"
+            assert initialized == ("initialized", "10.101.0.1", "rdma")
+            assert worker.simulated_transport["device"] == "mlx5_1"
+            assert worker.simulated_transport["engine"] == "tent"
+        finally:
+            worker.shutdown()
+
+
+def construct_recording_worker(config, monkeypatch):
+    """Construct the worker, recording MC_TENT_CONF when its transfer
+    engine is created."""
+    seen: list[dict | None] = []
+
+    class RecordingEngine(FakeMooncakeWrapper):
+        def __init__(self, *args, **kwargs):
+            seen.append(tent_config.load())
+            super().__init__(*args, **kwargs)
+
+    module = "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector"
+    with (
+        set_current_vllm_config(config),
+        patch_worker_dependencies(),
+        patch(f"{module}.TransferEngine", RecordingEngine),
+        patch(f"{module}.get_tensor_model_parallel_rank", return_value=0),
+        patch(f"{module}.get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(rank_kv, "get_tensor_model_parallel_rank", return_value=0),
+        patch.object(rank_kv, "get_tensor_model_parallel_world_size", return_value=1),
+        patch.object(MooncakeConnectorWorker, "_sync_block_size_with_kernel"),
+    ):
+        worker = MooncakeConnector(
+            config, KVConnectorRole.WORKER, _make_test_kv_cache_config()
+        ).connector_worker
+        worker.shutdown()
+    (conf,) = seen
+    return conf
+
+
+@pytest.mark.parametrize("extra", [{}, {"kv_transport": "tcp"}])
+def test_a_simulated_tcp_worker_without_addresses_keeps_tents_rdma_off(
+    monkeypatch, extra
+):
+    """Simulated execution over TCP, no rank_addresses (the host's address):
+    TENT's RDMA stays off before the engine exists; a configuration enabling
+    it is refused."""
+    monkeypatch.setenv(tent_config.ENV, json.dumps({"log_level": "warning"}))
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        block_size=maybe_update_block_size(16),
+        kv_connector_extra_config=extra,
+    )
+    config.simulation_config.simulate_forward = True
+    conf = construct_recording_worker(config, monkeypatch)
+    assert conf == {"log_level": "warning", "transports": {"rdma": {"enable": False}}}
+    monkeypatch.setenv(
+        tent_config.ENV, json.dumps({"transports": {"rdma": {"enable": True}}})
+    )
+    with pytest.raises(ValueError, match="keep TENT's RDMA transport off"):
+        construct_recording_worker(config, monkeypatch)
+
+
+def test_a_native_worker_keeps_its_tent_transports(monkeypatch):
+    """Without simulation the rank address still binds hp_tcp, and the
+    deployment's own TENT transports (RDMA enabled here) are left as set."""
+    monkeypatch.delenv("MOONCAKE_LOCAL_HOSTNAME", raising=False)
+    monkeypatch.setenv(
+        tent_config.ENV, json.dumps({"transports": {"rdma": {"enable": True}}})
+    )
+    config = create_vllm_config(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        block_size=maybe_update_block_size(16),
+        kv_connector_extra_config={"rank_addresses": ["10.100.0.1"]},
+    )
+    assert not config.simulation_config.simulate_forward
+    conf = construct_recording_worker(config, monkeypatch)
+    assert conf["transports"]["rdma"] == {"enable": True}
+    assert conf["transports"]["hp_tcp"]["bind_address"] == "10.100.0.1"
 
 
 def test_the_legacy_local_hostname_follows_the_rank_address(monkeypatch):

@@ -2710,6 +2710,339 @@ def test_nixl_ranks_bind_their_own_address_on_the_mooncake_backend(
     assert os.environ[tent_config.ENV] == before
 
 
+RDMA_ADDRESSES = ["10.100.0.1", "10.101.0.1"]
+
+
+def rdma_extra(**extra):
+    return {
+        "kv_transport": "rdma",
+        "rank_addresses": RDMA_ADDRESSES,
+        "rank_rdma_devices": ["mlx5_0", "mlx5_1:2"],
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    "connector, extra, problem",
+    [
+        ("NixlConnector", {"kv_transport": "roce"}, "kv_transport tcp or rdma"),
+        (
+            "NixlConnector",
+            {"rank_rdma_devices": ["mlx5_0"]},
+            "rank_rdma_devices only with kv_transport rdma",
+        ),
+        (
+            "NixlConnector",
+            rdma_extra(rank_rdma_devices=None),
+            "one RDMA device per rank",
+        ),
+        ("NixlConnector", rdma_extra(rank_rdma_devices=[]), "one RDMA device per rank"),
+        *(
+            (
+                "NixlConnector",
+                rdma_extra(rank_rdma_devices=["mlx5_0", bad]),
+                "is not an RDMA device",
+            )
+            for bad in ("mlx5_1:0", "mlx5_1:256", "mlx5_1:x", "mlx5_*", "", 1, ":1")
+        ),
+        ("NixlConnector", rdma_extra(rank_addresses=None), "rank_addresses"),
+        (
+            "NixlConnector",
+            rdma_extra(rank_rdma_devices=["mlx5_0"]),
+            "one rank_rdma_devices entry per rank_addresses entry",
+        ),
+        (
+            "NixlConnector",
+            rdma_extra(backends=["LIBFABRIC"]),
+            "LIBFABRIC path has no verbs support",
+        ),
+        (
+            "NixlConnector",
+            rdma_extra(backends=["UCX", "Mooncake"]),
+            "one UCX or Mooncake backend",
+        ),
+        (
+            "MooncakeConnector",
+            rdma_extra(mooncake_protocol="tcp"),
+            "mooncake_protocol rdma",
+        ),
+        ("MooncakeConnector", rdma_extra(device_name="mlx5_1"), "no device_name"),
+    ],
+)
+def test_rdma_transport_configurations_are_refused_at_configuration(
+    model_dir, connector, extra, problem
+):
+    extra = {k: v for k, v in extra.items() if v is not None}
+    with pytest.raises(ValueError, match=re.escape(problem)):
+        engine_config(
+            model_dir,
+            kv_transfer={"kv_connector": connector, "kv_connector_extra_config": extra},
+            tensor_parallel_size=2,
+        )
+
+
+@pytest.mark.parametrize(
+    "connector, extra",
+    [
+        ("NixlConnector", rdma_extra()),
+        ("NixlConnector", rdma_extra(backends=["Mooncake"])),
+        ("NixlPullConnector", rdma_extra(backends=["UCX"])),
+        # Ranks may share a NIC.
+        ("NixlConnector", rdma_extra(rank_rdma_devices=["mlx5_1", "mlx5_1"])),
+        ("MooncakeConnector", rdma_extra()),
+        ("MooncakeConnector", rdma_extra(mooncake_protocol="rdma")),
+        # TCP stays the default; existing TCP configurations need nothing new.
+        ("NixlConnector", {"backends": ["Mooncake"]}),
+        ("MooncakeConnector", {"mooncake_protocol": "tcp"}),
+        ("NixlConnector", {"kv_transport": "tcp", "rank_addresses": RDMA_ADDRESSES}),
+    ],
+)
+def test_rdma_and_tcp_transport_configurations_are_taken(model_dir, connector, extra):
+    from vllm.config import KVTransferConfig, VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import kv_transport
+
+    config = engine_config(
+        model_dir,
+        kv_transfer={"kv_connector": connector, "kv_connector_extra_config": extra},
+        tensor_parallel_size=2,
+    )
+    assert kv_transport(config.kv_transfer_config) == extra.get("kv_transport", "tcp")
+    # Outside simulated execution the simulator's transport options are not
+    # validated (the native connectors do not read them).
+    VllmConfig(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector=connector,
+            kv_role="kv_consumer",
+            kv_connector_extra_config={"kv_transport": "roce"},
+        )
+    )
+
+
+def rdma_worker_config(model_dir, monkeypatch, rank, **extra):
+    """A TP2 consumer's config, as its worker `rank` binds it."""
+    from vllm.distributed.kv_transfer.kv_connector.v1 import rank_kv
+
+    monkeypatch.setattr(rank_kv, "get_tensor_model_parallel_rank", lambda: rank)
+    monkeypatch.setattr(rank_kv, "get_tensor_model_parallel_world_size", lambda: 2)
+    return engine_config(
+        model_dir,
+        kv_transfer={"kv_connector_extra_config": rdma_extra(**extra)},
+        tensor_parallel_size=2,
+    )
+
+
+def clear_transport_environment(monkeypatch):
+    """Unset the variables a binding sets or reads; each is restored after
+    the test, absent ones included (a bare delenv records nothing for them,
+    and the binding then sets them)."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
+
+    for name in (
+        "UCX_TLS",
+        "UCX_NET_DEVICES",
+        "UCX_CONFIG_FILE",
+        "NIXL_MOONCAKE_IP_ADDR",
+        "MC_USE_TENT",
+        "MC_USE_TEV1",
+        "MC_IB_PORT",
+        "MC_TE_FILTERS",
+        "MC_TE_FILTERS_EXCLUDE",
+        "MC_FORCE_TCP",
+        "MOONCAKE_LOCAL_HOSTNAME",
+        tent_config.ENV,
+        *(k for k in os.environ if k.startswith("NIXL_UCX_")),
+    ):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+@pytest.mark.parametrize(
+    "rank, devices, expected",
+    [
+        (0, ["mlx5_0", "mlx5_1:2"], "mlx5_0:1"),  # the port defaults to 1
+        (1, ["mlx5_0", "mlx5_1:2"], "mlx5_1:2"),
+        (1, ["mlx5_1", "mlx5_1"], "mlx5_1:1"),  # a shared NIC
+    ],
+)
+def test_nixl_ucx_ranks_bind_rc_on_their_rdma_device(
+    monkeypatch, model_dir, rank, devices, expected
+):
+    """Managed UCX/RDMA, before NIXL creates its UCX backend: RC (UD for
+    wireup) on the rank's device:port only, no TCP transport."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        _bind_rank_kv_address,
+    )
+
+    clear_transport_environment(monkeypatch)
+    config = rdma_worker_config(model_dir, monkeypatch, rank, rank_rdma_devices=devices)
+    binding = _bind_rank_kv_address(config, ["UCX"])
+    assert (os.environ["UCX_TLS"], os.environ["UCX_NET_DEVICES"]) == (
+        "rc,self",
+        expected,
+    )
+    assert binding == {
+        "transport": "rdma",
+        "address": RDMA_ADDRESSES[rank],
+        "device": expected.split(":")[0],
+        "port": int(expected.split(":")[1]),
+        "UCX_TLS": "rc,self",
+        "UCX_NET_DEVICES": expected,
+    }
+
+
+@pytest.mark.parametrize(
+    "env, extra, problem",
+    [
+        ({"UCX_TLS": "tcp,self"}, {}, "needs UCX_TLS=rc,self"),
+        ({"UCX_NET_DEVICES": "mlx5_0:1"}, {}, "needs UCX_NET_DEVICES=mlx5_1:2"),
+        ({"UCX_CONFIG_FILE": "/x"}, {}, "UCX_CONFIG_FILE"),
+        ({"NIXL_UCX_DEVICE_LIST": "mlx5_0"}, {}, "NIXL_UCX overrides"),
+        ({}, {"device_list": "mlx5_0"}, "backend/device_list overrides"),
+    ],
+)
+def test_nixl_ucx_rdma_refuses_overrides_of_its_binding(
+    monkeypatch, model_dir, env, extra, problem
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        _bind_rank_kv_address,
+    )
+
+    clear_transport_environment(monkeypatch)
+    config = rdma_worker_config(model_dir, monkeypatch, 1, **extra)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=re.escape(problem)):
+        _bind_rank_kv_address(config, ["UCX"])
+
+
+@pytest.mark.parametrize("extra", [{}, {"kv_transport": "tcp"}])
+def test_nixl_mooncake_tcp_without_addresses_keeps_tents_rdma_off(
+    monkeypatch, model_dir, extra
+):
+    """Over TCP on the host's address (no rank_addresses), NIXL's Mooncake
+    backend still keeps TENT's RDMA off before the backend exists, and
+    refuses a configuration enabling it."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        _bind_rank_kv_address,
+    )
+
+    clear_transport_environment(monkeypatch)
+    monkeypatch.setenv(tent_config.ENV, json.dumps({"log_level": "warning"}))
+    config = engine_config(
+        model_dir,
+        kv_transfer={"kv_connector_extra_config": {"backends": ["Mooncake"], **extra}},
+    )
+    assert _bind_rank_kv_address(config, ["Mooncake"]) is None
+    assert json.loads(os.environ[tent_config.ENV]) == {
+        "log_level": "warning",
+        "transports": {"rdma": {"enable": False}},
+    }
+    monkeypatch.setenv(tent_config.ENV, json.dumps({"transports/rdma/enable": True}))
+    with pytest.raises(ValueError, match="keep TENT's RDMA transport off"):
+        _bind_rank_kv_address(config, ["Mooncake"])
+
+
+TENT_TUNING = {
+    "log_level": "warning",
+    "transports": {"rdma": {"endpoint": {"max_qp_wr": 128}}},
+}
+
+
+@pytest.mark.parametrize("existing", [None, "inline", "file"])
+def test_nixl_mooncake_ranks_bind_tent_rdma_on_their_device(
+    monkeypatch, model_dir, tmp_path, existing
+):
+    """Managed TENT/RDMA, before NIXL creates its Mooncake backend: TENT
+    selected, its RDMA transport alone on the rank's bare device and port,
+    every other transport off, its RPC on the rank address; other tuning
+    kept, from an inline or file MC_TENT_CONF."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        _bind_rank_kv_address,
+    )
+
+    clear_transport_environment(monkeypatch)
+    if existing == "inline":
+        monkeypatch.setenv(tent_config.ENV, json.dumps(TENT_TUNING))
+    elif existing == "file":
+        path = tmp_path / "tent.json"
+        path.write_text(json.dumps(TENT_TUNING))
+        monkeypatch.setenv(tent_config.ENV, str(path))
+    config = rdma_worker_config(model_dir, monkeypatch, 1, backends=["Mooncake"])
+    binding = _bind_rank_kv_address(config, ["Mooncake"])
+    assert binding == {
+        "transport": "rdma",
+        "engine": "tent",
+        "address": "10.101.0.1",
+        "device": "mlx5_1",
+        "port": 2,
+        "tent_transports": ["rdma"],
+    }
+    assert os.environ["MC_USE_TENT"] == "1"
+    assert os.environ["NIXL_MOONCAKE_IP_ADDR"] == "10.101.0.1"
+    conf = json.loads(os.environ[tent_config.ENV])
+    for key, value in (
+        ("rpc_server_hostname", "10.101.0.1"),
+        ("transports/rdma/enable", True),
+        ("transports/rdma/device/port", 2),
+        ("topology/rdma_whitelist", ["mlx5_1"]),
+        ("transports/tcp/enable", False),
+        ("transports/hp_tcp/enable", False),
+        ("transports/shm/enable", False),
+        ("transports/io_uring/enable", False),
+    ):
+        assert tent_config.lookup(conf, key) == (True, value), key
+    if existing is not None:
+        assert conf["log_level"] == "warning"
+        assert conf["transports"]["rdma"]["endpoint"] == {"max_qp_wr": 128}
+
+
+@pytest.mark.parametrize(
+    "env, conf, problem",
+    [
+        *(
+            ({name: value}, None, name)
+            for name, value in (
+                ("MC_IB_PORT", "1"),
+                ("MC_TE_FILTERS", "mlx5_0"),
+                ("MC_TE_FILTERS_EXCLUDE", "mlx5_1"),
+                ("MC_FORCE_TCP", "1"),
+                ("MOONCAKE_LOCAL_HOSTNAME", "10.100.0.1"),
+            )
+        ),
+        ({}, {"transports": {"rdma": {"enable": False}}}, "transports/rdma/enable"),
+        ({}, {"transports": {"rdma": {"device": {"port": 1}}}}, "device/port"),
+        ({}, {"topology": {"rdma_whitelist": ["mlx5_0"]}}, "rdma_whitelist"),
+        ({}, {"transports/hp_tcp/enable": True}, "transports/hp_tcp/enable"),
+        ({}, {"transports": {"io_uring": {"enable": True}}}, "io_uring"),
+        ({}, "{not json", "cannot read"),
+    ],
+)
+def test_tent_rdma_refuses_settings_that_would_move_its_binding(
+    monkeypatch, model_dir, env, conf, problem
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import tent_config
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        _bind_rank_kv_address,
+    )
+
+    clear_transport_environment(monkeypatch)
+    config = rdma_worker_config(model_dir, monkeypatch, 1, backends=["Mooncake"])
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    if conf is not None:
+        monkeypatch.setenv(
+            tent_config.ENV, conf if isinstance(conf, str) else json.dumps(conf)
+        )
+    with pytest.raises(ValueError, match=re.escape(problem)):
+        _bind_rank_kv_address(config, ["Mooncake"])
+    # The rank's own address as MOONCAKE_LOCAL_HOSTNAME agrees with it.
+    if env == {"MOONCAKE_LOCAL_HOSTNAME": "10.100.0.1"}:
+        monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "10.101.0.1")
+        assert _bind_rank_kv_address(config, ["Mooncake"])["transport"] == "rdma"
+
+
 @pytest.mark.parametrize(
     "connector, dp_index, dp_size, tp_rank, name, steps",
     [

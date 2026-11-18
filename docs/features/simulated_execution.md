@@ -742,6 +742,39 @@ the logged binding is the environment set before the agent is created;
 the native transport and device selection is not observed
 (`native_transport_observed: false` for UCX).
 
+The ranks move KV over TCP by default. With `"kv_transport": "rdma"` they
+move it over RDMA instead, each on its own device:
+`"rank_rdma_devices": [...]` lists one `device[:port]` per rank (port 1 by
+default, 1-255), ordered like `rank_addresses`, which RDMA still requires:
+the handshakes and TENT's RPC stay on each rank's address. Ranks may share a
+device. Each binding is set before the native engine is created, and
+settings that would move it are refused rather than overridden:
+
+* NIXL's `["UCX"]` backend uses `rc,self` on the rank's `device:port` (RC
+  connects its endpoints over UD, which UCX adds for wireup). No TCP
+  transport is allowed, so a missing RDMA path fails instead of falling
+  back. The overrides refused for managed UCX/TCP are refused here too.
+* NIXL's `["Mooncake"]` backend and `MooncakeConnector` use TENT
+  (`MC_USE_TENT`): its RDMA transport alone, on the bare device name
+  (`topology/rdma_whitelist`) and port (`transports/rdma/device/port`), its
+  TCP, `hp_tcp`, SHM and io_uring transports disabled, in `MC_TENT_CONF`
+  (inline or a file; other settings kept). `MC_IB_PORT`, `MC_TE_FILTERS`,
+  `MC_TE_FILTERS_EXCLUDE`, `MC_FORCE_TCP`, a different
+  `MOONCAKE_LOCAL_HOSTNAME` and `MC_TENT_CONF` values contradicting the
+  binding are refused. `MooncakeConnector` takes `mooncake_protocol` `rdma`
+  (its default) and no `device_name`.
+* NIXL's `["LIBFABRIC"]` backend is refused over RDMA: the pinned managed
+  path has no verbs support (NIXL selects libfabric's CXI, EFA, TCP or
+  sockets providers).
+
+Managed TCP keeps TENT's RDMA transport disabled (TENT enables it on any
+RDMA NIC it sees) and refuses an `MC_TENT_CONF` that enables it. The
+image's RDMA support (verbs providers, `librdmacm`, UCX built with verbs,
+rdmacm and mlx5) is used only when a run selects RDMA and its containers
+are given the RDMA devices, `IPC_LOCK` and an unlimited memlock limit. Each
+rank's `kv_layout` record holds its binding (`nixl_transport`, or
+`mooncake_transport` for `MooncakeConnector` over RDMA).
+
 A managed UCX or LIBFABRIC `add_remote_agent` can block indefinitely
 when the peer's side channel answers but its KV address is unreachable
 (a wrong `rank_addresses` entry, a missing route, a dead peer). The call
