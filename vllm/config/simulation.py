@@ -46,7 +46,7 @@ def moves_real_kv(vllm_config: "VllmConfig") -> bool:
     connector, which registers real KV cache tensors and moves them between
     instances."""
     return (
-        vllm_config.simulation_config.simulate_forward
+        vllm_config.simulation_config.simulate_forward is True
         and vllm_config.kv_transfer_config is not None
     )
 

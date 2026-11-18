@@ -594,6 +594,22 @@ def test_real_mode_keeps_the_native_connector(model_dir):
 
 
 @pytest.mark.parametrize(
+    "simulate_forward, connector, moves",
+    [(True, True, True), (True, False, False), (False, True, False)],
+)
+def test_only_a_simulated_instance_with_a_connector_moves_real_kv(
+    model_dir, simulate_forward, connector, moves
+):
+    from vllm.config.simulation import moves_real_kv
+
+    kwargs = {} if connector else {"kv_transfer_config": None}
+    config = engine_config(
+        model_dir, simulation={"simulate_forward": simulate_forward}, **kwargs
+    )
+    assert moves_real_kv(config) is moves
+
+
+@pytest.mark.parametrize(
     "simulation, kv_transfer, kwargs, error",
     [
         ({}, {"kv_connector": "NixlPushConnector"}, {}, "one of NixlConnector"),
@@ -1571,6 +1587,247 @@ def test_real_transfers_pair_sliding_window_models_at_unequal_tp(
         simulated_tp_mismatch(config, local_tp, remote_tp, nixl_consumer=True)
         is not None
     ) == refused
+
+
+PLAIN_OR_MLA_ONLY = "plain or sparse MLA only"
+# A Jamba (Mamba1 mixers beside attention) and a Bailing linear hybrid (MLA
+# beside linear attention): hybrids of no state layout the pairing knows.
+JAMBA = {
+    "architectures": ["JambaForCausalLM"],
+    "model_type": "jamba",
+    "vocab_size": 128,
+    "hidden_size": 128,
+    "intermediate_size": 256,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "attn_layer_period": 2,
+    "attn_layer_offset": 1,
+    "expert_layer_period": 2,
+    "expert_layer_offset": 1,
+    "num_experts": 1,
+    "mamba_d_state": 16,
+    "mamba_d_conv": 4,
+    "mamba_expand": 2,
+    "mamba_dt_rank": 8,
+    "torch_dtype": "float32",
+}
+BAILING_HYBRID = {
+    "architectures": ["BailingMoeV2_5ForCausalLM"],
+    "model_type": "bailing_hybrid",
+    "vocab_size": 128,
+    "hidden_size": 128,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "kv_lora_rank": 64,
+}
+
+
+# The tiny hybrids with states that split over TP 8: a Nemotron-H of 8
+# groups (16 SSM heads, 2 KV heads) and a Qwen3.5 of 8 GDN key heads (16
+# value heads, 4 KV heads).
+NEMOTRON_H_8_GROUPS = {**NEMOTRON_H, "mamba_num_heads": 16, "n_groups": 8}
+QWEN3_5_8_KEY_HEADS = {
+    **QWEN3_5_MOE,
+    "text_config": {
+        **QWEN3_5_MOE["text_config"],
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "linear_num_key_heads": 8,
+        "linear_num_value_heads": 16,
+    },
+}
+
+
+@pytest.mark.parametrize("prefix", [False, True], ids=["no-prefix", "prefix"])
+@pytest.mark.parametrize(
+    "config, kwargs",
+    [(NEMOTRON_H_8_GROUPS, {}), (QWEN3_5_8_KEY_HEADS, {"language_model_only": True})],
+    ids=["mamba2", "gdn"],
+)
+def test_real_transfers_pair_mamba2_and_gdn_hybrids_at_unequal_tp_over_nixl_only(
+    tmp_path_factory, ds_conv_layout, config, kwargs, prefix
+):
+    """A Mamba2 (Nemotron-H, 2 KV heads) and a GDN (Qwen3.5, 4 KV heads)
+    hybrid pair unequal sizes over NIXL (its decode side) where the state
+    splits on both sides and attention splits or replicates evenly, a larger
+    producer whose attention replicates included (a hybrid's mapping
+    separates attention sources from state sources); with prefix caching
+    too, a cached state being a rank's shard like the running one. Mooncake
+    keeps refusing."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    model = write_model_dir(tmp_path_factory, "tiny-hybrid-8-way", config)
+    nixl = engine_config(
+        model, tensor_parallel_size=2, enable_prefix_caching=prefix, **kwargs
+    )
+    mooncake = engine_config(
+        model,
+        kv_transfer={"kv_connector": "MooncakeConnector"},
+        tensor_parallel_size=2,
+        enable_prefix_caching=prefix,
+        **kwargs,
+    )
+    assert nixl.model_config.is_hybrid
+    for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2), (1, 4), (8, 2), (2, 8)):
+        assert simulated_tp_mismatch(nixl, local, remote, nixl_consumer=True) is None, (
+            local,
+            remote,
+        )
+        assert PLAIN_OR_MLA_ONLY in simulated_tp_mismatch(mooncake, local, remote)
+    assert simulated_tp_mismatch(nixl, 2, 2, nixl_consumer=True) is None
+    assert simulated_tp_mismatch(mooncake, 2, 2) is None
+    assert "one dividing the other" in simulated_tp_mismatch(
+        nixl, 2, 3, nixl_consumer=True
+    )
+
+
+def test_real_transfers_refuse_hybrids_at_unequal_tp_whose_state_or_heads_do_not_pair(
+    tmp_path_factory, ds_conv_layout
+):
+    """Over NIXL a hybrid's unequal pair is refused, equal sizes still pairing,
+    for a state that does not split over a size (8 groups over a TP16 peer),
+    attention heads that neither split nor replicate evenly (6 KV heads on
+    TP4), a recurrent state of no known layout (Jamba's Mamba1), or an MLA
+    hybrid other than Kimi-K3 (a Bailing linear hybrid)."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    nemotron = write_model_dir(
+        tmp_path_factory, "tiny-nemotron-h-8-groups", NEMOTRON_H_8_GROUPS
+    )
+    for config, local, remote, why in (
+        (
+            engine_config(nemotron, tensor_parallel_size=2),
+            2,
+            16,
+            "does not split over TP 16",
+        ),
+        (
+            engine_config(
+                nemotron,
+                tensor_parallel_size=2,
+                hf_overrides={"num_key_value_heads": 6, "num_attention_heads": 12},
+            ),
+            2,
+            4,
+            "attention KV heads (6) that neither split nor replicate evenly over TP 4",
+        ),
+        (
+            engine_config(write_model_dir(tmp_path_factory, "tiny-jamba", JAMBA)),
+            1,
+            2,
+            "neither Mamba2 nor GDN",
+        ),
+        (
+            engine_config(
+                write_model_dir(tmp_path_factory, "tiny-bailing", BAILING_HYBRID)
+            ),
+            1,
+            2,
+            "an MLA hybrid other than Kimi-K3",
+        ),
+    ):
+        assert config.model_config.is_hybrid
+        reason = simulated_tp_mismatch(config, local, remote, nixl_consumer=True)
+        assert reason is not None and why in reason, (why, reason)
+        assert simulated_tp_mismatch(config, local, local, nixl_consumer=True) is None
+
+
+def test_a_mamba2_hybrids_native_mtp_pairs_unequal_tp_over_nixl_only(
+    tmp_path_factory, ds_conv_layout
+):
+    """Nemotron-H's native MTP pairs at unequal sizes over NIXL as its states
+    without a draft do (the tiny model's 2 groups split over TP2, not TP4);
+    over Mooncake the configuration refuses the draft."""
+    from tests.v1.worker.simulated.test_hybrid_mtp_states import (
+        nemotron_mtp_config,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    model = write_model_dir(
+        tmp_path_factory, "tiny-nemotron-mtp", nemotron_mtp_config()
+    )
+    draft = {"method": "mtp", "num_speculative_tokens": 1}
+    config = engine_config(model, speculative_config=draft)
+    for local, remote in ((1, 2), (2, 1)):
+        assert simulated_tp_mismatch(config, local, remote, nixl_consumer=True) is None
+        assert PLAIN_OR_MLA_ONLY in simulated_tp_mismatch(config, local, remote)
+    assert "does not split over TP 4" in simulated_tp_mismatch(
+        config, 2, 4, nixl_consumer=True
+    )
+    with pytest.raises(ValueError, match="not MooncakeConnector for nemotron_h"):
+        engine_config(
+            model,
+            kv_transfer={"kv_connector": "MooncakeConnector"},
+            speculative_config=draft,
+        )
+
+
+def test_real_transfers_pair_plain_attention_at_unequal_tp_and_refuse_beyond_it(
+    model_dir, tmp_path_factory
+):
+    """Plain attention of 4 KV heads (the tiny Llama's) pairs unequal sizes,
+    one dividing the other, either way over either connector, but NIXL's
+    decode refuses a larger producer whose heads are replicated (TP8), as
+    NIXL does. DeepSeek-V3.2 without an `index_topk` value is not served as
+    sparse MLA: refused either way, equal sizes pairing. A draft other than
+    a native MTP, or a sparse MLA nested under another model type, is
+    refused at configuration."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+        simulated_tp_mismatch,
+    )
+
+    plain = engine_config(
+        model_dir,
+        tensor_parallel_size=2,
+        hf_overrides={"num_attention_heads": 4, "num_key_value_heads": 4},
+    )
+    assert plain.model_config.get_total_num_kv_heads() == 4
+    for local, remote in ((2, 4), (4, 2), (8, 2)):
+        assert simulated_tp_mismatch(plain, local, remote) is None
+        assert simulated_tp_mismatch(plain, local, remote, nixl_consumer=True) is None
+    assert simulated_tp_mismatch(plain, 2, 8) is None
+    assert "replicated" in simulated_tp_mismatch(plain, 2, 8, nixl_consumer=True)
+    assert "one dividing the other" in simulated_tp_mismatch(plain, 2, 3)
+
+    topk = engine_config(
+        write_model_dir(tmp_path_factory, "tiny-deepseek-v3.2-no-topk", DEEPSEEK_V32),
+        dtype="bfloat16",
+        tensor_parallel_size=2,
+        block_size=64,
+        hf_overrides={"index_topk": None},
+    )
+    for nixl_consumer in (False, True):
+        assert PLAIN_OR_MLA_ONLY in simulated_tp_mismatch(
+            topk, 2, 4, nixl_consumer=nixl_consumer
+        )
+        assert simulated_tp_mismatch(topk, 2, 2, nixl_consumer=nixl_consumer) is None
+
+    ngram = {"method": "ngram", "num_speculative_tokens": 2, "prompt_lookup_max": 3}
+    with pytest.raises(ValueError, match="not method ngram"):
+        engine_config(model_dir, speculative_config=ngram)
+    nested = write_model_dir(
+        tmp_path_factory,
+        "tiny-kimi-k25-glm-dsa",
+        {
+            "architectures": ["KimiK25ForConditionalGeneration"],
+            "model_type": "kimi_k25",
+            "text_config": {
+                **DEEPSEEK_V32,
+                "model_type": "glm_moe_dsa",
+                "architectures": ["GlmMoeDsaForCausalLM"],
+            },
+        },
+    )
+    with pytest.raises(ValueError, match="no sparse MLA"):
+        engine_config(nested, dtype="bfloat16", block_size=64)
 
 
 # The tiny Kimi-K3 with 8 KDA heads, so that TP 8 splits them.

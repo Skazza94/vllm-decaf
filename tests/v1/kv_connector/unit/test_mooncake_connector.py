@@ -3650,56 +3650,6 @@ def _simulation_config(
     )
 
 
-NEMOTRON_STATE = dict(
-    mamba_num_heads=64, mamba_head_dim=64, n_groups=8, ssm_state_size=128, conv_kernel=4,
-    mamba_ssm_cache_dtype="float32",
-)
-QWEN_STATE = dict(
-    linear_num_key_heads=16, linear_key_head_dim=128, linear_num_value_heads=48,
-    linear_value_head_dim=128, linear_conv_kernel_dim=4, mamba_ssm_dtype="float32",
-)
-
-
-def test_simulated_real_transfers_pair_unequal_tp_for_a_hybrid_over_nixl_only():
-    """A Mamba2 or GDN hybrid pairs unequal sizes over NIXL (its decode side)
-    where the state splits on both sides and attention splits or replicates
-    evenly; Mooncake keeps refusing; the pure-attention replicated-producer
-    rule does not apply (Nemotron's K=2 at TP4 -> TP2 is native hybrid mapping)."""
-    nemotron = _simulation_config(hybrid=True, kv_heads=2, text_attrs=NEMOTRON_STATE)
-    qwen = _simulation_config(hybrid=True, kv_heads=4, text_attrs=QWEN_STATE)
-    for config in (nemotron, qwen):
-        assert simulated_tp_mismatch(config, 2, 2, nixl_consumer=True) is None
-        for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2), (1, 4), (8, 2)):
-            assert simulated_tp_mismatch(config, local, remote, nixl_consumer=True) is None, (local, remote)
-            assert "plain or sparse MLA only" in simulated_tp_mismatch(config, local, remote)
-    # A larger producer whose attention replicates: admitted for a hybrid (K=2 on 4).
-    assert simulated_tp_mismatch(nemotron, 2, 4, nixl_consumer=True) is None
-    # Prefix caching (a state a block) pairs the same sizes: a cached state
-    # is a rank's shard like the running one.
-    for attrs, heads in ((NEMOTRON_STATE, 2), (QWEN_STATE, 4)):
-        cached = _simulation_config(
-            hybrid=True, kv_heads=heads, text_attrs=attrs, prefix_caching=True
-        )
-        for local, remote in ((1, 2), (2, 1), (2, 4), (4, 2)):
-            assert simulated_tp_mismatch(cached, local, remote, nixl_consumer=True) is None
-    for config, why in (
-        (_simulation_config(hybrid=True, kv_heads=2, text_attrs=NEMOTRON_STATE, speculative=SimpleNamespace(method="mtp")), "speculative"),
-        (_simulation_config(hybrid=True, mla=True, kv_heads=1, text_attrs=NEMOTRON_STATE), "MLA"),
-        (_simulation_config(hybrid=True, kv_heads=2), "neither Mamba2 nor GDN"),
-        # Mamba1's, or any state without the config this layout needs.
-        (_simulation_config(hybrid=True, kv_heads=2, text_attrs=dict(mamba_num_heads=64)), "neither Mamba2 nor GDN"),
-        # A state that does not split over TP 16 (8 groups).
-        (_simulation_config(hybrid=True, kv_heads=2, text_attrs=NEMOTRON_STATE), "does not split over TP 16"),
-        # Attention heads that neither split nor replicate evenly (K=6 on TP4).
-        (_simulation_config(hybrid=True, kv_heads=6, text_attrs=NEMOTRON_STATE), "neither split nor replicate"),
-    ):
-        local, remote = (2, 16) if "16" in why else (2, 4)
-        reason = simulated_tp_mismatch(config, local, remote, nixl_consumer=True)
-        assert reason is not None and why in reason, (why, reason)
-    # Indivisible sizes stay refused first.
-    assert "one dividing" in simulated_tp_mismatch(nemotron, 2, 3, nixl_consumer=True)
-
-
 def test_simulated_real_transfers_pair_unequal_tp_for_sparse_mla():
     """DeepSeek-V3.2's and GLM-5's sparse MLA: the latent and the indexer's
     keys are each whole on every rank, so unequal sizes pair either way over
@@ -3716,40 +3666,6 @@ def test_simulated_real_transfers_pair_unequal_tp_for_sparse_mla():
     )
     drafted.model_config.hf_text_config.index_topk = 2048
     assert "plain or sparse MLA only" in simulated_tp_mismatch(drafted, 2, 4)
-
-
-def test_simulated_real_transfers_pair_unequal_tp_for_plain_attention():
-    assert simulated_tp_mismatch(_simulation_config(), 2, 2) is None
-    # Plain attention: each head's pattern is its own, so a connector may
-    # re-shard heads between unequal sizes, either way.
-    assert simulated_tp_mismatch(_simulation_config(), 2, 4) is None
-    assert simulated_tp_mismatch(_simulation_config(), 4, 2) is None
-    assert "one dividing the other" in simulated_tp_mismatch(_simulation_config(), 2, 3)
-    for config in (
-        # A sparse-MLA config the simulator does not serve as DSA (no
-        # `index_topk` value, or DSA nested under another model type).
-        _simulation_config(mla=True, model_type="deepseek_v32", dsa=True),
-        _simulation_config(mla=True, model_type="kimi_k25", text_model_type="glm_moe_dsa", dsa=True),
-        # DeepSeek-V4's compressed caches; a hybrid's (Kimi-K3's) states.
-        _simulation_config(mla=True, model_type="deepseek_v4", kv_heads=1),
-        _simulation_config(mla=True, hybrid=True, model_type="kimi_linear"),
-        _simulation_config(mla=True, model_type="deepseek_v3", speculative=SimpleNamespace(method="mtp")),
-        _simulation_config(hybrid=True),
-        _simulation_config(speculative=SimpleNamespace(method="mtp")),
-    ):
-        assert "plain or sparse MLA only" in simulated_tp_mismatch(config, 2, 4)
-        # Equal sizes pair as before.
-        assert simulated_tp_mismatch(config, 2, 2) is None
-    # NIXL's decode refuses a larger producer whose heads are replicated (K
-    # 4 on 8 ranks), as NIXL itself does; Mooncake writes from such a one.
-    replicated = _simulation_config(kv_heads=4)
-    assert "replicated" in simulated_tp_mismatch(replicated, 2, 8, nixl_consumer=True)
-    assert simulated_tp_mismatch(replicated, 2, 8) is None
-    assert simulated_tp_mismatch(replicated, 8, 2, nixl_consumer=True) is None
-    assert simulated_tp_mismatch(replicated, 2, 4, nixl_consumer=True) is None
-    # Real deployments keep Mooncake's heterogeneous TP.
-    sparse = {"mla": True, "model_type": "deepseek_v32", "dsa": True}
-    assert simulated_tp_mismatch(_simulation_config(False, **sparse), 2, 1) is None
 
 
 def test_simulated_real_transfers_pair_unequal_tp_with_sliding_window_layers():

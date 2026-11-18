@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from .utils import (
+    create_model_runner_output,
     create_request,
     create_scheduler,
     create_vllm_config,
@@ -2558,42 +2559,76 @@ def test_sync_recved_kv_copies_each_group_own_layers(group_block_ids):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "window,num_tokens,window_first,window_held",
+    "window,num_tokens,window_first,window_held,window_sent",
     [
-        (64, 40, 0, 3),  # within the window: every block
+        (64, 40, 0, 3, 3),  # within the window: every block
         # 320 tokens, 20 blocks: the next token's 64-token window skips the
-        # first 16 blocks (null); the 4 after them are pulled.
-        (64, 320, 16, 4),
-        # 325 tokens, 21 blocks: still 16 null; 5, the clip's cdiv(64, 16) + 1.
-        (64, 325, 16, 5),
-        (1, 320, 20, 0),  # a 1-token window skips the aligned prompt whole
+        # first 16 blocks (null); the 4 after them are pulled. The producer
+        # sends the clip's cdiv(64, 16) + 1 = 5, its first a null block.
+        (64, 320, 16, 4, 5),
+        # 325 tokens, 21 blocks: still 16 null; 5 pulled, as sent.
+        (64, 325, 16, 5, 5),
+        # A 1-token window skips the aligned prompt whole; the producer still
+        # sends the clip's 2.
+        (1, 320, 20, 0, 2),
     ],
 )
 def test_pulls_say_where_each_groups_blocks_start(
-    window, num_tokens, window_first, window_held
+    window, num_tokens, window_first, window_held, window_sent
 ):
-    """A consumer pulls a sliding window's last blocks only; the pull says
-    where each group's pulled blocks start among the request's blocks (null
-    blocks padding a window's head), apart from its prefix hit."""
+    """A consumer pulls a sliding window's last blocks only, of the ones the
+    producer's clip sends; the pull says where each group's pulled blocks
+    start among the request's blocks (null blocks padding a window's head),
+    apart from its prefix hit."""
     from vllm.v1.worker.simulated.kv_transfer import requested_reads
 
     block_size = 16
-    vllm_config = create_vllm_config(
-        kv_connector="NixlConnector",
-        kv_role="kv_consumer",
-        block_size=block_size,
-        disable_hybrid_kv_cache_manager=False,
-    )
+    total = -(-num_tokens // block_size)
     kv_cache_config = make_kv_cache_config(
         block_size=block_size, swa_enabled=True, sw_size=window, num_blocks=1000
     )
-    scheduler = create_scheduler(vllm_config, kv_cache_config=kv_cache_config)
+
+    producer = create_scheduler(
+        create_vllm_config(
+            kv_connector="NixlConnector",
+            kv_role="kv_producer",
+            block_size=block_size,
+            max_num_batched_tokens=num_tokens,
+            disable_hybrid_kv_cache_manager=False,
+        ),
+        kv_cache_config=kv_cache_config,
+    )
+    prefill = create_request(
+        request_id=1,
+        block_size=block_size,
+        num_tokens=num_tokens,
+        do_remote_decode=True,
+    )
+    producer.add_request(prefill)
+    (output,) = producer.update_from_output(
+        producer.schedule(), create_model_runner_output(reqs=[prefill])
+    )[0].outputs
+    assert output.kv_transfer_params is not None
+    sent = output.kv_transfer_params["remote_block_ids"]
+    assert [len(group) for group in sent] == [total, window_sent]
+
+    scheduler = create_scheduler(
+        create_vllm_config(
+            kv_connector="NixlConnector",
+            kv_role="kv_consumer",
+            block_size=block_size,
+            disable_hybrid_kv_cache_manager=False,
+        ),
+        kv_cache_config=kv_cache_config,
+    )
     request = create_request(
         request_id=1,
         block_size=block_size,
         num_tokens=num_tokens,
         do_remote_prefill=True,
     )
+    assert request.kv_transfer_params is not None
+    request.kv_transfer_params["remote_block_ids"] = sent
     scheduler.add_request(request)
 
     metadata = scheduler.schedule().kv_connector_metadata
@@ -2603,7 +2638,6 @@ def test_pulls_say_where_each_groups_blocks_start(
         [block.block_id for block in manager.req_to_blocks[request.request_id]]
         for manager in managers
     ]
-    total = -(-num_tokens // block_size)
     assert [len(blocks) for blocks in held] == [total, total]
     assert pull.local_first_block_indices == (0, window_first)
     assert pull.local_num_computed_blocks == (0, 0)  # no prefix hit
@@ -2615,6 +2649,8 @@ def test_pulls_say_where_each_groups_blocks_start(
     assert sum(1 for block in pull.local_block_ids[1] if block) == window_held
     (read,) = requested_reads(metadata)
     assert read.first_logical_blocks == [0, window_first]
+    assert read.remote_block_counts == [total, window_sent]
+    assert read.remote_block_ids == tuple(tuple(group) for group in sent)
 
 
 @pytest.mark.cpu_test
