@@ -175,6 +175,36 @@ L1 does not enable a synchronous step logger or add per-token records to
 manufacture a missing compute track. The format follows Chrome Trace Event
 conventions used by vllm-vcr, not its inferred request-prefill durations.
 
+## Offline analysis summary
+
+```console
+.venv/bin/python -m vllm.kv_profiling.summary \
+  /profiles/run --output summary.json [--calibration mapping.json ...]
+```
+
+`--output` is required. Directories are searched for `events.jsonl`; identical
+copies of one process capture fold into one source, conflicting copies are
+rejected. The summary reports, per process
+and per transfer, the handshake, prepared-to-posted and posted-to-completed
+durations (with transfer throughput and NIXL's own integer microseconds),
+per-request handoffs, releases and failures, and per-backend/per-transport
+percentiles; TCP and RDMA are always separate keys. A request completes only
+when every one of its transfers completed and no required failure was
+recorded: receive-finished and senders-done are terminal notifications,
+recorded with their times but never establishing success, and only an
+identified cleanup or notification failure (a late notification, a failed
+notification or release) after the completed movement stays cleanup.
+Failure codes outside that set, and any failure before the movement
+boundary, keep the request failed. Durations stay inside one process's
+recorded clock; cross-process handoff-to-first-post spans require saved
+calibrations and keep the projection's uncertainty. Every event that
+could not be paired is listed in `problems`, and a metric the records do not
+carry is listed in `not_available`, never invented: the block-pool return
+(`BLOCKS_RELEASED`) is recorded by no adapter, so `release_requested_time_ns`
+is the scheduler's permission only. A missing end record means completeness
+is unknown, not that the capture is empty: rows flushed before the stop are
+summarized, rows left in a ring that was never closed are lost.
+
 ## Qualification boundaries
 
 The focused core tests use real recorder mappings, native publishers, helper
