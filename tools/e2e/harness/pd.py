@@ -304,6 +304,9 @@ class Profiler:
     transport: str = "tcp"
     clock_port_offset: int = 1000
     flush: str = "end"
+    level: str = "l1"
+    probes: dict = field(default_factory=dict)
+    observer_cpus: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -397,6 +400,21 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
     if (profiler := run.profiler) is not None:
         if run.server.connector != "nixl":
             raise ValueError("profiler needs server.connector nixl")
+        if profiler.level not in ("l1", "l3"):
+            raise ValueError("profiler.level must be l1 or l3")
+        if profiler.level == "l3":
+            nodes = set(run.prefill.nodes + run.decode.nodes)
+            if set(profiler.probes) != nodes or set(profiler.observer_cpus) != nodes:
+                raise ValueError(
+                    "L3 needs explicit probes and observer_cpus for every endpoint")
+            for cpus in profiler.observer_cpus.values():
+                if not isinstance(cpus, list) or not cpus or any(
+                    type(cpu) is not int or cpu < 0 for cpu in cpus
+                ):
+                    raise ValueError(
+                        "observer_cpus must contain non-negative CPU lists")
+        elif profiler.probes or profiler.observer_cpus:
+            raise ValueError("endpoint probe settings require L3")
         if profiler.transport not in ("tcp", "unknown") or profiler.flush not in ("end", "background"):
             raise ValueError("profiler.transport is tcp or unknown, profiler.flush end or background")
         if (not isinstance(profiler.clock_port_offset, int) or isinstance(profiler.clock_port_offset, bool)
@@ -873,7 +891,9 @@ def kv_events_topic(control: str, endpoint_port: int) -> str:
 
 
 def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SERVER_PORT,
-                   endpoint: tuple[str, int] | None = None, profile_id: str | None = None) -> list[str]:
+                   endpoint: tuple[str, int] | None = None,
+                   profile_id: str | None = None,
+                   node: str | None = None) -> list[str]:
     """``vllm serve`` for ``role`` (prefill or decode) on HTTP ``port``, TP
     rank r's KV on ``kv_addresses[r]`` in every DP rank (their own:
     ``rank_addresses``, DP rank by TP rank). ``endpoint``: the control
@@ -912,9 +932,14 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         if profile_id is None:
             raise ValueError("a profiled run needs one profile ID for both servers")
         kv_transfer["kv_connector_extra_config"]["network_profiler"] = {
-            "level": "l1", "run_id": profile_id, "output_dir": PROFILES,
+            "level": run.profiler.level, "run_id": profile_id, "output_dir": PROFILES,
             "transport": run.profiler.transport, "clock_port_offset": run.profiler.clock_port_offset,
             "flush": run.profiler.flush, "shutdown_timeout_s": 10}
+        if run.profiler.level == "l3":
+            if node is None:
+                raise ValueError("L3 server command needs its endpoint node")
+            profile = kv_transfer["kv_connector_extra_config"]["network_profiler"]
+            profile["probes"] = run.profiler.probes[node]
     connector_env = {
         # NIXL's handshake and its Mooncake backend's segment on the KV network.
         "VLLM_NIXL_SIDE_CHANNEL_HOST": kv_address, "NIXL_MOONCAKE_IP_ADDR": kv_address,
@@ -1022,13 +1047,14 @@ def execute(run: Run, output: Path | None = None) -> dict:
         for node in side.nodes:
             command = server_command(run, role, instances[role][node]["kv"], front.server_port(role),
                                      (instances[role][node]["control"], front.endpoint_port(role)),
-                                     profile_id)
+                                     profile_id, node=node)
             commands.setdefault(role, {})[node] = command
             _background(container[node], command, f"{WORK}/logs/{role}.log")
     # Each server as it was started: its environment and flags.
     (output / "servers.json").write_text(json.dumps(commands, indent=2) + "\n")
     # And what it runs in: each node container's image, by id, and its mounts.
     (output / "containers.json").write_text(json.dumps(container_identities(container), indent=2) + "\n")
+    observers = []
     try:
         # Every instance (the startup timeout counted from the first).
         deadline = time.monotonic() + run.startup_timeout
@@ -1036,6 +1062,20 @@ def execute(run: Run, output: Path | None = None) -> dict:
             for node in side.nodes:
                 _wait(container[run.client], front.health_url(role, instances[role][node]["control"]),
                       max(1.0, deadline - time.monotonic()), container[node], f"{WORK}/logs/{role}.log")
+        if run.profiler is not None and run.profiler.level == "l3":
+            from .endpoint_observer import EndpointObserver
+
+            for role, side in roles:
+                for node in side.nodes:
+                    observers.append(EndpointObserver.start(
+                        container[node], output=output / "endpoint-probes" / node,
+                        run_id=profile_id, endpoint=node, role=role,
+                        cpus=run.profiler.observer_cpus[node],
+                        probes=run.profiler.probes[node],
+                        expected_workers=sum(side.node_of(dp) == node
+                            for dp, _ in side.ranks(side.tp(run.server))),
+                        expected_schedulers=sum(side.node_of(dp) == node
+                            for dp, tp in side.ranks(side.tp(run.server)) if tp == 0)))
         base_url = front.start(container, address)
 
         tent_before = _tent_metrics(run, container)
@@ -1061,7 +1101,12 @@ def execute(run: Run, output: Path | None = None) -> dict:
             if run.profiler is not None:
                 # The servers close their recorders on SIGTERM, which flushes and
                 # completes each process's trace; only then is it copied.
-                stop_orderly(run, container, output)
+                def endpoint_closed(node, result):
+                    for observer in list(observers):
+                        if observer.endpoint == node:
+                            observer.stop(bool(result.get("graceful")))
+                            observers.remove(observer)
+                stop_orderly(run, container, output, on_endpoint_closed=endpoint_closed)
                 _collect_profiles(run, container, output, profile_id)
             if run.workload.measure:
                 # From the servers' own step logs, the samplers' files and (profiled)
@@ -1070,6 +1115,8 @@ def execute(run: Run, output: Path | None = None) -> dict:
                 (output / "cpu.json").write_text(json.dumps(
                     report if report is not None else {"error": "no samples or no priced step"}, indent=2) + "\n")
         finally:
+            for observer in observers:
+                observer.stop(False)
             front.stop(container)
             for name in container.values():
                 stop_services(name)
@@ -1095,6 +1142,10 @@ def execute(run: Run, output: Path | None = None) -> dict:
            for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
           for role in ("prefill", "decode")],
         routers, run, tent, ports or None, exempt)
+    if run.profiler is not None and run.profiler.level == "l3":
+        from .endpoint_observer import check_captures
+
+        check_captures(output, run, verdict)
     llmd.recheck(output, run, verdict)
     (output / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n")
     if verdict["problems"]:
@@ -1127,6 +1178,10 @@ def recheck(output: str | Path) -> dict:
         None if not uses_tent(run.server) else json.loads((output / "tent.json").read_text()),
         json.loads(ports.read_text()) if ports.exists() else None,
         control_saved)
+    if run.profiler is not None and run.profiler.level == "l3":
+        from .endpoint_observer import check_captures
+
+        check_captures(output, run, verdict)
     llmd.recheck(output, run, verdict)
     (output / "verdict-recheck.json").write_text(json.dumps(verdict, indent=2) + "\n")
     return verdict
@@ -3599,6 +3654,10 @@ def is_service(cmdline: bytes, comm: bytes) -> bool:
     """A process of the run: vLLM runs on the image's Python;
     vLLM renames its engine core and workers (VLLM::EngineCore,
     VLLM::Worker_TP0, ...)."""
+    argv = cmdline.split(b"\0")
+    if (len(argv) > 1 and
+            argv[1].endswith((b"/vllm/kv_profiling/probe.py", b"/observer.pyz"))):
+        return False  # The endpoint controller owns this separate lifecycle.
     return cmdline.startswith((b"/opt/venv/", b"VLLM::")) or comm.startswith(b"VLLM::")
 
 
@@ -3675,7 +3734,8 @@ print(json.dumps({"signalled": owners, "graceful": not left, "remaining": left,
 """
 
 
-def stop_orderly(run: Run, container: dict[str, str], output: Path, timeout: float = 60.0) -> list[dict]:
+def stop_orderly(run: Run, container: dict[str, str], output: Path,
+                 timeout: float = 60.0, *, on_endpoint_closed=None) -> list[dict]:
     """Shut the servers down so their recorders complete: SIGTERM only each
     node's ``vllm serve`` (never the profiler's helpers, which finish their own
     flush as their owner closes), decode first so prefill's clock server is
@@ -3690,6 +3750,11 @@ def stop_orderly(run: Run, container: dict[str, str], output: Path, timeout: flo
         if not result["graceful"]:
             result["forced"] = True
             stop_services(container[node])
+        if on_endpoint_closed is not None:
+            try:
+                on_endpoint_closed(node, result)
+            except Exception as error:
+                result["observer_error"] = str(error)
         steps.append({"node": node, **result})
     (output / "shutdown.json").write_text(json.dumps(steps, indent=2) + "\n")
     return steps
@@ -3857,12 +3922,16 @@ def sample():
             status = open(f"/proc/{pid}/status").read()
         except OSError:
             continue
-        helper = len(argv) > 2 and argv[1] == b"-m" and argv[2].startswith(b"vllm.kv_profiling.")
+        probe = (len(argv) > 1 and argv[1].endswith(
+            (b"/vllm/kv_profiling/probe.py", b"/observer.pyz")))
+        helper = probe or (len(argv) > 2 and argv[1] == b"-m" and
+                           argv[2].startswith(b"vllm.kv_profiling."))
         serving = not helper and (comm.startswith("VLLM") or
                                   (b"serve" in argv[1:4] and any(a.endswith(b"vllm") for a in argv[:3])))
         if not (helper or serving):
             continue
-        kind = "serving" if serving else "writer" if argv[2].endswith(b".sink") else "clock"
+        kind = ("probe" if probe else "serving" if serving else
+                "writer" if argv[2].endswith(b".sink") else "clock")
         fields = {f.split(":")[0]: int(f.split()[1]) for f in status.splitlines()
                   if f.startswith(("VmHWM:", "VmRSS:"))}
         found.append({"pid": int(pid), "start": int(stat[19]), "kind": kind,
@@ -3922,9 +3991,9 @@ def cpu_over(samples: list[dict], start: float, end: float) -> dict:
     reach both instants; ``max_gap_s`` the longest gap between samples."""
     by_identity = _series(samples)
     last_t = samples[-1]["t"]
-    totals = {"serving": 0.0, "writer": 0.0, "clock": 0.0}
-    at_start = {"writer": 0.0}
-    at_end = {"writer": 0.0}
+    totals = {"serving": 0.0, "writer": 0.0, "clock": 0.0, "probe": 0.0}
+    at_start = {"writer": 0.0, "probe": 0.0}
+    at_end = {"writer": 0.0, "probe": 0.0}
     lost, new = [], []
     for key, entry in by_identity.items():
         points = entry["points"]
@@ -3936,15 +4005,18 @@ def cpu_over(samples: list[dict], start: float, end: float) -> dict:
         else:
             before = _value(points, start)
         totals[entry["kind"]] += _value(points, end) - before
-        if entry["kind"] == "writer":
-            at_start["writer"] += _value(points, start)
-            at_end["writer"] += _value(points, end)
+        if entry["kind"] in ("writer", "probe"):
+            at_start[entry["kind"]] += _value(points, start)
+            at_end[entry["kind"]] += _value(points, end)
     times = [s["t"] for s in samples if start <= s["t"] <= end]
     edges = [max((s["t"] for s in samples if s["t"] <= start), default=start), *times,
              min((s["t"] for s in samples if s["t"] >= end), default=end)]
     gaps = [b - a for a, b in zip(edges, edges[1:])]
     return {"serving_s": totals["serving"], "writers_s": totals["writer"], "clock_s": totals["clock"],
-            "helpers_s": totals["writer"] + totals["clock"], "writers_at_start_s": at_start["writer"],
+            "helpers_s": totals["writer"] + totals["clock"] + totals["probe"],
+            "probes_s": totals["probe"], "probes_at_start_s": at_start["probe"],
+            "probes_at_end_s": at_end["probe"],
+            "writers_at_start_s": at_start["writer"],
             "writers_at_end_s": at_end["writer"], "lost": sorted(lost), "new": sorted(new),
             "covered": samples[0]["t"] <= start and last_t >= end, "samples": len(times),
             "max_gap_s": max(gaps) if gaps else 0.0}
@@ -4025,7 +4097,20 @@ def cpu_report_for(output: Path, run: Run) -> dict[str, dict] | None:
                 except ValueError:
                     values.append(None)
             manifests[node] = values
-    return cpu_report(samples, window, manifests, SAMPLE_INTERVAL)
+    report = cpu_report(samples, window, manifests, SAMPLE_INTERVAL)
+    if run.profiler is not None and run.profiler.level == "l3":
+        for node, item in report.items():
+            directory = output / "endpoint-probes" / node / "captures"
+            paths = list(directory.glob("*/*/manifest.json"))
+            manifest = json.loads(paths[0].read_text()) if len(paths) == 1 else {}
+            lifetime = manifest.get("observer_process_cpu_s")
+            consistent = (type(lifetime) in (int, float) and math.isfinite(lifetime) and
+                          lifetime + 2 * WRITER_TICK_S >= item["probes_at_end_s"])
+            item["probe_lifetime_cpu_s"] = lifetime if consistent else None
+            item["probe_flush_s"] = (max(0, lifetime - item["probes_at_end_s"])
+                                     if consistent else None)
+            item["probe_lifetime_rss_hwm_kib"] = manifest.get("observer_rss_hwm_kib")
+    return report
 
 
 SAMPLES = f"{WORK}/cpu-samples.jsonl"
@@ -4148,7 +4233,12 @@ def _collect_profiles(run: Run, container: dict[str, str], output: Path, profile
     """Each server node's profile directory under ``profiles/<role>/<node>/``,
     and the run's profile ID."""
 
-    (output / "profiler.json").write_text(json.dumps({"run_id": profile_id, **asdict(run.profiler)}, indent=2) + "\n")
+    settings = asdict(run.profiler)
+    if run.profiler.level == "l1":
+        for key in ("level", "probes", "observer_cpus"):
+            settings.pop(key)
+    (output / "profiler.json").write_text(
+        json.dumps({"run_id": profile_id, **settings}, indent=2) + "\n")
     for role, side in (("prefill", run.prefill), ("decode", run.decode)):
         for node in side.nodes:
             local = output / "profiles" / role / node

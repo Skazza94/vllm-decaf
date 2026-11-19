@@ -36,7 +36,7 @@ class ProcessRecorder:
     """
 
     def __init__(self, config: NetworkProfilerConfig, *, start_writer=True):
-        if config.level != "l1":
+        if config.level not in ("l1", "l3"):
             raise ValueError("use open_recorder for a disabled configuration")
         from vllm import _kv_profiler
 
@@ -58,6 +58,11 @@ class ProcessRecorder:
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
             "time_namespace": os.readlink("/proc/self/ns/time"),
             "pid": os.getpid(),
+            "net_namespace": os.readlink("/proc/self/ns/net"),
+            "pid_namespace": os.readlink("/proc/self/ns/pid"),
+            "start_ticks": int(
+                Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
+            ),
             "context": config.context,
             "byteorder": sys.byteorder,
             "capabilities": config.context.get(

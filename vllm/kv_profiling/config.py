@@ -28,12 +28,19 @@ class NetworkProfilerConfig:
     batch_records: int = 256
     shutdown_timeout_s: float = 2
     context: dict[str, Any] = field(default_factory=dict)
+    probes: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         import math
 
-        if self.level not in ("off", "l1"):
-            raise ValueError("level must be off or l1")
+        if self.level not in ("off", "l1", "l3"):
+            raise ValueError("level must be off, l1 or l3")
+        if self.level == "l3":
+            from .endpoint_probes.config import ProbeConfig
+
+            ProbeConfig(**self.probes)
+        elif self.probes:
+            raise ValueError("probe settings require level l3")
         if self.flush not in ("end", "background"):
             raise ValueError("flush must be end or background")
         if self.transport not in ("tcp", "rdma", "unknown"):
@@ -81,9 +88,9 @@ class NetworkProfilerConfig:
             raise ValueError("clock_end_budget_s must be finite in (0, 10]")
         if len(json.dumps(self.context).encode()) > 2048:
             raise ValueError("context exceeds 2 KiB")
-        if self.level == "l1":
+        if self.level in ("l1", "l3"):
             if self.run_id is None or self.output_dir is None:
-                raise ValueError("l1 requires run_id and output_dir")
+                raise ValueError("l1/l3 requires run_id and output_dir")
             UUID(self.run_id)
             if not Path(self.shared_dir).is_absolute():
                 raise ValueError("shared_dir must be absolute")

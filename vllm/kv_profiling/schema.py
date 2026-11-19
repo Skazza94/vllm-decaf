@@ -34,6 +34,10 @@ class EventKind(IntEnum):
     CLOCK_SAMPLE = 19
     MODEL_STEP = 20
     TRANSFER_RETIRE = 21
+    # JSONL observer kinds only; never produced by the native L1 ring.
+    ENDPOINT_METRICS = 22
+    PROBE_STATUS = 23
+    PROBE_RESOURCE = 24
 
 
 class Transport(IntEnum):
@@ -106,6 +110,12 @@ def decode_record(raw: bytes) -> dict[str, Any]:
     if w[2] >> 48 != VERSION:
         raise ValueError("unknown binary schema version")
     kind = EventKind((w[2] >> 32) & 0xFFFF)
+    if kind in (
+        EventKind.ENDPOINT_METRICS,
+        EventKind.PROBE_STATUS,
+        EventKind.PROBE_RESOURCE,
+    ):
+        raise ValueError("endpoint observations require probe JSONL schema")
     base = {"schema": VERSION, "sequence": w[1], "time_ns": w[0]}
     if kind == EventKind.DICTIONARY:
         length = w[6] & 0xFFFFFFFF

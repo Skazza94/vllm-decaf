@@ -1121,3 +1121,23 @@ steps:
       - vllm/v1/spec_decode/
       - tests/v1/spec_decode/test_acceptance_length.py
       - vllm/platforms/rocm.py
+
+- label: ":computer: (CPU) KV profiler core and endpoint probes"
+  key: kv-profiler-endpoints-cpu
+  depends_on:
+    - image-build-cpu
+  device: cpu-small
+  timeout_in_minutes: 15
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+    - vllm/kv_profiling/
+    - csrc/kv_profiler/
+    - tests/distributed/kv_transfer/test_endpoint_probes.py
+    - tests/distributed/kv_transfer/profiled_endpoint.py
+    - tests/distributed/kv_transfer/test_profiler_core.py
+    - .buildkite/test_areas/misc.yaml
+  commands:
+    - >-
+      pytest -v -s
+      distributed/kv_transfer/test_endpoint_probes.py
+      distributed/kv_transfer/test_profiler_core.py

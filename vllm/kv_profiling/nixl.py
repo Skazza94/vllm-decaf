@@ -566,6 +566,7 @@ def attach_nixl(
     Raises:
         ValueError: invalid configuration, or the push connector, which is not
             instrumented.
+
     """
     kv = vllm_config.kv_transfer_config
     context = {
@@ -579,7 +580,9 @@ def attach_nixl(
     if config is None:
         return None
     if transfer_mode != "pull":
-        raise ValueError("network_profiler level l1 supports the NIXL pull connector")
+        raise ValueError(
+            "network_profiler levels l1/l3 require the NIXL pull connector"
+        )
     return _build(config, role, engine_id, rank, side_channel, kv.kv_role)
 
 

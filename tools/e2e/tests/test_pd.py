@@ -78,6 +78,19 @@ class ProfilerConfig(unittest.TestCase):
         self.assertEqual([c for c in command if c.startswith("VLLM_WORKER_SHUTDOWN")],
                          ["VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=5"])
 
+    def test_l3_passes_only_the_named_endpoints_probe_settings(self):
+        run = self.run_with(profiler=pd.Profiler(
+            level="l3", probes={"p": {"interfaces": ["lo"]}},
+            observer_cpus={"p": [13]}))
+        command = pd.server_command(run, "prefill", ["10.100.0.1"],
+                                    profile_id="id-1", node="p")
+        extra = json.loads(command[command.index("--kv-transfer-config") + 1])
+        settings = extra["kv_connector_extra_config"]["network_profiler"]
+        self.assertEqual(settings["level"], "l3")
+        self.assertEqual(settings["probes"], {"interfaces": ["lo"]})
+        with self.assertRaisesRegex(ValueError, "endpoint node"):
+            pd.server_command(run, "prefill", ["10.100.0.1"], profile_id="id-1")
+
     def test_off_leaves_the_connector_configuration_unchanged(self):
         run = self.run_with()
         for role in ("prefill", "decode"):
@@ -334,9 +347,12 @@ class OrderlyShutdown(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(pd.topology, "exec_in", exec_in), \
                 mock.patch.object(pd, "stop_services", lambda name: calls.append(("force", name))):
-            steps = pd.stop_orderly(run, {"p": "c-p", "d": "c-d"}, Path(directory))
+            steps = pd.stop_orderly(run, {"p": "c-p", "d": "c-d"}, Path(directory),
+                on_endpoint_closed=lambda node, result:
+                    calls.append(("observer", node)))
             saved = json.loads(Path(directory, "shutdown.json").read_text())
-        self.assertEqual(calls, [("exec", "c-d"), ("exec", "c-p"), ("force", "c-p")])
+        self.assertEqual(calls, [("exec", "c-d"), ("observer", "d"),
+                                 ("exec", "c-p"), ("force", "c-p"), ("observer", "p")])
         self.assertEqual([(s["node"], s["graceful"], s.get("forced", False)) for s in steps],
                          [("d", True, False), ("p", False, True)])
         self.assertEqual(saved, steps)
@@ -4919,3 +4935,348 @@ class MtpStatePullTests(unittest.TestCase):
                                                           "blocks": 1, "bytes": 1600}],
                                self.admission([0, 7, 9]))[0]
         self.assertTrue(any("logged 1 prefix hit check(s), not the 0" in p for p in got), got)
+
+
+class EndpointCaptureChecks(unittest.TestCase):
+    def test_missing_or_partial_observer_cannot_pass_l3(self):
+        from harness.endpoint_observer import check_captures
+
+        run = pd.Run(**{f: getattr(RUN, f) for f in RUN.__dataclass_fields__})
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "profiler.json").write_text(json.dumps({"run_id": "run"}))
+            verdict = {"problems": []}
+            check_captures(output, run, verdict)
+            self.assertEqual(len(verdict["problems"]),
+                             len(run.prefill.nodes + run.decode.nodes))
+            for node in run.prefill.nodes + run.decode.nodes:
+                directory = output / "endpoint-probes" / node / "captures/run/process"
+                directory.mkdir(parents=True)
+                (directory / "manifest.json").write_text(json.dumps({
+                    "run_id": "run", "complete": False}))
+            verdict = {"problems": []}
+            check_captures(output, run, verdict)
+            self.assertTrue(all("incomplete" in item for item in verdict["problems"]))
+
+
+class EndpointObserverAccounting(unittest.TestCase):
+    def test_observer_is_not_a_server_child_and_its_cpu_counts_as_a_helper(self):
+        command = (b"/opt/venv/bin/python\0/installed/vllm/kv_profiling/"
+                   b"probe.py\0--config\0x")
+        self.assertFalse(pd.is_service(command, b"python"))
+        # This is also the exact function embedded in the server stop scripts.
+        self.assertIn("endpoint controller", pd.STOP_OWNERS)
+        samples = [sample(float(t), (1, 1, "serving", float(t)),
+                          (2, 2, "probe", 0.1 * t)) for t in range(5)]
+        report = pd.cpu_over(samples, 1.0, 3.0)
+        self.assertAlmostEqual(report["serving_s"], 2.0)
+        self.assertAlmostEqual(report["helpers_s"], 0.2)
+        self.assertAlmostEqual(report["probes_s"], 0.2)
+        self.assertAlmostEqual(report["probes_at_end_s"], 0.3)
+
+
+class EndpointCaptureIntegrity(unittest.TestCase):
+    def create(self, output):
+        import hashlib
+        import uuid
+        from harness.endpoint_observer import bundle
+
+        run_id = str(uuid.uuid4())
+        probes = {
+            node: {"interfaces": ["lo"], "required": ["netdev"]} for node in ("p", "d")
+        }
+        profiler = pd.Profiler(
+            level="l3", probes=probes, observer_cpus={"p": [12], "d": [13]}
+        )
+        run = pd.Run(
+            **{
+                **{f: getattr(RUN, f) for f in RUN.__dataclass_fields__},
+                "profiler": profiler,
+            }
+        )
+        (output / "profiler.json").write_text(json.dumps({"run_id": run_id}))
+        for role, node in (("prefill", "p"), ("decode", "d")):
+            directory = output / "endpoint-probes" / node
+            directory.mkdir(parents=True)
+            source_root = Path(os.environ.get("KV_PROFILER_SOURCE_ROOT", pd.REPOSITORY))
+            digest = bundle(directory / "observer.pyz", source_root=source_root)
+            entries = []
+            for capture_role in ("frontend", "scheduler", "worker"):
+                process = str(uuid.uuid4())
+                meta = {
+                    "schema": 1,
+                    "type": "metadata",
+                    "run_id": run_id,
+                    "process_id": process,
+                    "pid": 1,
+                    "start_ticks": 100,
+                    "clock_id": str(uuid.uuid4()),
+                    "clock_source": "CLOCK_MONOTONIC",
+                    "boot_id": "boot",
+                    "net_namespace": "net",
+                    "pid_namespace": "pid",
+                    "time_namespace": "time",
+                    "context": {"role": capture_role, "engine_id": node, "rank": 0},
+                }
+                entry = {
+                    key: value
+                    for key, value in meta.items()
+                    if key not in ("schema", "type")
+                }
+                entries.append(entry)
+                folder = output / "profiles" / role / node / run_id / process
+                folder.mkdir(parents=True)
+                end = {
+                    "schema": 1,
+                    "type": "end",
+                    "complete": True,
+                    "stats": {
+                        "head": 0,
+                        "tail": 0,
+                        **dict.fromkeys(
+                            (
+                                "drop_full",
+                                "drop_contention",
+                                "drop_ids",
+                                "drop_handles",
+                                "drop_identity",
+                                "drop_conflict",
+                                "drop_closed",
+                                "unknown_handles",
+                            ),
+                            0,
+                        ),
+                    },
+                }
+                (folder / "events.jsonl").write_text(
+                    json.dumps(meta) + "\n" + json.dumps(end) + "\n"
+                )
+                (folder / "manifest.json").write_text(
+                    json.dumps(
+                        {**meta, "saved": True, "complete": True, "stats": end["stats"]}
+                    )
+                )
+            config = {
+                "run_id": run_id,
+                "endpoint": node,
+                "role": role,
+                "probes": probes[node],
+                "cpus": profiler.observer_cpus[node],
+                "inventory": entries,
+                "package_sha256": digest,
+                "owner_pid": 1,
+                "owner_start": 100,
+            }
+            (directory / "config.json").write_text(json.dumps(config))
+            # Get normalized defaults from the same immutable, stdlib-only package.
+            import subprocess
+
+            script = (
+                "import sys,json;sys.path.insert(0,sys.argv[1]);"
+                "from endpoint_probes.config import ProbeConfig;"
+                "from dataclasses import asdict;"
+                "print(json.dumps(asdict(ProbeConfig(**json.loads(sys.argv[2]))),"
+                "sort_keys=True))"
+            )
+            normalized = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(directory / "observer.pyz"),
+                    json.dumps(probes[node]),
+                ],
+                text=True,
+            )
+            process = str(uuid.uuid4())
+            meta = {
+                "schema": 1,
+                "probe_schema": 1,
+                "type": "metadata",
+                "run_id": run_id,
+                "process_id": process,
+                "context": {
+                    "endpoint": node,
+                    "endpoint_role": role,
+                    "role": "endpoint_observer",
+                },
+                "clock_id": str(uuid.uuid4()),
+                "clock_source": "CLOCK_MONOTONIC",
+                "boot_id": "boot",
+                "net_namespace": "net",
+                "pid_namespace": "pid",
+                "time_namespace": "time",
+                "config_sha256": hashlib.sha256(
+                    normalized.strip().encode()
+                ).hexdigest(),
+                "inventory": entries,
+                "affinity": profiler.observer_cpus[node],
+                "owner": {
+                    "pid": 1,
+                    "start_ticks": 100,
+                    "net_namespace": "net",
+                    "pid_namespace": "pid",
+                },
+                "package_sha256": digest,
+            }
+            events = []
+            for sequence, (scope, observation) in enumerate(
+                (
+                    ("cpu_isolation", {"verified": True}),
+                    ("observer", {"cpu_s": 0.1}),
+                    ("netdev", {"fields": {}}),
+                ),
+                1,
+            ):
+                events.append(
+                    {
+                        "schema": 1,
+                        "probe_schema": 1,
+                        "type": "event",
+                        "kind": "probe_resource"
+                        if scope == "observer"
+                        else "probe_status",
+                        "scope": scope,
+                        "entity": node,
+                        "time_ns": sequence,
+                        "sample_begin_ns": sequence,
+                        "sample_end_ns": sequence,
+                        "sequence": sequence,
+                        "request_ref": 0,
+                        "handoff_ref": 0,
+                        "transfer": 0,
+                        "peer_ref": 0,
+                        **dict.fromkeys(
+                            (
+                                "bytes",
+                                "selected_descriptors",
+                                "merged_descriptors",
+                                "duration0_ns",
+                                "duration1_ns",
+                                "aux0",
+                                "aux1",
+                            )
+                        ),
+                        "transport": {"kind": "unknown", "tcp": None, "rdma": None},
+                        "observation": observation,
+                    }
+                )
+            end = {
+                "schema": 1,
+                "probe_schema": 1,
+                "type": "end",
+                "complete": True,
+                "reason": "controller_stop",
+                "stats": {
+                    "head": 3,
+                    "tail": 3,
+                    "drop_probe_rows": 0,
+                    "isolation_failures": 0,
+                    "required_source_failures": 0,
+                    "observation_gaps": 0,
+                    "samples": 1,
+                    "controller_children_closed": True,
+                    "core": {"all_closed": True},
+                },
+            }
+            folder = directory / "captures" / run_id / process
+            folder.mkdir(parents=True)
+            (folder / "events.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in [meta, *events, end])
+            )
+            (folder / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "process_id": process,
+                        "saved": True,
+                        "complete": True,
+                        "end": end,
+                    }
+                )
+            )
+            (directory / "container.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "Id": node,
+                            "State": {
+                                "ExitCode": 0,
+                                "Running": False,
+                                "OOMKilled": False,
+                            },
+                        }
+                    ]
+                )
+            )
+            (directory / "endpoint-status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "endpoint": node,
+                        "container_id": node,
+                        "exit_code": 0,
+                        "removed": True,
+                        "timed_out": False,
+                    }
+                )
+            )
+        return run
+
+    def test_complete_flags_do_not_replace_capture_contents_or_matching_identity(self):
+        import shutil
+        from harness.endpoint_observer import check_captures
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            clean = root / "clean"
+            clean.mkdir()
+            run = self.create(clean)
+            verdict = {"problems": []}
+            check_captures(clean, run, verdict)
+            self.assertEqual(verdict["problems"], [])
+            for fault in (
+                "missing_events",
+                "bad_json",
+                "swapped",
+                "stale",
+                "exit",
+                "timeout",
+            ):
+                out = root / fault
+                shutil.copytree(clean, out)
+                folder = out / "endpoint-probes/d"
+                if fault == "missing_events":
+                    next((folder / "captures").glob("*/*/events.jsonl")).unlink()
+                elif fault == "bad_json":
+                    next((folder / "captures").glob("*/*/manifest.json")).write_text(
+                        "["
+                    )
+                elif fault in ("swapped", "stale"):
+                    config = json.loads((folder / "config.json").read_text())
+                    config["endpoint" if fault == "swapped" else "run_id"] = "wrong"
+                    (folder / "config.json").write_text(json.dumps(config))
+                else:
+                    status = json.loads((folder / "endpoint-status.json").read_text())
+                    status["exit_code" if fault == "exit" else "timed_out"] = (
+                        1 if fault == "exit" else True
+                    )
+                    (folder / "endpoint-status.json").write_text(json.dumps(status))
+                verdict = {"problems": []}
+                check_captures(out, run, verdict)
+                self.assertTrue(verdict["problems"], fault)
+
+
+class EndpointProfileBacking(unittest.TestCase):
+    def test_readonly_input_uses_the_exposed_backing_not_a_proc_magic_link(self):
+        from harness.endpoint_observer import profile_backing
+
+        description = {"Mounts": [
+            {"Type": "bind", "Destination": "/e2e", "Source": "/shared"},
+            {"Type": "volume", "Destination": "/e2e/profiles", "Source": "/captures"}],
+            "GraphDriver": {"Data": {"MergedDir": "/overlay/merged"}}}
+        self.assertEqual(profile_backing(description), ("/captures", "existing_mount"))
+        self.assertEqual(profile_backing({"GraphDriver": description["GraphDriver"]}),
+                         ("/overlay/merged/e2e/profiles", "overlay_merged"))
+        with self.assertRaisesRegex(ValueError, "exposed profile"):
+            profile_backing({"GraphDriver": {"Data": {}}})

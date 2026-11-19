@@ -260,3 +260,172 @@ cleanup grace; set it above the profiler's close deadlines (two recorders,
 `shutdown_timeout_s` each, plus the clock budget). A positive `--shutdown-timeout`
 is a shared shutdown budget that in-flight requests can consume, so it does not by
 itself guarantee that the recorders close.
+
+## Endpoint observations at L3
+
+L3 includes the L1 NIXL pull instrumentation and declares an external observer.
+It is off by default. L2 and eBPF are not implemented. Sampling, JSON formatting
+and kernel queries run in a separate endpoint process, never in a transfer
+callback. The native L1 ring ABI and transfer metrics are unchanged.
+
+Use `network_profiler.level: l3`, the same run UUID as L1, and a `probes` object.
+`probes` accepts `interval_s` (default 1), `slow_interval_s` (default 5), `tcp`,
+`interfaces`, `driver_statistics`, `rdma_ports`, `qp` and `required`. TCP needs
+explicit `local_ips` and `peer_ips`; optional `local_ports`, `peer_ports` and
+`exclude_ports` narrow discovery. Both address families have kernel and user
+filters. Interface names and RDMA `{device, port}` entries are explicit endpoint
+allowlists. No intermediate-network observation or packet modification occurs.
+`required` names enabled sources (`tcp`, `netdev`, `driver`, `rdma`, `qp`).
+Declare requirements before a capture: unsupported optional sources stay
+visible as unavailable; failures of required sources invalidate that capture.
+
+For example, the probe settings for a TCP endpoint might be:
+
+```json
+{
+  "interval_s": 1,
+  "slow_interval_s": 5,
+  "tcp": {
+    "local_ips": ["192.0.2.1"],
+    "peer_ips": ["192.0.2.2"],
+    "exclude_ports": [5559, 6559]
+  },
+  "interfaces": ["eth0"],
+  "required": ["tcp", "netdev"]
+}
+```
+
+Replace the documentation addresses, interface and exclusions with the actual
+endpoint configuration. An IP match alone can include control traffic.
+
+### Deployment and lifecycle
+
+Locate the installed `vllm/kv_profiling/probe.py` with `importlib.metadata` or
+the installation manifest. Run it by absolute file path to avoid importing
+vLLM/Torch in the observer:
+
+```console
+.venv/bin/python /installed/vllm/kv_profiling/probe.py --config endpoint.json
+```
+
+`endpoint.json` has the following runtime fields in addition to `probes`:
+
+| Field | Meaning |
+|---|---|
+| `run_id`, `endpoint`, `role` | Shared UUID, endpoint ID, `prefill` or `decode` |
+| `owner_pid`, `owner_start` | Shared-namespace server PID and proc start ticks |
+| `cpus` | Nonempty observer CPU list, disjoint from serving CPUs |
+| `irq_policy` | `operator_verified` or `virtual_not_applicable` |
+| `input_dir`, `output_dir` | Read-only L1 root and separate probe output |
+| `stop_file`, `endpoint_complete_file` | Stop and child-closure paths |
+
+Share the endpoint network and PID namespaces. Check physical IRQ affinities
+externally; the observer never retunes them. Existing L1 opening metadata makes
+worker discovery possible without adding transfer-path I/O. PID start ticks,
+namespace identities, engine and rank are validated before optional fd ownership
+reads. Permission denial remains unavailable; do not add privileges to hide it.
+
+Start the observer before admitting workload and wait for its opening manifest.
+After child/L1 completion, the controller writes the endpoint completion file:
+`{"run_id": "<UUID>", "endpoint": "<ID>", "children_closed": true}`, then
+creates `stop_file`. The observer independently checks the L1 manifests, samples
+once more and flushes. Unconfirmed owner exit, signal termination, incomplete
+child captures,
+required-source failures, queue loss and missed ticks cannot yield a complete
+capture. Owner exit is not proof of worker/helper closure: the observer allows
+a bounded two-second controller notification interval, then marks a timeout
+incomplete. The controller must
+also collect observer exit/timeout status; kill only its own observer after the
+shutdown deadline. Kernel driver I/O can outlast user-space deadlines. Observer
+failure never signals or stops the server.
+
+The harness's `profiler.level: l3` additionally requires per-node `probes` and
+`observer_cpus` mappings. It launches endpoint-only observer containers with
+shared network/PID namespaces, a read-only profile mount and separate output,
+then collects manifests and logs. The generic CLI contains all probe logic.
+Current-image availability and real serving shutdown are separate qualification
+steps; installing this code does not establish L3 overhead acceptance.
+
+### Data and interpretation
+
+Sidecar JSONL uses `schema: 1, probe_schema: 1`; unknown probe versions are
+refused. The Python-only endpoint/status/resource kinds are 22–24, outside the
+native ring. Sample begin/end times use `CLOCK_MONOTONIC`, with boot and time
+namespace identities for existing clock mapping. Socket, interface and port
+observations occupy separate Perfetto lanes; raw values retain their units and
+meaning. Configured backend hints never overwrite observed transport provenance.
+
+TCP uses socket cookies and five-tuples. TCP_INFO tail fields absent on an older
+kernel are unavailable, not zero. Queue bytes, retransmission gauges/counters,
+RTT/variance, cwnd and rate sentinels remain distinct. Polling cannot observe every
+short-lived connection; empty snapshots and disappearances are explicit. Dump
+interruption, byte/socket limits and timeouts are not complete empty results.
+Counter decreases and identity changes break observed continuity. Observation
+generations cannot prove that no reuse happened between polls.
+
+Interface and driver statistics describe their whole endpoint link, not a KV
+request. Driver units/types stay unknown unless documented. Standard RDMA data
+counters retain four-octet units and an explicit byte conversion. Hardware names
+are preserved; absent retry/RNR/CNP/WR/CQE fields are unavailable, not fabricated.
+Refresh `lifespan` is configuration, never written or counted as traffic.
+Optional QP identities are snapshots: QPN reuse between samples is not excluded.
+Physical NIC/RDMA counter correctness requires separate real-node qualification.
+
+`probe_join.candidates` makes offline local engine/rank ownership and interval
+matches. It validates run/endpoint/namespace/PID identities and projects different
+clock domains before comparing times. Unique temporal candidates remain
+candidates, never exact READ-to-FD/QP attribution. Shared socket/interface/port
+counters are never divided among requests. TCP bootstrap flows are not RDMA data.
+
+The observer bounds sockets (1,024), interfaces/ports (eight each), driver
+statistics (4,096), netlink dumps (4 MiB), queued rows (512 × 16 KiB), output size
+and polling rates. Large counter sets are chunked. It skips missed ticks rather
+than catching up, records gaps/loss and never fabricates completeness. Final
+manifests retain observer CPU/RSS accounting separately from serving and L1
+helpers. Off-vs-L3 serving overhead, complete capture closure and real RDMA-node
+validation must pass their frozen acceptance protocol before qualification.
+
+### Capture inventory and deployment snapshot
+
+The observer runtime config requires `inventory`: the frozen identities of
+**every** expected frontend, scheduler and worker capture on that endpoint.
+`--inventory <profiles-root> --run-id <UUID>` emits the observed opening
+metadata; the deployment must also check those counts against its topology.
+The harness checks one frontend, one scheduler per local engine and one worker
+per local rank. Unknown, extra, missing or identity-mismatched captures cannot
+close successfully. Both the native event stream's terminal/loss state and its
+matching manifest are required; a manifest alone is insufficient.
+
+CPU isolation is mandatory for all probe configurations, including netdev-only
+and RDMA-only. Every live serving process and thread in the inventory is checked
+by PID generation and affinity at each sample. Overlap or unverified placement
+invalidates the capture independently of optional fd-ownership permissions.
+These are placement snapshots; transient activity between polls is not proven.
+
+The harness makes a deterministic, hash-recorded `observer.pyz` containing only
+the stdlib probe package. It mounts that immutable file read-only into the
+endpoint sidecar; it does not rely on inherited source mounts or another image
+build. The generic CLI also runs from this zipapp. Its package/config hash and
+inventory are recorded with the capture. The harness acknowledges each endpoint
+as soon as that endpoint's own shutdown completes, before shutting down the next
+one, preserving decode-before-prefill clock shutdown.
+
+Offline validation checks the full core inventory, raw observer event file,
+terminal records, loss/isolation status, matching run/endpoint/config identities,
+package hash and saved observer container exit/timeout/cleanup status. Malformed
+or missing evidence fails the verdict rather than being accepted from flags.
+Partial input streams qualify candidate associations as `partial_coverage`,
+with reasons; an observed unique candidate never conceals incomplete coverage.
+
+For required RDMA observation, `rdma_required_families` explicitly names required
+counter directories: `counters` (default), `hw_counters`, or both. At least one
+actual counter must be readable in each required family. A `lifespan` value is
+refresh configuration and cannot satisfy counter coverage. Optional vendor
+families remain reported as unavailable without invalidating another family.
+
+For Docker deployment, the profile directory must have a daemon-exposed backing
+path: an existing bind/volume (preferred), or a classic overlay driver's merged
+root. Other drivers without an exposed backing path are refused explicitly.
+Procfs process-root magic links are not used as Docker bind sources. The helper
+uses `docker create` then `docker start`, records the created container ID and
+cleans up that ID even if startup fails; it never removes a name collision.

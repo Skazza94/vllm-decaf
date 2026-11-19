@@ -14,6 +14,13 @@ def _load(path: Path):
     if not rows or rows[0].get("type") != "metadata":
         raise ValueError("trace metadata missing")
     meta, decoder = rows[0], DictionaryDecoder()
+    if "probe_schema" in meta:
+        from .endpoint_probes.records import validate
+
+        for row in rows:
+            validate(row)
+    elif any("probe_schema" in row for row in rows):
+        raise ValueError("probe schema missing from metadata")
     seen = {}
     events = []
     for row in rows:
@@ -78,6 +85,8 @@ def _clock_aliases(metas, group):
 
 def _tagged_transport(transport, meta):
     """Backend and transport as configured for the process, never as observed."""
+    if "probe_schema" in meta:
+        return transport
     backend = (meta.get("context") or {}).get("backend")
     if not backend:
         return transport
@@ -94,6 +103,19 @@ def _signed64(value):
 
 def _semantics(row):
     """Name the event-specific words; units stay as recorded."""
+    if "probe_schema" in row:
+        return {
+            "endpoint_observation": {
+                key: row[key]
+                for key in (
+                    "scope",
+                    "entity",
+                    "sample_begin_ns",
+                    "sample_end_ns",
+                    "observation",
+                )
+            }
+        }
     kind, subject = row["kind"], row["subject"]
     aux0, aux1 = row["aux0"], row["aux1"]
     if kind == "complete_observed" and subject == 1:
@@ -246,9 +268,12 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
             pid = processes[meta["process_id"]]
             request_ref = row["request_ref"]
             lanes = requests[pid]
-            if request_ref not in lanes:
-                lanes[request_ref] = len(lanes) + 1
-            tid = lanes[request_ref]
+            lane = (
+                (row["scope"], row["entity"]) if "probe_schema" in row else request_ref
+            )
+            if lane not in lanes:
+                lanes[lane] = len(lanes) + 1
+            tid = lanes[lane]
             timestamp = projected.time_ns if projected else row["time_ns"]
             ts = float((timestamp - origin) / 1000)
             request = decoder.resolve(request_ref)
@@ -298,6 +323,35 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                     "args": args,
                 }
             )
+            if "probe_schema" in row:
+                data = (
+                    row["transport"].get(row["transport"]["kind"])
+                    or row["observation"]
+                    or {}
+                )
+                fields = data.get("fields", {})
+                values = (
+                    fields.items()
+                    if isinstance(fields, dict)
+                    else ((field["name"], field) for field in fields)
+                )
+                for name, field in values:
+                    if field.get("value") is not None and field.get("sentinel") is None:
+                        events.append(
+                            {
+                                "ph": "C",
+                                "pid": pid,
+                                "tid": tid,
+                                "ts": ts,
+                                "name": (
+                                    f"{row['entity']}:{name} "
+                                    f"[{field.get('unit', 'unknown')}]"
+                                ),
+                                "args": {
+                                    field.get("meaning", "unknown"): field["value"]
+                                },
+                            }
+                        )
             if row["kind"] == "model_step" and row["duration0_ns"] is not None:
                 events.append(
                     {
@@ -313,9 +367,7 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
             if row["kind"] == "notify_observed" and request_ref:
                 producer = (meta.get("context") or {}).get("engine_id")
                 if isinstance(request, str) and isinstance(producer, str):
-                    flow_ends.setdefault((producer, request), []).append(
-                        (pid, tid, ts)
-                    )
+                    flow_ends.setdefault((producer, request), []).append((pid, tid, ts))
             handshake = (pid, "handshake", row["peer_ref"])
             if row["kind"] == "handshake_begin":
                 pending[handshake] = ts
