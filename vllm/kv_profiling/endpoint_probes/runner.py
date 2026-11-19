@@ -21,6 +21,16 @@ from .netlink import ObservationError
 from .records import Writer, event
 
 
+def _time_namespace():
+    """This process's time namespace, or None on a kernel without time namespaces
+    (before Linux 5.6 or built without them), where every process shares the host's
+    monotonic clock."""
+    try:
+        return os.readlink("/proc/self/ns/time")
+    except OSError:
+        return None
+
+
 class Observer:
     """Observe an explicit owner; never signals it, rewrites sockets or retunes IRQs."""
 
@@ -102,7 +112,7 @@ class Observer:
             "clock_id": str(uuid4()),
             "clock_source": "CLOCK_MONOTONIC",
             "boot_id": netdev.read_small("/proc/sys/kernel/random/boot_id"),
-            "time_namespace": os.readlink("/proc/self/ns/time"),
+            "time_namespace": _time_namespace(),
             "net_namespace": os.readlink("/proc/self/ns/net"),
             "pid_namespace": os.readlink("/proc/self/ns/pid"),
             "context": {

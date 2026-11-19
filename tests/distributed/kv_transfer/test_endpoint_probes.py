@@ -1505,3 +1505,33 @@ def test_ebpf_missing_time_namespace_metadata_keeps_raw_events(tmp_path, monkeyp
             child.kill()
             channel.stop(writer)
         writer.close(False, "test", {})
+
+
+def test_a_kernel_without_time_namespaces_is_one_clock_domain(tmp_path, monkeypatch):
+    """Without /proc/self/ns/time every process shares the host's monotonic clock:
+    the observer records None and inventories with None validate; an empty or
+    non-string value is still refused."""
+    from vllm.kv_profiling.endpoint_probes import runner
+    from vllm.kv_profiling.endpoint_probes.health import validate_inventory
+
+    owner, entries, directory = start_recorded_endpoint(
+        tmp_path, sorted(os.sched_getaffinity(0))[0]
+    )
+    try:
+        run = entries[0]["run_id"]
+        validate_inventory([{**e, "time_namespace": None} for e in entries], run)
+        for bad in ("", 7):
+            with pytest.raises(ValueError, match="time_namespace"):
+                validate_inventory([{**e, "time_namespace": bad} for e in entries], run)
+    finally:
+        (directory / "exit").touch()
+        owner.wait(timeout=30)
+    real_readlink = os.readlink
+
+    def readlink(path, *args, **kwargs):
+        if str(path) == "/proc/self/ns/time":
+            raise FileNotFoundError("time namespaces not configured")
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "readlink", readlink)
+    assert runner._time_namespace() is None

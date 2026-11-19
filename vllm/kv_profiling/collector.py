@@ -567,10 +567,16 @@ def parse(text, limits: Limits, source="tent"):
 
 # --------------------------------------------------------------------- the capture
 def _identity():
-    return {
-        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-        "time_namespace": os.readlink("/proc/self/ns/time"),
-    }
+    """Boot ID and time namespace; each is None when unreadable (a kernel without time
+    namespaces shares the host's monotonic clock)."""
+    identity = {"boot_id": None, "time_namespace": None}
+    with contextlib.suppress(OSError):
+        identity["boot_id"] = (
+            Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        )
+    with contextlib.suppress(OSError):
+        identity["time_namespace"] = os.readlink("/proc/self/ns/time")
+    return identity
 
 
 class Capture:
@@ -590,10 +596,7 @@ class Capture:
         self.dropped = 0
         self.reserve = 4096
         self.run_id = run_id
-        try:
-            identity = _identity()
-        except OSError:
-            identity = {"boot_id": None, "time_namespace": None}
+        identity = _identity()
         self.write(
             {
                 "type": "metadata",

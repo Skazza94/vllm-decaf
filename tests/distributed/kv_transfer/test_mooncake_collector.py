@@ -1223,3 +1223,21 @@ def test_the_collector_imports_only_the_standard_library():
     )
     assert imports <= allowed, imports - allowed
     assert os.path.basename(collector.__file__) == "collector.py"
+
+
+def test_a_kernel_without_time_namespaces_keeps_the_boot_id(tmp_path, monkeypatch):
+    """A missing /proc/self/ns/time is None on its own, never a lost boot ID."""
+    real_readlink = os.readlink
+
+    def readlink(path, *args, **kwargs):
+        if str(path) == "/proc/self/ns/time":
+            raise FileNotFoundError("time namespaces not configured")
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "readlink", readlink)
+    capture = collector.Capture(tmp_path, str(uuid4()), limits(), [])
+    capture.end(True, [], {})
+    meta = read(summary_path(tmp_path))["meta"]
+    assert meta["time_namespace"] is None
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    assert meta["boot_id"] == boot_id

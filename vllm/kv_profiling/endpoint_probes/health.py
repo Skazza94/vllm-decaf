@@ -203,11 +203,16 @@ def validate_inventory(expected, run_id):
             "net_namespace",
             "pid_namespace",
             "clock_id",
-            "time_namespace",
             "clock_source",
         ):
             if not isinstance(meta.get(key), str) or not meta[key]:
                 raise ValueError(f"inventory missing {key}")
+        # None: the kernel has no time namespaces (one host monotonic clock).
+        time_namespace = meta.get("time_namespace", "")
+        if time_namespace is not None and (
+            not isinstance(time_namespace, str) or not time_namespace
+        ):
+            raise ValueError("inventory missing time_namespace")
         for key in ("pid", "start_ticks"):
             if type(meta.get(key)) is not int or meta[key] <= 0:
                 raise ValueError(f"inventory invalid {key}")
@@ -296,7 +301,10 @@ def endpoint_capture(directory, core_dir):
             or meta.get("clock_source") != "CLOCK_MONOTONIC"
             or not isinstance(meta.get("clock_id"), str)
             or not meta["clock_id"]
-            or not isinstance(meta.get("time_namespace"), str)
+            or not (
+                meta.get("time_namespace") is None
+                or isinstance(meta.get("time_namespace"), str)
+            )
             or any(
                 meta.get(key) != front[key]
                 for key in ("boot_id", "net_namespace", "pid_namespace")

@@ -1081,3 +1081,23 @@ print("imported:", module.__file__)
         )
         assert str(destination) in result.stdout
         (destination / "import.log").write_text(result.stdout)
+
+
+def test_a_kernel_without_time_namespaces_records_with_none(recorders, monkeypatch):
+    """Before Linux 5.6 (or without CONFIG_TIME_NS) there is no /proc/self/ns/time:
+    every process shares the host's monotonic clock, so the recorder still records,
+    with time_namespace None."""
+    real_readlink = os.readlink
+
+    def readlink(path, *args, **kwargs):
+        if str(path) == "/proc/self/ns/time":
+            raise FileNotFoundError("time namespaces not configured")
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "readlink", readlink)
+    recorder = recorders()
+    assert recorder.metadata["time_namespace"] is None
+    assert recorder.wait_ready()
+    recorder.record(*fields())
+    result = recorder.close()
+    assert result.saved and result.complete

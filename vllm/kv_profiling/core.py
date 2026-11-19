@@ -18,6 +18,16 @@ from .config import NetworkProfilerConfig
 from .sink import FINISHED, OUTPUT_FAILED, RUNNING
 
 
+def _time_namespace():
+    """This process's time namespace, or None on a kernel without time namespaces
+    (before Linux 5.6 or built without them), where every process shares the host's
+    monotonic clock."""
+    try:
+        return os.readlink("/proc/self/ns/time")
+    except OSError:
+        return None
+
+
 @dataclass(frozen=True)
 class CloseResult:
     saved: bool
@@ -56,7 +66,7 @@ class ProcessRecorder:
             "clock_id": str(uuid4()),
             "clock_source": "CLOCK_MONOTONIC",
             "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-            "time_namespace": os.readlink("/proc/self/ns/time"),
+            "time_namespace": _time_namespace(),
             "pid": os.getpid(),
             "net_namespace": os.readlink("/proc/self/ns/net"),
             "pid_namespace": os.readlink("/proc/self/ns/pid"),
