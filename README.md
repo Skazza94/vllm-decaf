@@ -76,8 +76,8 @@ next scheduling decisions.
   real deployment.
 - **Real KV transfers for disaggregated prefill/decode.** KV caches are real
   CPU buffers with the model's geometry, moved between instances by vLLM's
-  own `NixlConnector` or `MooncakeConnector`, over TCP backends (Mooncake's
-  TENT, UCX, libfabric), one NIC per rank if you want.
+  own `NixlConnector` or `MooncakeConnector`, over TCP (Mooncake's TENT, UCX,
+  libfabric) or RDMA (UCX, TENT), one NIC per rank if you want.
 - **Byte-level verification.** Prefill can fill its KV blocks with a
   deterministic pattern and decode can check every byte it receives, with
   prefix caching on or off.
@@ -110,7 +110,7 @@ the README does not describe it.
 | **Compute time** | Per step, from the batch the scheduler formed: GPU performance model, formula or recorded steps | Replay of a recorded trace, or a latency model | Configured time to first token and inter-token latency, scaled with load |
 | **KV cache** | vLLM's allocator, prefix cache and eviction | — | Tracked usage |
 | **KV events** | vLLM's own | — | Published for allocation and eviction |
-| **Prefill/decode transfer** | Real bytes, vLLM's NIXL or Mooncake connector, several TCP backends | Simulated KV bytes over NIXL | Transfer latency only |
+| **Prefill/decode transfer** | Real bytes, vLLM's NIXL or Mooncake connector, over TCP or RDMA | Simulated KV bytes over NIXL | Transfer latency only |
 | **Transferred bytes checked** | Every byte, optionally | — | Not applicable |
 | **TP / DP / expert parallelism** | Yes, each rank with its own KV and NIC | — | — |
 | **Speculative decoding** | Native MTP | — | — |
@@ -138,19 +138,19 @@ A timing provider prices every step. Select it with `--simulation-config`:
 | `zero` | Nothing | Functional tests |
 
 > [!IMPORTANT]
-> **vllm-decaf follows AISimulate.** A model, GPU, quantization, cache format
+> **vllm-decaf follows AISim.** A model, GPU, quantization, cache format
 > or parallel layout is supported only if it passes both the simulator's own
-> checks and the `aisimulate` provider: what AISimulate rejects, vllm-decaf
+> checks and the `aisimulate` provider: what AISim rejects, vllm-decaf
 > rejects too. With that provider, the server refuses to start instead of
-> guessing a number. The other providers do not consult AISimulate: they
+> guessing a number. The other providers do not consult AISim: they
 > remain for tests and for replaying your own measurements, and a
 > configuration that only runs with them is not a supported one. The
-> reverse does not hold either: not every layout AISimulate can time is
+> reverse does not hold either: not every layout AISim can time is
 > supported here yet.
 
-### AISimulate
+### AISim
 
-`aisimulate` needs the optional AISimulate package, which the second image
+`aisimulate` needs the optional AISim package, which the second image
 adds on top of the CPU one:
 
 ```bash
@@ -162,7 +162,7 @@ docker build -f docker/Dockerfile.aisim -t vllm:cpu-aisim .
 
 It times the **published model** you name (`target_model`) at its published
 precision, on `gpu` `a100`, `h100`, `h200` or `b200`. A model or a layout
-AISimulate has no data for is refused at startup instead of being guessed.
+AISim has no data for is refused at startup instead of being guessed.
 
 | | Supported |
 | :--- | :--- |
@@ -220,7 +220,7 @@ You need Docker and an x86-64 Linux host. No GPU, no weights.
 
 For GPU step times, build `vllm:cpu-aisim` as above, use it in step 2 and
 swap the simulation config. The model's name also names the deployment
-AISimulate times:
+AISim times:
 
 ```bash
      --simulation-config '{"timing": "aisimulate", "timing_args": {"gpu": "h100"}}'
@@ -288,16 +288,17 @@ llm-d's router.
 
 - **Tokens are filler.** Only their counts and timing mean something; KV
   contents are synthetic.
-- **AISimulate sets the scope.** A supported configuration is one the
-  `aisimulate` provider accepts; what AISimulate cannot time is rejected by
+- **AISim sets the scope.** A supported configuration is one the
+  `aisimulate` provider accepts; what AISim cannot time is rejected by
   it, not approximated (see [Timing models](#timing-models)).
 - **Latency is as good as the timing provider.** Scheduling, caching and
-  transfers run for real; compute time is an estimate. AISimulate covers the
+  transfers run for real; compute time is an estimate. AISim covers the
   models, GPUs and single-node layouts listed above, and its own
   approximations apply.
-- **Real KV transfers currently focus on TCP stacks.** They run on the CPU
-  platform over TCP backends; RDMA is not covered yet, nor are pipeline and
-  context parallelism.
+- **Real KV transfers run over TCP or RDMA.** They run on the CPU platform;
+  RDMA needs the RDMA devices in each instance's container, and NIXL's
+  libfabric backend stays TCP-only (NIXL selects no verbs devices for it).
+  Pipeline and context parallelism are not covered.
 - **Per-model scope.** Each cache layout is supported for specific
   connectors and parallel layouts; unsupported combinations are refused at
   startup.

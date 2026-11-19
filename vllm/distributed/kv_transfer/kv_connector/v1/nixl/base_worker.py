@@ -69,9 +69,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
     bind_hp_tcp,
+    bind_tent_rdma,
+    keep_tent_tcp,
+    kv_transport,
     simulated_dcp_scope,
     simulated_tp_mismatch,
     this_rank_kv_address,
+    this_rank_rdma_device,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
     MambaConvSplitInfo,
@@ -144,7 +148,10 @@ def _bind_rank_kv_address(vllm_config: "VllmConfig", backends: list[str]) -> dic
     (NIXL_MOONCAKE_IP_ADDR, read when the backend is created) and TENT's
     hp_tcp binds there, as MooncakeConnector's ranks do. UCX resolves the
     selected IPv4 address to an interface and restricts its transport to TCP.
-    The handshake stays on the instance's side channel."""
+    With ``kv_transport`` rdma, UCX's RC transport and TENT's RDMA transport
+    move it on the rank's ``rank_rdma_devices`` device instead, the address
+    carrying TENT's RPC. The handshake stays on the instance's side
+    channel."""
     if not moves_real_kv(vllm_config):
         return
     if list(backends) not in (["Mooncake"], ["LIBFABRIC"], ["UCX"]):
@@ -160,13 +167,19 @@ def _bind_rank_kv_address(vllm_config: "VllmConfig", backends: list[str]) -> dic
                 f"Managed {backends[0]}/TCP needs rank_addresses, "
                 "including single-rank runs"
             )
+        # TCP (RDMA needs rank_addresses): on the host's address.
+        keep_tent_tcp()
         return
+    rdma = kv_transport(kv_transfer_config) == "rdma"
     if list(backends) == ["UCX"]:
-        from .simulated_tcp import bind_ucx_tcp
+        from .simulated_tcp import bind_ucx_rdma, bind_ucx_tcp
 
         address = this_rank_kv_address(vllm_config)
         assert address is not None
-        return bind_ucx_tcp(address, kv_transfer_config.kv_connector_extra_config)
+        extra = kv_transfer_config.kv_connector_extra_config
+        if rdma:
+            return bind_ucx_rdma(address, this_rank_rdma_device(vllm_config), extra)
+        return bind_ucx_tcp(address, extra)
     if list(backends) == ["LIBFABRIC"]:
         from .simulated_libfabric import bind_libfabric_tcp
 
@@ -176,7 +189,10 @@ def _bind_rank_kv_address(vllm_config: "VllmConfig", backends: list[str]) -> dic
     address = this_rank_kv_address(vllm_config)
     assert address is not None
     os.environ["NIXL_MOONCAKE_IP_ADDR"] = address
+    if rdma:
+        return bind_tent_rdma(address, this_rank_rdma_device(vllm_config))
     bind_hp_tcp(address)
+    keep_tent_tcp()
 
 
 def _reserve_cores_for_kv(vllm_config: "VllmConfig") -> None:

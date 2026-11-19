@@ -503,6 +503,30 @@ def test_native_admitted_kernel_pairs_keep_exact_bytes(
         assert sum(load["count"] for load in loads) == sources
 
 
+@pytest.mark.parametrize("prompt", [801, 833, 1600], ids=["row0", "row1", "full"])
+def test_equal_block_pair_moves_every_kernel_block_of_the_handoff_blocks(
+    tmp_path, prompt
+):
+    """Two peers of one split kernel geometry pair no sub-blocks: NIXL reads every
+    kernel block of each of the producer's blocks, so the kernel blocks past the
+    handoff's last token arrive (the producer's fill of its whole block) and are
+    checked, never expected zero or unread."""
+    options = {"tensor_parallel_size": 1, "block_size": 800, "backend": "FLASHINFER"}
+    value, logs = native_peers(
+        tmp_path,
+        QWEN,
+        {**options, "prompt": prompt},
+        {**options, "prompt": prompt, "check": True},
+    )
+    assert len(value["tokens"]) == 2
+    (result,) = [r["kv_check"] for r in logs["decode"][0] if "kv_check" in r]
+    assert result["ok"], result
+    assert result["coverage"]["problems"] == []
+    assert result["mismatched_bytes"] == 0
+    assert sum(g.get("zeroed_bytes", 0) for g in result["groups"]) == 0
+    assert result["posted_matches_checked"], result
+
+
 @pytest.mark.parametrize(
     "local,remote,local_tp,remote_tp,heads",
     [

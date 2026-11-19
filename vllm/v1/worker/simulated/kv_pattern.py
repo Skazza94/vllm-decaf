@@ -2633,14 +2633,25 @@ class NativeChecker(_ConsumerPages):
         its start. NIXL pairs the producer's retained sub-blocks and the
         consumer's from the handoff's last token backwards, so it writes
         where they overlap, up to the end of the last producer sub-block
-        holding a handoff token; the rest of the block is zeroed."""
-        if group.remote_blocks is None or expected.remote_num_tokens is None:
+        holding a handoff token; the rest of the block is zeroed. A pull of equal
+        geometry pairs nothing: every kernel block of the producer's blocks moves."""
+        worker = self.selection.worker
+        engine = expected.remote_engine_id
+        info = None if engine is None else worker.transfer_topo.get_engine_info(engine)
+        if (
+            info is not None
+            and info.remote_block_size == worker.block_size
+            and info.remote_physical_blocks_per_logical == self.selection.factor
+        ):
+            return range(tokens)
+        if (
+            info is None
+            or group.remote_blocks is None
+            or expected.remote_num_tokens is None
+        ):
             raise ValueError(
                 "a pull of unequal block sizes is missing its handoff geometry"
             )
-        info = self.selection.worker.transfer_topo.get_engine_info(
-            expected.remote_engine_id
-        )
         return pull_covered_tokens(
             start,
             tokens,

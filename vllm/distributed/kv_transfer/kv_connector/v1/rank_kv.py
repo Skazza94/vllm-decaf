@@ -3,11 +3,13 @@
 """Per-rank KV transfer settings shared by the native connectors under
 simulated execution with real KV transfers (MooncakeConnector, and the
 NixlConnector over NIXL's Mooncake backend): each rank's own KV address
-(``rank_addresses``), TENT's hp_tcp bound to it, and the tensor-parallel
-sizes real transfers pair."""
+(``rank_addresses``), its transport (``kv_transport``: TCP, or RDMA on its
+device in ``rank_rdma_devices``), TENT bound to them, and the
+tensor-parallel sizes real transfers pair."""
 
 import ipaddress
 import os
+import re
 from dataclasses import dataclass, replace
 
 from vllm import envs
@@ -140,6 +142,198 @@ def bind_hp_tcp(address: str) -> None:
     ):
         tent_config.store(conf, key, value)
     tent_config.save(conf)
+
+
+def keep_tent_tcp() -> None:
+    """Keep TENT's RDMA transport off for a TCP run of simulated execution's
+    real transfers (``kv_transport`` tcp, with or without
+    ``rank_addresses``): TENT enables it whenever it sees an RDMA NIC. An
+    MC_TENT_CONF enabling it is refused; other settings are kept."""
+    conf = tent_config.load() or {}
+    rdma = tent_config.lookup(conf, "transports/rdma/enable")
+    if rdma is not None and rdma[1] is not False:
+        raise ValueError(
+            "Real KV transfers over TCP keep TENT's RDMA transport off; "
+            "MC_TENT_CONF enables it (kv_transport rdma selects RDMA)."
+        )
+    tent_config.store(conf, "transports/rdma/enable", False)
+    tent_config.save(conf)
+
+
+KV_TRANSPORTS = ("tcp", "rdma")
+# An RDMA device name as the kernel lists it (no wildcard or list).
+RDMA_DEVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+# TENT's transports besides RDMA, each disabled for managed RDMA (io_uring
+# and SHM included, whatever the container allows).
+TENT_OTHER_TRANSPORTS = ("tcp", "hp_tcp", "shm", "io_uring")
+# Legacy variables TENT applies after MC_TENT_CONF (its Config's
+# loadFromEnv) that would move the RDMA binding.
+TENT_RDMA_OVERRIDES = (
+    "MC_IB_PORT",
+    "MC_TE_FILTERS",
+    "MC_TE_FILTERS_EXCLUDE",
+    "MC_FORCE_TCP",
+)
+
+
+@dataclass(frozen=True)
+class RdmaDevice:
+    """A rank's RDMA device and port (``rank_rdma_devices`` entry
+    ``device[:port]``, port 1 by default)."""
+
+    name: str
+    port: int = 1
+
+    @property
+    def ucx(self) -> str:
+        """UCX's device:port form (UCX_NET_DEVICES)."""
+        return f"{self.name}:{self.port}"
+
+
+def parse_rdma_device(entry: object) -> RdmaDevice:
+    """A ``rank_rdma_devices`` entry: a device name and an optional port in
+    1-255."""
+    if isinstance(entry, str):
+        name, sep, port = entry.partition(":")
+        if RDMA_DEVICE_NAME.fullmatch(name) and (
+            not sep or (port.isascii() and port.isdigit() and 1 <= int(port) <= 255)
+        ):
+            return RdmaDevice(name, int(port) if sep else 1)
+    raise ValueError(
+        f"rank_rdma_devices: {entry!r} is not an RDMA device[:port] (port 1-255)."
+    )
+
+
+def kv_transport(kv_transfer_config: KVTransferConfig) -> str:
+    """The ranks' KV transport: ``kv_transport`` in the connector's extra
+    config, TCP by default."""
+    return kv_transfer_config.kv_connector_extra_config.get("kv_transport", "tcp")
+
+
+def transport_problems(kv_transfer_config: KVTransferConfig) -> list[str]:
+    """What real KV transfers need of ``kv_transport`` and
+    ``rank_rdma_devices`` at configuration (each rank's own entry is checked
+    against the local rank count by `rank_rdma_device`)."""
+    extra = kv_transfer_config.kv_connector_extra_config
+    transport = kv_transport(kv_transfer_config)
+    devices = extra.get("rank_rdma_devices")
+    if transport not in KV_TRANSPORTS:
+        return [f"kv_transport tcp or rdma, not {transport!r}"]
+    if transport == "tcp":
+        if devices is not None:
+            return ["rank_rdma_devices only with kv_transport rdma"]
+        return []
+    problems = []
+    if not isinstance(devices, list) or not devices:
+        problems.append("rank_rdma_devices, one RDMA device per rank, for RDMA")
+    else:
+        for entry in devices:
+            try:
+                parse_rdma_device(entry)
+            except ValueError as error:
+                problems.append(str(error).rstrip("."))
+    addresses = extra.get("rank_addresses")
+    if addresses is None:
+        problems.append("rank_addresses (each rank's control address) for RDMA")
+    elif isinstance(devices, list) and (
+        not isinstance(addresses, list) or len(addresses) != len(devices)
+    ):
+        problems.append("one rank_rdma_devices entry per rank_addresses entry")
+    if kv_transfer_config.kv_connector in NIXL_CONNECTORS:
+        backends = extra.get("backends", ["UCX"])
+        if backends == ["LIBFABRIC"]:
+            problems.append(
+                "RDMA over NIXL's UCX or Mooncake backend: the pinned managed "
+                "LIBFABRIC path has no verbs support (NIXL selects CXI, EFA or "
+                "TCP providers)"
+            )
+        elif backends not in (["UCX"], ["Mooncake"]):
+            problems.append(
+                f"one UCX or Mooncake backend for RDMA, not backends {backends}"
+            )
+    elif kv_transfer_config.kv_connector == "MooncakeConnector":
+        protocol = extra.get("mooncake_protocol", "rdma")
+        if protocol != "rdma":
+            problems.append(
+                f"mooncake_protocol rdma (or unset) for RDMA, not {protocol!r}"
+            )
+        if "device_name" in extra:
+            problems.append(
+                "no device_name for RDMA: rank_rdma_devices names each rank's"
+            )
+    return problems
+
+
+def rank_rdma_device(
+    kv_transfer_config: KVTransferConfig, rank: int, ranks: int
+) -> RdmaDevice:
+    """This rank's RDMA device, from ``rank_rdma_devices`` (one per rank of
+    the instance on this host, ordered as ``rank_addresses``; ranks may share
+    a NIC)."""
+    devices = kv_transfer_config.kv_connector_extra_config.get("rank_rdma_devices")
+    if not isinstance(devices, list) or len(devices) != ranks:
+        raise ValueError(
+            "rank_rdma_devices needs one device per rank on this host (local "
+            f"DP ranks x TP ranks: {ranks}), got {devices!r}."
+        )
+    return [parse_rdma_device(entry) for entry in devices][rank]
+
+
+def this_rank_rdma_device(vllm_config: VllmConfig) -> RdmaDevice:
+    """`rank_rdma_device` of this worker's rank."""
+    kv_transfer_config = vllm_config.kv_transfer_config
+    assert kv_transfer_config is not None
+    return rank_rdma_device(
+        kv_transfer_config,
+        *local_kv_rank(
+            vllm_config,
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+        ),
+    )
+
+
+def bind_tent_rdma(address: str, device: RdmaDevice) -> dict:
+    """Make TENT in this process move KV over RDMA on `device` only: TENT
+    selected (MC_USE_TENT), its RDMA transport enabled on the device and
+    port, every other transport disabled, and its RPC server (control
+    metadata) on `address`. Settings that contradict the binding are
+    refused, other tuning kept."""
+    if tent_config.ENV in os.environ and tent_config.load() is None:
+        raise ValueError(f"Managed RDMA cannot read {tent_config.ENV}.")
+    conf = tent_config.load() or {}
+    contradictions = [name for name in TENT_RDMA_OVERRIDES if name in os.environ]
+    hostname = os.environ.get("MOONCAKE_LOCAL_HOSTNAME")
+    if hostname is not None and hostname != address:
+        contradictions.append("MOONCAKE_LOCAL_HOSTNAME")
+    expected: list[tuple[str, object]] = [
+        ("rpc_server_hostname", address),
+        ("transports/rdma/enable", True),
+        ("transports/rdma/device/port", device.port),
+        ("topology/rdma_whitelist", [device.name]),
+        *((f"transports/{name}/enable", False) for name in TENT_OTHER_TRANSPORTS),
+    ]
+    for key, value in expected:
+        found = tent_config.lookup(conf, key)
+        if found is not None and found[1] != value and key != "rpc_server_hostname":
+            contradictions.append(f"{tent_config.ENV} {key}")
+    if contradictions:
+        raise ValueError(
+            f"Managed RDMA on {device.ucx} sets TENT's transports itself; "
+            f"remove {', '.join(contradictions)}."
+        )
+    os.environ.setdefault("MC_USE_TENT", "1")
+    for key, value in expected:
+        tent_config.store(conf, key, value)
+    tent_config.save(conf)
+    return {
+        "transport": "rdma",
+        "engine": "tent",
+        "address": address,
+        "device": device.name,
+        "port": device.port,
+        "tent_transports": ["rdma"],
+    }
 
 
 def plain_mla(model) -> bool:

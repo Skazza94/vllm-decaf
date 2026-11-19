@@ -367,13 +367,17 @@ class SimulationConfig:
         one block or, with prefix caching, a state a block (the align mode
         vLLM then sets), over Mooncake or over NIXL with the DS conv-state
         layout NIXL's state descriptors need. The native connector stays in
-        place."""
-        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import plain_mla
+        place. Its ranks move KV over TCP, or over RDMA (``kv_transport``)
+        on their ``rank_rdma_devices``."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
+            plain_mla,
+            transport_problems,
+        )
         from vllm.platforms import current_platform
 
         kv_transfer = vllm_config.kv_transfer_config
         assert kv_transfer is not None
-        problems = []
+        problems = transport_problems(kv_transfer)
         if vllm_config.cache_config.kv_offloading_size is not None:
             # Validated before VllmConfig turns it into an offloading
             # connector (kv_role kv_both), which would replace the native one.
