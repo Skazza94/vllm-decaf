@@ -329,26 +329,29 @@ class Observer:
     def ebpf_row(self, row):
         if row.get("outcome") == "FAIL":
             self.ebpf_failures += 1
-        # Native epochs/socket aggregates never become L1 transfer metrics.
         data = {**row, "exact": False, "transfer_refs": "unbound"}
-        if row.get("type") == "api":
+        begin = end = time.monotonic_ns()
+        if row.get("type") == "tcp_event":
             data["clock_source"] = "kernel_monotonic"
             data["time_conversion_qualified"] = False
-            if self.ebpf.monotonic_offset is not None:
+            if self.ebpf is not None and self.ebpf.monotonic_offset is not None:
                 from .ebpf import convert_time
 
-                data["endpoint_begin_ns"] = convert_time(
-                    row["begin_ns"], self.ebpf.monotonic_offset
+                begin = end = convert_time(
+                    row["timestamp_ns"], self.ebpf.monotonic_offset
                 )
-                data["endpoint_end_ns"] = convert_time(
-                    row["end_ns"], self.ebpf.monotonic_offset
-                )
-        return self.emit(
-            "ebpf",
-            self.endpoint,
-            time.monotonic_ns(),
-            data,
-            "tcp" if row.get("type") in ("tcp", "tcp_namespace") else "unknown",
+                data["endpoint_time_ns"] = begin
+                data["time_conversion_qualified"] = True
+        return self.writer.put(
+            event(
+                "endpoint_metrics",
+                "ebpf",
+                self.endpoint,
+                begin,
+                end,
+                data,
+                "tcp" if row.get("type") == "tcp_event" else "unknown",
+            )
         )
 
     def sample_ebpf(self):
@@ -356,7 +359,7 @@ class Observer:
             return
         try:
             for row in self.ebpf.poll(self.writer):
-                self.ebpf.acknowledge(row, self.ebpf_row(row))
+                self.ebpf_row(row)
             if not self.ebpf.status["available"]:
                 self.failure(
                     "ebpf",

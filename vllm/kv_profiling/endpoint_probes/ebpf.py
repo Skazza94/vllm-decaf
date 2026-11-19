@@ -1,24 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Explicit native collector control; no import-time probing or native imports."""
+"""Opt-in portable TCP event collector; no import-time privilege or kernel probes."""
 
+import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import selectors
 import signal
-import struct
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-IMAGE = "sha256:ff979851b632e2048a4a8dd141cf71b2a4701f243c0bf96fb275f7286daadc76"
-LIMITS_SHA256 = "5f9162c8a1e3a907c5ccaadfa7cb29ba09b418f4dc11326eb12701e147be4929"
-NIXL_SHA256 = "82c8d0197eb43a4cdbbe3a8cb71e7b0a722cb1af38cf8ade768a1ea22f8ad20d"
-NIXL_OFFSET = 0x48900
-SETS = {"native_api", "tcp_events", "provider_wr"}
+RECORD_BYTES = 2048
+EVENTS = {
+    "tcp_retransmit_skb",
+    "tcp_send_reset",
+    "tcp_receive_reset",
+    "inet_sock_set_state",
+}
+FIELDS = {
+    "srtt_us",
+    "snd_cwnd",
+    "snd_ssthresh",
+    "packets_out",
+    "retrans_out",
+    "lost_out",
+    "total_retrans",
+    "mss_cache",
+}
 
 
 def digest(path):
@@ -29,56 +42,40 @@ def digest(path):
 class Settings:
     enabled: bool = False
     privileged_opt_in: bool = False
-    sets: tuple = ("native_api", "tcp_events")
+    mode: str | None = None
     artifacts: str | None = None
-    kernel_audit: str | None = None
+    local_ports: tuple = ()
+    peer_ports: tuple = ()
 
     def __post_init__(self):
         for name in ("enabled", "privileged_opt_in"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"ebpf.{name} must be boolean")
-        if not isinstance(self.sets, (tuple, list)) or not self.sets:
-            raise ValueError("ebpf.sets requires explicit sources")
-        if set(self.sets) - SETS or len(set(self.sets)) != len(self.sets):
-            raise ValueError("unknown/duplicate ebpf set")
-        for name in ("artifacts", "kernel_audit"):
-            value = getattr(self, name)
-            if value is not None and (
-                not isinstance(value, str) or not Path(value).is_absolute()
+        if self.enabled and self.mode != "tcp_tracepoints":
+            raise ValueError("ebpf.mode must explicitly name tcp_tracepoints")
+        if self.artifacts is not None and (
+            not isinstance(self.artifacts, str)
+            or not Path(self.artifacts).is_absolute()
+        ):
+            raise ValueError("ebpf.artifacts requires an absolute path")
+        for name in ("local_ports", "peer_ports"):
+            ports = getattr(self, name)
+            if (
+                not isinstance(ports, (tuple, list))
+                or len(ports) > 32
+                or any(type(p) is not int or not 0 < p <= 65535 for p in ports)
+                or len(set(ports)) != len(ports)
             ):
-                raise ValueError(f"ebpf.{name} requires an absolute path")
+                raise ValueError(f"ebpf.{name} requires up to 32 distinct ports")
 
 
 def effective_privilege():
-    """Availability check only; never changes caps, policy or resource limits."""
+    """Never grants capabilities, changes sysctls or raises resource limits."""
     for line in Path("/proc/self/status").read_text().splitlines():
         if line.startswith("CapEff:"):
             caps = int(line.split()[1], 16)
             return bool(caps & (1 << 21) or (caps & (1 << 38) and caps & (1 << 39)))
     return False
-
-
-def executable_offset(path, offset):
-    """Validate an executable file offset, not a symbol VMA or data alias."""
-    with Path(path).open("rb") as stream:
-        head = stream.read(64)
-        if len(head) != 64 or head[:6] != b"\x7fELF\x02\x01":
-            raise ValueError("ELF64 little-endian required")
-        if struct.unpack_from("<H", head, 18)[0] != 62:
-            raise ValueError("x86-64 ABI required")
-        table = struct.unpack_from("<Q", head, 32)[0]
-        size, count = struct.unpack_from("<HH", head, 54)
-        if size != 56 or not 0 < count <= 64:
-            raise ValueError("bounded ELF program headers required")
-        for index in range(count):
-            stream.seek(table + index * size)
-            raw = stream.read(size)
-            if len(raw) != size:
-                raise ValueError("truncated ELF")
-            kind, flags, start, _, _, length, _, _ = struct.unpack("<IIQQQQQQ", raw)
-            if kind == 1 and flags & 1 and start <= offset < start + length:
-                return
-    raise ValueError("offset is not executable")
 
 
 def read_offsets(path):
@@ -111,13 +108,11 @@ def convert_time(value, offset):
 
 
 def decode_row(line):
-    if len(line) + 1 > 256:
+    if len(line) + 1 > RECORD_BYTES:
         raise ValueError("native record bound")
     row = json.loads(line)
     if not isinstance(row, dict) or row.get("type") not in {
-        "api",
-        "tcp",
-        "tcp_namespace",
+        "tcp_event",
         "loss",
         "ready",
         "end",
@@ -129,177 +124,63 @@ def decode_row(line):
         key in row for key in ("request_ref", "handoff_ref", "transfer", "transfer_id")
     ):
         raise ValueError("native observation claimed a transfer")
-    if row["type"] == "api":
-        for key in (
-            "generation",
-            "epoch",
-            "pid",
-            "tid",
-            "thread_ns",
-            "begin_ns",
-            "end_ns",
-        ):
-            if type(row.get(key)) is not int or not 0 <= row[key] < 1 << 64:
-                raise ValueError("invalid native integer")
-        if not all(row[k] > 0 for k in ("generation", "epoch", "pid", "tid")):
-            raise ValueError("positive native identities required")
-        if row["begin_ns"] > row["end_ns"] or type(row.get("status")) is not int:
-            raise ValueError("invalid native interval/status")
-    if row["type"] == "tcp":
-        if row.get("counter") not in {
-            "rx_events",
-            "skb_len_bytes",
-            "states",
-            "retrans",
-            "reset_tx",
-            "reset_rx",
-        }:
-            raise ValueError("unknown TCP counter")
-        for key in ("cookie", "value"):
-            if type(row.get(key)) is not int or not 0 <= row[key] < 1 << 64:
+    if row["type"] == "tcp_event":
+        if row.get("schema") != 2 or row.get("event") not in EVENTS:
+            raise ValueError("unknown TCP event")
+        for key in ("timestamp_ns", "netns"):
+            if type(row.get(key)) is not int or not 0 < row[key] < 1 << 64:
                 raise ValueError("invalid TCP integer")
-        if not row["cookie"]:
-            raise ValueError("unknown socket identity is not a socket row")
+        family = row.get("family")
+        if type(family) is not int or family not in (2, 10):
+            raise ValueError("invalid TCP address family")
+        for key in ("local_ip", "peer_ip"):
+            address = ipaddress.ip_address(row[key])
+            if address.version != (4 if family == 2 else 6):
+                raise ValueError("TCP address family mismatch")
+        for key in ("local_port", "peer_port"):
+            if type(row.get(key)) is not int or not 0 <= row[key] <= 65535:
+                raise ValueError("invalid TCP port")
+        cookie = row.get("cookie")
+        if cookie is not None and (type(cookie) is not int or not 0 < cookie < 1 << 64):
+            raise ValueError("invalid TCP cookie")
+        for key in ("old_state", "new_state"):
+            value = row.get(key)
+            if row["event"] == "inet_sock_set_state":
+                if type(value) is not int or not 0 <= value <= 255:
+                    raise ValueError("missing TCP transition state")
+            elif value is not None:
+                raise ValueError("unexpected TCP transition state")
+        if not isinstance(row.get("snapshot"), dict) or set(row["snapshot"]) != FIELDS:
+            raise ValueError("invalid TCP snapshot")
+        for field in row["snapshot"].values():
+            if not isinstance(field, dict):
+                raise ValueError("invalid TCP snapshot field")
+            state, value = field.get("state"), field.get("value")
+            if state == "available":
+                if type(value) is not int or not 0 <= value < 1 << 32:
+                    raise ValueError("invalid TCP snapshot value")
+            elif state not in ("unavailable", "read_error") or value is not None:
+                raise ValueError("invalid TCP snapshot availability")
+        if row.get("srtt_encoding") != "usec_shift_3":
+            raise ValueError("TCP srtt encoding missing")
     return row
 
 
 def validate_artifacts(directory):
+    """Check a package against its own manifest, never against its build host."""
     root = Path(directory)
     manifest = json.loads((root / "manifest.json").read_text())
-    if manifest.get("image") != IMAGE or manifest.get("limits_sha256") != LIMITS_SHA256:
-        raise ValueError("unreviewed image/limits")
-    expected = {"collector", "observe.bpf.o", "limits.json", "vmlinux.h"}
-    if set(manifest.get("files", {})) != expected:
-        raise ValueError("incomplete artifact manifest")
+    expected = {"collector", "observe.bpf.o", "limits.json"}
+    if (
+        manifest.get("schema") != 2
+        or manifest.get("mode") != "tcp_tracepoints"
+        or set(manifest.get("files", {})) != expected
+    ):
+        raise ValueError("incomplete TCP artifact manifest")
     for name in expected:
         if digest(root / name) != manifest["files"][name]:
             raise ValueError("artifact hash mismatch: " + name)
-    if digest(root / "limits.json") != LIMITS_SHA256:
-        raise ValueError("limits hash mismatch")
-    if manifest.get("kernel_release") != os.uname().release:
-        raise ValueError("unvalidated kernel release")
-    if digest("/sys/kernel/btf/vmlinux") != manifest.get("kernel_btf_sha256"):
-        raise ValueError("unvalidated kernel BTF")
     return manifest
-
-
-def validate_audit(path, manifest):
-    audit = json.loads(Path(path).read_text())
-    bound = audit.get("map_upper_bound_bytes")
-    if type(bound) is not int or not 0 < bound <= 16 << 20:
-        raise ValueError("kernel map bound absent/over cap")
-    for name in ("kernel_release", "kernel_btf_sha256", "limits_sha256"):
-        if audit.get(name) != manifest[name]:
-            raise ValueError("kernel accounting audit identity mismatch")
-    if audit.get("object_sha256") != manifest["files"]["observe.bpf.o"]:
-        raise ValueError("kernel accounting object mismatch")
-    if audit.get("method") != "audited_upper_bound_and_fdinfo_memlock":
-        raise ValueError("kernel map accounting unavailable")
-    if not re.fullmatch(r"[0-9a-f]{64}", audit.get("source_audit_sha256", "")):
-        raise ValueError("target-kernel allocation/field audit required")
-    launch = audit.get("launch", {})
-    binding = audit.get("namespace_bindings", {})
-    if (
-        launch.get("HostConfig", {}).get("Privileged") is not True
-        or launch.get("Image") != IMAGE
-    ):
-        raise ValueError("raw privileged launch proof required")
-    if binding.get("pid_namespace") != os.readlink("/proc/self/ns/pid") or binding.get(
-        "net_namespace"
-    ) != os.readlink("/proc/self/ns/net"):
-        raise ValueError("launch namespace proof mismatch")
-    # Controller evidence is not a privilege grant; effective caps are checked too.
-    return bound
-
-
-def targets(inventory, need_native=True):
-    """Bind reviewed SDK bytes/offset to actual worker mappings and PID generation."""
-    from .identity import process_identity
-
-    result, generations = [], set()
-    for item in inventory:
-        if item.get("context", {}).get("role") != "worker":
-            continue
-        pid = item.get("pid")
-        if type(pid) is not int or pid <= 0:
-            raise ValueError("positive TGID required; no autoattach fallback")
-        actual = process_identity(pid)
-        if any(actual[key] != item.get(key) for key in actual):
-            raise ValueError("worker identity changed")
-        if actual["pid_namespace"] != os.readlink("/proc/self/ns/pid") or actual[
-            "net_namespace"
-        ] != os.readlink("/proc/self/ns/net"):
-            raise ValueError("worker namespace mismatch")
-        tids = list((Path("/proc") / str(pid) / "task").iterdir())
-        if len(tids) > 128:
-            raise ValueError("per-process thread limit")
-        path = Path(
-            f"/proc/{pid}/root/opt/nixl/lib/libnixl.so"
-            if need_native
-            else f"/proc/{pid}/exe"
-        )
-        description = path.stat()
-        inode = description.st_ino
-        device = description.st_dev
-        mapping = False
-        rows = (Path("/proc") / str(pid) / "maps").read_text().splitlines()
-        if len(rows) > 8192:
-            raise ValueError("worker mapping inventory limit")
-        for row in rows:
-            fields = row.split(maxsplit=5)
-            if (
-                len(fields) == 6
-                and int(fields[4]) == inode
-                and tuple(int(part, 16) for part in fields[3].split(":"))
-                == (os.major(device), os.minor(device))
-                and "x" in fields[1]
-                and fields[5] == "/opt/nixl/lib/libnixl.so"
-            ):
-                mapping = True
-        if need_native:
-            if not mapping or digest(path) != NIXL_SHA256:
-                raise ValueError("mapped SDK inode/hash unavailable")
-            executable_offset(path, NIXL_OFFSET)
-        generation = int.from_bytes(
-            hashlib.sha256(item["process_id"].encode()).digest()[:8], "little"
-        )
-        if not generation or generation in generations:
-            raise ValueError("process generation collision")
-        generations.add(generation)
-        result.append(
-            (pid, actual["start_ticks"], generation, device, inode, str(path))
-        )
-    if not result or len(result) > 256:
-        raise ValueError("worker process inventory limit/empty")
-    if (
-        sum(
-            len(list((Path("/proc") / str(row[0]) / "task").iterdir()))
-            for row in result
-        )
-        > 2048
-    ):
-        raise ValueError("endpoint thread limit")
-    return result
-
-
-def mapping_signature(pid, sdk=False):
-    """Observe executable mappings; a periodic check is not a gap-free exec monitor."""
-    if type(pid) is not int or pid <= 0:
-        raise ValueError("positive TGID required")
-    root = Path("/proc") / str(pid)
-    executable = (root / "exe").stat()
-    name = "/opt/nixl/lib/libnixl.so" if sdk else os.readlink(root / "exe")
-    raw = (root / "maps").read_text().splitlines()
-    if len(raw) > 8192:
-        raise ValueError("mapping inventory bound")
-    selected = []
-    for line in raw:
-        fields = line.split(maxsplit=5)
-        if len(fields) == 6 and fields[5] == name and "x" in fields[1]:
-            selected.append(tuple(fields[:5]))
-    if not selected:
-        raise ValueError("target executable mapping unavailable")
-    return executable.st_dev, executable.st_ino, tuple(selected)
 
 
 class Channel:
@@ -312,7 +193,6 @@ class Channel:
         self.child = child
         self.selector = None
         self.buffers = {}
-        self.pending = []
         self.stderr_bytes = 0
         self.final_usage = None
         self.reaped = False
@@ -321,8 +201,6 @@ class Channel:
         self.monotonic_offset = None
         self.time_namespace = None
         self.namespaces = None
-        self.mapping_generations = {}
-        self.next_identity_check = 0
         self.started = False
         self.input_closed = False
         self.input_error = None
@@ -335,8 +213,7 @@ class Channel:
             "available": False,
             "state": "inactive",
             "exact": False,
-            "sets": [],
-            "provider_wr": "unavailable",
+            "mode": self.settings.mode,
             "transfer_refs": "unbound",
         }
         if child is not None:
@@ -353,14 +230,16 @@ class Channel:
         ):
             raise ValueError("owned child with three pipes required")
         if self.namespaces is None:
-            self.namespaces = {
-                name: os.readlink("/proc/self/ns/" + name)
-                for name in ("pid", "net", "time")
-            }
-            self.time_namespace = self.namespaces["time"]
-            self.monotonic_offset = read_offsets("/proc/self/timens_offsets")[
-                "monotonic"
-            ]
+            self.namespaces = {"net": os.readlink("/proc/self/ns/net")}
+            # Time namespaces are optional kernel metadata, not load eligibility.
+            with contextlib.suppress(OSError):
+                self.time_namespace = os.readlink("/proc/self/ns/time")
+                self.namespaces["time"] = self.time_namespace
+            # Without conversion, retain raw kernel time and leave joins unaligned.
+            with contextlib.suppress(OSError, ValueError):
+                self.monotonic_offset = read_offsets("/proc/self/timens_offsets")[
+                    "monotonic"
+                ]
         os.set_blocking(self.child.stdin.fileno(), False)
         self.selector = selectors.DefaultSelector()
         for name, stream in (
@@ -466,14 +345,6 @@ class Channel:
             for name, value in self.namespaces.items()
         ):
             raise ValueError("observer namespace changed")
-        if time.monotonic() >= self.next_identity_check:
-            self.next_identity_check = time.monotonic() + 1
-            for pid, signature in self.mapping_generations.items():
-                if (
-                    mapping_signature(pid, "native_api" in self.settings.sets)
-                    != signature
-                ):
-                    raise ValueError("target executable/mapping changed")
         rows = []
         for key, _ in sorted(
             self.selector.select(timeout), key=lambda item: item[0].data == "stdout"
@@ -505,7 +376,7 @@ class Channel:
                     self.status.update(
                         available=True,
                         state="partial",
-                        sets=list(self.settings.sets),
+                        mode=self.settings.mode,
                         kernel_miss_visibility="unverified",
                     )
                 elif row.get("type") == "status":
@@ -515,39 +386,20 @@ class Channel:
                         if row.get("outcome") == "FAIL"
                         else "unavailable",
                     )
-                elif row.get("type") == "resource" and row.get("outcome") == "FAIL":
-                    self.status.update(
-                        available=False,
-                        state="failed",
-                        outcome="FAIL",
-                        reason="kernel_map_budget_exceeded",
-                        resource=row,
-                    )
+                elif row.get("type") == "resource":
+                    self.status["resource"] = row
                 elif row.get("type") == "end":
                     self.terminal = row
+                    if row.get("failed") is True:
+                        self.fail("native_terminal_failure")
                 if row.get("outcome") == "FAIL":
                     self.fail(self.status.get("reason", "native_collector_failure"))
                 elif self.failed_reason is not None:
                     self.fail(self.failed_reason)
                 rows.append(row)
-            if len(buffer) >= 256:
+            if len(buffer) >= RECORD_BYTES:
                 raise ValueError("unterminated native record bound")
-        waiting = []
-        for ticket, generation, epoch in self.pending:
-            if (
-                not self.running()
-                or writer.saved_sequence < ticket
-                or not self.send_command(f"ack {generation} {epoch}\n".encode())
-            ):
-                waiting.append((ticket, generation, epoch))
-        self.pending = waiting
         return rows
-
-    def acknowledge(self, row, ticket):
-        if row.get("type") == "api" and ticket is not None:
-            if len(self.pending) >= 4096:
-                raise ValueError("native acknowledgement queue bound")
-            self.pending.append((ticket, row["generation"], row["epoch"]))
 
     def stop(self, writer, consume=None):
         if self.stopped_result is not None:
@@ -562,7 +414,7 @@ class Channel:
                 rows = self.poll(writer, timeout)
                 for row in rows:
                     if consume:
-                        self.acknowledge(row, consume(row))
+                        consume(row)
                     else:
                         with (self.directory / "shutdown.jsonl").open("a") as stream:
                             stream.write(json.dumps(row) + "\n")
@@ -630,13 +482,13 @@ class Channel:
             "resource_error": self.accounting_error,
             "final_usage": self.final_usage,
             "terminal": self.terminal,
-            "kernel_qualification": "pending_live_checkpoint",
+            "coverage": "partial",
         }
         return self.stopped_result
 
 
 class Collector(Channel):
-    """Opt-in launcher: no child or privilege retry on inactive/unavailable paths."""
+    """Explicit TCP-only launcher; no image/kernel pin or alternate attachment."""
 
     def __init__(self, settings, inventory, directory):
         super().__init__(None, directory, settings, inventory)
@@ -644,47 +496,26 @@ class Collector(Channel):
     def start(self):
         if not self.settings.enabled:
             return
-        self.status.update(state="unavailable", requested=list(self.settings.sets))
-        if "provider_wr" in self.settings.sets:
-            self.status["reason"] = "provider_abi_unavailable"
-            return
-        if not self.settings.privileged_opt_in or not effective_privilege():
-            self.status["reason"] = "missing_explicit_effective_privilege"
-            return
+        self.status.update(state="unavailable", mode=self.settings.mode)
         try:
-            if not self.settings.artifacts or not self.settings.kernel_audit:
-                raise ValueError("artifact and target-kernel accounting audit required")
-            manifest = validate_artifacts(self.settings.artifacts)
-            bound = validate_audit(self.settings.kernel_audit, manifest)
-            admitted = targets(self.inventory, "native_api" in self.settings.sets)
-            self.mapping_generations = {
-                row[0]: mapping_signature(row[0], "native_api" in self.settings.sets)
-                for row in admitted
-            }
-            offsets = read_offsets("/proc/self/timens_offsets")
-            self.monotonic_offset = offsets["monotonic"]
-            self.time_namespace = os.readlink("/proc/self/ns/time")
-            self.namespaces = {
-                name: os.readlink("/proc/self/ns/" + name)
-                for name in ("pid", "net", "time")
-            }
-            self.directory.mkdir(parents=True, exist_ok=False)
-            spec = self.directory / "native.plan"
+            if not self.settings.privileged_opt_in or not effective_privilege():
+                self.status["reason"] = "missing_explicit_effective_privilege"
+                return
+            if not self.settings.artifacts:
+                raise ValueError("artifact directory required")
+            validate_artifacts(self.settings.artifacts)
             from .identity import process_identity
 
             own = process_identity(os.getpid())
-            ns = os.stat("/proc/self/ns/pid")
-            lines = [
-                f"P {own['pid']} {own['start_ticks']}",
-                (
-                    f"N {ns.st_dev} {ns.st_ino} {os.stat('/proc/self/ns/net').st_ino} "
-                    f"{offsets['monotonic']} {int('tcp_events' in self.settings.sets)} "
-                    f"{int('native_api' in self.settings.sets)}"
-                ),
-                f"B {bound}",
-            ]
-            lines.extend("T " + " ".join(map(str, row)) for row in admitted)
-            spec.write_text("\n".join(lines) + "\n")
+            netns = os.stat("/proc/self/ns/net").st_ino
+            self.directory.mkdir(parents=True, exist_ok=False)
+            spec = self.directory / "tcp.plan"
+            local_ports = " ".join(map(str, self.settings.local_ports))
+            peer_ports = " ".join(map(str, self.settings.peer_ports))
+            spec.write_text(
+                f"P {own['pid']} {own['start_ticks']}\nN {netns}\n"
+                f"L {local_ports}\nR {peer_ports}\n"
+            )
             spec.chmod(0o600)
             root = Path(self.settings.artifacts)
             self.child = subprocess.Popen(
@@ -703,4 +534,3 @@ class Collector(Channel):
             self.open_pipes()
         except (OSError, ValueError, KeyError, TypeError) as error:
             self.status["reason"] = str(error)
-            self.error = str(error)

@@ -1,140 +1,47 @@
 {
-  "status": "PROPOSED; approval freezes limits, not runtime support",
-  "image": "sha256:ff979851b632e2048a4a8dd141cf71b2a4701f243c0bf96fb275f7286daadc76",
-  "processes": 256,
-  "threads_per_process": 128,
-  "threads_per_endpoint": 2048,
-  "unique_elf_manifests": 64,
-  "elf_mappings_per_process": 8,
-  "function_sites_per_process": 32,
-  "phased_uprobe_slots_per_endpoint": 4096,
-  "uprobe_link_fds": 4096,
-  "tcp_link_fds": 8,
-  "total_link_fds": 4104,
-  "program_fds": 128,
-  "total_collector_fds": 8192,
-  "map_fds": 16,
-  "max_instructions_per_program": 16384,
-  "max_instructions_total": 262144,
-  "native_call_depth": 4,
-  "provider_call_depth_shared_with_native": true,
-  "active_native_calls": 4096,
-  "unacknowledged_api_epochs": 16384,
-  "legacy_lists_inflight": 256,
-  "wr_per_legacy_list": 64,
-  "sges_per_wr": 8,
-  "ext_transactions": 1024,
-  "ext_transactions_per_thread": 4,
-  "ext_transactions_per_qp": 1,
-  "ext_operations_per_transaction": 64,
-  "ext_builder_calls_per_transaction": 1024,
-  "ext_sges_per_operation": 8,
-  "stack_scratch_bytes_per_bpf_frame": 256,
-  "possible_cpu_limit": 4096,
-  "kernel_maps_cap_bytes": 16777216,
-  "sample_interval_ms": 1000,
-  "lookup_batch_rows": 256,
-  "map_rows_per_tick": 32768,
-  "user_output_queue_records": 4096,
-  "user_record_size_cap": 256,
-  "api_call_watchdog_ms": 30000,
-  "shutdown_ms": 2000,
-  "return_grace_ms": 500,
-  "capability_statuses": [
-    "available",
-    "unavailable",
-    "partial",
-    "inactive"
+  "mode": "tcp_tracepoints",
+  "hooks": [
+    "tcp_retransmit_skb",
+    "tcp_send_reset",
+    "tcp_receive_reset",
+    "inet_sock_set_state"
   ],
-  "user_uprobe_backend": "process-filtered uprobe-multi only; explicit positive TGID; no fallback",
-  "maps": [
-    {
-      "name": "processes",
-      "type": "HASH",
-      "entries": 256,
-      "key_bytes_cap": 32,
-      "value_bytes_cap": 128
+  "excluded_hooks": [
+    "tcp_probe"
+  ],
+  "maps": {
+    "events": {
+      "type": "RINGBUF",
+      "max_entries": 1048576
     },
-    {
-      "name": "threads",
-      "type": "HASH",
-      "entries": 2048,
-      "key_bytes_cap": 32,
-      "value_bytes_cap": 96
-    },
-    {
-      "name": "call_frames",
-      "type": "HASH",
-      "entries": 2048,
-      "key_bytes_cap": 32,
-      "value_bytes_cap": 128
-    },
-    {
-      "name": "active_calls",
-      "type": "HASH",
-      "entries": 4096,
-      "key_bytes_cap": 48,
-      "value_bytes_cap": 96
-    },
-    {
-      "name": "api_epochs",
-      "type": "HASH",
-      "entries": 16384,
-      "key_bytes_cap": 48,
-      "value_bytes_cap": 128
-    },
-    {
-      "name": "legacy_lists",
-      "type": "HASH",
-      "entries": 256,
-      "key_bytes_cap": 48,
-      "value_bytes_cap": 2176
-    },
-    {
-      "name": "ext_txns",
-      "type": "HASH",
-      "entries": 1024,
-      "key_bytes_cap": 48,
-      "value_bytes_cap": 2176
-    },
-    {
-      "name": "qp_counts",
-      "type": "HASH",
-      "entries": 4096,
-      "key_bytes_cap": 48,
-      "value_bytes_cap": 128
-    },
-    {
-      "name": "socket_counts",
-      "type": "HASH",
-      "entries": 1024,
-      "key_bytes_cap": 48,
-      "value_bytes_cap": 128
-    },
-    {
-      "name": "control",
+    "control": {
       "type": "ARRAY",
-      "entries": 16,
-      "key_bytes_cap": 4,
-      "value_bytes_cap": 64
+      "max_entries": 1,
+      "key_bytes": 4,
+      "value_bytes": 256
     },
-    {
-      "name": "loss_counts",
-      "type": "PERCPU_ARRAY",
-      "entries": 1,
-      "key_bytes_cap": 4,
-      "value_bytes_cap": 256
+    "loss_counts": {
+      "type": "ARRAY",
+      "max_entries": 1,
+      "key_bytes": 4,
+      "value_bytes": 256
     }
-  ],
-  "compiler_global_maps": {
-    "max_count": 3,
-    "entries": 1,
-    "key_bytes_cap": 4,
-    "value_bytes_cap": 16384
   },
-  "max_key_value_payload_bytes_at_possible_cpu_limit": 8950864,
-  "thread_slot_semantics": "resident generation records including pending retirement, not a target thread-creation limit",
-  "user_uprobe_autoattach": false,
-  "perf_inheritance_fallback": false,
-  "sleepable_programs": false
+  "ring_and_array_value_capacity_bytes": 1049088,
+  "capacity_is_physical_charge": false,
+  "memory_audit_gate": false,
+  "local_ports_max": 32,
+  "peer_ports_max": 32,
+  "event_binary_bytes_max": 256,
+  "output_json_bytes_max": 2048,
+  "output_queue_max_records": 4096,
+  "programs": 4,
+  "links": 4,
+  "instruction_limit_per_program": 16384,
+  "instruction_limit_total": 65536,
+  "stack_target_bytes": 256,
+  "helper_fd_limit": 64,
+  "loss_sample_ms": 1000,
+  "runtime_environment_pins": false,
+  "artifact_self_hashes": true
 }

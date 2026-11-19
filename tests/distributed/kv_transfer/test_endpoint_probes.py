@@ -385,10 +385,12 @@ def test_off_configuration_imports_no_observer_and_l3_validates_sources():
 
 
 @pytest.mark.parametrize("flow_count,unaligned", [(1, False), (2, False), (1, True)])
+@pytest.mark.parametrize("rare_event", [False, True])
 def test_synthetic_read_windows_have_only_qualified_flow_candidates(
     tmp_path,
     flow_count,
     unaligned,
+    rare_event,
 ):
     """Real recorder and sockets, not evidence of a native NIXL handle/FD map."""
     from tests.distributed.kv_transfer.test_profiler_core import fields
@@ -446,6 +448,38 @@ def test_synthetic_read_windows_have_only_qualified_flow_candidates(
                         "endpoint_metrics", "socket", str(index), now, now, row, "tcp"
                     )
                 )
+                if rare_event:
+                    native = {
+                        **tcp_event_row(),
+                        **{
+                            k: row[k]
+                            for k in (
+                                "family",
+                                "local_ip",
+                                "local_port",
+                                "peer_ip",
+                                "peer_port",
+                            )
+                        },
+                        "cookie": row["cookie"][0] | (row["cookie"][1] << 32),
+                        "timestamp_ns": now,
+                        "time_conversion_qualified": True,
+                    }
+                    writer.put(
+                        event("endpoint_metrics", "ebpf", "d", now, now, native, "tcp")
+                    )
+                    # Same timestamp but wrong tuple must not become this flow's event.
+                    writer.put(
+                        event(
+                            "endpoint_metrics",
+                            "ebpf",
+                            "d",
+                            now,
+                            now,
+                            {**native, "peer_ip": "192.0.2.99"},
+                            "tcp",
+                        )
+                    )
     core.record(*fields(EventKind.COMPLETE_OBSERVED, handle=7))
     assert core.close().complete
     assert writer.close(True, "test", {})
@@ -462,6 +496,11 @@ def test_synthetic_read_windows_have_only_qualified_flow_candidates(
     )
     assert result[0]["exact"] is False
     assert len(result[0]["candidates"]) == (0 if unaligned else flow_count)
+    if rare_event and not unaligned:
+        assert all(len(c["tcp_events"]) == 1 for c in result[0]["candidates"])
+        assert all(
+            c["tcp_events"][0]["exact"] is False for c in result[0]["candidates"]
+        )
     if unaligned:
         assert "unaligned_clocks" in result[0]["reasons"]
         from vllm.kv_profiling.clock import ClockGroup, ClockMapping, ClockSample
@@ -823,8 +862,10 @@ def test_ebpf_unavailable_paths_create_no_child_or_output(tmp_path):
 
     for options, reason in [
         ({"enabled": False}, None),
-        ({"enabled": True}, "missing_explicit_effective_privilege"),
-        ({"enabled": True, "sets": ["provider_wr"]}, "provider_abi_unavailable"),
+        (
+            {"enabled": True, "mode": "tcp_tracepoints"},
+            "missing_explicit_effective_privilege",
+        ),
     ]:
         root = tmp_path / str(len(options)) / str(reason)
         collector = Collector(Settings(**options), [], root)
@@ -861,37 +902,57 @@ def test_ebpf_clock_domains_are_explicit_and_integer_bounded(tmp_path, raw, vali
             convert_time(value, delta)
 
 
+def tcp_event_row():
+    from vllm.kv_profiling.endpoint_probes.ebpf import FIELDS
+
+    return dict(
+        type="tcp_event",
+        schema=2,
+        event="inet_sock_set_state",
+        timestamp_ns=10,
+        netns=99,
+        family=2,
+        local_ip="127.0.0.1",
+        peer_ip="127.0.0.2",
+        local_port=1234,
+        peer_port=4321,
+        cookie=None,
+        old_state=1,
+        new_state=7,
+        snapshot={name: {"state": "available", "value": 0} for name in FIELDS},
+        srtt_encoding="usec_shift_3",
+        exact=False,
+    )
+
+
 def test_ebpf_wire_records_cannot_invent_attribution_or_byte_semantics():
     from vllm.kv_profiling.endpoint_probes.ebpf import decode_row
 
-    row = dict(
-        type="api",
-        generation=1,
-        epoch=2,
-        pid=3,
-        tid=4,
-        thread_ns=5,
-        begin_ns=10,
-        end_ns=11,
-        status=0,
-        exact=False,
-    )
+    row = tcp_event_row()
     assert decode_row(json.dumps(row).encode()) == row
     for update in [
         {"exact": True},
         {"transfer": 0},
-        {"tid": 0},
-        {"begin_ns": 12},
-        {"epoch": True},
+        {"cookie": 0},
+        {"timestamp_ns": True},
+        {"old_state": None},
+        {"family": 10},
+        {"event": "tcp_probe"},
     ]:
         with pytest.raises(ValueError):
             decode_row(json.dumps({**row, **update}).encode())
     with pytest.raises(ValueError):
-        decode_row(b"x" * 256)
-    tcp = dict(type="tcp", cookie=1, counter="skb_len_bytes", value=123, exact=False)
-    assert decode_row(json.dumps(tcp).encode())["counter"] == "skb_len_bytes"
-    with pytest.raises(ValueError):
-        decode_row(json.dumps({**tcp, "counter": "kv_bytes"}).encode())
+        decode_row(b"x" * 2048)
+    for name in row["snapshot"]:
+        for state in ("unavailable", "read_error"):
+            updated = {
+                **row,
+                "snapshot": {**row["snapshot"], name: {"state": state, "value": None}},
+            }
+            assert (
+                decode_row(json.dumps(updated).encode())["snapshot"][name]["value"]
+                is None
+            )
 
 
 def test_ebpf_writer_acknowledges_only_after_stream_flush(tmp_path):
@@ -941,85 +1002,34 @@ def test_ebpf_native_code_contracts_unprivileged(tmp_path):
     )
 
 
-@pytest.mark.parametrize("pid", [0, -1, True])
-def test_ebpf_target_admission_has_no_implicit_process_fallback(pid):
-    from vllm.kv_profiling.endpoint_probes.ebpf import targets
+def test_ebpf_artifacts_match_their_own_manifest_not_build_environment(tmp_path):
+    from vllm.kv_profiling.endpoint_probes.ebpf import digest, validate_artifacts
 
-    with pytest.raises(ValueError, match="positive TGID"):
-        targets([{"context": {"role": "worker"}, "pid": pid}])
-
-
-def test_ebpf_kernel_memory_cap_requires_more_than_raw_map_sizes(tmp_path):
-    from vllm.kv_profiling.endpoint_probes.ebpf import validate_audit
-
-    path = tmp_path / "audit"
-    for bound in (0, (16 << 20) + 1, True):
-        path.write_text(json.dumps({"map_upper_bound_bytes": bound}))
-        with pytest.raises(ValueError, match="map bound"):
-            validate_audit(path, {})
-
-
-def test_ebpf_executable_offset_rejects_headers_and_foreign_abi(tmp_path):
-    from vllm.kv_profiling.endpoint_probes.ebpf import executable_offset
-
-    path = tmp_path / "not-elf"
-    path.write_bytes(b"bad" * 30)
-    with pytest.raises(ValueError, match="ELF64"):
-        executable_offset(path, 0)
-    with pytest.raises(ValueError, match="not executable"):
-        executable_offset(sys.executable, 0)
+    names = ("collector", "observe.bpf.o", "limits.json")
+    for name in names:
+        (tmp_path / name).write_text(name)
+    manifest = {
+        "schema": 2,
+        "mode": "tcp_tracepoints",
+        "files": {name: digest(tmp_path / name) for name in names},
+        "image": "different-build",
+        "kernel_release": "different-kernel",
+        "kernel_btf_sha256": "different-BTF",
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    assert validate_artifacts(tmp_path) == manifest
+    (tmp_path / "collector").write_text("changed")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        validate_artifacts(tmp_path)
 
 
-def test_ebpf_mapping_identity_changes_after_an_owned_child_exec():
-    from vllm.kv_profiling.endpoint_probes.ebpf import mapping_signature
-
-    code = (
-        "import os,sys;print('ready',flush=True);os.read(0,1);"
-        "os.execv('/bin/cat',['cat'])"
-    )
-    child = subprocess.Popen(
-        [sys.executable, "-c", code],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        assert child.stdout.readline().strip() == "ready"
-        before = mapping_signature(child.pid)
-        child.stdin.write("e")
-        child.stdin.flush()
-        # cat echoes only after exec, making the ordering explicit.
-        child.stdin.write("changed\n")
-        child.stdin.flush()
-        assert child.stdout.readline().strip() == "changed"
-        assert mapping_signature(child.pid) != before
-    finally:
-        child.terminate()
-        child.wait(timeout=5)
-        child.stdin.close()
-        child.stdout.close()
-
-
-def test_ebpf_real_child_channel_waits_for_writer_flush_and_never_qualifies(tmp_path):
+def test_ebpf_real_child_channel_preserves_event_time_and_never_qualifies(tmp_path):
     from vllm.kv_profiling.endpoint_probes.ebpf import Channel
 
-    row = dict(
-        type="api",
-        generation=1,
-        epoch=2,
-        pid=3,
-        tid=4,
-        thread_ns=5,
-        begin_ns=10,
-        end_ns=11,
-        status=0,
-        exact=False,
-    )
+    row = tcp_event_row()
     code = (
         "import json,sys;"
         f"print({json.dumps(json.dumps(row))},flush=True);"
-        "assert sys.stdin.readline()=='ack 1 2\\n';"
-        "print(json.dumps({'type':'status','available':False,'reason':'ack_seen','exact':False}),flush=True);"
         "assert sys.stdin.readline()=='stop\\n';"
         "print(json.dumps({'type':'end','complete':True}),flush=True)"
     )
@@ -1031,26 +1041,22 @@ def test_ebpf_real_child_channel_waits_for_writer_flush_and_never_qualifies(tmp_
     )
     channel = Channel(child, tmp_path)
     writer = Writer(tmp_path / "writer", metadata(), ProbeConfig())
-
-    def consume(item):
-        return writer.put(event("probe_status", "ebpf", "test", 1, 1, item))
-
-    deadline = time.monotonic() + 5
+    captured = []
     try:
-        while channel.status.get("reason") != "ack_seen":
+        deadline = time.monotonic() + 5
+        while not captured:
             assert time.monotonic() < deadline
-            for item in channel.poll(writer, 0.05):
-                channel.acknowledge(item, consume(item))
-        assert writer.saved_sequence >= 1
-        result = channel.stop(writer, consume)
+            captured.extend(channel.poll(writer, 0.05))
+        assert captured == [row]
+        result = channel.stop(writer, captured.append)
         assert result["complete"] is False
         assert result["native_exit"] == 0 and result["error"] is None
         assert result["terminal"]["complete"] is True
         assert writer.close(True, "test", {})
     finally:
-        if child.poll() is None:
+        if channel.running():
             child.kill()
-            child.wait(timeout=5)
+            channel.stop(writer)
 
 
 def test_ebpf_channel_preserves_stderr_without_a_newline_and_truncated_stdout(tmp_path):
@@ -1079,7 +1085,7 @@ def test_ebpf_channel_preserves_stderr_without_a_newline_and_truncated_stdout(tm
         writer.close(False, "test", {})
 
 
-def test_ebpf_native_pipe_backpressure_and_ack_queue_are_bounded(tmp_path):
+def test_ebpf_native_pipe_backpressure_is_bounded(tmp_path):
     from vllm.kv_profiling.endpoint_probes.ebpf import Channel
 
     child = subprocess.Popen(
@@ -1096,10 +1102,6 @@ def test_ebpf_native_pipe_backpressure_and_ack_queue_are_bounded(tmp_path):
             count += 1
             assert count < 8192
         assert count > 0
-        for epoch in range(4096):
-            channel.acknowledge({"type": "api", "generation": 1, "epoch": epoch + 1}, 1)
-        with pytest.raises(ValueError, match="queue bound"):
-            channel.acknowledge({"type": "api", "generation": 1, "epoch": 4097}, 1)
     finally:
         child.kill()
         child.wait(timeout=5)
@@ -1225,7 +1227,7 @@ def test_ebpf_final_accounting_is_explicitly_missing_if_another_waiter_reaps(tmp
 
 
 @pytest.mark.parametrize("outcome", ["FAIL", "UNAVAILABLE"])
-def test_ebpf_map_failure_invalidates_even_an_optional_source(tmp_path, outcome):
+def test_ebpf_explicit_failure_invalidates_even_an_optional_source(tmp_path, outcome):
     from vllm.kv_profiling.endpoint_probes.runner import Observer
 
     original = os.sched_getaffinity(0)
@@ -1250,8 +1252,8 @@ def test_ebpf_map_failure_invalidates_even_an_optional_source(tmp_path, outcome)
     resource = {
         "type": "resource",
         "outcome": outcome,
-        "kernel_map_bytes": 101,
-        "bound_bytes": 100,
+        "output_drops": 101,
+        "queue_capacity": 100,
     }
     try:
         observer.ebpf_row(resource)
@@ -1269,7 +1271,7 @@ def test_ebpf_map_failure_invalidates_even_an_optional_source(tmp_path, outcome)
         assert manifest["end"]["stats"]["ebpf_failures"] == int(outcome == "FAIL")
         assert manifest["complete"] is complete
         text = next((tmp_path / "out").glob("*/*/events.jsonl")).read_text()
-        assert '"kernel_map_bytes":101' in text.replace(" ", "")
+        assert '"output_drops":101' in text.replace(" ", "")
     finally:
         os.sched_setaffinity(0, original)
         (directory / "exit").touch()
@@ -1286,14 +1288,14 @@ def test_ebpf_stop_drains_unread_fail_rows_and_stderr_after_exit_or_epipe(
         {
             "type": "resource",
             "outcome": "FAIL",
-            "kernel_map_bytes": 101,
-            "bound_bytes": 100,
+            "output_drops": 101,
+            "queue_capacity": 100,
         },
         {
             "type": "status",
             "available": False,
             "outcome": "FAIL",
-            "reason": "kernel_map_budget_exceeded",
+            "reason": "event_output_failure",
             "exact": False,
         },
         {"type": "end", "complete": False},
@@ -1303,7 +1305,7 @@ def test_ebpf_stop_drains_unread_fail_rows_and_stderr_after_exit_or_epipe(
         "import os,sys,json,signal;from pathlib import Path;os.close(0);"
         f"rows=json.loads({json.dumps(json.dumps(rows))});"
         "exec('for row in rows: print(json.dumps(row),flush=True)');"
-        "sys.stderr.write('map failure diagnostics');sys.stderr.flush();"
+        "sys.stderr.write('event failure diagnostics');sys.stderr.flush();"
         f"Path({str(ready)!r}).touch();"
         + ("sys.exit(3)" if exited else "signal.pause()")
     )
@@ -1313,7 +1315,7 @@ def test_ebpf_stop_drains_unread_fail_rows_and_stderr_after_exit_or_epipe(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    channel = Channel(child, tmp_path, Settings(enabled=True))
+    channel = Channel(child, tmp_path, Settings(enabled=True, mode="tcp_tracepoints"))
     writer = Writer(tmp_path / "writer", metadata(), ProbeConfig())
     captured = []
     try:
@@ -1322,10 +1324,10 @@ def test_ebpf_stop_drains_unread_fail_rows_and_stderr_after_exit_or_epipe(
             wait_for(lambda: not channel.running())
         result = channel.stop(writer, captured.append)
         assert captured == rows
-        assert (tmp_path / "native.stderr").read_bytes() == b"map failure diagnostics"
+        assert (tmp_path / "native.stderr").read_bytes() == b"event failure diagnostics"
         assert result["outcome"] == "FAIL" and result["state"] == "failed"
-        assert result["resource"]["kernel_map_bytes"] == 101
-        assert result["resource"]["bound_bytes"] == 100
+        assert result["resource"]["output_drops"] == 101
+        assert result["resource"]["queue_capacity"] == 100
         assert result["terminal"] == rows[-1]
         assert result["resource_complete"]
         if exited:
@@ -1358,7 +1360,7 @@ def test_ebpf_optional_observer_cannot_pass_with_unread_or_lost_failure_at_shutd
     wait_for(lambda: (directory / "closed").exists(), timeout=20)
     run = entries[0]["run_id"]
     observer = Observer(
-        ProbeConfig(ebpf={"enabled": True}),
+        ProbeConfig(ebpf={"enabled": True, "mode": "tcp_tracepoints"}),
         run_id=run,
         endpoint="d",
         role="decode",
@@ -1377,8 +1379,8 @@ def test_ebpf_optional_observer_cannot_pass_with_unread_or_lost_failure_at_shutd
                 {
                     "type": "resource",
                     "outcome": "FAIL",
-                    "kernel_map_bytes": 101,
-                    "bound_bytes": 100,
+                    "output_drops": 101,
+                    "queue_capacity": 100,
                 }
             )
             + "\n"
@@ -1387,7 +1389,7 @@ def test_ebpf_optional_observer_cannot_pass_with_unread_or_lost_failure_at_shutd
                     "type": "status",
                     "outcome": "FAIL",
                     "available": False,
-                    "reason": "kernel_map_budget_exceeded",
+                    "reason": "event_output_failure",
                     "exact": False,
                 }
             )
@@ -1423,7 +1425,9 @@ def test_ebpf_optional_observer_cannot_pass_with_unread_or_lost_failure_at_shutd
 
     channel_dir = tmp_path / "channel"
     channel_dir.mkdir()
-    observer.ebpf = ExitAtShutdown(child, channel_dir, Settings(enabled=True))
+    observer.ebpf = ExitAtShutdown(
+        child, channel_dir, Settings(enabled=True, mode="tcp_tracepoints")
+    )
     try:
         (tmp_path / "stop").touch()
         (tmp_path / "children").write_text(
@@ -1443,7 +1447,7 @@ def test_ebpf_optional_observer_cannot_pass_with_unread_or_lost_failure_at_shutd
         expected_exit = "null" if payload == "lost-status" else str(exit_code)
         assert f'"native_exit":{expected_exit}' in text.replace(" ", "")
         if payload == "rows":
-            assert '"kernel_map_bytes":101' in text.replace(" ", "")
+            assert '"output_drops":101' in text.replace(" ", "")
         assert observer.ebpf.stopped_result["resource_complete"] is (
             payload != "lost-status"
         )
@@ -1454,3 +1458,50 @@ def test_ebpf_optional_observer_cannot_pass_with_unread_or_lost_failure_at_shutd
         os.sched_setaffinity(0, original)
         (directory / "exit").touch()
         owner.wait(10)
+
+
+def test_ebpf_missing_time_namespace_metadata_keeps_raw_events(tmp_path, monkeypatch):
+    """Optional proc metadata cannot prevent capture on a BTF kernel."""
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel
+
+    capture_metadata = metadata()
+    real_readlink, real_read_text = os.readlink, Path.read_text
+
+    def readlink(path, *args, **kwargs):
+        if str(path) == "/proc/self/ns/time":
+            raise FileNotFoundError("time namespaces not configured")
+        return real_readlink(path, *args, **kwargs)
+
+    def read_text(path, *args, **kwargs):
+        if str(path) == "/proc/self/timens_offsets":
+            raise FileNotFoundError("time namespaces not configured")
+        return real_read_text(path, *args, **kwargs)
+
+    # Only the external proc service is emulated; the channel/child are real.
+    monkeypatch.setattr(os, "readlink", readlink)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    row = tcp_event_row()
+    code = (
+        f"print({json.dumps(json.dumps(row))},flush=True);"
+        'input();print(\'{"type":"end","complete":false}\',flush=True)'
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    channel = Channel(child, tmp_path)
+    writer = Writer(tmp_path / "writer", capture_metadata, ProbeConfig())
+    captured = []
+    try:
+        wait_for(lambda: captured.extend(channel.poll(writer, 0.01)) or bool(captured))
+        assert captured == [row] and captured[0]["timestamp_ns"] == 10
+        assert channel.monotonic_offset is None
+        result = channel.stop(writer)
+        assert result["native_exit"] == 0 and result["complete"] is False
+    finally:
+        if channel.running():
+            child.kill()
+            channel.stop(writer)
+        writer.close(False, "test", {})

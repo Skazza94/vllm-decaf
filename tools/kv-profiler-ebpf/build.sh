@@ -1,40 +1,35 @@
 #!/bin/bash
-# Build artifacts only; no BPF program load or attachment.
+# Portable artifact build and passive inspection only; never loads BPF.
 set -euo pipefail
 source_root=$1
 output=$2
 mkdir "$output"
-prefix=/opt/kv-profiler-tools
+prefix=${KVP_TOOLS_PREFIX:-/opt/kv-profiler-tools}
 src="$source_root/csrc/kv_profiler/ebpf"
-export KVP_BTF_FILE=${KVP_BTF_FILE:-/sys/kernel/btf/vmlinux}
-"$prefix/bin/bpftool" btf dump file "$KVP_BTF_FILE" format c > "$output/vmlinux.h"
-"$prefix/bin/clang" -target bpf -mcpu=v3 -D__TARGET_ARCH_x86 -O2 -g \
-    -Wall -Werror -Wframe-larger-than=256 -I"$output" -I"$prefix/include" -I"$src" \
-    -c "$src/observe.bpf.c" -o "$output/observe.bpf.o"
+multiarch=$("$prefix/bin/clang" -print-target-triple)
+multiarch=${multiarch/-unknown/}
+multiarch=${multiarch/-pc/}
+"$prefix/bin/clang" -target bpf -mcpu=v3 -O2 -g -Wall -Werror \
+  -Wframe-larger-than=256 -I"$prefix/include" -I"$src" \
+  -idirafter "/usr/include/$multiarch" -c "$src/observe.bpf.c" -o "$output/observe.bpf.o"
 "$prefix/bin/clang" -O2 -g -Wall -Werror -I"$prefix/include" -I"$src" \
-    "$src/collector.c" "$prefix/lib/libbpf.a" -l:libelf.so.1 -lz -o "$output/collector"
-"$prefix/bin/clang" -O2 -g -Wall -Werror -pthread -I"$source_root" \
-    -I"$source_root/tests/distributed/kv_transfer" -I"$src" \
-    "$source_root/tests/distributed/kv_transfer/endpoint_ebpf_native.c" -o "$output/native_tests"
-"$prefix/bin/clang" -O2 -shared -fPIC -Wall -Werror \
-    "$source_root/tests/distributed/kv_transfer/endpoint_ebpf_syscalls.c" \
-    -ldl -o "$output/deny_syscalls.so"
-"$prefix/bin/clang" -O2 -g -Wall -Werror -I"$prefix/include" -I"$source_root" -I"$src" \
-    "$source_root/tests/distributed/kv_transfer/endpoint_ebpf_accounting.c" \
-    "$prefix/lib/libbpf.a" -l:libelf.so.1 -lz -o "$output/accounting_fixture"
+  "$src/collector.c" "$prefix/lib/libbpf.a" -l:libelf.so.1 -lz -o "$output/collector"
 cp "$src/limits.json" "$output/limits.json"
-/opt/venv/bin/python - "$output" <<'MANIFEST'
+/opt/venv/bin/python - "$output" "$src" <<'MANIFEST'
 from pathlib import Path
-import hashlib,json,os,sys
-root=Path(sys.argv[1])
+import hashlib,json,sys
+root,src=map(Path,sys.argv[1:])
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
-assert sha(root/'limits.json')=='5f9162c8a1e3a907c5ccaadfa7cb29ba09b418f4dc11326eb12701e147be4929'
-data=dict(image='sha256:ff979851b632e2048a4a8dd141cf71b2a4701f243c0bf96fb275f7286daadc76',
- limits_sha256=sha(root/'limits.json'),kernel_release=os.uname().release,
- kernel_btf_sha256=sha(Path(os.environ['KVP_BTF_FILE'])),
- files={name:sha(root/name) for name in ['collector','observe.bpf.o','limits.json','vmlinux.h']},
- qualification='unprivileged tests only; no kernel runtime coverage')
+data=dict(schema=2,mode='tcp_tracepoints',
+ files={name:sha(root/name) for name in ['collector','observe.bpf.o','limits.json']})
 (root/'manifest.json').write_text(json.dumps(data,indent=2)+'\n')
+# Build input provenance is never a runtime host eligibility rule.
+(root/'build-inputs.json').write_text(json.dumps({
+ name:sha(src/name) for name in ['core_types.h','protocol.h','observe.bpf.c','collector.c']
+},indent=2)+'\n')
 MANIFEST
 "$output/collector" --inspect "$output/observe.bpf.o" > "$output/object-inspection.jsonl"
-"$output/native_tests"
+"$prefix/bin/bpftool" gen skeleton "$output/observe.bpf.o" > "$output/observe.skel.h"
+
+"$prefix/bin/llvm-objdump" --section-headers "$output/observe.bpf.o" > "$output/sections.txt"
+"$prefix/bin/llvm-objdump" --disassemble "$output/observe.bpf.o" > "$output/disassembly.txt"

@@ -8,6 +8,52 @@ from .endpoint_probes.health import inspect_trace
 from .perfetto import _clock_aliases, _domain, _load
 
 
+def _with_tcp_events(samples):
+    """Offer tuple/cookie inventory candidates, never event-time ownership proof."""
+    result = list(samples)
+    sockets = [s for s in samples if s.get("scope") == "socket"]
+    keys = ("family", "local_ip", "local_port", "peer_ip", "peer_port")
+    for sample in samples:
+        tcp = sample.get("transport", {}).get("tcp")
+        if (
+            sample.get("scope") != "ebpf"
+            or not tcp
+            or tcp.get("type") != "tcp_event"
+            or not tcp.get("time_conversion_qualified")
+        ):
+            continue
+        for flow in sockets:
+            data = flow["transport"]["tcp"]
+            if any(tcp.get(k) != data.get(k) for k in keys):
+                continue
+            parts = data.get("cookie")
+            cookie = (
+                (parts[0] | (parts[1] << 32))
+                if isinstance(parts, list) and len(parts) == 2
+                else parts
+            )
+            if cookie and tcp.get("cookie") and tcp["cookie"] != cookie:
+                continue
+            result.append(
+                {
+                    **sample,
+                    "scope": "socket",
+                    "entity": flow["entity"],
+                    "transport": {
+                        **sample["transport"],
+                        "tcp": {
+                            **tcp,
+                            "owners": data.get("owners", []),
+                            "candidate_owner_basis": "tuple_cookie_inventory"
+                            if cookie and tcp.get("cookie")
+                            else "tuple_inventory_only",
+                        },
+                    },
+                }
+            )
+    return result
+
+
 def candidates(core_paths, probe_paths, group=None):
     """Associate only validated local engine/rank owners and projected intervals.
 
@@ -69,7 +115,7 @@ def candidates(core_paths, probe_paths, group=None):
                     for problem in probe_health[observed["process_id"]]["problems"]
                 )
                 same = _domain(meta) == _domain(observed) and all(_domain(meta))
-                for sample in samples:
+                for sample in _with_tcp_events(samples):
                     if sample.get("scope") != "socket":
                         continue
                     flow = sample["transport"]["tcp"]
@@ -116,16 +162,40 @@ def candidates(core_paths, probe_paths, group=None):
                         ) + max(p.uncertainty_ns for p in projected[2:])
                     if end + uncertainty < left or begin - uncertainty > right:
                         continue
-                    found[sample["entity"]] = {
-                        "entity": sample["entity"],
-                        "endpoint": observed["context"]["endpoint"],
-                        "sample_interval_ns": [
-                            sample["sample_begin_ns"],
-                            sample["sample_end_ns"],
-                        ],
-                        "clock_uncertainty_ns": uncertainty,
-                        "association": "temporal_candidate_not_causal",
-                    }
+                    match = found.setdefault(
+                        sample["entity"],
+                        {
+                            "entity": sample["entity"],
+                            "endpoint": observed["context"]["endpoint"],
+                            "sample_interval_ns": [
+                                sample["sample_begin_ns"],
+                                sample["sample_end_ns"],
+                            ],
+                            "clock_uncertainty_ns": uncertainty,
+                            "association": "temporal_candidate_not_causal",
+                        },
+                    )
+                    if flow.get("type") == "tcp_event":
+                        candidate_event = {
+                            "event": flow["event"],
+                            "timestamp_ns": sample["sample_begin_ns"],
+                            "socket": {
+                                k: flow.get(k)
+                                for k in (
+                                    "family",
+                                    "local_ip",
+                                    "local_port",
+                                    "peer_ip",
+                                    "peer_port",
+                                    "cookie",
+                                )
+                            },
+                            "ownership_basis": flow["candidate_owner_basis"],
+                            "exact": False,
+                        }
+                        events = match.setdefault("tcp_events", [])
+                        if candidate_event not in events:
+                            events.append(candidate_event)
             results.append(
                 {
                     "run_id": meta["run_id"],

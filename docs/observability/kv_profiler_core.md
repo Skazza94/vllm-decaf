@@ -485,60 +485,77 @@ Procfs process-root magic links are not used as Docker bind sources. The helper
 uses `docker create` then `docker start`, records the created container ID and
 cleans up that ID even if startup fails; it never removes a name collision.
 
-### Opt-in eBPF collector (unqualified until live validation)
+### Opt-in TCP eBPF events
 
-The stdlib observer accepts an optional `probes.ebpf` mapping with `enabled`,
-`privileged_opt_in`, `sets`, `artifacts` and `kernel_audit`. Off is the default:
-there is no native child, eBPF import, capability syscall or automatic privileged
-launch. Off configurations keep their previous configuration identity. Existing
-saved stdlib captures still validate. A requested source can be made mandatory
-with `required: [ebpf]`; unavailable or incomplete required observations prevent
-a complete capture.
+The stdlib observer accepts `probes.ebpf` with `enabled: true`,
+`privileged_opt_in: true`, `mode: tcp_tracepoints`, and an absolute `artifacts`
+directory. Optional `local_ports` and `peer_ports` lists contain at most 32
+unique ports each. Matching is OR within each list and AND between configured
+lists; absent lists are unrestricted. Off is the default: there is no native
+child, capability check, BPF syscall or automatic privileged launch. Off identities
+and old stdlib captures remain unchanged. Uprobe `sets` and `kernel_audit` options
+are removed; old enabled configurations need an explicit migration.
 
-The implementation provides native NIXL post attempts and endpoint TCP events.
-It uses only explicitly positive process-scoped uprobe-multi links and disables
-skeleton autoattach. Missing support has no fallback. `provider_wr` is explicitly
-unavailable: the current image lacks an audited provider. Owned fixture parsers
-exercise list and extended-builder contracts, not real-provider coverage.
+Four `tp_btf` hooks emit timestamped rare events: `tcp_retransmit_skb`,
+`tcp_send_reset`, `tcp_receive_reset`, and `inet_sock_set_state` (old/new state).
+There is no `tcp_probe`, per-segment hook, native NIXL post or provider WR probe.
+The events complement the sampled TCP_INFO gauges instead of repeating byte or
+segment counters. RDMA remains out-of-process hardware/port observation.
 
-Artifacts are compiled separately with `tools/kv-profiler-ebpf/build.sh` in the
-accepted tooling image and mounted read-only. The manifest fixes hashes, image,
-limits and target kernel/BTF identity. The compiler/object inspector runs without
-loading or attaching the object. Starting observation additionally requires
-explicit opt-in, effective privilege, controller launch/namespace evidence and
-an audited target-kernel allocation/accounting contract. A raw map-size estimate
-or a claimed privilege flag alone cannot enable it. No SDK, provider or transport
-library is patched or replaced.
+Each record has kernel CLOCK_MONOTONIC time (`bpf_ktime_get_ns`), network namespace,
+family, local/peer address and port, cookie when known, and CO-RE snapshots of
+`srtt_us`, `snd_cwnd`, `snd_ssthresh`, `packets_out`, `retrans_out`, `lost_out`,
+`total_retrans`, and `mss_cache`. Missing fields are unavailable, never zero;
+failed reads are distinct. `srtt_us` retains the kernel's raw usec-shift-3 encoding.
+The fields are concurrent reads, not an atomic snapshot. Live time-namespace
+conversion is explicit; an unknown conversion leaves raw time without a join.
+There is no implied cross-host clock alignment. The channel tolerates missing
+optional clock metadata, but the enclosing observer still requires its own
+time-namespace metadata at startup.
 
-The frozen limits include 256 processes, 128 resident thread records per process,
-2,048 total, 4,096 phased uprobe slots, a 16 MiB kernel-map cap, call depth four,
-64 WRs/list and eight SGEs/WR. All limits are joint refusal bounds; overflow,
-missing returns, corrupt metadata and generation changes are explicit failures.
-API attempts have observed epochs, not L1 transfer generations. They never gain
-request/transfer bindings from a shared thread or matching times.
+Only endpoint-network-namespace matches (and optional port matches) reserve
+records. Hooks still execute the early filter on unrelated events globally.
+Null, TIME_WAIT and request sockets are excluded before full-socket reads and
+reported as global unknown exclusions, not endpoint losses. Ordinary namespace,
+protocol, family and port rejections are filter exclusions. Reservation/read/output
+losses have separate counters and scope. A zero cookie stays unknown rather than
+becoming a pointer identity. Tuples and time provide candidate-only joins to L1;
+TCP inventory may offer possible owners, not prove ownership at the event.
+An event between TCP_INFO samples can use a matching tuple/cookie inventory
+candidate; ambiguous or absent evidence stays explicit. Aggregate bytes are never
+apportioned and unique candidates are never causal attribution.
 
-TCP records distinguish event counts and RX skb buffer lengths from wire or KV
-bytes. Zero socket cookies remain namespace-level unknown identities, not guessed
-flows. Snapshot records retain their native read spans. API kernel timestamps
-and endpoint timestamps remain separate; conversion arithmetic does not establish
-runtime clock qualification. The existing probe envelope records delivery time.
+Build artifacts separately with `tools/kv-profiler-ebpf/build.sh` and mount the
+finished artifact directory read-only. One CO-RE BPF
+object targets BTF kernels from 5.15 upward, consuming positional argument prefixes
+and ignoring appended arguments. This is the compatibility contract, not a claim
+that an untested kernel has passed validation. The tooling image and dependency
+pins are BUILD reproducibility only. Runtime verifies files against their own
+manifest, never an image, kernel release, BTF digest or allocation-audit identity.
+Missing privilege/BTF/hook, kernel verifier/load/attach refusal is unavailable with
+its diagnostic; there is no fallback, automatic capability grant or policy change.
+All four hooks must attach for this explicit mode. Required-source behavior remains
+`required: [ebpf]`; optional unavailability leaves other observations unchanged.
 
-The native channel bounds each JSON record to 256 bytes and queues to 4,096
-records. The existing common probe envelope keeps its separate 16 KiB record and
-512-row writer limits. Kernel epoch retirement waits for acknowledgement after
-that writer flushes; live counters are never read-and-zeroed. The observer adds
-the exact owned child's final `wait4` CPU and RSS HWM to its helper accounting.
-An exit reaped outside this path is explicit missing accounting, never replaced
-with cumulative usage from unrelated children. Measured map allocations above
-the audited bound or the frozen cap are failures with observed bytes retained,
-even for optional eBPF sources; missing accounting remains unavailable.
-Shutdown drains buffered output and stderr independently of stdin delivery or
-child exit. An abnormal exit or incomplete drain cannot pass as an optional
-source; owned-child accounting retains its separate completeness status. Missing
-normal-load loss visibility, target-kernel quiescence or privileged cleanup proof
-cannot become a qualified capture. The current native terminal explicitly stays
-incomplete until those live gates are validated; unprivileged tests do not lift
-this restriction. No serving or overhead qualification is implied.
+The ring has fixed 1 MiB data capacity, plus two one-entry 256-byte ARRAY values
+for control and loss counters. That is 1,049,088 bytes of ring/value capacity,
+not physical kernel memory charge. Kernel bookkeeping and JIT memory are additional.
+Map fdinfo is diagnostic only; missing or large reported values are not a gate.
+No per-host qualification or per-kernel audit is required. Four programs/links,
+256-byte binary events, 2 KiB native JSON records and a 4,096-row native output
+queue are bounded. Ring reservation never waits; full ring/output queues count
+drops and mark coverage partial. Storms can lose events; rarity is not guaranteed.
+The existing common envelope keeps separate 16 KiB/512-row writer limits.
+
+Shutdown disables emission, detaches, drains the ring and both pipes within the
+total deadline, then closes owned FDs. Nothing is pinned. Parent-death cleanup
+and owned-child `wait4` resource accounting are retained. Abnormal exit, missing
+failure evidence and incomplete output cannot pass as an optional capture.
+Detachment and an empty userspace queue alone do not establish that every kernel
+producer finished: terminal coverage remains partial with quiescence/miss visibility
+unverified. Unprivileged fixtures and object inspection do not establish verifier
+acceptance, live kernel cleanup or overhead. Those require separate validation;
+no per-deployment kernel identity gate is introduced.
 
 ## Mooncake adapter (L1)
 
