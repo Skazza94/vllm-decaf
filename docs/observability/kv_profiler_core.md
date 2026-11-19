@@ -59,7 +59,13 @@ Record fields, in order:
 3. Optional local handle.
 4. Seven optional unsigned values: bytes, selected descriptors, merged
    descriptors, two durations in ns, and two event-specific auxiliary values.
-5. Transport (unknown/TCP/RDMA/mixed), status and numeric subject.
+5. Transport (unknown/TCP/RDMA/mixed), status and numeric subject (at most
+   2³²−1; a wider subject is refused).
+
+The recorder adds the recording thread's kernel ID to every event (decoded as
+`tid`; word 8 holds the subject in its low 32 bits and the thread in the high
+32, binary layout version 2). It costs one `gettid` per record and no
+allocation.
 
 `None` is unknown/not supplied; a valid zero remains zero. A transfer bind
 allocates a generation for a local handle. Explicit retirement frees the
@@ -110,6 +116,31 @@ A failed write leaves an unacknowledged batch available for recovery; a failed
 footer cannot publish successful completion. Consumer death can
 cause identical sequence replays; the exporter deduplicates them and rejects
 conflicting replays.
+
+Each recorder's metadata (the metadata row and the manifest) also carries
+`config`, a configuration snapshot taken once when the recorder opens, for
+every enabled role (frontend, scheduler, worker): the profiler's own settings
+(level, flush, sizes), vLLM's parallel, cache and KV-transfer settings, the
+transport environment (variables prefixed `UCX_`, `NIXL_`, `MC_`, `TENT_`,
+`MOONCAKE_`, `FI_`, `VLLM_NIXL_`, `VLLM_MOONCAKE_`), TENT's `MC_TENT_CONF`
+settings as TENT reads them (file or inline, with its source), library
+versions, and, for a NIXL worker, the agent's initialized backends with the
+options NIXL reports beside what was requested. Credentials are redacted at any
+depth (secret-named keys, URL user information, secret-named query
+parameters). The snapshot is at most 4 KiB: its largest entries are dropped
+first and named under `dropped`; if the metadata row would still exceed the
+reader's line limit, `config` is an explicit `unavailable` entry.
+
+Thread names are best effort and read off the recording path: the helper
+reads `/proc/<pid>/task/*/comm` of the recording process every second and at
+the end. Before the end record it writes the inventory of every `tid` it
+decoded as `threads` rows (`{"type": "threads", "threads": {tid: name}}`, each
+under 6 KiB so any number of threads stays readable). A thread that exited
+before the helper ever saw it has a `null` name. The end record gives the
+count (`thread_count`) and the manifest the whole map (`threads`). A helper
+restarted after a crash seeds its inventory from the rows already written.
+The offline summary reports each transfer's posting thread (`thread`,
+`thread_name`), from its post record, and `null` for a transfer never posted.
 
 Helpers launch their own lightweight module; they do not re-import the serving
 entry point or import Torch through distributed-package initializers. They still

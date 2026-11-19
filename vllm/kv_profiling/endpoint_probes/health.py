@@ -62,6 +62,8 @@ def inspect_trace(path, *, expected=None, probe=False):
                 if row.get("type") == "end":
                     terminal = row
                     continue
+                if not probe and row.get("type") == "threads":
+                    continue  # the core writer's thread inventory, unsequenced
                 if row.get("type") not in ("event", "dictionary_fragment"):
                     raise ValueError("unexpected capture record")
                 if (

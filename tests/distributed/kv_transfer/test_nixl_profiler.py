@@ -3,10 +3,12 @@
 """The NIXL L1 adapter on real recorders, sockets, helper processes and objects."""
 
 import ast
+import dataclasses
 import gc
 import json
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -1494,3 +1496,350 @@ def test_the_hook_callsites_format_nothing_and_do_no_io_or_blocking():
                     if isinstance(func, ast.Name):
                         assert name in ALLOWED_CALLS, (relative, node.lineno, name)
     assert found >= 30, found
+
+
+# ------------------------------------------------------------------ config snapshot
+def test_an_attached_profiler_records_what_was_requested_and_what_nixl_set_up(
+    tmp_path, monkeypatch
+):
+    """The recorder metadata carries the run's configuration: vLLM's KV settings, the
+    transport environment only, library versions, and the NIXL agent's initialized
+    backends with the options it reports for them."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
+        attach_profiler,
+        nixl_snapshot,
+    )
+
+    monkeypatch.setenv("UCX_TLS", "tcp,self")
+    monkeypatch.setenv("UNRELATED_TOKEN", "not-a-transport-setting")
+    _, (agent, _, buffers) = telemetry()
+    extra = {
+        "backends": ["UCX"],
+        "num_threads": 4,
+        "network_profiler": {"level": "l1", "run_id": str(uuid4()),
+                             "output_dir": str(tmp_path)},
+    }  # fmt: skip
+    p = attach_profiler(
+        vllm_config(extra), "worker", "engine-A", 0, "pull",
+        transport_snapshot=lambda: nixl_snapshot(
+            agent, {"backends": ["UCX"], "num_threads": 4}
+        ),
+    )  # fmt: skip
+    try:
+        snapshot = p.recorder.metadata["config"]
+        assert "config" not in p.recorder.metadata["context"]
+        assert snapshot["profiler"]["level"] == "l1"
+        assert snapshot["profiler"]["flush"] == "end"
+        assert snapshot["environment"]["UCX_TLS"] == "tcp,self"
+        assert "UNRELATED_TOKEN" not in snapshot["environment"]
+        kv = snapshot["vllm"]["kv_transfer"]
+        assert kv["kv_role"] == "kv_producer" and kv["kv_connector"] == "NixlConnector"
+        assert kv["extra_config"] == {"backends": ["UCX"], "num_threads": 4}
+        assert snapshot["libraries"]["nixl"] == nixl_version()
+        transport = snapshot["transport"]
+        assert transport["requested"] == {"backends": ["UCX"], "num_threads": 4}
+        ucx = transport["initialized"]["UCX"]
+        assert ucx["options"] == agent.get_backend_params("UCX")
+        assert ucx["plugin_defaults"] == agent.get_plugin_params("UCX")
+        assert len(json.dumps(snapshot)) <= 4096
+    finally:
+        p.close()
+    meta, _, _ = read(p)
+    assert meta["config"] == snapshot
+
+
+def nixl_version():
+    import importlib.metadata
+
+    return importlib.metadata.version("nixl")
+
+
+def test_a_backend_query_that_fails_is_reported_not_raised():
+    from vllm.kv_profiling.snapshot import nixl_agent
+
+    class Agent:
+        backends = {"UCX": object()}
+
+        def get_backend_params(self, name):
+            return {"num_threads": "4"}
+
+        def get_plugin_params(self, name):
+            raise RuntimeError("plugin gone, access_token=FAKE-SECRET-0")
+
+    result = nixl_agent(Agent(), {"backends": ["UCX"]})
+    ucx = result["initialized"]["UCX"]
+    assert ucx["options"] == {"num_threads": "4"}
+    assert ucx["plugin_defaults"] is None
+    assert ucx["plugin_defaults_error"] == "RuntimeError"  # never its message
+
+
+def test_an_oversized_snapshot_names_what_it_dropped():
+    from vllm.kv_profiling.snapshot import MAX_BYTES, bounded
+
+    snapshot = bounded({
+        "environment": {"UCX_BIG": "x" * 5000, "UCX_TLS": "tcp,self"},
+        "vllm": {"kv_transfer": {"extra_config": {
+            "rank_addresses": ["a" * 30] * 200, "backends": ["UCX"],
+        }}},
+    })  # fmt: skip
+    assert snapshot["environment"] == {"UCX_TLS": "tcp,self"}
+    assert snapshot["vllm"]["kv_transfer"]["extra_config"] == {"backends": ["UCX"]}
+    assert snapshot["dropped"] == {
+        "environment": ["UCX_BIG"],
+        "extra_config": ["rank_addresses"],
+    }
+    assert len(json.dumps(snapshot, separators=(",", ":"))) <= MAX_BYTES
+
+
+def test_a_transfer_is_attributed_to_the_thread_that_posted_it(tmp_path):
+    """The posting thread is the one whose post record observed the post (NIXL
+    records POST_RETURN after transfer()), not the thread that prepared it; a
+    transfer never posted has no posting thread."""
+    import threading
+
+    from vllm.kv_profiling.summary import summarize
+
+    p = profiler(tmp_path)
+    res, (agent, posted, _) = telemetry()
+    unposted = handle(0x7F0000002000)
+    tids = {}
+
+    def run(name, work):
+        def body():
+            tids[name] = threading.get_native_id()
+            work()
+
+        thread = threading.Thread(target=body)
+        thread.start()
+        thread.join()
+
+    run("prepare", lambda: (p.transfer_prepared(posted, 0, 1, 12),
+                            p.transfer_prepared(unposted, 0, 1, 2)))  # fmt: skip
+    run("post", lambda: p.transfer_posted(posted))
+    p.transfer_done(posted, res)
+    p.transfer_retired(posted)
+    p.transfer_unposted(unposted)
+    p.transfer_retired(unposted)
+    p.close()
+    assert tids["prepare"] != tids["post"]
+    transfers = summarize([p.output_dir / "events.jsonl"])["transfers"]
+    by_state = {t["state"]: t for t in transfers}
+    assert by_state["completed"]["thread"] == tids["post"]
+    assert by_state["failed"]["thread"] is None
+    assert by_state["failed"]["thread_name"] is None
+
+
+
+def _kv_config(extra, connector="NixlConnector", role="kv_producer"):
+    from vllm.config import KVTransferConfig, VllmConfig
+
+    return VllmConfig(
+        kv_transfer_config=KVTransferConfig(
+            kv_connector=connector, kv_role=role, kv_connector_extra_config=extra
+        )
+    )
+
+
+def _profiler_extra(tmp_path, **settings):
+    return {"network_profiler": {"level": "l1", "run_id": str(uuid4()),
+                                 "output_dir": str(tmp_path), **settings}}  # fmt: skip
+
+
+def _saved(profiler):
+    """The metadata row and the manifest a closed profiler saved."""
+    profiler.close()
+    rows = (profiler.output_dir / "events.jsonl").read_text().splitlines()
+    meta = json.loads(rows[0])
+    manifest = json.loads((profiler.output_dir / "manifest.json").read_text())
+    return meta, manifest, rows[0] + (profiler.output_dir / "manifest.json").read_text()
+
+
+def _large_tent_conf():
+    rails = [f"198.51.100.{i}" for i in range(1, 140)]
+    return json.dumps({"rpc_server_hostname": "198.51.100.1", "transports": {
+        "hp_tcp": {"enable": True, "bind_address": "198.51.100.1",
+                   "rail_addresses": rails}, "rdma": {"enable": False}}})  # fmt: skip
+
+
+def test_a_large_valid_configuration_still_attaches_saves_and_reads(
+    tmp_path, monkeypatch
+):
+    """A 2+ KB inline TENT configuration and a caller context valid on its own
+    attach a NIXL worker and a Mooncake worker: the snapshot is outside the
+    context budget, and the saved metadata row stays under the reader's line
+    limit."""
+    from vllm.kv_profiling.mooncake import attach_mooncake
+    from vllm.kv_profiling.sink import MAX_LINE
+
+    conf = _large_tent_conf()
+    assert len(conf) > 2000
+    monkeypatch.setenv("MC_TENT_CONF", conf)
+    caller = {"note": "c" * 1000}  # valid on its own; the snapshot must not count
+    nixl_p = attach_nixl(_kv_config(_profiler_extra(tmp_path / "n")), "worker",
+                         engine_id="e", rank=0, context=caller)  # fmt: skip
+    moon_p = attach_mooncake(
+        _kv_config(_profiler_extra(tmp_path / "m"), connector="MooncakeConnector"),
+        "worker", engine_id="e", rank=0, context=caller)  # fmt: skip
+    for p in (nixl_p, moon_p):
+        meta, manifest, _ = _saved(p)
+        assert meta["context"]["note"] == caller["note"]
+        assert len(json.dumps(meta["config"])) > len(json.dumps(caller))
+        assert len(json.dumps({"type": "metadata", "schema": 1, **meta})) <= MAX_LINE
+        tent = meta["config"]["tent_config"]
+        assert tent["source"] == "inline"
+        assert manifest["config"] == meta["config"]
+
+
+def test_every_enabled_role_records_the_snapshot_and_only_workers_query_nixl(
+    tmp_path, monkeypatch
+):
+    """Frontend, scheduler and worker recorders each save a snapshot; the NIXL
+    agent is queried only for a worker; nothing is collected while off."""
+    import vllm.kv_profiling.snapshot as snapshot_module
+    from vllm.kv_profiling.mooncake import attach_mooncake
+
+    worker_only = lambda: pytest.fail("agent queried for a non-worker")  # noqa: E731
+    scheduler = attach_nixl(
+        _kv_config(_profiler_extra(tmp_path / "s")), "scheduler",
+        engine_id="e", rank=0, transport_snapshot=worker_only,
+    )  # fmt: skip
+    frontend = attach_frontend(_kv_config(_profiler_extra(tmp_path / "f")))
+    for p in (scheduler, frontend):
+        meta, manifest, _ = _saved(p)
+        assert meta["config"]["profiler"]["level"] == "l1"
+        assert meta["config"]["transport"] is None
+        assert manifest["config"] == meta["config"]
+    calls = []
+    monkeypatch.setattr(snapshot_module, "snapshot", lambda *a, **k: calls.append(a))
+    for extra in ({}, {"network_profiler": {}}, {"network_profiler": {"level": "off"}}):
+        cfg = _kv_config(extra, connector="MooncakeConnector")
+        assert attach_mooncake(cfg, "worker", engine_id="e", rank=0) is None
+        assert attach_nixl(_kv_config(extra), "worker", engine_id="e", rank=0) is None
+    assert calls == []
+
+
+def test_credentials_never_reach_the_saved_metadata_or_manifest(tmp_path, monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import nixl_snapshot
+
+    """Credentials in transport URLs, nested connector options and an inline TENT
+    configuration are redacted in both artifacts; ordinary settings remain."""
+    monkeypatch.setenv("UCX_TLS", "tcp,self")
+    monkeypatch.setenv(
+        "MC_HOST_lab", "http://user:FAKE-SECRET-1@host:7/x?token=FAKE-SECRET-3"
+    )
+    monkeypatch.setenv("MC_TENT_CONF", json.dumps(
+        {"metadata_server": "etcd://u:FAKE-SECRET-4@h:2379/x?session_id=FAKE-SECRET-7"
+                            "&credential=FAKE-SECRET-8&region=eu",
+         "versioned": "etcd://h:2379/x;version=1?session_id=FAKE-SECRET-9&region=eu",
+         "quoted": "etcd://h:2379/it's;v=1?session_id=FAKE-SECRET-10&region=eu",
+         "endpoints": "etcd://a:2379?x=1,etcd://u:FAKE-SECRET-11@b:2379",
+         "ambiguous": "etcd://a;etcd://u:FAKE-SECRET-12@b",
+         "password": "FAKE-SECRET-5",
+         "transports": {"hp_tcp": {"enable": True}}}))  # fmt: skip
+    extra = {**_profiler_extra(tmp_path), "nested": {"access_token": "FAKE-SECRET-2"},
+             "backends": ["UCX"]}  # fmt: skip
+    class EchoingAgent:
+        backends = {"UCX": object()}
+
+        def get_backend_params(self, name):
+            raise RuntimeError("bad options: access_token=FAKE-SECRET-6")
+
+        def get_plugin_params(self, name):
+            return {"num_threads": "0"}
+
+    p = attach_nixl(
+        _kv_config(extra), "worker", engine_id="e", rank=0,
+        transport_snapshot=lambda: nixl_snapshot(EchoingAgent(), {"backends": ["UCX"]}),
+    )  # fmt: skip
+    meta, _, text = _saved(p)
+    assert "FAKE-SECRET" not in text
+    ucx = meta["config"]["transport"]["initialized"]["UCX"]
+    assert ucx["options_error"] == "RuntimeError"
+    env = meta["config"]["environment"]
+    assert env["UCX_TLS"] == "tcp,self"
+    assert env["MC_HOST_lab"] == "http://<redacted>@host:7/x?token=<redacted>"
+    assert meta["config"]["vllm"]["kv_transfer"]["extra_config"]["nested"] == {
+        "access_token": "<redacted>"
+    }
+    tent = meta["config"]["tent_config"]["settings"]
+    assert tent["metadata_server"] == (
+        "etcd://<redacted>@h:2379/x?session_id=<redacted>"
+        "&credential=<redacted>&region=eu"
+    )
+    assert tent["versioned"] == "etcd://h:2379/x;version=1?session_id=<redacted>&region=eu"
+    # One URL per value: its boundary is the value's end, apostrophe or not.
+    assert tent["quoted"] == "etcd://h:2379/it's;v=1?session_id=<redacted>&region=eu"
+    # A comma-separated endpoint list, item by item; anything else ambiguous, whole.
+    assert tent["endpoints"] == "etcd://a:2379?x=1,etcd://<redacted>@b:2379"
+    assert tent["ambiguous"] == "<redacted>"
+    assert tent["password"] == "<redacted>"
+    assert tent["transports"] == {"hp_tcp": {"enable": True}}
+
+
+def test_settings_that_distinguish_runs_are_recorded(tmp_path, monkeypatch):
+    """Two TENT configuration files differing in hp_tcp's bind address and the RPC
+    hostname, TENT's hostname override, libfabric's provider and interface, and
+    the profiler's flush mode all show in the snapshot."""
+    from vllm.kv_profiling.config import NetworkProfilerConfig
+    from vllm.kv_profiling.snapshot import snapshot
+
+    def conf_file(name, address):
+        path = tmp_path / name
+        path.write_text(json.dumps({"rpc_server_hostname": address, "transports": {
+            "hp_tcp": {"enable": True, "bind_address": address}}}))  # fmt: skip
+        return str(path)
+
+    monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "192.0.2.7")
+    monkeypatch.setenv("FI_PROVIDER", "tcp")
+    monkeypatch.setenv("FI_TCP_IFACE", "eth1")
+    cfg = _kv_config({"backends": ["LIBFABRIC"]})
+    end = NetworkProfilerConfig(
+        level="l1", run_id=str(uuid4()), output_dir=str(tmp_path)
+    )
+    background = dataclasses.replace(end, flush="background")
+    taken = []
+    runs = ((conf_file("a.json", "192.0.2.1"), end),
+            (conf_file("b.json", "192.0.2.2"), background))  # fmt: skip
+    for path, profiler_config in runs:
+        monkeypatch.setenv("MC_TENT_CONF", path)
+        taken.append(snapshot(cfg, profiler_config))
+    a, b = taken
+    assert a["tent_config"]["source"] == b["tent_config"]["source"] == "file"
+    assert a["tent_config"]["settings"]["rpc_server_hostname"] == "192.0.2.1"
+    hp_tcp = b["tent_config"]["settings"]["transports"]["hp_tcp"]
+    assert hp_tcp["bind_address"] == "192.0.2.2"
+    assert a["environment"]["MOONCAKE_LOCAL_HOSTNAME"] == "192.0.2.7"
+    env = a["environment"]
+    assert (env["FI_PROVIDER"], env["FI_TCP_IFACE"]) == ("tcp", "eth1")
+    assert (a["profiler"]["flush"], b["profiler"]["flush"]) == ("end", "background")
+    assert a != b
+
+
+
+def test_a_non_finite_setting_is_kept_as_text_and_the_recorder_starts(tmp_path):
+    """Strict JSON has no infinity: an optional connector setting such as an
+    infinite TTL is recorded as text instead of aborting attachment."""
+    extra = {**_profiler_extra(tmp_path), "decoder_kv_blocks_ttl": float("inf")}
+    p = attach_nixl(_kv_config(extra), "worker", engine_id="e", rank=0)
+    meta, manifest, _ = _saved(p)
+    extra_config = meta["config"]["vllm"]["kv_transfer"]["extra_config"]
+    assert extra_config["decoder_kv_blocks_ttl"] == "inf"
+    assert manifest["config"] == meta["config"]
+
+
+def test_a_recorder_that_cannot_start_leaves_no_ring_directory(tmp_path, monkeypatch):
+    """A metadata row over the reader's limit even without the snapshot refuses
+    the recorder, and the ring directory it had created is removed."""
+    import tempfile
+
+    import vllm.kv_profiling.sink as sink_module
+
+    shared = Path(tempfile.mkdtemp(prefix="kvprof-test-", dir=SHM))
+    try:
+        monkeypatch.setattr(sink_module, "MAX_LINE", 256)
+        extra = _profiler_extra(tmp_path, shared_dir=str(shared))
+        with pytest.raises(ValueError, match="metadata exceeds"):
+            attach_nixl(_kv_config(extra), "worker", engine_id="e", rank=0)
+        assert list(shared.iterdir()) == []
+    finally:
+        shutil.rmtree(shared, ignore_errors=True)

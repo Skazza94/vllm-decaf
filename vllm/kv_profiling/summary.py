@@ -134,6 +134,14 @@ def load_capture(path: Path):
         "path": path,
         "meta": meta,
         "events": events,
+        # The writer's map of recording threads, kernel ID -> name (or None),
+        # from its bounded "threads" rows.
+        "threads": {
+            tid: name
+            for row in rows
+            if row.get("type") == "threads"
+            for tid, name in row["threads"].items()
+        },
         "capture_rows": rows,
         "decoder": decoder,
         "loss": loss,
@@ -357,11 +365,17 @@ class _Source:
         elif failed is not None:
             state = "failed"
         leg = None if self.mooncake or not prepared else prepared["aux0"]
+        # The thread that issued the post, as observed by its post records; an
+        # unposted transfer has no posting thread.
+        poster = post_begin or post_return
+        tid = poster.get("tid") if poster else None
         entry = {
             "source": self.index,
             "process_id": self.meta["process_id"],
             "transfer": transfer,
             "state": state,
+            "thread": tid,
+            "thread_name": self.capture["threads"].get(str(tid)) if tid else None,
             "leg": {0: "single", 1: "device", 2: "dram"}.get(leg, leg),
             "request": self._name(prepared["request_ref"])
             if prepared

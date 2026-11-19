@@ -552,6 +552,7 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                 "drift_known": projected.drift_known if projected else False,
                 "extrapolated": projected.extrapolated if projected else False,
                 "clock_alias": alias.get(meta["clock_id"]),
+                "thread": row.get("tid"),
                 "clock_model": (
                     "modeled_elapsed"
                     if bucket[0] == "modeled"

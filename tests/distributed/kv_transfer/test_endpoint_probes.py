@@ -586,10 +586,10 @@ int main(void) { return 0; }
 
 
 def test_probe_only_kinds_cannot_enter_the_native_l1_binary_abi():
-    from vllm.kv_profiling.schema import RECORD, decode_record
+    from vllm.kv_profiling.schema import RECORD, VERSION, decode_record
 
     words = [0] * 16
-    words[2] = (1 << 48) | (22 << 32)
+    words[2] = (VERSION << 48) | (22 << 32)
     with pytest.raises(ValueError, match="probe JSONL schema"):
         decode_record(RECORD.pack(*words))
 

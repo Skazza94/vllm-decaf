@@ -11,6 +11,7 @@
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
@@ -79,6 +80,11 @@ uint64_t hash_id(const KvprofIdentity& v) {
   return mix(h);
 }
 Record* records(Header* h) { return (Record*)((char*)h + START); }
+// The recording thread's kernel ID. No per-thread cache: thread_local storage in a
+// dlopen'ed module is allocated lazily by libc on a thread's first access, and the
+// record path allocates nothing. One gettid per record, like the getpid the
+// ownership check already makes; always the current thread, also after a fork.
+uint32_t thread_id() { return uint32_t(syscall(SYS_gettid)); }
 Identity* ids(Header* h) { return (Identity*)((char*)h + h->ids_offset); }
 char* arena(Header* h) { return (char*)h + h->arena_offset; }
 Handle* handles(Header* h) { return (Handle*)((char*)h + h->handles_offset); }
@@ -98,10 +104,11 @@ bool same(const KvprofIdentity& a, const KvprofIdentity& b) {
 
 extern "C" int kvprof_record(void* mapping, const KvprofEvent* e) {
   auto* h = (Header*)mapping;
-  if (h->owner != (uint64_t)getpid()) return -1;
+  const uint64_t pid = uint64_t(getpid());
+  if (h->owner != pid) return -1;
   h->counters[ATTEMPTS].fetch_add(1, std::memory_order_relaxed);
   if (e->kind < 2 || e->kind > 21 || e->kind == 20 || e->transport > 3 ||
-      e->status > 255 || (e->valid & ~127u) ||
+      e->status > 255 || e->subject > 0xFFFFFFFFULL || (e->valid & ~127u) ||
       ((e->kind == 6 || e->kind == 21) && !e->has_handle))
     return drop(h, BAD_ID);
   if (h->closing.load(std::memory_order_acquire)) return drop(h, CLOSED);
@@ -242,7 +249,7 @@ extern "C" int kvprof_record(void* mapping, const KvprofEvent* e) {
     do {
       auto& r = next();
       uint32_t n = s.length - offset < CHUNK ? s.length - offset : CHUNK;
-      r.v[2] = (1ULL << 48) | (1ULL << 32);
+      r.v[2] = (2ULL << 48) | (1ULL << 32);
       r.v[3] = id;
       r.v[4] = s.length;
       r.v[5] = offset;
@@ -256,7 +263,7 @@ extern "C" int kvprof_record(void* mapping, const KvprofEvent* e) {
     ++h->handle_count;
   }
   auto& r = next();
-  r.v[2] = (1ULL << 48) | (e->kind << 32) | (e->transport << 24) |
+  r.v[2] = (2ULL << 48) | (e->kind << 32) | (e->transport << 24) |
            (e->status << 16) | e->valid |
            ((e->has_handle && !transfer) ? (1ULL << 15) : 0);
   r.v[3] = e->context;
@@ -264,7 +271,8 @@ extern "C" int kvprof_record(void* mapping, const KvprofEvent* e) {
   r.v[5] = resolved[1];
   r.v[6] = transfer;
   r.v[7] = resolved[2];
-  r.v[8] = e->subject;
+  // Word 8: the subject (low 32 bits) and the recording thread (high 32).
+  r.v[8] = e->subject | (uint64_t(thread_id()) << 32);
   memcpy(r.v + 9, e->values, sizeof(e->values));
   h->counters[EVENTS].fetch_add(1, std::memory_order_relaxed);
   h->head.store(head, std::memory_order_release);
@@ -497,8 +505,8 @@ PyObject* record(Ring* self, PyObject* const* args, Py_ssize_t n) {
   if (!number(args[13], e.transport) || !number(args[14], e.status) ||
       !number(args[15], e.subject))
     return nullptr;
-  if (e.transport > 3 || e.status > 255) {
-    PyErr_SetString(PyExc_ValueError, "invalid transport or status");
+  if (e.transport > 3 || e.status > 255 || e.subject > 0xFFFFFFFFULL) {
+    PyErr_SetString(PyExc_ValueError, "invalid transport, status or subject");
     return nullptr;
   }
   if (kvprof_record(self->h, &e) == -1) {

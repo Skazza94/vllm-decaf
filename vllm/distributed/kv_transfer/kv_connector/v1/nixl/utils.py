@@ -59,6 +59,14 @@ def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
             ctx.destroy(linger=0)
 
 
+def nixl_snapshot(agent, requested: dict) -> dict:
+    """What the NIXL agent set up (its initialized backends and their options)
+    beside what was requested. Imported and run only when a profiler attaches."""
+    from vllm.kv_profiling.snapshot import nixl_agent
+
+    return nixl_agent(agent, requested)
+
+
 def attach_profiler(
     vllm_config,
     role: str,
@@ -67,11 +75,14 @@ def attach_profiler(
     transfer_mode: str,
     side_channel: tuple[str, int] | None = None,
     context: dict | None = None,
+    transport_snapshot=None,
 ):
     """The KV network profiler of this scheduler or worker, None when off.
 
     Nothing of ``vllm.kv_profiling`` is imported unless
     ``kv_connector_extra_config["network_profiler"]`` enables a level.
+    ``transport_snapshot``, a callable, reports what the transport library set
+    up; it runs only when a worker's profiler attaches.
     """
     extra = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
         "network_profiler"
@@ -98,6 +109,7 @@ def attach_profiler(
         transfer_mode=transfer_mode,
         side_channel=side_channel,
         context=context,
+        transport_snapshot=transport_snapshot,
     )
 
 

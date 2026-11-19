@@ -34,6 +34,23 @@ def atomic_json(path: Path, value: dict) -> None:
     os.replace(temporary, path)
 
 
+def thread_names(pid: int) -> dict[int, str]:
+    """The producer's threads and their kernel names, read from /proc; a thread
+    that already exited is absent. Never called on a recording path."""
+    names = {}
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return names
+    for tid in tids:
+        with (
+            contextlib.suppress(OSError, ValueError),
+            open(f"/proc/{pid}/task/{tid}/comm", "rb") as f,
+        ):
+            names[int(tid)] = f.read(64).decode("utf-8", "replace").strip()
+    return names
+
+
 class JsonlSink:
     """Single-reader lease plus peek/write/ack transactions.
 
@@ -45,6 +62,7 @@ class JsonlSink:
         from vllm import _kv_profiler
 
         self.ring = _kv_profiler.attach(ring_path)
+        self.tids: set[int] = set()
         if not self.ring.acquire_reader():
             self.ring.close()
             raise BlockingIOError(errno.EBUSY, "profiler reader already leased")
@@ -55,6 +73,8 @@ class JsonlSink:
             row = decode_record(raw[offset : offset + RECORD.size])
             if row["sequence"] <= after_sequence:
                 continue
+            if row.get("tid"):
+                self.tids.add(row["tid"])
             write_all(stream, dump_line(row))
         stream.flush()
         os.fsync(stream.fileno())
@@ -71,8 +91,36 @@ class JsonlSink:
         self.close()
 
 
-def recover_output(stream) -> int:
-    """Trim only an incomplete final line; complete corrupt rows are errors."""
+THREAD_ROW_BYTES = 6144
+"""A ``threads`` row's serialized bound, under the reader's ``MAX_LINE``."""
+
+
+def thread_rows(threads: dict[str, str | None]) -> list[dict]:
+    """The thread inventory as bounded ``threads`` rows (each under
+    ``THREAD_ROW_BYTES``), so any number of threads stays readable."""
+    rows, chunk = [], {}
+    for tid in sorted(threads, key=int):
+        trial = {**chunk, tid: threads[tid]}
+        if (
+            chunk
+            and len(dump_line({"type": "threads", "schema": 1, "threads": trial}))
+            > THREAD_ROW_BYTES
+        ):
+            rows.append({"type": "threads", "schema": 1, "threads": chunk})
+            chunk = {tid: threads[tid]}
+        else:
+            chunk = trial
+    if chunk:
+        rows.append({"type": "threads", "schema": 1, "threads": chunk})
+    return rows
+
+
+def recover_output(stream, tids: set | None = None, names: dict | None = None) -> int:
+    """Trim only an incomplete final line; complete corrupt rows are errors.
+
+    ``tids`` and ``names``, when given, are seeded from the rows already written:
+    a writer restarted after a crash keeps the recording threads it had seen.
+    """
     if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
         raise OSError(errno.EINVAL, "profiler output must be a regular file")
     stream.seek(0)
@@ -88,6 +136,14 @@ def recover_output(stream) -> int:
         if row.get("schema") != 1:
             raise ValueError("unknown JSONL schema version")
         last_sequence = max(last_sequence, row.get("sequence", 0))
+        if tids is not None and row.get("tid"):
+            tids.add(row["tid"])
+        if names is not None and row.get("type") == "threads":
+            for tid, name in row["threads"].items():
+                if tids is not None:
+                    tids.add(int(tid))
+                if name is not None:
+                    names[int(tid)] = name
         good = stream.tell()
     stream.seek(0, os.SEEK_END)
     return last_sequence
@@ -109,14 +165,21 @@ def writer_main(ring_dir: str, output_dir: str, mode: str, batch: int):
         atomic_json(manifest, {**metadata, "complete": False, "reason": "open"})
         sink.ring.set_writer_state(RUNNING)
         path = output_dir / "events.jsonl"
+        names: dict[int, str] = {}
         with path.open("a+b", buffering=0) as stream:
-            sequence = recover_output(stream)
+            sequence = recover_output(stream, sink.tids, names)
             if not stream.tell():
                 write_all(
                     stream, dump_line({"type": "metadata", "schema": 1, **metadata})
                 )
                 os.fsync(stream.fileno())
+            names_at = 0.0
             while True:
+                if time.monotonic() - names_at >= 1.0:
+                    # Thread names, out of band: a thread that exits before the
+                    # end keeps the name it had when last seen here.
+                    names.update(thread_names(metadata["pid"]))
+                    names_at = time.monotonic()
                 if watch_parent and os.getppid() != metadata["pid"]:
                     producer_gone = True
                     sink.ring.finish()
@@ -130,6 +193,12 @@ def writer_main(ring_dir: str, output_dir: str, mode: str, batch: int):
                     and state["head"] == state["tail"]
                 ):
                     lost = sum(v for k, v in state.items() if k.startswith("drop_"))
+                    names.update(thread_names(metadata["pid"]))
+                    threads = {str(tid): names.get(tid) for tid in sorted(sink.tids)}
+                    # The inventory goes in bounded rows before the end record,
+                    # which only counts them; the manifest keeps the whole map.
+                    for row in thread_rows(threads):
+                        write_all(stream, dump_line(row))
                     complete = (
                         not producer_gone and not lost and not state["unknown_handles"]
                     )
@@ -141,6 +210,10 @@ def writer_main(ring_dir: str, output_dir: str, mode: str, batch: int):
                                 "schema": 1,
                                 "stats": state,
                                 "complete": complete,
+                                # Recording threads, kernel ID -> name (None when
+                                # it exited before it was ever observed here), are
+                                # in the "threads" rows before this record.
+                                "thread_count": len(threads),
                             }
                         ),
                     )
@@ -159,6 +232,7 @@ def writer_main(ring_dir: str, output_dir: str, mode: str, batch: int):
                                 else "loss_or_unknown"
                             ),
                             "stats": state,
+                            "threads": threads,
                             # The helper's lifetime CPU up to this manifest:
                             # startup, background drains and the end flush. A run's
                             # accounting subtracts what it had used when its

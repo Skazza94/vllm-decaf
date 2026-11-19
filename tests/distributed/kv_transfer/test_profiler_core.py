@@ -1101,3 +1101,189 @@ def test_a_kernel_without_time_namespaces_records_with_none(recorders, monkeypat
     recorder.record(*fields())
     result = recorder.close()
     assert result.saved and result.complete
+
+
+def _set_thread_name(name):
+    libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.prctl(15, name.encode(), 0, 0, 0) == 0  # PR_SET_NAME
+
+
+def test_records_carry_their_thread_and_the_writer_names_it(recorders):
+    """Each event records the kernel ID of the thread that recorded it; the writer
+    maps every recording thread still alive (or seen alive) to its kernel name."""
+    recorder = recorders()
+    assert recorder.wait_ready()
+    seen, recorded, release = {}, threading.Barrier(4), threading.Event()
+
+    def produce(index):
+        _set_thread_name(f"kvp-read-{index}")
+        seen[index] = threading.get_native_id()
+        for _ in range(3):
+            recorder.record(*fields(context=index, request=f"r{index}"))
+        recorded.wait()
+        release.wait(30)  # long-lived, like the connector's threads
+
+    workers = [threading.Thread(target=produce, args=(i,)) for i in range(3)]
+    for worker in workers:
+        worker.start()
+    recorded.wait()
+    recorder.record(*fields(context=99, request="main"))
+    result = recorder.close()
+    release.set()
+    for worker in workers:
+        worker.join()
+    assert result.saved and result.complete
+    rows = [
+        json.loads(s)
+        for s in (recorder.output_dir / "events.jsonl").read_text().splitlines()
+    ]
+    events = [r for r in rows if r["type"] == "event"]
+    assert {r["context"]: r["tid"] for r in events} == {
+        **seen,
+        99: threading.get_native_id(),
+    }
+    assert all(r["subject"] == 0 for r in events)
+    threads = {
+        k: v for r in rows if r["type"] == "threads" for k, v in r["threads"].items()
+    }
+    assert rows[-1]["thread_count"] == len(threads) == 4
+    assert {threads[str(seen[i])] for i in range(3)} == {
+        f"kvp-read-{i}" for i in range(3)
+    }
+    manifest = json.loads((recorder.output_dir / "manifest.json").read_text())
+    assert manifest["threads"] == threads
+
+
+def test_a_subject_wider_than_32_bits_is_refused(recorders):
+    """Word 8 holds the subject in its low 32 bits; a wider subject would collide
+    with the thread ID, so the binding refuses it and the C entry point drops it."""
+    recorder = recorders()
+    assert recorder.wait_ready()
+    with pytest.raises(ValueError, match="subject"):
+        recorder.record(*fields()[:15], 1 << 32)
+    recorder.record(*fields()[:15], (1 << 32) - 1)
+    result = recorder.close()
+    assert result.saved
+    rows = [
+        json.loads(s)
+        for s in (recorder.output_dir / "events.jsonl").read_text().splitlines()
+    ]
+    (event,) = [r for r in rows if r["type"] == "event"]
+    assert event["subject"] == (1 << 32) - 1
+    assert event["tid"] == threading.get_native_id()
+
+
+def test_a_forked_child_records_its_own_thread_id(recorders, tmp_path):
+    """After a fork the child's records carry the child's thread ID, never the
+    parent's, although the forking thread recorded in the parent first."""
+    parent = recorders()
+    assert parent.wait_ready()
+    parent.record(*fields(context=1))
+    out = tmp_path / "child.json"
+    pid = os.fork()
+    if pid == 0:  # child: a recorder of its own, then report what it recorded
+        code = 1
+        try:
+            config = NetworkProfilerConfig(
+                level="l1", run_id=str(uuid4()), output_dir=str(tmp_path / "child"),
+                ring_records=64, id_slots=32, id_bytes=4096, handle_slots=8,
+                shutdown_timeout_s=2,
+            )  # fmt: skip
+            child = ProcessRecorder(config)
+            assert child.wait_ready()
+            child.record(*fields(context=2))
+            assert child.close().saved
+            rows = [
+                json.loads(s)
+                for s in (child.output_dir / "events.jsonl").read_text().splitlines()
+            ]
+            (event,) = [r for r in rows if r["type"] == "event"]
+            out.write_text(
+                json.dumps({"tid": event["tid"], "own": threading.get_native_id()})
+            )
+            shutil.rmtree(child.ring_dir, ignore_errors=True)
+            code = 0
+        finally:
+            os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    reported = json.loads(out.read_text())
+    assert reported["tid"] == reported["own"] == pid
+    assert reported["tid"] != threading.get_native_id()
+    assert parent.close().saved
+
+
+def test_a_restarted_writer_keeps_the_threads_it_recovered(recorders):
+    """A writer restarted after it acknowledged events rebuilds its thread
+    inventory from the rows already written: a thread seen only before the
+    restart stays listed, with a null name if it exited unseen."""
+    recorder = recorders(flush="background")
+    assert recorder.wait_ready()
+    ids, release, recorded = {}, threading.Event(), threading.Event()
+
+    def short():
+        ids["short"] = threading.get_native_id()
+        recorder.record(*fields(context=1, request="short"))
+
+    def live():
+        _set_thread_name("kvp-live")
+        ids["live"] = threading.get_native_id()
+        recorder.record(*fields(context=2, request="live"))
+        recorded.set()
+        release.wait(30)
+
+    worker = threading.Thread(target=short)
+    worker.start()
+    worker.join()
+    alive = threading.Thread(target=live)
+    alive.start()
+    assert recorded.wait(10)
+    wait_for(lambda: (s := recorder.native.stats())["tail"] == s["head"] >= 2)
+    recorder.writer.kill()
+    recorder.writer.wait(10)
+    recorder.start_writer()
+    assert recorder.wait_ready()
+    result = recorder.close()
+    release.set()
+    alive.join()
+    assert result.saved and result.complete
+    rows = [
+        json.loads(s)
+        for s in (recorder.output_dir / "events.jsonl").read_text().splitlines()
+    ]
+    threads = {
+        k: v for r in rows if r["type"] == "threads" for k, v in r["threads"].items()
+    }
+    assert threads[str(ids["short"])] is None
+    assert threads[str(ids["live"])] == "kvp-live"
+    assert rows[-1]["thread_count"] == len(threads) == 2
+    manifest = json.loads((recorder.output_dir / "manifest.json").read_text())
+    assert manifest["threads"] == threads
+
+
+def test_any_number_of_threads_stays_readable_by_recovery_and_the_reader(
+    recorders,
+):
+    """The inventory is split into rows under the reader's line limit: 1,024
+    threads with maximal 15-character names round-trip through recover_output
+    and load_capture."""
+    from vllm.kv_profiling.sink import MAX_LINE, thread_rows
+    from vllm.kv_profiling.summary import load_capture
+
+    recorder = recorders()
+    assert recorder.wait_ready()
+    recorder.record(*fields(context=1))
+    assert recorder.close().complete
+    synthetic = {str(100000 + i): f"thread-{i:08d}" for i in range(1024)}
+    extra = [dump_line(row) for row in thread_rows(synthetic)]
+    assert len(extra) > 1 and all(len(line) <= MAX_LINE for line in extra)
+    path = recorder.output_dir / "events.jsonl"
+    lines = path.read_bytes().splitlines(keepends=True)
+    path.write_bytes(b"".join(lines[:-1] + extra + lines[-1:]))
+    tids, names = set(), {}
+    with path.open("r+b") as stream:
+        recover_output(stream, tids, names)
+    assert {str(t) for t in tids} >= set(synthetic)
+    assert {str(t): n for t, n in names.items() if str(t) in synthetic} == synthetic
+    capture = load_capture(path)
+    assert {k: v for k, v in capture["threads"].items() if k in synthetic} == synthetic

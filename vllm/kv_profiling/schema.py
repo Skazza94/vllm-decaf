@@ -7,7 +7,11 @@ import struct
 from enum import IntEnum
 from typing import Any
 
-VERSION = 1
+VERSION = 2
+"""The binary record layout (word 2's top 16 bits). Version 2 splits word 8 into
+the subject (low 32 bits) and the recording thread's kernel ID (high 32 bits)."""
+JSONL_SCHEMA = 1
+"""The decoded row format, unchanged by version 2 except for the added ``tid``."""
 RECORD = struct.Struct("=16Q")
 MAX_ID_BYTES = 512
 
@@ -159,7 +163,7 @@ def decode_record(raw: bytes) -> dict[str, Any]:
         EventKind.PROBE_RESOURCE,
     ):
         raise ValueError("endpoint observations require probe JSONL schema")
-    base = {"schema": VERSION, "sequence": w[1], "time_ns": w[0]}
+    base = {"schema": JSONL_SCHEMA, "sequence": w[1], "time_ns": w[0]}
     if kind == EventKind.DICTIONARY:
         length = w[6] & 0xFFFFFFFF
         encoding = w[6] >> 32
@@ -185,7 +189,9 @@ def decode_record(raw: bytes) -> dict[str, Any]:
         "handoff_ref": w[5],
         "transfer": w[6],
         "peer_ref": w[7],
-        "subject": w[8],
+        "subject": w[8] & 0xFFFFFFFF,
+        # The recording thread's kernel ID; 0 (no thread recorded) becomes None.
+        "tid": (w[8] >> 32) or None,
         "transport": {
             "kind": transport,
             "backend": None,

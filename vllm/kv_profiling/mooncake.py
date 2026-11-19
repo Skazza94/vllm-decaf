@@ -699,10 +699,15 @@ def attach_mooncake(
     config = profiler_config(kv.kv_connector_extra_config, context)
     if config is None:
         return None
-    return _build(config, role, engine_id, rank, kv.kv_role)
+    from .snapshot import snapshot
+
+    settings = snapshot(vllm_config, config)
+    return _build(config, role, engine_id, rank, kv.kv_role, settings)
 
 
-def _build(config: NetworkProfilerConfig, role, engine_id, rank, kv_role):
+def _build(
+    config: NetworkProfilerConfig, role, engine_id, rank, kv_role, settings=None
+):
     import dataclasses
 
     context = {
@@ -712,7 +717,7 @@ def _build(config: NetworkProfilerConfig, role, engine_id, rank, kv_role):
         "capabilities": capabilities(role, kv_role, config),
     }
     config = dataclasses.replace(config, context=context)
-    recorder = open_recorder(config)
+    recorder = open_recorder(config, settings)
     profiler = MooncakeProfiler(
         config, recorder, rank=rank, engine_id=engine_id, kv_role=kv_role
     )

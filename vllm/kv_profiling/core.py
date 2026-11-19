@@ -45,7 +45,9 @@ class ProcessRecorder:
     Stop producers before close. No production observer is installed here.
     """
 
-    def __init__(self, config: NetworkProfilerConfig, *, start_writer=True):
+    def __init__(
+        self, config: NetworkProfilerConfig, *, start_writer=True, settings=None
+    ):
         if not config.enabled:
             raise ValueError("use open_recorder for a disabled configuration")
         from vllm import _kv_profiler
@@ -58,30 +60,38 @@ class ProcessRecorder:
                 dir=config.shared_dir,
             )
         )
-        self.output_dir = Path(config.output_dir) / str(config.run_id) / self.process_id
-        self.metadata = {
-            "run_id": config.run_id,
-            "process_id": self.process_id,
-            "recovery_directory": str(self.ring_dir),
-            "clock_id": str(uuid4()),
-            "clock_source": "CLOCK_MONOTONIC",
-            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-            "time_namespace": _time_namespace(),
-            "pid": os.getpid(),
-            "net_namespace": os.readlink("/proc/self/ns/net"),
-            "pid_namespace": os.readlink("/proc/self/ns/pid"),
-            "start_ticks": int(
-                Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
-            ),
-            "context": config.context,
-            "byteorder": sys.byteorder,
-            "capabilities": config.context.get(
-                "capabilities", {"attached": False, "socket": False, "qp": False}
-            ),
-        }
         self.writer = None
         self._result = None
         try:
+            # Everything after the ring directory exists is inside the cleanup
+            # scope: a metadata or snapshot failure leaves nothing behind.
+            self.output_dir = (
+                Path(config.output_dir) / str(config.run_id) / self.process_id
+            )
+            self.metadata = {
+                "run_id": config.run_id,
+                "process_id": self.process_id,
+                "recovery_directory": str(self.ring_dir),
+                "clock_id": str(uuid4()),
+                "clock_source": "CLOCK_MONOTONIC",
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "time_namespace": _time_namespace(),
+                "pid": os.getpid(),
+                "net_namespace": os.readlink("/proc/self/ns/net"),
+                "pid_namespace": os.readlink("/proc/self/ns/pid"),
+                "start_ticks": int(
+                    Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
+                ),
+                "context": config.context,
+                "byteorder": sys.byteorder,
+                "capabilities": config.context.get(
+                    "capabilities", {"attached": False, "socket": False, "qp": False}
+                ),
+            }
+            if settings is not None:
+                # The configuration snapshot, beside (not inside) the caller's context.
+                self.metadata["config"] = settings
+            _fit_metadata(self.metadata)
             self.native = _kv_profiler.create(
                 str(self.ring_dir / "ring"),
                 config.ring_records,
@@ -176,6 +186,26 @@ class ProcessRecorder:
         return self._result
 
 
-def open_recorder(config: NetworkProfilerConfig):
-    """The off path imports no native extension and starts no helper."""
-    return ProcessRecorder(config) if config.enabled else None
+def _fit_metadata(metadata: dict) -> None:
+    """The metadata row must stay readable by the writer's recovery (its line
+    limit): a snapshot that does not fit becomes an explicit unavailable entry,
+    and a row too large without it is refused before anything starts."""
+    from .schema import dump_line
+    from .sink import MAX_LINE
+
+    def size():
+        return len(dump_line({"type": "metadata", "schema": 1, **metadata}))
+
+    if size() > MAX_LINE and "config" in metadata:
+        metadata["config"] = {
+            "unavailable": f"the metadata row would exceed {MAX_LINE} bytes"
+        }
+    if size() > MAX_LINE:
+        raise ValueError(f"profiler metadata exceeds {MAX_LINE} bytes")
+
+
+def open_recorder(config: NetworkProfilerConfig, settings=None):
+    """The off path imports no native extension and starts no helper.
+
+    ``settings`` is the configuration snapshot recorded in the metadata."""
+    return ProcessRecorder(config, settings=settings) if config.enabled else None

@@ -65,6 +65,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.utils import (
     get_dcp_replicated_group_ids,
     get_representative_spec_type,
     kv_lease_extension,
+    nixl_snapshot,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.rank_kv import (
@@ -1220,6 +1221,15 @@ class NixlBaseConnectorWorker:
                 "tp_rank": self.tp_rank,
                 "dp_rank": vllm_config.parallel_config.data_parallel_index,
             },
+            transport_snapshot=lambda: nixl_snapshot(
+                self.nixl_wrapper,
+                {
+                    "backends": list(self.nixl_backends),
+                    "num_threads": num_threads,
+                    "ucx_backend_params": ucx_backend_params,
+                    "progress_thread": getattr(config, "enable_pthread", None),
+                },
+            ),
         )
 
     def _validate_remote_parallel_config(

@@ -585,8 +585,12 @@ def attach_nixl(
     transfer_mode: str = "pull",
     side_channel: tuple[str, int] | None = None,
     context: dict | None = None,
+    transport_snapshot=None,
 ):
     """Return a profiler for a NIXL ``scheduler`` or ``worker``, or None when off.
+
+    ``transport_snapshot``, a callable reporting what the NIXL agent set up, is
+    called only for an enabled worker.
 
     Raises:
         ValueError: invalid configuration, or the push connector, which is not
@@ -608,10 +612,18 @@ def attach_nixl(
         raise ValueError(
             "network_profiler levels l1/l3 require the NIXL pull connector"
         )
-    return _build(config, role, engine_id, rank, side_channel, kv.kv_role)
+    from .snapshot import snapshot
+
+    transport = (
+        transport_snapshot() if transport_snapshot and role == "worker" else None
+    )
+    settings = snapshot(vllm_config, config, transport)
+    return _build(config, role, engine_id, rank, side_channel, kv.kv_role, settings)
 
 
-def _build(config, role, engine_id, rank, side_channel, kv_role) -> NixlProfiler:
+def _build(
+    config, role, engine_id, rank, side_channel, kv_role, settings=None
+) -> NixlProfiler:
     import dataclasses
 
     backends = config.context.get("backends")
@@ -622,7 +634,7 @@ def _build(config, role, engine_id, rank, side_channel, kv_role) -> NixlProfiler
         "backend": backends,
     }
     config = dataclasses.replace(config, context=context)
-    recorder = open_recorder(config)
+    recorder = open_recorder(config, settings)
     profiler = NixlProfiler(config, recorder, rank=rank, engine_id=engine_id)
     try:
         if role == "scheduler" and config.clock and side_channel is not None:
@@ -668,7 +680,9 @@ def attach_frontend(vllm_config) -> FrontendProfiler | None:
         "capabilities": caps,
     }
     config = dataclasses.replace(config, context=context)
-    recorder = open_recorder(config)
+    from .snapshot import snapshot
+
+    recorder = open_recorder(config, snapshot(vllm_config, config))
     try:
         return FrontendProfiler(config, recorder)
     except BaseException:
