@@ -692,3 +692,96 @@ scrape before it exits, so the orchestrator must stop it after the workload and
 before the engine's metrics server goes away; the terminal record says whether every
 scrape was complete (exit status 3 when it was not). Its CPU and the target's
 `/metrics` cost are measured, not assumed zero.
+
+In the end-to-end harness (`tools/e2e`) a run's optional `collector` key starts one
+collector on each server node, inside the node's container (TENT's metrics server
+listens on the node's loopback), with a manifest of the node's ranks and the
+repository's `collector.py` copied in as it is. It starts after every server and the
+router answer and before the harness's own first TENT scrape, and is stopped (its stop
+file) after the workload and the harness's last scrape and before any server: its final
+scrape needs the metrics servers. Its capture is copied to `collector/<node>/` and
+checked: the terminal record and the summary say complete, the collector finished on
+its own, every rank has a first and a last sample, no counter went backwards, and each
+counter's change between them equals the harness's own scrape of the same rank (both
+record kinds). Any miss is a problem of the run's verdict. The collector is not a
+service of the run: the harness's server filters leave it alone and its CPU is counted
+as a helper of its own kind (`collector_s`).
+
+The same harness turns the Mooncake adapter on with the run's `profiler` key (L1; data-parallel size 1 on both
+sides, one engine ID an instance): both servers get one run ID, every instance a pinned engine ID
+(`<role>-<node>`, written to `profile-identities.json`), each prefill instance's scheduler binds its clock
+server on the node's control address (`BOOTSTRAP_PORT + clock_port_offset`, so the clock traffic never rides
+the KV network the checks count) and the decode instance maps each prefill engine ID to that endpoint
+(`clock_peers`). The servers are stopped as under NIXL (decode first, so the clock servers are alive for the
+end calibration) before the profile directories are copied. With `collector` as well, each producer rank's
+batches can be checked against its TENT counters: the batches' bytes equal the collector's write bytes, and
+TENT's requests (it merges adjacent descriptors of a batch) are at most the batches' descriptors.
+
+### NIXL's built-in telemetry (L2 source `nixl`)
+
+A collector target with `source: "nixl"` reads NIXL's own telemetry through its multi-process Prometheus exporter
+(`prometheus_mp`, a beta exporter in the NIXL release the harness was built against): one aggregated endpoint a node serves every NIXL agent of that node. The servers are
+given `NIXL_TELEMETRY_EXPORTER=prometheus_mp`, a private `NIXL_TELEMETRY_MULTIPROC_DIR` (tmpfs), a port on the node's loopback
+and nothing else: vLLM's NIXL connector already requests telemetry from every agent (a discarding sink without an exporter),
+so the exporter only adds accumulation, an endpoint and the scrapes. Two further collector-only record kinds (the native
+recorder and kinds 22-26 are unchanged): 27 `nixl_telemetry` (per exporting process: `tx_bytes`, `rx_bytes`, `tx_requests`,
+`rx_requests`, `xfer_time_us`, `xfer_post_time_us`, `memory_registered_bytes`, `memory_deregistered_bytes`; cumulative) and 28
+`nixl_telemetry_events` (`events_dropped` at NIXL's producer-side staging queue, and `errors` by `status`: the errors NIXL
+reports, not every failure, since some early returns bypass its error telemetry). Every record keeps the full series labels
+(`hostname`, `agent_name`, `pid`, `agent_instance`, `local_rank` when exported); `agent_name` is a UUID in vLLM and encodes no
+rank. A field the page did not serve is `null`; the last-operation gauges, the histogram buckets and the HTTP server's own
+families are not recorded. NIXL counts only what an initiator completes: a prefill worker reports registration and no
+transfers, and nothing is attributed per peer, backend or request.
+
+NIXL exports asynchronously (a flush every 100 ms), so a successful scrape does not show that every completed transfer has
+reached its counters. The collector therefore answers **boundary requests**: an orchestrator drops `<id>.json`
+(`{"name": "baseline"}` or `"final"`) in `--boundary-dir`; the collector scrapes a pass that began after it noticed the file and
+appends a `boundary` record (never changing an earlier one) naming the pass's sample IDs, its begin and end instants and each
+target's completeness. The harness (`collector: {nixl_telemetry: true}`, any NIXL backend, data-parallel size 1; `tent: false`
+for a backend without TENT) uses them as follows. *Inventory:* from the node's process titles and start ticks it expects one
+agent for each worker rank (the engine process for TP1). *Baseline:* the first boundary sample whose agents equal the inventory
+exactly, with every field and every error series served and a positive registration (at least the rank's allocated KV bytes),
+equal to the harness's own scrape taken right after; bounded, and a failure aborts the run. *Final:* with the servers and the
+collector alive, after the counters have been unchanged for 0.5 s over samples that began after the workload, and still in
+agreement with the inventory and the step logs, one more boundary sample equal to the stable stretch and to the harness's
+own scrape, with the same processes (pid and start ticks) as at the baseline; a timeout or a mismatch is recorded and fails
+the validation. The checks against what moved are per decode rank, over the two boundary samples, with zero tolerance: receive
+requests and bytes equal the step log's transfers, the transfer and post times equal the sums of the logged durations each
+converted back to integer microseconds, transmit zero, nothing dropped, no served error moved, registration unchanged; a prefill
+rank's counters do not move. Equal values during quiescence establish a common accounting boundary, not simultaneous reads; both
+reads' instants are kept (`collector/<node>/boundaries.json`). An agent is identified by its whole label set (hostname,
+`agent_name`, `pid`, `agent_instance`, `local_rank` when present) and the node's own hostname is part of the inventory; a saved run is
+judged again from the raw capture, never from a stored outcome: the request, the pass, the sample and the harness's own read in order,
+the final stretch made of real consecutive complete samples (at least three, spanning 0.5 s, begun after the workload's last step in the
+step logs) with unchanged counters equal to the selected final sample's, at the saved-run entry point (`harness recheck`) as well, which
+reads TENT's saved evidence only where TENT applies.
+
+For a latency comparison of NIXL telemetry configurations the harness has `server.nixl_telemetry_arm` (NIXL connector; the exporter arm is
+`collector.nixl_telemetry`). `default` is vLLM's own configuration (the collect-only sink) and `emissions_disabled` sets
+`NIXL_TELEMETRY_ENABLED_METRICS` to a token that matches none of NIXL's event names, so no event is emitted or enqueued while the timers, the
+per-transfer statistics and the idle flush infrastructure remain (`NIXL_TELEMETRY_ENABLE=0` is not an option: without telemetry the connector's
+per-transfer statistics raise and every completed transfer is handled as a failure). Each arm sets what it needs and clears every other
+`NIXL_TELEMETRY_*` variable; the run's verdict checks the servers' environment, that no endpoint answers, that the per-transfer statistics are intact
+and that no server log shows a telemetry failure, and reports the dropped-event count as unavailable (the collect-only sink discards that record too):
+only the exporter arm measures it.
+
+Latency comparisons use two workload options of the harness. `workload.percentiles` reports the benchmark's p50/p95/p99 of TTFT, TPOT, ITL and end-to-end
+latency without `measure`'s per-node CPU samplers, so that nothing extra runs in any arm. `workload.monitor` runs a small contamination monitor around the
+client's whole benchmark command: one stdlib process on a CPU outside the measured CPUs (15; the measured ones are 0-13) reads, once a second, the per-CPU
+lines of `/proc/stat` and the `cpu.stat` of the topology's own containers' cgroups, each reading with its own begin and end instants; it never scans
+`/proc` per process. The *foreign busy* time of an interval is the user, nice and system time of the measured CPUs minus the owned cgroups' user and system
+time (interrupt and softirq time are reported, never counted: the run's own KV traffic produces it and the cgroups do not account it). Because the two
+readings are taken at slightly different instants and `/proc/stat` is quantized in ticks, every interval carries a bound (the owned capacity times the
+reading mismatch at both ends, plus the ticks), and a threshold is *exceeded* only if the estimate minus the bound is over it, *clear* only if the estimate
+plus the bound is under it, and otherwise *unknown*, which never makes a run clean; accounting that is inconsistent beyond its own bound, a reset or missing
+counter, a measured CPU that is absent, a gap above 3 s, many slow reads, samples that do not bracket both ends of the client's benchmark, owned cgroups that
+are not disjoint, whose identities changed between the two ends or whose effective CPU sets reach outside 0-13 are unknown as well. The judgement (mean foreign
+busy above 0.20 CPU, any 1 s sample above 0.75 CPU, a throttled owned cgroup) is saved with its raw samples (`monitor/`, `bench-window.json`) and re-derived
+from them by readers, never taken from the stored status. The evidence is admitted strictly: a record that cannot be parsed or is truncated, a missing,
+duplicate or out-of-order sequence entry, invalid or backwards read instants (nothing is sorted or dropped to repair a recording), a counter of any single CPU
+or cgroup that falls between two readings (checked one counter at a time before anything is summed, so a fall offset by another counter's rise is found), an
+ownership snapshot that is invalid on its own (each snapshot is validated separately: non-empty, disjoint cgroups, non-empty effective CPU sets inside 0-13) or
+that differs from the other (a changed id, start instant, cgroup path or effective CPU assignment) are all *unknown*. The sampler's shutdown is evidence too
+(`monitor/sampler.json`: started, exit status, whether it had to be killed, whether it was reaped): a non-zero exit, a forced kill or no record is *unknown*, and a
+sampler whose starter is gone exits by itself. The window, both ownership snapshots, the sampler's termination and the judgement are saved even when the benchmark
+raises or Docker stops answering.

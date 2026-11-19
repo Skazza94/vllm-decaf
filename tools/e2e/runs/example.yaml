@@ -100,3 +100,25 @@ workload:  # vllm bench serve --dataset-name random
   num_prompts: 40
   concurrency: 4
   # seed: 0
+  # measure: false      # true: p50/p95/p99 of the latencies and each server node's CPU over the workload window
+  # percentiles: false  # true: only the latency percentiles (no per-node CPU samplers), for latency comparisons
+  # monitor: false      # true: judge the client's benchmark window for CPU used on the measured CPUs by anything that is
+  #                     # not this topology (a per-second /proc/stat and owned-cgroup reading from CPU 15; bench-window.json,
+  #                     # monitor/)
+
+# The out-of-process L2 collector on each server node: it scrapes the TENT
+# metrics of the node's ranks (server.connector mooncake, or nixl with
+# nixl_backend mooncake) from before the workload until after it, and is
+# stopped before the servers. Its capture is copied to collector/<node>/ and
+# checked: complete, and its counters' change over the workload equal to the
+# harness's own scrape (tent.json). Independent of the L1 profiler.
+# nixl_telemetry (any NIXL backend, data_parallel_size 1) reads NIXL's own telemetry too, with a recorded process
+# inventory, a bounded baseline and a bounded, stable and checked final sample; tent: false drops the TENT scrape
+# (a backend without TENT).
+# collector:
+#   tent: true
+#   nixl_telemetry: false
+#   interval_s: 1.0
+#   scrape_timeout_s: 2.0
+#   startup_timeout_s: 10.0
+#   shutdown_timeout_s: 10.0

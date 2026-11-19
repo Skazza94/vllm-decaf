@@ -124,11 +124,15 @@ class CollectorKind(IntEnum):
 
     TRANSPORT_METRICS = 25
     TRANSPORT_METRICS_FAILURES = 26
+    NIXL_TELEMETRY = 27
+    NIXL_TELEMETRY_EVENTS = 28
 
 
 COLLECTOR_KIND_NAMES = {
     CollectorKind.TRANSPORT_METRICS: "transport_metrics",
     CollectorKind.TRANSPORT_METRICS_FAILURES: "transport_metrics_failures",
+    CollectorKind.NIXL_TELEMETRY: "nixl_telemetry",
+    CollectorKind.NIXL_TELEMETRY_EVENTS: "nixl_telemetry_events",
 }
 
 

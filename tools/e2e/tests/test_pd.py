@@ -109,10 +109,51 @@ class ProfilerConfig(unittest.TestCase):
             for bad, message in (({"profiler": {"transport": "rdma"}}, "profiler.transport"),
                                  ({"profiler": {"clock_port_offset": 0}}, "clock_port_offset"),
                                  ({"profiler": {"nope": 1}}, "unexpected keyword"),
-                                 ({"profiler": {}, "server": {"connector": "mooncake", "timing": "linear"}},
-                                  "profiler needs server.connector nixl")):
+                                 ({"profiler": {"level": "l3"}, "server": {"connector": "mooncake", "timing": "linear"}},
+                                  "profiler is L1 with data_parallel_size 1"),
+                                 ({"profiler": {}, "server": {"connector": "mooncake", "timing": "linear"},
+                                   "decode": {"node": "d", "kv_network": "data0", "data_parallel_size": 2}},
+                                  "profiler is L1 with data_parallel_size 1")):
                 with self.assertRaisesRegex(ValueError, message):
                     pd.parse({**raw, **bad}, Path("/r.yaml"))
+            mooncake = pd.parse({**raw, "profiler": {}, "server": {"connector": "mooncake", "timing": "linear"}},
+                                Path("/r.yaml"))
+            self.assertEqual(mooncake.profiler, pd.Profiler())
+
+    MOONCAKE = pd.Server(connector="mooncake", timing="linear")
+    INSTANCES = {"prefill": {"p0": {"control": "10.250.0.2"}, "p1": {"control": "10.250.0.3"}},
+                 "decode": {"d0": {"control": "10.250.0.4"}}}
+
+    def test_profiled_mooncake_servers_pin_engine_ids_and_clock_endpoints_on_the_control_network(self):
+        run = self.run_with(server=self.MOONCAKE, profiler=pd.Profiler(clock_port_offset=1500))
+        identities = pd.profile_identities(run, self.INSTANCES)
+        self.assertEqual(identities["prefill"]["p1"], {"engine_id": "prefill-p1",
+                                                       "clock": f"10.250.0.3:{pd.BOOTSTRAP_PORT + 1500}"})
+
+        def transfer(role, node):
+            command = pd.server_command(run, role, ["10.100.0.1"], profile_id="id-1", node=node, identities=identities)
+            return json.loads(command[command.index("--kv-transfer-config") + 1])
+
+        producer = transfer("prefill", "p1")
+        profile = producer["kv_connector_extra_config"]["network_profiler"]
+        self.assertEqual((producer["engine_id"], profile["clock_bind"]), ("prefill-p1", identities["prefill"]["p1"]["clock"]))
+        self.assertNotIn("clock_peers", profile)
+        self.assertNotIn("clock_port_offset", profile)
+        consumer = transfer("decode", "d0")
+        profile = consumer["kv_connector_extra_config"]["network_profiler"]
+        self.assertEqual(consumer["engine_id"], "decode-d0")
+        self.assertEqual(profile["clock_peers"], {"prefill-p0": f"10.250.0.2:{pd.BOOTSTRAP_PORT + 1500}",
+                                                  "prefill-p1": f"10.250.0.3:{pd.BOOTSTRAP_PORT + 1500}"})
+        self.assertNotIn("clock_bind", profile)
+        for missing in ({"node": None}, {"identities": None}):
+            with self.assertRaisesRegex(ValueError, "needs its node and the instances' identities"):
+                pd.server_command(run, "prefill", ["10.100.0.1"], profile_id="id-1",
+                                  **{"node": "p0", "identities": identities, **missing})
+        # Off, or under NIXL, no engine ID is pinned and nothing of the clock is added.
+        plain = pd.server_command(self.run_with(server=self.MOONCAKE), "prefill", ["10.100.0.1"])
+        self.assertNotIn("engine_id", json.loads(plain[plain.index("--kv-transfer-config") + 1]))
+        nixl = pd.server_command(self.run_with(profiler=pd.Profiler()), "prefill", ["10.100.0.1"], profile_id="id-1")
+        self.assertNotIn("engine_id", json.loads(nixl[nixl.index("--kv-transfer-config") + 1]))
 
     def test_a_saved_profiled_run_loads_again(self):
         run = self.run_with(profiler=pd.Profiler(), model=Path("/m"))
@@ -4062,8 +4103,30 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
         (out/"run.json").write_text(json.dumps(raw))
         with self.assertRaises(FileNotFoundError):pd.recheck(out)
 
+    def test_a_nixl_only_collector_saved_run_rechecks_without_tent_evidence(self):
+        """UCX and LIBFABRIC runs save ``transport.json``, never ``tent.json``: the saved-run entry point must not read it for a
+        collector that reads NIXL's telemetry only (the collector's own evidence is judged, and found missing here)."""
+        run,p,d,ports,moved,_=self.fixture()
+        run.server.timing="linear"
+        run.collector=pd.Collector(tent=False,nixl_telemetry=True)
+        out=Path(self.directory.name)/"saved-nixl"
+        out.mkdir()
+        (out/"run.json").write_text(json.dumps({**asdict(run),"model":str(run.model)},default=str))
+        (out/"control-ports.json").write_text(json.dumps({"nodes":["gw"],"bytes":0,"ports":{"p0":{"node":"c","rx":50,"tx":0},"p1":{"node":"p","rx":0,"tx":25},"p2":{"node":"d","rx":0,"tx":25},"p3":{"node":"gw","rx":0,"tx":0}}}))
+        for role,texts in (("prefill",p),("decode",d)):
+            for rank,text in enumerate(texts):(out/getattr(run,role).step_log(role,0,rank)).write_text(text)
+        for file,data in (("bench.json",{"completed":2,"errors":[]}),("routers.json",{"control":50,"kv":moved+500}),("router-ports.json",ports)):
+            (out/file).write_text(json.dumps(data))
+        self.assertFalse((out/"tent.json").exists())
+        verdict=pd.recheck(out)
+        self.assertTrue(any("L2 collector p: no usable capture" in problem for problem in verdict["problems"]),
+                        verdict["problems"])
+        self.assertFalse(any("tent.json" in problem for problem in verdict["problems"]))
+
     def test_tcp_live_collection_marks_tent_not_applicable(self):
         from unittest.mock import patch
+        from harness.collector import SIGNAL_COLLECTOR as collector_script
+        cleared=[]
         run,p,d,ports,moved,_=self.fixture()
         output=Path(self.directory.name)/"live"
         state={"nodes":{name:{"container":name,"interfaces":{"control":{"address":"10.250.0.1"}}}
@@ -4074,7 +4137,8 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
                 for rank,text in enumerate(texts):(output/getattr(run,role).step_log(role,0,rank)).write_text(text)
         def addresses(*_):return ["10.1.0.1"]*4
         with patch.object(topology,"load_state",return_value=state), \
-             patch.object(topology,"exec_in",return_value=""), \
+             patch.object(topology,"exec_in",side_effect=lambda name,command,**kw:
+                 (cleared.append(name) or '{"signalled":[],"remaining":[]}') if command[:2]==[pd.PYTHON,"-c"] and command[2]==collector_script else ""), \
              patch.object(pd.shell,"run",return_value=""), \
              patch.object(pd,"stop_services"),patch.object(pd,"_background"),patch.object(pd,"_wait"), \
              patch.object(pd,"container_identities",return_value={}), \
@@ -4088,6 +4152,8 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
             self.assertEqual(pd.execute(run,output)["problems"],[])
         self.assertFalse((output/"tent.json").exists())
         self.assertFalse((output/"tent-after.json").exists())
+        # A run without a collector still clears any one an earlier run left on every node.
+        self.assertEqual(sorted(cleared),["c","d","p"])
         started=json.loads((output/"servers.json").read_text())
         self.assertEqual({role:list(nodes) for role,nodes in started.items()},{"prefill":["p"],"decode":["d"]})
         self.assertIn("VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120",started["decode"]["d"])

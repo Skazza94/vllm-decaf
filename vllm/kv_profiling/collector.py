@@ -11,7 +11,17 @@ two collector-only kinds (the native recorder's ABI and kinds are unchanged):
 * ``transport_metrics`` (25): by ``transport`` label, the cumulative bytes written
   and read, write and read request counts, and the registered buffer gauge;
 * ``transport_metrics_failures`` (26): the transport attempts and attempt failures
-  by (``transport``, ``operation``), and task failures by (``transport``, ``reason``).
+  by (``transport``, ``operation``), and task failures by (``transport``, ``reason``);
+
+and, for a target whose ``source`` is ``nixl`` (NIXL's built-in telemetry through its
+multi-process Prometheus exporter, one aggregated endpoint a node), two more:
+
+* ``nixl_telemetry`` (27): per exporting process, the cumulative transmit and receive
+  bytes and requests, the transfer and post time sums in microseconds and the memory
+  registered and deregistered;
+* ``nixl_telemetry_events`` (28): per process the events dropped at the producer-side
+  staging queue, and the errors NIXL reported by ``status`` (not every failure: some
+  early returns bypass its error telemetry).
 
 The two kinds are different label partitions of the source and are not forced into
 one row shape: each record carries its own ``labels`` and typed ``fields``, a field
@@ -57,9 +67,13 @@ from uuid import UUID, uuid4
 SCHEMA = 1
 KIND_TRANSPORT_METRICS = 25
 KIND_TRANSPORT_METRICS_FAILURES = 26
+KIND_NIXL_TELEMETRY = 27
+KIND_NIXL_TELEMETRY_EVENTS = 28
 NAMES = {
     KIND_TRANSPORT_METRICS: "transport_metrics",
     KIND_TRANSPORT_METRICS_FAILURES: "transport_metrics_failures",
+    KIND_NIXL_TELEMETRY: "nixl_telemetry",
+    KIND_NIXL_TELEMETRY_EVENTS: "nixl_telemetry_events",
 }
 
 # The source's families: (metric, label names, typed field, unit), by kind.
@@ -87,6 +101,46 @@ _FAILURE_FAMILIES = {
     ),
     "tent_task_failures_total": ("task_failures", "tasks", ("transport", "reason")),
 }
+# NIXL's multi-process Prometheus exporter: one series set per exporting process, every
+# series present from the first scrape (registered at start: absent means unavailable).
+# Last-operation gauges, histogram buckets and the HTTP server's own families are not
+# recorded (the totals and the sums carry the information).
+_NIXL_PROCESS = ("hostname", "agent_name", "pid", "agent_instance")
+_NIXL_FAMILIES = {
+    "agent_tx_bytes_total": ("tx_bytes", "bytes", _NIXL_PROCESS),
+    "agent_rx_bytes_total": ("rx_bytes", "bytes", _NIXL_PROCESS),
+    "agent_tx_requests_num_total": ("tx_requests", "requests", _NIXL_PROCESS),
+    "agent_rx_requests_num_total": ("rx_requests", "requests", _NIXL_PROCESS),
+    "agent_xfer_time_total": ("xfer_time_us", "microseconds", _NIXL_PROCESS),
+    "agent_xfer_post_time_total": ("xfer_post_time_us", "microseconds", _NIXL_PROCESS),
+    "agent_memory_registered_total": (
+        "memory_registered_bytes",
+        "bytes",
+        _NIXL_PROCESS,
+    ),
+    "agent_memory_deregistered_total": (
+        "memory_deregistered_bytes",
+        "bytes",
+        _NIXL_PROCESS,
+    ),
+}
+_NIXL_EVENT_FAMILIES = {
+    "agent_telemetry_events_dropped_total": ("events_dropped", "events", _NIXL_PROCESS),
+    "agent_errors_total": ("errors", "errors", (*_NIXL_PROCESS, "status")),
+}
+# Per source: its record kinds with their families, and the labels a series may carry
+# besides the documented ones (``local_rank`` appears only when the engine exports it).
+SOURCES = {
+    "tent": {
+        KIND_TRANSPORT_METRICS: _TRANSPORT_FAMILIES,
+        KIND_TRANSPORT_METRICS_FAILURES: _FAILURE_FAMILIES,
+    },
+    "nixl": {
+        KIND_NIXL_TELEMETRY: _NIXL_FAMILIES,
+        KIND_NIXL_TELEMETRY_EVENTS: _NIXL_EVENT_FAMILIES,
+    },
+}
+_OPTIONAL_LABELS = {"tent": (), "nixl": ("local_rank",)}
 _GAUGES = frozenset({"tent_registered_buffer_bytes"})
 DEFAULT_METRICS_PORT = 9100
 _MAX_LINE = 4096
@@ -153,6 +207,7 @@ class Target:
     mc_tent_conf: str | None = None
     env: dict = field(default_factory=dict)
     port_offset: int = 0
+    source: str = "tent"
 
     @classmethod
     def from_json(cls, raw):
@@ -167,6 +222,10 @@ class Target:
             raise ValueError(f"target {raw['id']!r}: unknown keys {unknown}")
         if not isinstance(raw.get("env", {}), dict):
             raise ValueError(f"target {raw['id']!r}: env must be an object")
+        if raw.get("source", "tent") not in SOURCES:
+            raise ValueError(
+                f"target {raw['id']!r}: source must be one of {sorted(SOURCES)}"
+            )
         return cls(**raw)
 
 
@@ -231,6 +290,8 @@ def resolve_endpoint(target: Target):
         except ValueError as exc:
             return None, None, str(exc)
         return host, port, "manifest"
+    if target.source == "nixl":
+        return None, None, "a nixl target needs an explicit endpoint"
     host, port, source = "127.0.0.1", None, None
     conf_text = target.mc_tent_conf or target.env.get("MC_TENT_CONF")
     if conf_text:
@@ -446,7 +507,7 @@ def fetch(host, port, path, deadline, limits: Limits):
             connection.close()
 
 
-def parse(text, limits: Limits):
+def parse(text, limits: Limits, source="tent"):
     """Series of the known families from a page: ({(metric, labels): value}, problems).
 
     ``labels`` is a sorted tuple of pairs. Bounded work: at most ``max_series``
@@ -456,7 +517,7 @@ def parse(text, limits: Limits):
     series = {}
     problems = {"series_cap": 0, "line_too_long": 0, "label_cap": 0, "malformed": 0}
     seen = 0
-    wanted = {**_TRANSPORT_FAMILIES, **_FAILURE_FAMILIES}
+    wanted = {k: v for families in SOURCES[source].values() for k, v in families.items()}
     for line in text.splitlines():
         if not line or line.startswith("#"):
             continue
@@ -518,6 +579,7 @@ class Capture:
 
     def __init__(self, directory: Path, run_id: str, limits: Limits, targets):
         self.limits = limits
+        sources = sorted({t.source for t in targets}) or ["tent"]
         self.process_id = str(uuid4())
         self.directory = Path(directory) / run_id / self.process_id
         self.directory.mkdir(parents=True)
@@ -545,15 +607,20 @@ class Capture:
                 "byteorder": sys.byteorder,
                 "context": {
                     "role": "collector",
-                    "connector": "mooncake",
+                    "connector": "mooncake" if "tent" in sources else "nixl",
+                    "sources": sources,
                     "targets": [t.id for t in targets],
                     "limits": limits.__dict__,
                 },
                 "capabilities": {
                     "attached": False,
                     "transport_metrics": True,
-                    "kinds": {str(k): n for k, n in NAMES.items()},
-                    "families": sorted({**_TRANSPORT_FAMILIES, **_FAILURE_FAMILIES}),
+                    "kinds": {
+                        str(k): NAMES[k] for src in sources for k in SOURCES[src]
+                    },
+                    "families": sorted(
+                        {k for src in sources for f in SOURCES[src].values() for k in f}
+                    ),
                 },
             },
             force=True,
@@ -635,9 +702,14 @@ class Collector:
         self.generation = {t.id: 0 for t in targets}
         self.status = {t.id: "pending" for t in targets}
         self.reasons: set = set()
+        # Series a NIXL exporter serves with labels this collector does not know (another
+        # version): unavailable, counted, never an incomplete capture.
+        self.unserved_label_series = 0
         self.partial_samples = 0
         self.total_samples = 0
         self.unavailable: dict = {}
+        self.last_pass: dict | None = None
+        self._sample_ids: dict = {}
 
     def hard_deadline(self) -> float:
         """No scrape of any kind outlives the shutdown budget that starts when stop
@@ -657,6 +729,7 @@ class Collector:
         host, port, source = self.resolved[tid]
         self.samples[tid] += 1
         sample_id = f"{self.capture.process_id[:8]}-{tid}-{self.samples[tid]}"
+        self._sample_ids[tid] = sample_id
         identity = {
             "id": tid,
             "role": target.role,
@@ -685,7 +758,7 @@ class Collector:
                     reason = "empty_page"
                 else:
                     series, problems = parse(
-                        page.decode("utf-8", "replace"), self.limits
+                        page.decode("utf-8", "replace"), self.limits, target.source
                     )
             except ScrapeError as exc:
                 reason = exc.reason
@@ -704,12 +777,11 @@ class Collector:
             (
                 kind,
                 families,
-                self._partitions(tid, series, families) if reason is None else [],
+                self._partitions(tid, series, families, target.source)
+                if reason is None
+                else [],
             )
-            for kind, families in (
-                (KIND_TRANSPORT_METRICS, _TRANSPORT_FAMILIES),
-                (KIND_TRANSPORT_METRICS_FAILURES, _FAILURE_FAMILIES),
-            )
+            for kind, families in SOURCES[target.source].items()
         )
         # One generation for the whole sample: every series of both kinds was
         # inspected first, and a discontinuity in any of them moves it once.
@@ -755,7 +827,7 @@ class Collector:
             self.partial_samples += 1
         return complete
 
-    def _partitions(self, tid, series, families):
+    def _partitions(self, tid, series, families, source="tent"):
         """Rows by label set for one kind.
 
         Each row is (labels, fields, units, discontinuity, expected, baseline);
@@ -771,10 +843,17 @@ class Collector:
             if name not in families:
                 continue
             field_name, unit, expected = families[name]
-            if tuple(sorted(k for k, _ in labels)) != tuple(sorted(expected)):
+            names = {k for k, _ in labels}
+            if not (set(expected) <= names <= set(expected) | set(_OPTIONAL_LABELS[source])):
                 # A series with other labels than the source documents is not this
-                # family's partition: never merged into one.
-                self.reasons.add("unexpected_labels")
+                # family's partition: never merged into one. For TENT that makes the
+                # capture incomplete; a NIXL exporter of another version may name its
+                # labels otherwise, which is data this collector cannot read (counted,
+                # the fields stay unavailable), not a failure.
+                if source == "nixl":
+                    self.unserved_label_series += 1
+                else:
+                    self.reasons.add("unexpected_labels")
                 continue
             grouped.setdefault((tuple(sorted(expected)), labels), {})[name] = (
                 field_name,
@@ -813,6 +892,8 @@ class Collector:
         """One pass over every target inside ``budget_s`` seconds in total."""
         deadline = min(time.monotonic() + budget_s, self.hard_deadline())
         complete = True
+        begin_ns = time.monotonic_ns()
+        samples, target_complete = {}, {}
         for index, target in enumerate(self.targets):
             deadline = min(deadline, self.hard_deadline())
             left = deadline - time.monotonic()
@@ -820,12 +901,122 @@ class Collector:
                 complete = False
                 self.reasons.add("pass_budget_exhausted")
                 self.status[target.id] = "not_scraped"
+                samples[target.id], target_complete[target.id] = None, False
                 continue
             share = left / (len(self.targets) - index)
-            complete &= self.scrape(
+            ok = self.scrape(
                 target, time.monotonic() + min(self.limits.scrape_timeout_s, share)
             )
+            complete &= ok
+            samples[target.id] = self._sample_ids[target.id]
+            target_complete[target.id] = ok
+        self.last_pass = {
+            "begin_ns": begin_ns,
+            "end_ns": time.monotonic_ns(),
+            "complete": complete,
+            "samples": samples,
+            "targets_complete": target_complete,
+        }
         return complete
+
+    def answer(self, requests) -> None:
+        """Append one boundary marker per request the last pass answers: a request
+        noticed before the pass began names that pass's samples (the sample IDs,
+        the pass's own begin and end instants and each target's completeness). The
+        capture is append-only: a marker is a record of its own, nothing already
+        written is changed."""
+        last = self.last_pass
+        if last is None:
+            return
+        for request in requests:
+            if request["detected_ns"] >= last["begin_ns"]:
+                continue
+            self.capture.write(
+                {
+                    "schema": SCHEMA,
+                    "type": "boundary",
+                    "name": request["name"],
+                    "request_id": request["id"],
+                    "detected_ns": request["detected_ns"],
+                    "pass": {
+                        k: last[k]
+                        for k in ("begin_ns", "end_ns", "complete", "targets_complete")
+                    },
+                    "samples": last["samples"],
+                },
+                force=True,
+            )
+            request["answered"] = True
+
+
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_REQUEST_NAME = re.compile(r"^[a-z_]{1,32}$")
+
+
+class Boundaries:
+    """Boundary requests an orchestrator drops as ``<id>.json`` (``{"name": ...}``) in a
+    directory: the collector notices each once, scrapes a pass that begins after it,
+    and answers with a marker record naming that pass's samples. An invalid request
+    is ignored and counted; a request is answered once."""
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.requests: dict[str, dict] = {}
+        self.invalid = 0
+        self._bad: set = set()
+
+    def poll(self) -> bool:
+        """Notice new requests; True when one arrived."""
+        found = False
+        try:
+            names = sorted(os.listdir(self.directory))
+        except OSError:
+            return False
+        for name in names:
+            stem, dot, suffix = name.rpartition(".")
+            if suffix != "json" or stem in self.requests or name in self._bad:
+                continue
+            try:
+                text = (self.directory / name).read_text()
+                value = json.loads(text)
+                if (
+                    not _REQUEST_ID.match(stem)
+                    or not isinstance(value, dict)
+                    or not _REQUEST_NAME.match(str(value.get("name", "")))
+                ):
+                    raise ValueError("invalid request")
+            except (OSError, ValueError):
+                # A half-written file is retried on the next poll; a bad one counted once.
+                if (self.directory / name).exists() and name not in self._bad:
+                    self._bad.add(name)
+                    self.invalid += 1
+                continue
+            self.requests[stem] = {
+                "id": stem,
+                "name": value["name"],
+                "detected_ns": time.monotonic_ns(),
+                "answered": False,
+            }
+            found = True
+        return found
+
+    def pending(self):
+        return [r for r in self.requests.values() if not r["answered"]]
+
+
+def _wait(stop, interval, boundaries):
+    """Wait ``interval`` seconds or until ``stop`` is set or a boundary request arrives;
+    True when stop is set."""
+    deadline = time.monotonic() + interval
+    while True:
+        left = deadline - time.monotonic()
+        if stop.is_set():
+            return True
+        if boundaries is not None and boundaries.poll():
+            return False
+        if left <= 0:
+            return False
+        stop.wait(min(left, 0.05 if boundaries is not None else left))
 
 
 def run(
@@ -836,6 +1027,7 @@ def run(
     stop: threading.Event,
     *,
     final_scrape=True,
+    boundaries: Boundaries | None = None,
 ):
     """The collector's whole life. Returns the capture's terminal summary.
 
@@ -850,11 +1042,17 @@ def run(
     complete = True
     reasons = set()
     try:
+        if boundaries is not None:
+            boundaries.poll()
         complete &= collector.scrape_all(limits.startup_timeout_s)
-        while not stop.wait(limits.interval_s):
+        if boundaries is not None:
+            collector.answer(boundaries.pending())
+        while not _wait(stop, limits.interval_s, boundaries):
             complete &= collector.scrape_all(
                 limits.interval_s + limits.scrape_timeout_s
             )
+            if boundaries is not None:
+                collector.answer(boundaries.pending())
         if final_scrape:
             collector.hard_deadline()
             final = collector.scrape_all(limits.shutdown_timeout_s)
@@ -877,6 +1075,7 @@ def run(
             "unavailable_targets": len(collector.unavailable),
             "history_series": len(collector.last),
             "history_evicted": collector.evicted_total,
+            "unserved_label_series": collector.unserved_label_series,
         }
         capture.end(
             complete,
@@ -909,6 +1108,10 @@ def main(argv=None):
         "--stop-file", help="stop (final scrape, then exit) when this file exists"
     )
     parser.add_argument("--no-final-scrape", action="store_true")
+    parser.add_argument(
+        "--boundary-dir",
+        help="answer boundary requests (<id>.json) dropped in this directory",
+    )
     for name, field_ in Limits.__dataclass_fields__.items():
         parser.add_argument(
             f"--{name.replace('_', '-')}",
@@ -940,6 +1143,7 @@ def main(argv=None):
         args.run_id,
         stop,
         final_scrape=not args.no_final_scrape,
+        boundaries=Boundaries(args.boundary_dir) if args.boundary_dir else None,
     )
     print(json.dumps(summary))
     return 0 if summary["observation_complete"] else 3
