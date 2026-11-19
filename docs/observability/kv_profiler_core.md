@@ -248,3 +248,15 @@ counted (`hook_errors`, `first_error` and any `shutdown_failures` in
 is counted loss.
 Hooks build at most a few small transient integers (a length, a sum) and
 retain nothing; formatting, I/O and waiting stay out of them.
+
+Engine shutdown: the scheduler and worker recorders live in the engine-core
+process and close when it tears down. With the default `--shutdown-timeout 0`
+the API server signals the engine-core process and force-kills it at once, before
+its recorders close: their manifests stay `open`, no `profiler.json` is written and
+the end flush is lost (the frontend recorders, in the API-server process, still
+complete). When the request and process timeouts are both zero, an explicitly set
+`VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS` gives the engine-core process that much
+cleanup grace; set it above the profiler's close deadlines (two recorders,
+`shutdown_timeout_s` each, plus the clock budget). A positive `--shutdown-timeout`
+is a shared shutdown budget that in-flight requests can consume, so it does not by
+itself guarantee that the recorders close.

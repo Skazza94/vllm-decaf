@@ -66,6 +66,10 @@ DP_SUPERVISOR_PORT = 9256  # a per-rank instance's aggregated health (vLLM's def
 WORK = "/e2e"
 STEP_LOG = f"{WORK}/steps.jsonl"
 PROFILES = f"{WORK}/profiles"
+# With vLLM's default shutdown timeout (0) the API server force-kills its engine process the moment it
+# signals it, before the connector's recorders close; an explicit worker-shutdown grace gives them the
+# time. It is above two recorders' close deadlines (``shutdown_timeout_s``) and under ``stop_orderly``'s wait.
+PROFILER_SHUTDOWN_GRACE_S = 30
 TENT_METRICS_PORT = 9100  # rank r of the host serves on TENT_METRICS_PORT + r
 DISABLED_TENT_TRANSPORTS = ("tcp", "rdma", "shm", "gds", "ascend_direct")
 
@@ -930,6 +934,8 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         "MC_USE_TENT": "1",
         "MC_TENT_CONF": json.dumps(tent_config(kv_address, run.server.hp_tcp_args), separators=(",", ":")),
         **connector_env,
+        **({"VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": str(PROFILER_SHUTDOWN_GRACE_S)}
+           if run.profiler is not None else {}),
         # TENT's metrics, read from inside the node.
         "TENT_METRICS_HTTP_HOST": "127.0.0.1",
         "TENT_METRICS_HTTP_PORT": str(TENT_METRICS_PORT),
@@ -2116,6 +2122,17 @@ def _group_pages(group: dict) -> list[int | None]:
                   key=str) or [group.get("real_page_bytes") or group.get("block_bytes")]
 
 
+def _kernel_rows(geometry: dict | None) -> tuple[set[int] | None, int]:
+    """A layout's registered block lengths (the bytes of each region's kernel block) and its kernel
+    blocks per logical block (1 when the layout records no split kernel geometry)."""
+    if not isinstance(geometry, dict):
+        return None, 1
+    split = geometry.get("kernel_blocks_per_logical")
+    lengths = geometry.get("registered_region_block_lengths")
+    return (set(lengths) if isinstance(lengths, list) and lengths else None,
+            split if isinstance(split, int) and not isinstance(split, bool) and split > 0 else 1)
+
+
 def group_kv_heads(model: Path, kinds: list) -> tuple[list[int] | None, str | None]:
     """Each KV cache group's total KV heads, from its layout `kind`: the
     model's own for all groups, except in the config family that gives its
@@ -2478,6 +2495,18 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
         for dp, rank in keys[role]:
             groups = (layout(role, dp, rank) or {}).get("groups") or []
             mine_slabs = []
+            # NIXL posts a descriptor per kernel block: a group's logical page over the kernel blocks it
+            # holds. The layout's registered block lengths describe all its groups' regions, so they
+            # must be exactly the kernel blocks of every group's pages together.
+            registered, split = _kernel_rows((layout(role, dp, rank) or {}).get("kernel_geometry"))
+            if nixl and split > 1 and registered is not None:
+                kernel_blocks = {page // split if isinstance(page, int) and page % split == 0 else None
+                                 for group in groups for page in _group_pages(group)}
+                if registered != kernel_blocks:
+                    problems.append(f"{name(role, dp, rank)}'s registered block lengths {sorted(registered)} are "
+                                    f"not its groups' kernel blocks' {sorted(kernel_blocks, key=str)} bytes")
+                    slabs[(role, dp, rank)] = (None,)
+                    continue
             for index, group in enumerate(groups):
                 want = gheads[role][rank][index] if index < len(totals) else None
                 if want is None or group.get("pattern") != "head-v1" or group.get("global_heads") != want:
@@ -2488,6 +2517,9 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                 # A group of several page sizes (sparse MLA: a latent's and an
                 # indexer's layers) has a slab for each.
                 pages = _group_pages(group)
+                if nixl and split > 1:
+                    pages = [page // split if isinstance(page, int) and page % split == 0 else None
+                             for page in pages]
                 good = all(isinstance(page, int) and page > 0 and page % len(want) == 0 for page in pages)
                 each = tuple(page // len(want) for page in pages) if good else None
                 mine_slabs.append(each[0] if each and len(each) == 1 else each)

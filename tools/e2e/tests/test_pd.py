@@ -60,6 +60,24 @@ class ProfilerConfig(unittest.TestCase):
         for role in ("prefill", "decode"):
             self.assertEqual(self.extra(run, role)["network_profiler"], expected)
 
+    def test_a_profiled_server_gets_the_shutdown_grace_its_recorders_close_in(self):
+        """vLLM kills an engine process at once unless a worker-shutdown grace is set: the profiled
+        servers get one, above two recorders' close deadlines and under the orderly stop's wait."""
+        grace = "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=30"
+        for role in ("prefill", "decode"):
+            command = pd.server_command(self.run_with(profiler=pd.Profiler()), role, ["10.100.0.1"], profile_id="id-1")
+            self.assertIn(grace, command)
+            self.assertNotIn(grace, pd.server_command(self.run_with(), role, ["10.100.0.1"]))
+        self.assertGreater(pd.PROFILER_SHUTDOWN_GRACE_S, 2 * self.extra(
+            self.run_with(profiler=pd.Profiler()), "prefill")["network_profiler"]["shutdown_timeout_s"])
+        import inspect
+        self.assertLess(pd.PROFILER_SHUTDOWN_GRACE_S, inspect.signature(pd.stop_orderly).parameters["timeout"].default)
+        override = self.run_with(profiler=pd.Profiler(), server=pd.Server(
+            connector="nixl", timing="linear", env={"VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": 5}))
+        command = pd.server_command(override, "prefill", ["10.100.0.1"], profile_id="id-1")
+        self.assertEqual([c for c in command if c.startswith("VLLM_WORKER_SHUTDOWN")],
+                         ["VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=5"])
+
     def test_off_leaves_the_connector_configuration_unchanged(self):
         run = self.run_with()
         for role in ("prefill", "decode"):
@@ -3434,6 +3452,96 @@ class HeterogeneousTpTests(unittest.TestCase):
                     lambda entry: entry[:3] + [2] + entry[4:6] + [[entry[6][0], 10, 2]]))
                 self.assertEqual(verdict["problems"], [])
                 self.assertEqual(verdict["hetero_tp"]["max_descriptors"], 10)
+
+    def test_nixl_descriptors_follow_the_kernel_blocks_of_a_split_layout(self) -> None:
+        """A layout that splits each logical block into kernel blocks has NIXL post a
+        descriptor for each: the carried heads' bytes in a kernel block (here half a
+        logical block's, 5 per head), which the regions' registered block length must
+        confirm. The same READs against a layout without the split, or with another
+        registered length, are rejected."""
+        sizes = (2, 4)
+
+        def split_layouts(lengths=lambda page: page // 2, blocks=2):
+            def change(record):
+                layout = record.get("kv_layout")
+                if layout:
+                    page = layout["groups"][0]["real_page_bytes"]
+                    layout["kernel_geometry"] = {"kernel_blocks_per_logical": blocks,
+                                                 "registered_region_block_lengths": [lengths(page)] * 2}
+                return record
+
+            def apply(prefill, decode, ports):
+                for logs in (prefill, decode):
+                    for rank, text in enumerate(logs):
+                        logs[rank] = "".join(json.dumps(change(json.loads(line))) + "\n"
+                                             for line in text.splitlines())
+                return prefill, decode, ports
+            return apply
+
+        def halved(prefill, decode, ports):
+            for rank in range(len(decode)):
+                prefill, decode, ports = self.rewrite("decode", rank, self.each_transfer(
+                    "load", lambda entry: [entry[0] // 2] + entry[1:]))(prefill, decode, ports)
+            return prefill, decode, ports
+
+        def chained(*changes):
+            def apply(prefill, decode, ports):
+                for change in changes:
+                    prefill, decode, ports = change(prefill, decode, ports)
+                return prefill, decode, ports
+            return apply
+
+        def geometry_problems(change):
+            found = self.verdict(*sizes, 8, True, change)["problems"]
+            return [problem for problem in found if "head(s) of" in problem or "registered block lengths" in problem]
+
+        self.assertEqual(geometry_problems(chained(split_layouts(), halved)), [])
+        unsplit = geometry_problems(halved)
+        self.assertTrue(any("not 2 head(s) of 10 bytes each" in problem for problem in unsplit), unsplit)
+        whole = geometry_problems(split_layouts())
+        self.assertTrue(any("not 2 head(s) of 5 bytes each" in problem for problem in whole), whole)
+        wrong = geometry_problems(chained(split_layouts(lambda page: page), halved))
+        self.assertTrue(any("registered block lengths [20]" in problem or "registered block lengths [10]" in problem
+                            for problem in wrong), wrong)
+
+    def test_registered_lengths_cover_every_group_of_a_split_layout(self) -> None:
+        """A layout's registered block lengths describe all its groups' regions: with sliding and full
+        groups of different row lengths (10 and 20 bytes of head slab) split into two kernel rows each,
+        the lengths are the kernel blocks of both groups together. The descriptors' bytes (doubled
+        counts, same bytes) are accepted; a missing group's length, an extra one, and whole-page
+        descriptor bytes are rejected."""
+        groups = [("SlidingWindowSpec", 8, 10), ("FullAttentionSpec", 2, 20)]
+
+        def split(lengths=lambda layout: [g["real_page_bytes"] // 2 for g in layout["groups"]
+                                          for _ in range(g["layers"])], whole=False):
+            def apply(prefill, decode, ports):
+                for logs in (prefill, decode):
+                    for rank, text in enumerate(logs):
+                        records = [json.loads(line) for line in text.splitlines()]
+                        layout = records[0]["kv_layout"]
+                        layout["kernel_geometry"] = {"kernel_blocks_per_logical": 2,
+                                                     "registered_region_block_lengths": lengths(layout)}
+                        for record in records:
+                            for entry in (record.get("kv_transfers") or {}).get("load", {}).get("each", []):
+                                if not whole:
+                                    entry[3] *= 2
+                                    entry[6][1] *= 2
+                                    entry[6][2] *= 2
+                        logs[rank] = "".join(json.dumps(record) + "\n" for record in records)
+                return prefill, decode, ports
+            return apply
+
+        def problems(change):
+            return self.reconcile(2, 4, 8, True, change, groups=groups, global_heads=2)["problems"]
+
+        self.assertEqual(problems(None), [])
+        self.assertEqual(problems(split()), [])
+        only_full = problems(split(lambda layout: [layout["groups"][1]["real_page_bytes"] // 2] * 2))
+        self.assertTrue(any("registered block lengths [10] are not its groups' kernel blocks' [10, 20]" in p for p in only_full), only_full)
+        extra = problems(split(lambda layout: [g["real_page_bytes"] // 2 for g in layout["groups"]] + [7]))
+        self.assertTrue(any("registered block lengths [7, 10, 20] are not its groups' kernel blocks'" in p for p in extra), extra)
+        whole = problems(split(whole=True))
+        self.assertTrue(any("selected descriptors, not" in p for p in whole), whole)
 
     def test_unequal_sizes_need_one_switched_network(self) -> None:
         base = (E2E / "runs" / "example.yaml").read_text()

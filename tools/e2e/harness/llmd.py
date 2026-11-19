@@ -557,7 +557,17 @@ def _pool_ready(metrics: str, instances: int) -> bool:
     return False
 
 
-ENGINE_REQUEST_ID = re.compile(r"^(?:cmpl|chatcmpl)-(?P<id>.+)-\d+-[0-9a-f]+$")
+# vLLM names a completion's engine request cmpl-<id>-<prompt index>-<suffix> and a chat's
+# chatcmpl-<id>-<suffix>: a chat id never loses its last segment as an index.
+ENGINE_REQUEST_ID = re.compile(r"^(?:cmpl-(?P<completion>.+)-\d+|chatcmpl-(?P<chat>.+))-[0-9a-f]+$")
+
+
+def routed_id(request: str) -> str | None:
+    """The id the router gave an engine request (``x-request-id``), None for a name that is not vLLM's."""
+    match = ENGINE_REQUEST_ID.match(request)
+    return match and (match["completion"] or match["chat"])
+
+
 # A request's completion on each side, as the simulator's step logs name it
 # for either connector: the producer released the request's blocks, the
 # consumer has its KV (NIXL's decode read it; Mooncake's prefill wrote it).
@@ -588,8 +598,7 @@ def _engine_requests(texts: list[str]) -> tuple[dict[str, set[str]], dict[str, s
         for record in pd._records(text):
             for kind, value in (record.get("kv_events") or {}).items():
                 for request in value if isinstance(value, (list, dict)) else []:
-                    match = ENGINE_REQUEST_ID.match(str(request))
-                    routed = match["id"] if match else str(request)
+                    routed = routed_id(str(request)) or str(request)
                     kinds.setdefault(kind, set()).add(routed)
                     full.setdefault(routed, set()).add(str(request))
     return kinds, full
@@ -690,7 +699,7 @@ def routing_evidence(output: Path, run: pd.Run) -> dict:
                 others.add(request)
                 continue
             handled.setdefault(request, []).append(record)
-        elif body == PICKED and request:
+        elif body == PICKED and request and record.get("incomingModelName") == pd.MODEL_NAME:
             picks.setdefault(request, []).append(_picked(record))
         elif body == "Selecting endpoints from candidates sorted by max score":
             for scored in record.get("scored-endpoints") or []:
@@ -949,9 +958,9 @@ def precise_index_evidence(directory: Path, named: dict[str, dict], completions:
             for record in pd._records(text):
                 step = record.get("step")
                 for request in (step.get("requests") or []) if isinstance(step, dict) else []:
-                    match = ENGINE_REQUEST_ID.match(str(request.get("req_id")))
-                    if match:
-                        engine.setdefault(match["id"], {}).setdefault(name, (
+                    routed = routed_id(str(request.get("req_id")))
+                    if routed:
+                        engine.setdefault(routed, {}).setdefault(name, (
                             int(request.get("num_prompt_tokens") or 0), int(request.get("num_cached_tokens") or 0)))
     by_address = {address: e["name"] for address, e in named.items()}
     cold = 0
