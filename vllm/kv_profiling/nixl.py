@@ -15,7 +15,7 @@ import os
 import threading
 import weakref
 
-from .config import NetworkProfilerConfig
+from .config import NetworkProfilerConfig, profiler_config
 from .core import open_recorder
 from .peers import PeerClocks
 from .schema import EventKind, Failure, IdSource, Subject, Transport
@@ -122,6 +122,14 @@ class _Profiler:
         self._detached = True
         self.closed = True
         self._record = _discard
+        self._lock = threading.Lock()
+
+    def _before_close(self) -> None:
+        """Runs under the close lock while hooks may still record (default: nothing)."""
+
+    def _extra_summary(self) -> dict:
+        """Adapter fields of ``profiler.json`` (default: none)."""
+        return {}
 
     def _close_helpers(self) -> list:
         """Stop threads and servers; every helper is attempted, failures returned."""
@@ -132,6 +140,7 @@ class _Profiler:
         with self._lock:
             if self.closed:
                 return self.result
+            self._before_close()
             self.closed = True
             self._record = _discard
             failures = self._close_helpers()
@@ -165,6 +174,7 @@ class _Profiler:
                     "backend": self.config.context.get("backend"),
                     "saved": None if self.result is None else self.result.saved,
                     "complete": None if self.result is None else self.result.complete,
+                    **self._extra_summary(),
                 },
             )
 
@@ -524,16 +534,9 @@ class FrontendProfiler(_Profiler):
 
 def _profiler_config(vllm_config, context: dict) -> NetworkProfilerConfig | None:
     kv = vllm_config.kv_transfer_config
-    if kv is None or "network_profiler" not in kv.kv_connector_extra_config:
-        return None
-    values = dict(kv.kv_connector_extra_config["network_profiler"])
-    if values.get("level", "off") == "off":
-        NetworkProfilerConfig.from_extra_config(
-            {"network_profiler": values}
-        )  # validate even when off
-        return None
-    values["context"] = {**values.get("context", {}), **context}
-    return NetworkProfilerConfig.from_extra_config({"network_profiler": values})
+    return profiler_config(
+        None if kv is None else kv.kv_connector_extra_config, context
+    )
 
 
 def capabilities(role: str) -> dict:
@@ -627,10 +630,20 @@ def attach_frontend(vllm_config) -> FrontendProfiler | None:
     config = _profiler_config(vllm_config, {"role": "frontend"})
     if config is None:
         return None
+    kv = vllm_config.kv_transfer_config
+    if kv is not None and kv.kv_connector == "MooncakeConnector":
+        from .mooncake import capabilities as mooncake_capabilities
+
+        caps = mooncake_capabilities("frontend", kv.kv_role, config)
+        config = dataclasses.replace(
+            config, context={**config.context, "connector": "mooncake"}
+        )
+    else:
+        caps = capabilities("frontend")
     context = {
         **config.context,
         "transport": config.transport,
-        "capabilities": capabilities("frontend"),
+        "capabilities": caps,
     }
     config = dataclasses.replace(config, context=context)
     recorder = open_recorder(config)

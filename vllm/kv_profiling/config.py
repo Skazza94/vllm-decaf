@@ -7,6 +7,26 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+LEVELS = ("off", "l1", "l3")
+"""The levels the shared configuration validates."""
+ENABLED_LEVELS = frozenset({"l1", "l3"})
+"""The levels that attach a recorder: ``off`` attaches nothing. A connector asks
+``config.enabled``, never a literal level, so a level added to both sets attaches
+everywhere at once."""
+
+
+def _endpoint(value, name: str) -> tuple[str, int]:
+    """A ``host:port`` endpoint with a nonempty host and a valid port."""
+    if type(value) is not str or value.count(":") < 1:
+        raise ValueError(f"{name} must be host:port")
+    host, _, port = value.rpartition(":")
+    host = host.strip("[]")
+    if not host or any(c.isspace() for c in host):
+        raise ValueError(f"{name} needs a nonempty host")
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError(f"{name} needs a port in 1..65535")
+    return host, int(port)
+
 
 @dataclass(frozen=True)
 class NetworkProfilerConfig:
@@ -27,14 +47,21 @@ class NetworkProfilerConfig:
     clock_end_budget_s: float = 2
     batch_records: int = 256
     shutdown_timeout_s: float = 2
+    clock_bind: str | None = None
+    """Mooncake producer: ``host:port`` its scheduler's clock server binds."""
+    clock_peers: dict[str, str] = field(default_factory=dict)
+    """Mooncake consumer: remote engine ID -> the producer's clock ``host:port``."""
+    inflight_cap: int | None = None
+    """Mooncake: bound on generations open at once (a write batch is one); None is
+    1024 or the handle slots, whichever is smaller."""
     context: dict[str, Any] = field(default_factory=dict)
     probes: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         import math
 
-        if self.level not in ("off", "l1", "l3"):
-            raise ValueError("level must be off, l1 or l3")
+        if self.level not in LEVELS:
+            raise ValueError(f"level must be one of {', '.join(LEVELS)}")
         if self.level == "l3":
             from .endpoint_probes.config import ProbeConfig
 
@@ -88,12 +115,46 @@ class NetworkProfilerConfig:
             raise ValueError("clock_end_budget_s must be finite in (0, 10]")
         if len(json.dumps(self.context).encode()) > 2048:
             raise ValueError("context exceeds 2 KiB")
-        if self.level in ("l1", "l3"):
+        if self.clock_bind is not None:
+            _endpoint(self.clock_bind, "clock_bind")
+        if (
+            type(self.clock_peers) is not dict
+            or len(self.clock_peers) > self.clock_max_peers
+        ):
+            raise ValueError(
+                "clock_peers must be a mapping of at most clock_max_peers engines"
+            )
+        for engine, endpoint in self.clock_peers.items():
+            if type(engine) is not str or not engine:
+                raise ValueError("clock_peers keys must be nonempty engine IDs")
+            _endpoint(endpoint, f"clock_peers[{engine!r}]")
+        if self.inflight_cap is not None and (
+            type(self.inflight_cap) is not int
+            or not 1 <= self.inflight_cap <= self.handle_slots
+        ):
+            raise ValueError("inflight_cap must be an integer in 1..handle_slots")
+        if self.enabled:
             if self.run_id is None or self.output_dir is None:
                 raise ValueError("l1/l3 requires run_id and output_dir")
             UUID(self.run_id)
             if not Path(self.shared_dir).is_absolute():
                 raise ValueError("shared_dir must be absolute")
+
+    @property
+    def effective_inflight_cap(self) -> int:
+        """The bound on open generations (the default stays within the handle slots)."""
+        if self.inflight_cap is not None:
+            return self.inflight_cap
+        return min(1024, self.handle_slots)
+
+    @property
+    def enabled(self) -> bool:
+        """Whether this configuration attaches a recorder (its level is enabled)."""
+        return self.level in ENABLED_LEVELS
+
+    def clock_peer_endpoints(self) -> dict[str, tuple[str, int]]:
+        """The validated ``clock_peers`` as (host, port) pairs."""
+        return {e: _endpoint(v, "clock_peers") for e, v in self.clock_peers.items()}
 
     @classmethod
     def from_extra_config(cls, extra: dict[str, Any]):
@@ -103,3 +164,24 @@ class NetworkProfilerConfig:
         if unknown:
             raise ValueError(f"unknown network_profiler keys: {unknown}")
         return cls(**values)
+
+
+def profiler_config(extra: dict[str, Any] | None, context: dict[str, Any]):
+    """The validated configuration of a connector, or None when it attaches nothing.
+
+    ``extra`` is the connector's ``kv_connector_extra_config``. An absent namespace
+    means off; a present one is validated even when its level is off, and a level
+    that is valid but not enabled attaches nothing. Every connector uses this, so
+    the enabled-level rule lives here once.
+    """
+    if not extra or "network_profiler" not in extra:
+        return None
+    values = extra["network_profiler"]
+    if not isinstance(values, dict):
+        raise ValueError("network_profiler must be a dict")
+    values = dict(values)
+    config = NetworkProfilerConfig.from_extra_config({"network_profiler": values})
+    if not config.enabled:
+        return None
+    values["context"] = {**values.get("context", {}), **context}
+    return NetworkProfilerConfig.from_extra_config({"network_profiler": values})

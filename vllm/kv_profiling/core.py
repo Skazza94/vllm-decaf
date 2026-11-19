@@ -36,7 +36,7 @@ class ProcessRecorder:
     """
 
     def __init__(self, config: NetworkProfilerConfig, *, start_writer=True):
-        if config.level not in ("l1", "l3"):
+        if not config.enabled:
             raise ValueError("use open_recorder for a disabled configuration")
         from vllm import _kv_profiler
 
@@ -168,4 +168,4 @@ class ProcessRecorder:
 
 def open_recorder(config: NetworkProfilerConfig):
     """The off path imports no native extension and starts no helper."""
-    return None if config.level == "off" else ProcessRecorder(config)
+    return ProcessRecorder(config) if config.enabled else None

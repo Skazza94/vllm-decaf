@@ -263,8 +263,10 @@ itself guarantee that the recorders close.
 
 ## Endpoint observations at L3
 
-L3 includes the L1 NIXL pull instrumentation and declares an external observer.
-It is off by default. L2 and eBPF are not implemented. Sampling, JSON formatting
+L3 includes the L1 connector instrumentation (NIXL pull and the Mooncake
+adapter below) and declares an external observer. It is off by default. Transport
+metrics come from the separate L2 collector (below); eBPF probes are not part of
+this level yet. Sampling, JSON formatting
 and kernel queries run in a separate endpoint process, never in a transfer
 callback. The native L1 ring ABI and transfer metrics are unchanged.
 
@@ -429,3 +431,121 @@ root. Other drivers without an exposed backing path are refused explicitly.
 Procfs process-root magic links are not used as Docker bind sources. The helper
 uses `docker create` then `docker start`, records the created container ID and
 cleans up that ID even if startup fails; it never removes a name collision.
+
+## Mooncake adapter (L1)
+
+The same `network_profiler` namespace in the Mooncake connector's
+`kv_connector_extra_config` enables it, on the prefill (producer) and decode
+(consumer) instances with one run ID. The enabled-level rule is the shared
+configuration's (`NetworkProfilerConfig.enabled`), never a literal level in the
+connector: an absent namespace or `off` attaches nothing (no recorder, helper or
+clock thread), an invalid one is refused when the connector is built.
+
+Mooncake's producer writes KV into the consumer, so the unit is a **write batch**:
+the requests one pull found ready for one consumer rank. Each batch has its own
+generation, in the frame that owns it (`send_kv_to_decode`), and the sequence is
+
+```
+transfer_bind -> prepared -> post_begin -> post_return
+    -> complete_observed | failed -> batch_member / request failures -> transfer_retire
+```
+
+`transfer_bind` is preparation (peer: the consumer's `host:port`; subject: its TP
+rank; `aux0`: the members). `prepared` is the executor thread picking the batch up
+(queue time), `post_begin` and `post_return` bracket the synchronous
+`batch_transfer_sync_write` call, and `complete_observed` carries the connector's
+own totals (bytes and descriptors posted) and its own timer around the call
+(`duration0_ns`, read as `mooncake_write_duration_ns`; an observation interval, not
+engine telemetry, and never rendered under a NIXL name). There is no asynchronous
+in-flight interval for a blocking write. A write that returns non-zero, raises or is
+cancelled has a `failed` (never a fabricated `post_return`); a batch that moves
+nothing (a replica of a replicated producer) has a `complete_observed` with explicit
+zero bytes and descriptors and status 2, and a batch whose every member was rejected
+a transfer-scoped `failed`; neither has `post_begin`/`post_return`. `transfer_retire`
+runs in the batch's `finally`, once, after every record that needs the generation.
+Each member's outcome is a `request_bind` row with subject `batch_member` (its
+`transfer` is the batch; it is not a request occurrence), a rejected member also a
+request-scoped `failed`. A member is never attributed bytes of its own: descriptors
+are the batch's.
+
+Request-scoped events outside a batch: the producer answering a pull with an error or
+for an expired lease, the readiness timeout (`ready_timeout`, a missing producer, not
+a transport failure; recorded before the response is sent), the producer worker's
+pairing of its request with the shared transfer ID (`request_bind`, subject
+`handoff_identity`, never a canonical handoff), the lease expiry, and
+`senders_done`. The scheduler records the producer's handoff (after the checks that
+make the request deferred; a decode request cancelled before its pull is not one) and
+the consumer's, joined by the shared transfer ID, `request_bound`, the aggregation of
+finished receives (`recv_finished_all`; not proof of success, a failed request also
+reports finished, status 1 when its failure was reported by request) and the release
+permission. The consumer's worker records the bootstrap query (`handshake_begin`/
+`handshake_end`), each request's rank-local receive completion only when every peer
+answered and none failed (the failure flag is sticky: a later peer's success does not
+heal an earlier peer's failure), and `failed(receive_failed)`. A recovered
+`LAYOUT_MISS` retry is not observed; only a terminal failure is.
+
+The adapter keeps a bounded registry of open generations (`inflight_cap`). If the
+profiler closes while a generation is open it records `failed(interrupted)` and the
+retire for it first, and marks the capture **incomplete observation** in
+`profiler.json` (`observation_complete: false`, `interrupted_generations`) even when
+no record was dropped; a later call for that generation records nothing, so a late
+success cannot turn an interrupted observation into a complete one. An overflow of the
+registry (`inflight_overflow`) is the same. The offline reader reports such a capture
+with `loss: true` and names the interruption (`failure_class:
+observation_interrupted`), distinct from a connector-reported failure. Closing does
+not wait for a transfer and serving shutdown is unchanged.
+
+Clocks: the producer's scheduler binds an explicit `clock_bind` (`host:port`) and the
+consumer's maps each remote engine ID to the producer's advertised clock endpoint in
+`clock_peers`; no wire message changes and no side-channel offset is added. A peer
+without a mapping stays unaligned and is listed in `profiler.json`
+(`clock.unmapped_engines`). Capabilities are by process role and KV role
+(`capabilities` in the metadata): a worker or scheduler without the producer role does
+not claim write batches or handoff blocks.
+
+## Transport metrics collector (L2)
+
+`python <vllm>/kv_profiling/collector.py --run-id <UUID> --output-dir <dir> --manifest
+<targets.json>` (the file's path in the source tree or the installed package; it
+imports nothing outside the standard library, so it runs without Torch or the rest of
+vLLM, and `python -m vllm.kv_profiling.collector` is not the supported form because it
+imports the whole `vllm` package first) scrapes each target's Prometheus endpoint (TENT's `/metrics`) from
+outside the serving processes, with the standard library only, and writes
+`<dir>/<run id>/<process id>/events.jsonl` and `profiler.json`. Two record kinds are
+reserved for collector JSONL (native recorder kinds, its ABI and the endpoint-probe
+kinds 22-24 are unchanged): 25 `transport_metrics` (by `transport`: bytes written and
+read, write and read request counts, the registered-buffer gauge) and 26
+`transport_metrics_failures` (transport attempts and attempt failures by `transport`
+and `operation`, task failures by `transport` and `reason`). They are different label
+partitions of the source: every record carries its own `labels` and typed `fields`
+with units, a field the page did not serve is `null` and listed in `missing`
+(unavailable, never zero), and no transport-wide value is copied into another
+partition. The two kinds of one scrape share the sample ID, the target (engine ID,
+role, rank, endpoint, process ID and pid where the manifest gives them), the reset
+generation and the scrape's begin and end; every record has its own sequence. A page
+that fails or parses incompletely gives missing rows for that half only, with
+`partial: true` and the reason; a counter that decreases is a discontinuity and starts
+a new reset generation (not a claim that the engine restarted).
+
+Bounds are fixed and validated: response bytes, series examined, labels and label
+size, targets, retained output bytes (records past the cap are dropped and counted
+as loss, the terminal record always lands), the counter history kept between scrapes
+(`max_history` series, least recently seen out first: a series seen again after an
+eviction has `baseline: "unavailable"` and the capture says `history_evicted`), a total
+deadline per scrape that covers connecting, the headers and every piece of the body
+(a peer sending a byte at a time cannot extend it), the startup budget and the
+shutdown budget. The shutdown budget starts when stop is seen and covers a scrape in
+progress and the final pass together. All records of one sample, of both kinds,
+carry one reset generation; a discontinuity in any series moves it once, and each
+record keeps its own `discontinuity` flag. In a trace each target, label set and
+reset generation is its own counter track (numeric fields only), with the sample's
+identity and completeness on an instant event beside it.
+Endpoints are IP literals: a hostname makes the target unavailable with that reason, because a name lookup cannot be interrupted and would leave work behind every scrape. A target without an explicit endpoint is resolved from its own recorded
+configuration (`MC_TENT_CONF`, nested `metrics/http_port` before the flat key, then
+`TENT_METRICS_HTTP_PORT`, then the default), never from the collector's environment;
+unreadable or ambiguous ownership makes the target unavailable with a reason. The
+collector takes an initial scrape at start and, on SIGTERM or a stop file, one final
+scrape before it exits, so the orchestrator must stop it after the workload and
+before the engine's metrics server goes away; the terminal record says whether every
+scrape was complete (exit status 3 when it was not). Its CPU and the target's
+`/metrics` cost are measured, not assumed zero.

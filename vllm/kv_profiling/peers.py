@@ -23,8 +23,14 @@ PEER_ABANDONED = "abandoned"
 
 
 class PeerClocks:
-    def __init__(self, config, run_id: str, local_generation: str):
+    def __init__(
+        self, config, run_id: str, local_generation: str, *, offset: int | None = None
+    ):
+        """``offset`` is added to an admitted peer's port: the NIXL side-channel port
+        plus ``clock_port_offset`` by default; 0 for peers admitted by their own
+        explicit clock endpoint (Mooncake's ``clock_peers``)."""
         self.config = config
+        self.offset = config.clock_port_offset if offset is None else offset
         self.run_id = run_id
         self.local_generation = local_generation
         cap = self.cap = config.clock_max_peers
@@ -74,7 +80,7 @@ class PeerClocks:
                 time.sleep(0.1)
 
     def _address(self, index: int) -> tuple[str, int]:
-        return self.host[index], self.port[index] + self.config.clock_port_offset
+        return self.host[index], self.port[index] + self.offset
 
     def _measure(self, index: int) -> None:
         entry = {"engine_id": self.engine[index], "address": None}

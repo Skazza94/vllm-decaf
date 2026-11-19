@@ -75,6 +75,12 @@ class Subject(IntEnum):
     PARENT_TO_ITEM = 3
     EXTERNAL_TO_ENGINE = 4
     CHILD_TO_PARENT_ENGINE = 5
+    # Mooncake REQUEST_BIND edges: a request that is a member of a write batch
+    # (the row's ``transfer`` is the batch; never a request occurrence of its
+    # own), and the producer worker's pairing of its request with the shared
+    # transfer ID (not a canonical handoff row).
+    BATCH_MEMBER = 6
+    HANDOFF_IDENTITY = 7
 
 
 class Failure(IntEnum):
@@ -91,6 +97,34 @@ class Failure(IntEnum):
     LEASE_EXPIRED = 9
     LATE_NOTIFICATION = 10
     CLOCK_PEER_TABLE_FULL = 11
+    # The observation stopped (profiler closing) while the generation was live:
+    # not a connector-reported transport result.
+    INTERRUPTED = 12
+    # A request's KV was not ready on the producer before the timeout.
+    READY_TIMEOUT = 13
+    # A batch member rejected before any write (layout or block-count error).
+    MEMBER_REJECTED = 14
+    # A consumer's remote KV load failed.
+    RECEIVE_FAILED = 15
+    # The sender coroutine or executor call raised or was cancelled.
+    SEND_EXCEPTION = 16
+
+
+class CollectorKind(IntEnum):
+    """JSONL record kinds written only by the out-of-process collector.
+
+    Never emitted by the native recorder, whose kinds end at ``TRANSFER_RETIRE``
+    and whose ABI is unchanged. 22-24 belong to the endpoint-probe records.
+    """
+
+    TRANSPORT_METRICS = 25
+    TRANSPORT_METRICS_FAILURES = 26
+
+
+COLLECTOR_KIND_NAMES = {
+    CollectorKind.TRANSPORT_METRICS: "transport_metrics",
+    CollectorKind.TRANSPORT_METRICS_FAILURES: "transport_metrics_failures",
+}
 
 
 class IdSource(IntEnum):
