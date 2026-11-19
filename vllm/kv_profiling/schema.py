@@ -47,6 +47,8 @@ class Transport(IntEnum):
     MIXED = 3
 
 
+# TRANSFER_BIND's first value word is the NIXL worker's post pass (``post_pass``):
+# decode_record renames it and leaves ``bytes`` unset; other kinds keep these names.
 VALUE_NAMES = (
     "bytes",
     "selected_descriptors",
@@ -108,6 +110,9 @@ class Failure(IntEnum):
     RECEIVE_FAILED = 15
     # The sender coroutine or executor call raised or was cancelled.
     SEND_EXCEPTION = 16
+    # A prepared READ (a mixed-memory leg) that was never posted: an earlier leg's
+    # preparation or post failed, so it was released unused. Not a transport failure.
+    TRANSFER_NOT_POSTED = 17
 
 
 class CollectorKind(IntEnum):
@@ -167,7 +172,7 @@ def decode_record(raw: bytes) -> dict[str, Any]:
         }
     transport = Transport((w[2] >> 24) & 255).name.lower()
     flags = w[2] & 0xFFFF
-    return {
+    row = {
         **base,
         "type": "event",
         "kind": kind.name.lower(),
@@ -191,6 +196,11 @@ def decode_record(raw: bytes) -> dict[str, Any]:
             for i, name in enumerate(VALUE_NAMES)
         },
     }
+    if kind == EventKind.TRANSFER_BIND:
+        # TRANSFER_BIND carries no byte count (bytes belong to the completion): its
+        # first value word is the NIXL worker's post pass, never payload accounting.
+        row["post_pass"], row["bytes"] = row["bytes"], None
+    return row
 
 
 class DictionaryDecoder:

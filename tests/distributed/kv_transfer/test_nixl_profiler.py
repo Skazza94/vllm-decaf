@@ -246,6 +246,220 @@ def test_the_worker_hooks_write_the_expected_records(tmp_path):
     assert failures[2]["transfer"] == failed_bind["transfer"] != bind["transfer"]
 
 
+def test_reads_posted_in_one_pass_share_the_post_pass_and_a_new_pass_changes_it(
+    tmp_path,
+):
+    p = profiler(tmp_path)
+    first, second, third = handle(0x3100), handle(0x3200), handle(0x3300)
+    p.load_pass()
+    p.read_context("r1", "p1", "engine-P", 0)
+    p.transfer_prepared(first, 0, 1, 4)
+    p.read_context("r2", "p2", "engine-P", 1)
+    p.transfer_prepared(second, 2, 0, 6)
+    p.transfer_prepared(third, 1, 0, 8)  # a second leg of the same request, same pass
+    p.load_pass()  # a pass that posts nothing records nothing
+    p.load_pass()
+    fourth = handle(0x3400)
+    p.read_context("r3", "p3", "engine-P", 0)
+    p.transfer_prepared(fourth, 0, 1, 5)
+    meta, events, _ = read(p)
+    binds = [e for e in events if e["kind"] == "transfer_bind"]
+    assert [e["post_pass"] for e in binds] == [1, 1, 1, 3]
+    # The word is the pass, never bytes; no other record carries it.
+    assert all(e["bytes"] is None for e in binds)
+    assert [e["selected_descriptors"] for e in binds] == [4, 6, 8, 5]
+    assert all("post_pass" not in e for e in events if e["kind"] != "transfer_bind")
+    assert meta["capabilities"]["post_pass"] is True
+
+
+def _pass_read(p, number, request, native_handle, selected, *, done=True, leg=0):
+    """One read of pass ``number`` through the adapter's own hooks (after a ``load_pass`` for each new pass)."""
+    p.read_context(request, f"{request}-p", "engine-P", 0)
+    p.transfer_prepared(native_handle, leg, 1, selected)
+    p.transfer_posted(native_handle)
+    if done:
+        p.transfer_done(native_handle, None)
+
+
+def test_a_hook_error_that_hides_a_whole_member_never_leaves_an_exact_group(tmp_path):
+    """With the real adapter and recorder: the second read of the last pass hits an error in its bind hook, which
+    disables recording without any ring drop. The recorder still closes complete; the group must not be exact."""
+    from vllm.kv_profiling.summary import summarize
+
+    def run(directory, *, fail):
+        directory.mkdir()
+        p = profiler(directory)
+        p.load_pass()
+        _pass_read(p, 1, "r1", handle(0x4100), 4)
+        p.load_pass()
+        _pass_read(p, 2, "r2", handle(0x4200), 5)
+        p.read_context("r3", "r3-p", "engine-P", 0)
+        p.transfer_prepared(handle(0x4300), "not-an-int" if fail else 0, 1, 6)
+        p.transfer_posted(handle(0x4300))
+        p.transfer_done(handle(0x4300), None)
+        read(p)
+        return p, summarize([p.output_dir])
+
+    clean, clean_summary = run(tmp_path / "clean", fail=False)
+    assert [g["completeness"] for g in clean_summary["post_groups"]] == [
+        "exact",
+        "exact",
+    ]
+    assert clean_summary["post_groups"][1]["reads"] == 2
+    broken, summary = run(tmp_path / "broken", fail=True)
+    document = json.loads((broken.output_dir / "profiler.json").read_text())
+    assert document["hook_errors"] == 1 and document["complete"] is True
+    assert not any(p["kind"] == "capture_loss" for p in summary["problems"]), (
+        "the recorder saw no loss"
+    )
+    assert any(p["kind"] == "adapter_unhealthy" for p in summary["problems"])
+    two = summary["post_groups"][1]
+    assert two["completeness"] == "observed_only" and two["reads"] == 1
+    assert two["selected_descriptors"] is None and two["bytes"] is None
+    assert any("hook error" in r for r in two["reasons"])
+
+
+def test_a_graceful_close_during_an_unfinished_pass_is_observed_only_through_the_real_adapter(
+    tmp_path,
+):
+    from vllm.kv_profiling.summary import summarize
+
+    p = profiler(tmp_path)
+    p.load_pass()
+    _pass_read(p, 1, "r1", handle(0x4100), 4)
+    p.load_pass()
+    _pass_read(
+        p, 2, "r2", handle(0x4200), 5, done=False
+    )  # posted, then the process closes the profiler
+    read(p)
+    summary = summarize([p.output_dir])
+    one, two = summary["post_groups"]
+    assert one["completeness"] == "exact"
+    assert two["completeness"] == "observed_only" and two["bytes"] is None
+    assert any("posting ended" in r for r in two["reasons"])
+
+
+class _FakeNixl:
+    """The NIXL wrapper's surface the mixed-memory read path uses, with a scripted failure."""
+
+    def __init__(self, handles, fail_post_at=None, fail_prepare_at=None):
+        self.handles, self.fail_post_at, self.fail_prepare_at = (
+            handles,
+            fail_post_at,
+            fail_prepare_at,
+        )
+        self.prepared, self.released = 0, []
+
+    def make_prepped_xfer(self, *args, **kwargs):
+        if self.prepared == self.fail_prepare_at:
+            raise RuntimeError("prepare failed")
+        self.prepared += 1
+        return self.handles[self.prepared - 1]
+
+    def transfer(self, native_handle):
+        if self.handles.index(native_handle) == self.fail_post_at:
+            raise RuntimeError("post failed")
+
+    def release_xfer_handle(self, native_handle):
+        self.released.append(native_handle)
+
+
+def _mixed_read(tmp_path, **failure):
+    """The connector's own ``_read_blocks_mixed`` (and ``_try_release_xfer_handle``), executed on a stand-in worker with a
+    scripted NIXL failure, then a clean second pass so the first is known to have ended; returns the profiler and its summary."""
+    import types
+    from collections import defaultdict
+
+    import numpy as np
+    import pytest
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
+        NixlBaseConnectorWorker,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_worker import (
+        NixlPullConnectorWorker,
+    )
+    from vllm.kv_profiling.summary import summarize
+
+    p = profiler(tmp_path)
+    handles = [handle(0x4500), handle(0x4600)]
+    worker = types.SimpleNamespace(
+        _desc_is_dram_by_block_size={128: np.array([True, False])},
+        _desc_pos_by_block_size={128: np.array([0, 1])},
+        _skip_dram_xfer=False,
+        _recving_transfers=defaultdict(list),
+        _pending_recv_notifs={},
+        nixl_wrapper=_FakeNixl(handles, **failure),
+        _kvp=p,
+    )
+    worker._try_release_xfer_handle = types.MethodType(
+        NixlBaseConnectorWorker._try_release_xfer_handle, worker
+    )
+    p.load_pass()
+    p.read_context("r1", "r1-p", "engine-P", 0)
+    with pytest.raises(RuntimeError):
+        NixlPullConnectorWorker._read_blocks_mixed(
+            worker, "r1", 128, "device", "dram", "remote",
+            np.array([0, 1]), np.array([0, 1]), "agent", b"notif",
+        )  # fmt: skip
+    if failure.get("fail_prepare_at") is None and failure.get("fail_post_at") != 0:
+        p.transfer_done(handles[0], None)  # the first leg was posted and completes
+    p.load_pass()
+    _pass_read(p, 2, "r2", handle(0x4700), 9)
+    _, events, _ = read(p)
+    return worker, events, summarize([p.output_dir])
+
+
+def test_a_first_leg_whose_post_raises_fails_and_the_leg_after_it_is_unposted(tmp_path):
+    worker, events, summary = _mixed_read(tmp_path, fail_post_at=0)
+    failed = [(e["status"], e["transfer"]) for e in events if e["kind"] == "failed"]
+    binds = [e["transfer"] for e in events if e["kind"] == "transfer_bind"][:2]
+    assert failed == [
+        (int(Failure.TRANSFER_FAILED), binds[0]),
+        (int(Failure.TRANSFER_NOT_POSTED), binds[1]),
+    ]
+    assert len(worker.nixl_wrapper.released) == 2, (
+        "both legs were released after their outcome"
+    )
+    one = summary["post_groups"][0]
+    assert one["outcomes"]["submission_failed"] == 1 and one["outcomes"]["unused"] == 1
+    assert one["outcomes"]["incomplete"] == 0 and one["completeness"] == "exact"
+    assert [(m["leg"], m["posted"]) for m in one["members"]] == [
+        ("dram", False),
+        ("device", False),
+    ]
+
+
+def test_a_second_leg_whose_post_raises_fails_while_the_first_completes(tmp_path):
+    worker, events, summary = _mixed_read(tmp_path, fail_post_at=1)
+    one = summary["post_groups"][0]
+    assert one["outcomes"] == {
+        "completed": 1, "failed": 1, "unused": 0, "submission_failed": 1, "incomplete": 0, "not_posted": 1,
+    }  # fmt: skip
+    assert [m["state"] for m in one["members"]] == ["completed", "failed"]
+    assert one["completeness"] == "exact"
+
+
+def test_a_preparation_failure_leaves_the_earlier_leg_recorded_as_unused(tmp_path):
+    worker, events, summary = _mixed_read(tmp_path, fail_prepare_at=1)
+    one = summary["post_groups"][0]
+    assert (
+        one["reads"] == 1
+        and one["outcomes"]["unused"] == 1
+        and one["outcomes"]["incomplete"] == 0
+    )
+    assert one["members"][0]["failure"] == "TRANSFER_NOT_POSTED"
+    assert one["completeness"] == "exact"
+
+
+def test_the_pass_capability_is_a_worker_capability():
+    from vllm.kv_profiling.nixl import capabilities
+
+    assert capabilities("worker")["post_pass"] is True
+    assert capabilities("scheduler")["post_pass"] is False
+    assert capabilities("frontend")["post_pass"] is False
+
+
 def test_a_reused_handle_gets_a_new_generation(tmp_path):
     p = profiler(tmp_path)
     p.read_context("r1", "q1", "engine-P", 0)

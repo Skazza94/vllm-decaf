@@ -146,7 +146,12 @@ def _semantics(row, meta=None):
     if kind == "handshake_end":
         return {"remote_pp_rank": aux0}
     if kind == "transfer_bind":
-        return {"leg": {0: "single", 1: "device", 2: "dram"}.get(aux0), "notif": aux1}
+        # The pass is the post group's key; it is never a byte count.
+        return {
+            "leg": {0: "single", 1: "device", 2: "dram"}.get(aux0),
+            "notif": aux1,
+            "post_pass": row.get("post_pass"),
+        }
     if kind == "handoff":
         return {"registration_generation": aux0, "handoff_blocks": aux1}
     if kind == "notify_observed":
@@ -176,7 +181,14 @@ def _mooncake_semantics(row):
             "posted_descriptors": row["selected_descriptors"],
         }
     if kind == "request_bind" and subject == int(Subject.BATCH_MEMBER):
-        return {"batch_member": True, "member_ok": status == 0}
+        # The member's share of the batch as built (posted if the write succeeded,
+        # planned if it failed); absent when the build had not finished.
+        return {
+            "batch_member": True,
+            "member_ok": status == 0,
+            "member_bytes": row["bytes"],
+            "member_descriptors": row["selected_descriptors"],
+        }
     if kind == "request_bind" and subject == int(Subject.HANDOFF_IDENTITY):
         return {"handoff_identity": True}
     if kind == "handoff":

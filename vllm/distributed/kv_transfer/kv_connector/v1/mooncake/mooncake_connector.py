@@ -2097,6 +2097,7 @@ class MooncakeConnectorWorker:
                     )
 
             batch = None
+            shares = None
             if (p := self._kvp) is not None and ready_reqs:
                 batch = p.batch_bind(
                     f"{meta.remote_hostname}:{meta.remote_port}",
@@ -2115,8 +2116,13 @@ class MooncakeConnectorWorker:
                     meta,
                     local_regions,
                     remote_regions,
+                    observe=batch is not None,
                 )
                 plan = self._sender_plan
+                # Taken before anything awaits: never read another batch's build.
+                spans, self._sender_spans = getattr(self, "_sender_spans", None), None
+                if batch is not None and spans is not None:
+                    shares = p.member_shares(spans, lengths)
                 err_req_set = set(err_reqs)
                 rejected = set(err_reqs) if batch is not None else ()
                 ok_ready_reqs = [
@@ -2183,6 +2189,7 @@ class MooncakeConnectorWorker:
                             d_req_id,
                             send_meta.transfer_id,
                             d_req_id not in err_req_set,
+                            None if shares is None else shares.get(d_req_id),
                         )
                         if d_req_id in err_req_set:
                             p.member_failed(
@@ -2215,7 +2222,14 @@ class MooncakeConnectorWorker:
                     p.batch_exception(
                         batch,
                         isinstance(exc, asyncio.CancelledError),
-                        [(d_req, sent.transfer_id) for d_req, sent in ready_reqs],
+                        [
+                            (
+                                d_req,
+                                sent.transfer_id,
+                                None if shares is None else shares.get(d_req),
+                            )
+                            for d_req, sent in ready_reqs
+                        ],
                     )
                 raise
             finally:
@@ -2274,10 +2288,17 @@ class MooncakeConnectorWorker:
         agent_meta: MooncakeXferMetadata,
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
+        observe: bool | None = None,
     ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
         src_ptrs = []
         dst_ptrs = []
         lengths = []
+        # Reset per build: a build that raises never leaves an earlier batch's spans.
+        self._sender_spans = None
+        # Where each request's descriptors start in the flat lists (observed only).
+        if observe is None:
+            observe = self._kvp is not None
+        starts: list[tuple[ReqId, int]] | None = [] if observe else None
         # Each region's plan (sends, source and destination offsets, length).
         plans: set[tuple[bool, int, int, int]] = set()
         err_reqs: list[ReqId] = []
@@ -2285,6 +2306,8 @@ class MooncakeConnectorWorker:
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
 
         for d_req_id, send_meta in ready_reqs:
+            if starts is not None:
+                starts.append((d_req_id, len(lengths)))
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
 
             if not remote_block_ids_per_group or all(
@@ -2481,6 +2504,12 @@ class MooncakeConnectorWorker:
         # Read by the caller right after this returns (one event loop: no
         # other response's coroutine runs in between).
         self._sender_plan = [list(p) for p in sorted(plans)]
+        if starts is not None:
+            # (decode request, first, end): a partition of the flat lists.
+            ends = [first for _, first in starts[1:]] + [len(lengths)]
+            self._sender_spans = [
+                (d_req_id, first, end) for (d_req_id, first), end in zip(starts, ends)
+            ]
         return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
 
     def _bind_sender_thread_device(self) -> None:

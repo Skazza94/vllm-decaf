@@ -25,6 +25,7 @@ from .schema import Failure, Subject
 # The loader yields kind names as lower-case strings (the JSONL rows); these
 # sets are checked against schema.EventKind in the tests.
 _PREPARED = frozenset(("transfer_bind", "prepared"))
+_POST_BEGIN = frozenset(("post_begin",))
 _POST_RETURN = frozenset(("post_return",))
 _COMPLETE = frozenset(("complete_observed",))
 _RETIRE = "transfer_retire"
@@ -58,6 +59,12 @@ _CLEANUP_CODES = frozenset(
         Failure.TRANSFER_RELEASE_FAILED.name,
     )
 )
+
+
+def _is_member(row):
+    """A Mooncake write-batch member row: an association of a request with a batch,
+    never a request occurrence of its own."""
+    return row["kind"] == "request_bind" and row["subject"] == Subject.BATCH_MEMBER
 
 
 def _percentiles(samples):
@@ -153,19 +160,66 @@ class _Source:
         self.transfers = []
         self.requests = []
         self.handshakes = []
+        self.members = {}
+        self.write_batches = []
+        self.post_groups = []
+        self.view_unavailable = []
+        self.mooncake = self.context.get("connector") == "mooncake"
+        self.health = self._adapter_health()
         self._classify()
 
     def _classify(self):
         buckets = self._transfer_rows()
         for transfer, rows in sorted(buckets.items()):
             self.transfers.append(self._build_transfer(transfer, rows))
+        self._collect_members()
         self._classify_handshakes()
         self._assign_request_occurrences()
         self._classify_requests()
         self._attach_handshakes_to_transfers()
+        self._build_write_batches()
+        self._build_post_groups()
         for row in self.events:
             if id(row) not in self.classified and row["kind"] != "model_step":
                 self.unclassified += 1
+
+    def _adapter_health(self):
+        """Why the adapter's observation cannot be taken as complete: the capture's
+        ``profiler.json`` (a hook error disables recording without any ring drop, so
+        the sink's own end record cannot show it). Empty means healthy; a missing or
+        unreadable file is unknown, which is not healthy."""
+        path = Path(self.capture["path"]).parent / "profiler.json"
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return ["adapter health unknown: profiler.json missing or unreadable"]
+        reasons = []
+        if doc.get("hook_errors"):
+            reasons.append(
+                f"{doc['hook_errors']} hook error(s) disabled recording "
+                f"({doc.get('first_error')})"
+            )
+        if doc.get("shutdown_failures"):
+            reasons.append(f"shutdown failures: {doc['shutdown_failures']}")
+        if doc.get("saved") is not True or doc.get("complete") is not True:
+            reasons.append("the recorder did not report a saved, complete capture")
+        if doc.get("observation_complete") is False:
+            reasons.append("the adapter reports an incomplete observation")
+        for key in (
+            "interrupted_generations",
+            "inflight_overflow",
+            "unbound_batches",
+            "late_hooks",
+        ):
+            if doc.get(key):
+                reasons.append(f"{key} = {doc[key]}")
+        return reasons
+
+    def _collect_members(self):
+        """Members of each write batch by batch generation, in recorded order."""
+        for row in sorted(self.events, key=lambda row: row["sequence"]):
+            if _is_member(row):
+                self.members.setdefault(row["transfer"], []).append(row)
 
     def _assign_request_occurrences(self):
         """Give every transfer its request occurrence, from recorded order.
@@ -176,7 +230,11 @@ class _Source:
         """
         binds = {}
         for row in self.events:
-            if row["kind"] == "request_bind" and row["request_ref"]:
+            if (
+                row["kind"] == "request_bind"
+                and row["request_ref"]
+                and not _is_member(row)
+            ):
                 binds.setdefault(row["request_ref"], []).append(row)
         self.occurrence_counts = {
             raw: len(rows) for raw, rows in binds.items()
@@ -219,7 +277,8 @@ class _Source:
                 self.classified.add(id(row))
                 continue
             is_transfer_event = (
-                row["kind"] in _POST_RETURN
+                row["kind"] in _POST_BEGIN
+                or row["kind"] in _POST_RETURN
                 or row["kind"] == _RETIRE
                 or (row["kind"] in _COMPLETE
                     and row["subject"] == Subject.WORKER)
@@ -248,10 +307,19 @@ class _Source:
         return buckets
 
     def _build_transfer(self, transfer, rows):
-        prepared = post_return = complete = failed = retire = None
+        prepared = post_begin = pickup = post_return = None
+        complete = failed = retire = None
         for row in rows:
             kind = row["kind"]
-            if kind in _PREPARED:
+            if kind == "prepared":
+                # Mooncake: the executor thread picked the batch up (queue time), not a
+                # second bind.
+                if pickup is None:
+                    pickup = row
+            elif kind in _POST_BEGIN:
+                if post_begin is None:
+                    post_begin = row
+            elif kind in _PREPARED:
                 if prepared is None:
                     prepared = row
                 else:
@@ -288,7 +356,7 @@ class _Source:
                 )
         elif failed is not None:
             state = "failed"
-        leg = prepared["aux0"] if prepared else None
+        leg = None if self.mooncake or not prepared else prepared["aux0"]
         entry = {
             "source": self.index,
             "process_id": self.meta["process_id"],
@@ -315,6 +383,21 @@ class _Source:
             "nixl_xfer_us": None if complete is None else complete["aux1"],
             "prepared_time_ns": prepared["time_ns"] if prepared else None,
             "prepared_sequence": prepared["sequence"] if prepared else None,
+            "post_pass": prepared.get("post_pass") if prepared else None,
+            "declared_members": (
+                prepared["aux0"] if prepared and self.mooncake else None
+            ),
+            "executor_pickup_time_ns": pickup["time_ns"] if pickup else None,
+            "post_begin_time_ns": post_begin["time_ns"] if post_begin else None,
+            "posted_bytes": post_begin["bytes"] if post_begin else None,
+            "posted_descriptors": (
+                post_begin["selected_descriptors"] if post_begin else None
+            ),
+            "complete_status": complete["status"] if complete else None,
+            "complete_bytes_word": complete["bytes"] if complete else None,
+            "complete_descriptors_word": (
+                complete["selected_descriptors"] if complete else None
+            ),
             "posted_time_ns": post_return["time_ns"] if post_return else None,
             "completed_time_ns": complete["time_ns"] if complete else None,
             "failed_time_ns": failed["time_ns"] if failed else None,
@@ -493,7 +576,8 @@ class _Source:
 
     def _build_request(self, request, raw, rows):
         binds = [
-            row for row in rows if row["kind"] == "request_bind"
+            row for row in rows
+            if row["kind"] == "request_bind" and not _is_member(row)
         ]
         occurrences = [rows]
         if len(binds) > 1:
@@ -503,17 +587,404 @@ class _Source:
             current = []
             seen_binds = 0
             for row in ordered:
-                if row["kind"] == "request_bind" and seen_binds:
+                is_bind = row["kind"] == "request_bind" and not _is_member(row)
+                if is_bind and seen_binds:
                     occurrences.append(current)
                     current = []
                 current.append(row)
-                if row["kind"] == "request_bind":
+                if is_bind:
                     seen_binds += 1
             occurrences.append(current)
         for index, occurrence in enumerate(occurrences):
             self._build_request_occurrence(
                 request, raw, index, len(occurrences), occurrence,
                 len(occurrences) > 1,
+            )
+
+    def _batch_write(self, batch):
+        """How a write batch ended: written, no_data, failed or incomplete."""
+        if batch is None:
+            return None
+        if batch["state"] == "completed":
+            return "no_data" if batch["complete_status"] == 2 else "written"
+        return "failed" if batch["state"] == "failed" else "incomplete"
+
+    def _membership(self, rows):
+        """A request's write-batch memberships (Mooncake).
+
+        Associations, never request occurrences; the posted totals (members of
+        batches whose write succeeded) are kept apart from the planned-but-
+        unconfirmed ones (a failed or unfinished write) and from members whose
+        share is unknown.
+        """
+        if not rows:
+            return {}
+        by_handle = {item["transfer"]: item for item in self.transfers}
+        batches = []
+        posted_bytes = posted_descriptors = 0
+        planned_bytes = planned_descriptors = 0
+        unknown = 0
+        for row in rows:
+            batch = by_handle.get(row["transfer"])
+            write = self._batch_write(batch)
+            known = row["bytes"] is not None and row["selected_descriptors"] is not None
+            basis = (
+                "unknown"
+                if not known
+                else "posted"
+                if write in ("written", "no_data")
+                else "planned"
+            )
+            batches.append(
+                {
+                    "batch": row["transfer"],
+                    "ok": row["status"] == 0,
+                    "write": write,
+                    "bytes": row["bytes"],
+                    "descriptors": row["selected_descriptors"],
+                    "basis": basis,
+                }
+            )
+            if basis == "posted" and row["status"] == 0:
+                posted_bytes += row["bytes"]
+                posted_descriptors += row["selected_descriptors"]
+            elif basis in ("planned", "posted"):
+                planned_bytes += row["bytes"]
+                planned_descriptors += row["selected_descriptors"]
+            else:
+                unknown += 1
+        return {
+            "write_batches": batches,
+            "write_bytes_posted": posted_bytes,
+            "write_descriptors_posted": posted_descriptors,
+            "write_bytes_planned_unconfirmed": planned_bytes,
+            "write_descriptors_planned_unconfirmed": planned_descriptors,
+            "write_shares_unknown": unknown,
+        }
+
+    def _build_write_batches(self):
+        """The ``write_batch`` view (Mooncake): one entry per batch, with its
+        members and whether their shares partition the batch's measured totals
+        exactly.
+        """
+        if not self.mooncake:
+            return
+        loss = bool(self.capture["loss"])
+        for item in self.transfers:
+            rows = self.members.get(item["transfer"], [])
+            members = []
+            for row in rows:
+                members.append(
+                    {
+                        "request": self._name(row["request_ref"]),
+                        "ok": row["status"] == 0,
+                        "bytes": row["bytes"],
+                        "descriptors": row["selected_descriptors"],
+                    }
+                )
+            identities = [m["request"] for m in members]
+            totals = None
+            if item["posted_bytes"] is not None:
+                totals = (item["posted_bytes"], item["posted_descriptors"])
+            elif item["complete_status"] == 2:
+                totals = (
+                    item["complete_bytes_word"],
+                    item["complete_descriptors_word"],
+                )
+            reasons = []
+            if item["declared_members"] is None:
+                reasons.append("no declared member count")
+            elif item["declared_members"] != len(identities):
+                reasons.append(
+                    f"{item['declared_members']} members declared, "
+                    f"{len(identities)} recorded"
+                )
+            if len(set(identities)) != len(identities):
+                reasons.append("a request is recorded twice as a member")
+            known = all(
+                m["bytes"] is not None and m["descriptors"] is not None for m in members
+            )
+            bytes_sum = sum(m["bytes"] for m in members if m["bytes"] is not None)
+            descriptors_sum = sum(
+                m["descriptors"] for m in members if m["descriptors"] is not None
+            )
+            if reasons:
+                status = "member_mismatch"
+            elif not members or not known:
+                status = "shares_unavailable"
+            elif totals is None:
+                status = "not_posted"
+            elif (bytes_sum, descriptors_sum) != totals:
+                status = "mismatch"
+                reasons.append(
+                    f"members sum to {bytes_sum} bytes and {descriptors_sum} "
+                    f"descriptors, the batch to {totals[0]} and {totals[1]}"
+                )
+            elif loss or self.health:
+                status = "observed_only"
+                reasons.append("capture loss: a member row may be missing")
+                reasons.extend(f"adapter: {r}" for r in self.health)
+            else:
+                status = "exact"
+            confirmed = item["complete_bytes_word"]
+            if (
+                totals is not None
+                and item["posted_bytes"] is not None
+                and item["state"] == "completed"
+                and (confirmed, item["complete_descriptors_word"]) != totals
+            ):
+                reasons.append("the completion's totals differ from the posted totals")
+                status = "mismatch"
+            self.write_batches.append(
+                {
+                    "source": self.index,
+                    "process_id": self.meta["process_id"],
+                    "view": "write_batch",
+                    "batch": item["transfer"],
+                    "state": item["state"],
+                    "write": self._batch_write(item),
+                    "consumer": item["peer"],
+                    "consumer_tp_rank": item["source_rank"],
+                    "members_declared": item["declared_members"],
+                    "members_recorded": len(identities),
+                    "members": members,
+                    "bytes": None if totals is None else totals[0],
+                    "descriptors": None if totals is None else totals[1],
+                    "partition": {
+                        "status": status,
+                        "members_bytes": bytes_sum if known else None,
+                        "members_descriptors": descriptors_sum if known else None,
+                        "reasons": reasons,
+                    },
+                }
+            )
+
+    def _posting_ended(self, members):
+        """Whether the worker is known to have left the pass that posted ``members``.
+
+        A later pass's bind proves it for an earlier pass. For the last pass only a
+        worker ``complete_observed`` recorded after its last bind does: completions
+        are polled by the main thread after the step's ``start_load_kv`` returned, so
+        a pass counter alone, or a clean recorder end, does not prove it.
+        """
+        last_bind = max(m["prepared_sequence"] for m in members)
+        return any(
+            row["kind"] == "complete_observed"
+            and row["subject"] == Subject.WORKER
+            and row["sequence"] > last_bind
+            for row in self.events
+        )
+
+    def _build_post_groups(self):
+        """The ``post_group`` view (NIXL): the independent reads one worker pass posted
+        together, keyed by this process capture and the recorded pass. Reads stay
+        first-class rows; a group is a derived view. Never a transport call and never an
+        additive duration: reads overlap."""
+        if self.mooncake or self.role != "worker":
+            return
+        reads = [
+            item for item in self.transfers if item["prepared_sequence"] is not None
+        ]
+        if not reads:
+            return
+        caps = self.meta.get("capabilities") or self.context.get("capabilities") or {}
+        if not caps.get("post_pass") or all(
+            item["post_pass"] is None for item in reads
+        ):
+            self.view_unavailable.append(
+                {
+                    "scope": f"source {self.index} (worker)",
+                    "reason": "post_group unavailable: no post pass recorded "
+                    "(a capture made before the pass field, or a profiler without it)",
+                }
+            )
+            return
+        detail = self.capture["loss_detail"]
+        structural = bool(
+            detail["missing_sequences"]
+            or any(detail["dropped"].values())
+            or detail["unresolved_identities"]
+        )
+        end_complete = detail["end_complete"]
+        passes = sorted(
+            {item["post_pass"] for item in reads if item["post_pass"] is not None}
+        )
+        last = passes[-1] if passes else None
+        ungrouped = [item for item in reads if item["post_pass"] is None]
+        if ungrouped:
+            self.view_unavailable.append(
+                {
+                    "scope": f"source {self.index} (worker)",
+                    "reason": f"{len(ungrouped)} read(s) carry no post pass and "
+                    "are in no group",
+                }
+            )
+        for number in passes:
+            members = sorted(
+                (item for item in reads if item["post_pass"] == number),
+                key=lambda item: item["prepared_sequence"],
+            )
+            accepted = [m for m in members if m["posted_time_ns"] is not None]
+            unresolved = [
+                m
+                for m in members
+                if m["state"] == "incomplete" and m["posted_time_ns"] is None
+            ]
+            completed = [m for m in members if m["state"] == "completed"]
+            failed = [m for m in members if m["state"] == "failed"]
+            reasons = []
+            if structural:
+                reasons.append("capture loss: a member may be missing")
+            reasons.extend(f"adapter: {r}" for r in self.health)
+            if number == last and not self._posting_ended(members):
+                reasons.append(
+                    "no later worker record shows that posting ended: the last "
+                    "pass may have been unfinished"
+                )
+            if number == last and not end_complete:
+                reasons.append(
+                    "the capture has no complete end: the last pass may not "
+                    "have finished"
+                )
+            if unresolved:
+                reasons.append(
+                    f"{len(unresolved)} prepared read(s) never posted nor failed"
+                )
+            if any(
+                m["state"] == "incomplete" and m["posted_time_ns"] is not None
+                for m in members
+            ):
+                reasons.append("a posted read has no observed completion")
+            totals_known = bool(members) and all(
+                m["state"] == "completed" and m["bytes"] is not None for m in members
+            )
+            posting_known = bool(accepted) and not unresolved
+            completion_known = bool(accepted) and all(
+                m["state"] == "completed" for m in accepted
+            )
+            exact = not reasons
+            first_prepared = min(m["prepared_time_ns"] for m in members)
+            first_post = min((m["posted_time_ns"] for m in accepted), default=None)
+            self.post_groups.append(
+                {
+                    "source": self.index,
+                    "process_id": self.meta["process_id"],
+                    "view": "post_group",
+                    "post_pass": number,
+                    "reads": len(members),
+                    "requests": sorted({m["request"] for m in members if m["request"]}),
+                    "source_ranks": sorted(
+                        {
+                            m["source_rank"]
+                            for m in members
+                            if m["source_rank"] is not None
+                        }
+                    ),
+                    "members": [
+                        {
+                            "transfer": m["transfer"],
+                            "request": m["request"],
+                            "source_rank": m["source_rank"],
+                            "leg": m["leg"],
+                            "state": m["state"],
+                            "failure": m["failure_code"],
+                            "posted": m["posted_time_ns"] is not None,
+                            "selected_descriptors": m["selected_descriptors"],
+                            "merged_descriptors": m["merged_descriptors"],
+                            "bytes": m["bytes"],
+                        }
+                        for m in members
+                    ],
+                    "outcomes": {
+                        "completed": len(completed),
+                        "failed": len(failed),
+                        # never accepted: a leg released unused because an earlier leg
+                        # failed, versus a post that raised for this leg itself
+                        "unused": sum(
+                            1 for m in failed
+                            if m["failure_code"] == "TRANSFER_NOT_POSTED"
+                        ),
+                        "submission_failed": sum(
+                            1 for m in failed
+                            if m["posted_time_ns"] is None
+                            and m["failure_code"] != "TRANSFER_NOT_POSTED"
+                        ),
+                        "incomplete": len(unresolved)
+                        + sum(
+                            1
+                            for m in members
+                            if m["state"] == "incomplete"
+                            and m["posted_time_ns"] is not None
+                        ),
+                        "not_posted": sum(
+                            1 for m in failed if m["posted_time_ns"] is None
+                        ),
+                    },
+                    # Whole-pass totals and spans are claimed only for an exact
+                    # group; an observed-only one reports what was seen, under
+                    # the *_observed names.
+                    "selected_descriptors": (
+                        sum(m["selected_descriptors"] or 0 for m in members)
+                        if exact
+                        else None
+                    ),
+                    "selected_descriptors_observed": sum(
+                        m["selected_descriptors"] or 0 for m in members
+                    ),
+                    "merged_descriptors": (
+                        sum(m["merged_descriptors"] for m in members)
+                        if exact
+                        and totals_known
+                        and all(m["merged_descriptors"] is not None for m in members)
+                        else None
+                    ),
+                    "bytes": sum(m["bytes"] for m in members)
+                    if exact and totals_known
+                    else None,
+                    "bytes_observed": sum(
+                        m["bytes"] for m in members if m["bytes"] is not None
+                    ),
+                    "bytes_observed_reads": sum(
+                        1 for m in members if m["bytes"] is not None
+                    ),
+                    "first_prepared_time_ns": first_prepared,
+                    "first_post_time_ns": first_post,
+                    "last_post_time_ns": max(
+                        (m["posted_time_ns"] for m in accepted), default=None
+                    ),
+                    "last_completion_time_ns": max(
+                        (m["completed_time_ns"] for m in completed), default=None
+                    ),
+                    "posting_span_ns": (
+                        max(m["posted_time_ns"] for m in accepted) - first_prepared
+                        if exact and posting_known
+                        else None
+                    ),
+                    # first accepted post to last observed completion
+                    "completion_span_ns": (
+                        max(m["completed_time_ns"] for m in accepted) - first_post
+                        if exact and completion_known
+                        else None
+                    ),
+                    # sums of independent reads' own measurements, never a group
+                    # transport time
+                    "read_xfer_us_sum": (
+                        sum(m["nixl_xfer_us"] for m in completed)
+                        if exact
+                        and completed
+                        and all(m["nixl_xfer_us"] is not None for m in completed)
+                        else None
+                    ),
+                    "read_post_us_sum": (
+                        sum(m["nixl_post_us"] for m in completed)
+                        if exact
+                        and completed
+                        and all(m["nixl_post_us"] is not None for m in completed)
+                        else None
+                    ),
+                    "completeness": "observed_only" if reasons else "exact",
+                    "reasons": reasons,
+                }
             )
 
     def _transfers_of(self, request, raw, index, total):
@@ -657,12 +1128,14 @@ class _Source:
         else:
             state = "incomplete"
             boundary = None
+        membership = self._membership([row for row in ordered if _is_member(row)])
         entry = {
             "source": self.index,
             "process_id": self.meta["process_id"],
             "role": self.role,
             "request": request,
             "state": state,
+            **membership,
             "request_occurrence": index,
             "request_occurrences": total,
             "repeated_id": repeated,
@@ -1154,6 +1627,15 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
                     ),
                 }
             )
+        if source.health:
+            problems.append(
+                {
+                    "source": index,
+                    "process_id": capture["meta"]["process_id"],
+                    "kind": "adapter_unhealthy",
+                    "detail": "; ".join(source.health),
+                }
+            )
         if source.unclassified:
             problems.append(
                 {
@@ -1166,6 +1648,8 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
             )
         sources.append(source)
     not_available = [dict(item) for item in _NOT_AVAILABLE]
+    for source in sources:
+        not_available.extend(source.view_unavailable)
     for source in sources:
         if source.role in ("worker", "scheduler") and not source.capture[
             "loss_detail"
@@ -1235,10 +1719,13 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
                 "events": len(source.events),
                 "loss": source.capture["loss"],
                 "loss_detail": source.capture["loss_detail"],
+                "adapter_health": source.health,
             }
             for source in sources
         ],
         "transfers": transferred,
+        "write_batches": [item for source in sources for item in source.write_batches],
+        "post_groups": [item for source in sources for item in source.post_groups],
         "requests": [
             item for source in sources for item in source.requests
         ],

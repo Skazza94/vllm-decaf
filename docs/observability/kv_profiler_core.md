@@ -252,6 +252,25 @@ transfer-scoped with the handle). Native durations (`aux0`/`aux1` of
 `complete_observed` timestamps is the first poll that saw DONE, not a NIXL
 timestamp.
 
+Each `transfer_bind` also carries the **post pass**: a per-process counter of the worker's
+`start_load_kv` calls (one call per engine step, `load_pass`, which records nothing), in the
+bind's first value word, which that kind leaves otherwise unset (bytes belong to the completion).
+The sink decodes it as `post_pass` and leaves `bytes` unset on that row; the exporter shows it
+as `post_pass`, never as bytes; the capture's `capabilities.post_pass` advertises it. It is what
+makes the **`post_groups`** view possible: no existing record marks a pass (ring adjacency merges
+adjacent passes and splits one by records from inside it), so a capture without it has no groups
+(`post_group unavailable` in `not_available`) and no heuristic is applied. A `post_group` is the
+independent reads one worker posted in one pass, keyed by the capture and the pass; it is a derived
+view over the reads, not a transport call and not an additive duration (the reads overlap). It
+lists the prepared attempts with their outcomes (a failed post or an unused mixed-memory leg has
+no accepted post), the sums of bytes and descriptors (whole only when every read completed), the
+posting span (first prepared to last accepted post) and the completion span (**first accepted post
+to last observed completion**), and the sums of the reads' own NIXL microseconds labelled as sums.
+It is `exact` only if the capture shows no loss and its last pass is not unfinished (a pass
+counter alone does not prove the last pass finished) and every prepared read has a known fate;
+otherwise it is `observed_only`: whole-pass totals and spans are withheld and what was seen is
+reported under `*_observed` names.
+
 Not recorded: socket or queue-pair identity, the return of blocks to the pool
 (only the scheduler's permission to free them), push-mode transfers, requests of
 endpoints other than completions and chat (their router ID is unknown).
@@ -554,8 +573,26 @@ a transfer-scoped `failed`; neither has `post_begin`/`post_return`. `transfer_re
 runs in the batch's `finally`, once, after every record that needs the generation.
 Each member's outcome is a `request_bind` row with subject `batch_member` (its
 `transfer` is the batch; it is not a request occurrence), a rejected member also a
-request-scoped `failed`. A member is never attributed bytes of its own: descriptors
-are the batch's.
+request-scoped `failed`. A member row carries its **share** of the batch as the connector built it
+(`bytes` and `selected_descriptors` of the row, read as `member_bytes` and `member_descriptors`): the
+build keeps each request's descriptors as a contiguous slice of the flat lists (coalescing never
+crosses requests), so the shares partition the batch's measured totals exactly. The share is the
+connector's posted descriptors after its own coalescing, not the engine's: TENT's merging of
+adjacent descriptors inside the engine across members is counted at transport level and never
+attributed to a member; a member has no duration of its own (one call). A share is *posted* when
+the batch's write succeeded, *planned* when it failed (kept, never confirmed), and **absent, never
+zero,** when the build had not finished (an exception or cancellation before it); a rejected
+member, a member with no blocks and a replica's members are explicit zeros. The shares are only
+recorded for an observed batch and cost one boundary note per request and one slice sum per member
+there; nothing for an unobserved one.
+
+The summary's **`write_batches`** view (one entry per batch: one transport call) lists the members
+and checks the partition: `exact` only if the declared member count equals the distinct recorded
+identities (a missing zero-byte member is detected, not only a wrong sum), every share is known and
+the sums equal the posted totals (and the completion's); `mismatch`, `member_mismatch`,
+`shares_unavailable` and `not_posted` say otherwise, and a capture with loss is never `exact`.
+A request's entry lists its batch memberships (associations, never request occurrences) with
+posted, planned-unconfirmed and unknown shares kept apart.
 
 Request-scoped events outside a batch: the producer answering a pull with an error or
 for an expired lease, the readiness timeout (`ready_timeout`, a missing producer, not

@@ -150,6 +150,7 @@ def test_a_profiled_pair_moves_the_same_bytes_and_traces_every_request(tmp_path)
             e for r in steps(directory, "decode")
             for e in r.get("kv_transfers", {}).get("load", {}).get("each", ())
         ]  # fmt: skip
+
     assert [t[:1] for t in transfers(off)] == [t[:1] for t in transfers(on)]
 
     found = processes(on, run_id)
@@ -182,6 +183,14 @@ def test_a_profiled_pair_moves_the_same_bytes_and_traces_every_request(tmp_path)
     assert bind["selected_descriptors"] == read["descriptors"]
     assert bind["selected_descriptors"] > done["merged_descriptors"]
     assert bind["aux0"] == 0 and bind["aux1"] == 1
+    # The post pass: the real worker's start_load_kv call this READ was posted in. The
+    # sink names it ``post_pass`` and leaves ``bytes`` unset: it is never payload.
+    assert isinstance(bind["post_pass"], int) and bind["post_pass"] >= 1
+    assert bind["bytes"] is None
+    assert d_worker["meta"]["capabilities"]["post_pass"] is True
+    assert all(
+        "post_pass" not in e for e in d_worker["events"] if e["kind"] != "transfer_bind"
+    )
     handoff = json.loads((on / "prefill.json").read_text())["handoff"]
     assert bind["handoff"] == handoff["remote_request_id"]
     assert bind["peer"] == handoff["remote_engine_id"]
@@ -229,6 +238,23 @@ def test_a_profiled_pair_moves_the_same_bytes_and_traces_every_request(tmp_path)
     document = json.loads(documents[("wall", "aligned")].read_text())
     assert document["metadata"]["cross_process_flows"] == "exact_recorded_handoff_ids"
     assert document["metadata"]["flows_omitted_ambiguous"] == 0
+    # The exporter carries the pass under its own name, never as bytes.
+    bound = [
+        e for e in document["traceEvents"]
+        if e.get("args", {}).get("post_pass") is not None
+    ]  # fmt: skip
+    assert bound and all(e["args"].get("bytes") is None for e in bound)
+    assert {e["args"]["post_pass"] for e in bound} == {bind["post_pass"]}
+    # The offline summary derives the post group exactly, from the recorded pass.
+    from vllm.kv_profiling.summary import summarize
+
+    summary = summarize([str(p["dir"]) for p in found])
+    (post_group,) = summary["post_groups"]
+    assert post_group["post_pass"] == bind["post_pass"] and post_group["reads"] == 1
+    assert post_group["completeness"] == "exact" and post_group["reasons"] == []
+    assert post_group["bytes"] == done["bytes"]
+    assert post_group["completion_span_ns"] is not None
+    assert post_group["completion_span_ns"] > 0
     # No helper outlived its engine: every writer and clock server exited.
     import psutil
 

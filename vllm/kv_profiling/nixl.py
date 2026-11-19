@@ -191,6 +191,8 @@ class NixlProfiler(_Profiler):
         # Request context of the READ being posted (worker main thread).
         self._request = self._remote_request = self._peer = None
         self._source_rank = 0
+        # The pass (one ``start_load_kv`` call) the reads being posted belong to.
+        self._pass = 0
 
     # ------------------------------------------------------------------ worker
     def handshake_begin(self, engine_id):
@@ -238,6 +240,13 @@ class NixlProfiler(_Profiler):
         except Exception as exc:
             self._error(exc)
 
+    def load_pass(self):
+        """One ``start_load_kv`` call begins: the reads it posts form one post group.
+
+        Records nothing.
+        """
+        self._pass += 1
+
     def read_context(self, request_id, remote_request_id, engine_id, remote_rank):
         self._request = request_id
         self._remote_request = remote_request_id
@@ -246,11 +255,12 @@ class NixlProfiler(_Profiler):
 
     def transfer_prepared(self, handle, leg, notif, selected):
         """``selected``: the descriptors vLLM selected for this READ or leg (the
-        length of the existing array), before NIXL merges any."""
+        length of the existing array), before NIXL merges any. The first value word
+        carries the post pass (never bytes: the decoder names it ``post_pass``)."""
         try:
             self._record(
                 _TRANSFER_BIND, self.rank, self._request, self._remote_request,
-                self._peer, handle._handle, None, selected, None, None, None,
+                self._peer, handle._handle, self._pass, selected, None, None, None,
                 leg, notif, self._transport, 0, self._source_rank,
             )  # fmt: skip
         except Exception as exc:
@@ -288,6 +298,17 @@ class NixlProfiler(_Profiler):
                     res.postDuration, res.xferDuration,
                     self._transport, 0, _WORKER,
                 )  # fmt: skip
+        except Exception as exc:
+            self._error(exc)
+
+    def transfer_unposted(self, handle):
+        """A prepared READ (a mixed-memory leg) was released, never posted."""
+        try:
+            self._record(
+                _FAILED, self.rank, None, None, None, handle._handle,
+                None, None, None, None, None, None, None,
+                self._transport, int(Failure.TRANSFER_NOT_POSTED), _TRANSFER_SCOPE,
+            )  # fmt: skip
         except Exception as exc:
             self._error(exc)
 
@@ -546,6 +567,7 @@ def capabilities(role: str) -> dict:
         "qp": False,
         "selected_descriptors": True,
         "nixl_post_xfer_durations": True,
+        "post_pass": role == "worker",
         "nixl_offset": True,
         "handoff_blocks": True,
         "block_return": False,

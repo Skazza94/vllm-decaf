@@ -272,7 +272,9 @@ class MooncakeProfiler(_Profiler):
 
         Records the generation's failed terminal if none was recorded, then every
         member not already recorded as failed, with its request-scoped failure:
-        their pulls received no answer. ``members``: (decode request, transfer ID).
+        their pulls received no answer. ``members``: (decode request, transfer ID) or
+        (decode request, transfer ID, share), the share being the member's planned
+        (bytes, descriptors) when the build had finished and None when it had not.
         """
         if self._detached:
             return
@@ -289,13 +291,16 @@ class MooncakeProfiler(_Profiler):
                         self._transport, _SEND_EXCEPTION, _TRANSFER_SCOPE,
                     )  # fmt: skip
                 done = self._members.setdefault(handle, set())
-                for d_request, transfer_id in members:
+                for member in members:
+                    d_request, transfer_id = member[0], member[1]
+                    share = member[2] if len(member) > 2 else None
                     if d_request in done:
                         continue
                     done.add(d_request)
+                    bytes_, descriptors = share if share else (None, None)
                     self._record(
                         _REQUEST_BIND, self.rank, d_request, transfer_id, None, handle,
-                        None, None, None, None, None, None, None,
+                        bytes_, descriptors, None, None, None, None, None,
                         self._transport, MEMBER_FAILED, _BATCH_MEMBER,
                     )  # fmt: skip
                     self._record(
@@ -306,8 +311,29 @@ class MooncakeProfiler(_Profiler):
         except Exception as exc:
             self._error(exc)
 
-    def batch_member(self, handle, d_request, transfer_id, ok) -> None:
-        """One member's settled outcome, after the batch's terminal."""
+    def member_shares(self, spans, lengths) -> dict | None:
+        """Each member's share of a built write batch: ``spans`` are the build's (decode
+        request, first, end) positions in the flat descriptor lists, ``lengths`` the
+        batch's descriptor lengths. Returns {decode request: (bytes, descriptors)}; the
+        spans partition the lists, so the shares sum to the batch's totals. None if the
+        spans do not describe the lists."""
+        try:
+            shares = {}
+            cursor = 0
+            for d_request, first, end in spans:
+                if first != cursor or end < first or end > len(lengths):
+                    return None
+                shares[d_request] = (sum(lengths[first:end]), end - first)
+                cursor = end
+            return shares if cursor == len(lengths) else None
+        except Exception as exc:
+            self._error(exc)
+            return None
+
+    def batch_member(self, handle, d_request, transfer_id, ok, share=None) -> None:
+        """One member's settled outcome, after the batch's terminal. ``share``: the
+        member's (bytes, descriptors) of the batch as built (posted if the write
+        succeeded, planned if it failed); None when unknown."""
         if self._detached:
             return
         try:
@@ -319,9 +345,10 @@ class MooncakeProfiler(_Profiler):
                 if d_request in done:
                     return
                 done.add(d_request)
+                bytes_, descriptors = share if share else (None, None)
                 self._record(
                     _REQUEST_BIND, self.rank, d_request, transfer_id, None, handle,
-                    None, None, None, None, None, None, None,
+                    bytes_, descriptors, None, None, None, None, None,
                     self._transport, MEMBER_OK if ok else MEMBER_FAILED, _BATCH_MEMBER,
                 )  # fmt: skip
         except Exception as exc:
@@ -626,6 +653,7 @@ def capabilities(role: str, kv_role: str | None, config=None) -> dict:
         "posted_descriptors": worker and producer,
         "write_batches": worker and producer,
         "batch_members": worker and producer,
+        "batch_member_shares": worker and producer,
         "mooncake_write_duration": worker and producer,
         "nixl_post_xfer_durations": False,
         "nixl_offset": False,

@@ -275,6 +275,192 @@ async def test_mixed_members_zero_payload_and_rejected(tmp_path):
     assert not any(e["kind"] in ("post_begin", "post_return") for e in empty + rejected)
 
 
+def members_of(batch):
+    return {
+        e["request"]: (e["bytes"], e["selected_descriptors"], e["status"])
+        for e in batch
+        if e["kind"] == "request_bind"
+    }
+
+
+@pytest.mark.asyncio
+async def test_members_carry_their_exact_shares_and_partition_the_batch_totals(
+    tmp_path,
+):
+    """Three data members (one run of three blocks coalesced into one descriptor, one block,
+    two separate runs) and a member with no blocks: each member's share is its slice of the
+    connector's own lists, and the shares sum to the batch's measured totals exactly."""
+    with worker_of("kv_producer", profiler_extra(tmp_path)) as worker:
+        for p, t, blocks in (
+            ("p1", "t1", ((2, 3, 4),)),
+            ("p2", "t2", ((7,),)),
+            ("p3", "t3", ((20, 22),)),
+            ("p4", "t4", ((9,),)),
+        ):
+            ready_send_meta(worker, p, t, blocks=blocks)
+        response = await serve(
+            worker,
+            {
+                "a": ("t1", [[2, 3, 4]]),
+                "b": ("t2", [[7]]),
+                "c": ("t3", [[20, 22]]),
+                "empty": ("t4", [[]]),
+            },
+        )
+        assert sorted(response.ok_reqs) == ["a", "b", "c", "empty"]
+        assert worker._sender_spans is None, "consumed by the caller, never left behind"
+        events = events_of(worker._kvp)
+    (batch,) = batches(events).values()
+    bind = batch[0]
+    begin = next(e for e in batch if e["kind"] == "post_begin")
+    complete = next(e for e in batch if e["kind"] == "complete_observed")
+    shares = members_of(batch)
+    assert shares == {
+        "a": (768, 1, 0),
+        "b": (256, 1, 0),
+        "c": (512, 2, 0),
+        "empty": (0, 0, 0),
+    }
+    assert bind["aux0"] == len(shares) == 4
+    assert (begin["bytes"], begin["selected_descriptors"]) == (1536, 4)
+    assert (complete["bytes"], complete["selected_descriptors"]) == (1536, 4)
+    assert sum(v[0] for v in shares.values()) == begin["bytes"]
+    assert sum(v[1] for v in shares.values()) == begin["selected_descriptors"]
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_member_has_a_zero_share_and_the_others_still_sum_to_the_batch(
+    tmp_path,
+):
+    with worker_of("kv_producer", profiler_extra(tmp_path)) as worker:
+        for p, t in (("p1", "t1"), ("p2", "t2")):
+            ready_send_meta(worker, p, t)
+        await serve(worker, {"data": ("t1", [[2]]), "rejected": ("t2", [[2], [3]])})
+        events = events_of(worker._kvp)
+    (batch,) = batches(events).values()
+    shares = members_of(batch)
+    assert shares == {"data": (256, 1, 0), "rejected": (0, 0, 1)}
+    begin = next(e for e in batch if e["kind"] == "post_begin")
+    assert (begin["bytes"], begin["selected_descriptors"]) == (256, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_keeps_the_planned_shares_and_an_unfinished_build_leaves_them_unknown(
+    tmp_path,
+):
+    with worker_of("kv_producer", profiler_extra(tmp_path)) as worker:
+        ready_send_meta(worker, "p1", "t1", blocks=((2, 3),))
+        worker.engine.batch_transfer_sync_write = lambda *a: 7
+        response = await serve(worker, {"d1": ("t1", [[2, 3]])})
+        assert response.err_reqs == ["d1"]
+        # The build raises midway: the earlier batch's spans are never reused, the members are unknown.
+        worker._sender_spans = [("stale", 0, 1)]
+        ready_send_meta(worker, "p2", "t2")
+        with (
+            patch.object(
+                worker,
+                "_get_sender_transfer_plan",
+                side_effect=RuntimeError("build failed"),
+            ),
+            pytest.raises(RuntimeError, match="build failed"),
+        ):
+            await serve(worker, {"d2": ("t2", [[2]])}, remote_port=1235)
+        assert worker._sender_spans is None
+        events = events_of(worker._kvp)
+    failed, unbuilt = batches(events).values()
+    assert members_of(failed) == {"d1": (512, 1, 1)}, "planned, never confirmed"
+    assert members_of(unbuilt) == {"d2": (None, None, 1)}, "unknown, not zero"
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_raises_after_the_build_keeps_the_known_shares(tmp_path):
+    with worker_of("kv_producer", profiler_extra(tmp_path)) as worker:
+        ready_send_meta(worker, "p1", "t1", blocks=((2, 3),))
+
+        def boom(*args):
+            raise RuntimeError("engine exploded")
+
+        worker.engine.batch_transfer_sync_write = boom
+        with pytest.raises(RuntimeError):
+            await serve(worker, {"d1": ("t1", [[2, 3]])})
+        events = events_of(worker._kvp)
+    (batch,) = batches(events).values()
+    assert members_of(batch) == {"d1": (512, 1, 1)}
+
+
+@pytest.mark.asyncio
+async def test_an_unobserved_batch_builds_no_spans_and_the_build_keeps_its_five_values(
+    tmp_path,
+):
+    with worker_of("kv_producer", None) as worker:
+        ready_send_meta(worker, "p1", "t1")
+        response = await serve(worker, {"d1": ("t1", [[2]])})
+        assert response.ok_reqs == ["d1"]
+        assert worker._kvp is None and getattr(worker, "_sender_spans", None) is None
+    with worker_of("kv_producer", profiler_extra(tmp_path)) as worker:
+        ready_send_meta(worker, "p1", "t1")
+        meta = _xfer_meta(
+            [_region(0x2000, row_offset=-1, layer_name="model.layers.0.self_attn")],
+            {"d1": ("t1", [[2]])},
+            remote_hostname="consumer",
+            remote_port=1234,
+            remote_tp_rank=0,
+        )
+        local, remote, _ = worker._prepare_transfer_regions(meta)
+        built = await worker._build_transfer_params(
+            [("d1", worker.reqs_need_send["t1"])], meta, local, remote
+        )
+        assert len(built) == 5
+        assert worker._sender_spans == [("d1", 0, len(built[2]))]
+
+
+@pytest.mark.asyncio
+async def test_a_batch_the_profiler_declined_builds_no_spans_even_with_a_profiler_attached(
+    tmp_path,
+):
+    """The observed-batch guard: a full registry (or a closing profiler) refuses the batch's bind, and then the build does
+    none of the span work."""
+    with worker_of("kv_producer", profiler_extra(tmp_path)) as worker:
+        worker._kvp._cap = 0
+        ready_send_meta(worker, "p1", "t1")
+        response = await serve(worker, {"d1": ("t1", [[2]])})
+        assert response.ok_reqs == ["d1"], "the batch is still served"
+        assert worker._sender_spans is None
+        assert worker._kvp.inflight_overflow == 1
+        events = events_of(worker._kvp)
+    assert not any(
+        e["kind"] == "request_bind" and e["subject"] == Subject.BATCH_MEMBER
+        for e in events
+    )
+
+
+def test_the_share_helper_refuses_spans_that_do_not_partition_the_lists(tmp_path):
+    with worker_of("kv_producer", profiler_extra(tmp_path)) as worker:
+        profiler = worker._kvp
+        lengths = [256, 512, 256]
+        assert profiler.member_shares([("a", 0, 2), ("b", 2, 3)], lengths) == {
+            "a": (768, 2),
+            "b": (256, 1),
+        }
+        for bad in (
+            [("a", 0, 2)],
+            [("a", 0, 2), ("b", 3, 3)],
+            [("a", 0, 4)],
+            [("a", 1, 3)],
+            [("a", 2, 1), ("b", 1, 3)],
+        ):
+            assert profiler.member_shares(bad, lengths) is None, bad
+        assert profiler.member_shares([("a", 0, 3)], lengths) == {"a": (1024, 3)}
+
+
+def test_the_member_share_capability_follows_the_producer_role():
+    from vllm.kv_profiling.mooncake import capabilities
+
+    assert capabilities("worker", "kv_producer")["batch_member_shares"] is True
+    assert capabilities("worker", "kv_consumer")["batch_member_shares"] is False
+    assert capabilities("scheduler", "kv_producer")["batch_member_shares"] is False
+
+
 @pytest.mark.asyncio
 async def test_a_failed_write_and_an_engine_exception_never_fake_a_return(tmp_path):
     with worker_of("kv_producer", profiler_extra(tmp_path)) as worker:
@@ -1159,6 +1345,32 @@ def test_repeated_batch_membership_never_splits_a_request_into_lanes_or_flows(tm
     members = [e for e in trace["traceEvents"] if e.get("name") == "batch_member"]
     assert len(members) == 2 and len({(e["pid"], e["tid"]) for e in members}) == 1
     assert not [e for e in trace["traceEvents"] if e.get("cat") == "kv_handoff"]
+
+
+@pytest.mark.asyncio
+async def test_the_exporter_carries_each_members_share_under_member_names(tmp_path):
+    with worker_of("kv_producer", profiler_extra(tmp_path)) as worker:
+        for p, t, blocks in (("p1", "t1", ((2, 3),)), ("p2", "t2", ((7,),))):
+            ready_send_meta(worker, p, t, blocks=blocks)
+        await serve(worker, {"a": ("t1", [[2, 3]]), "b": ("t2", [[7]])})
+        profiler = worker._kvp
+        events_of(profiler)
+    (document,) = export_traces(
+        [profiler.output_dir / "events.jsonl"], str(tmp_path / "trace")
+    ).values()
+    trace = json.loads(document.read_text())["traceEvents"]
+    members = [e["args"] for e in trace if e.get("name") == "batch_member"]
+    assert sorted((m["member_bytes"], m["member_descriptors"]) for m in members) == [
+        (256, 1),
+        (512, 1),
+    ]
+    begin = [
+        e["args"] for e in trace if e.get("args", {}).get("posted_bytes") is not None
+    ]
+    assert begin and begin[0]["posted_bytes"] == sum(m["member_bytes"] for m in members)
+    assert begin[0]["posted_descriptors"] == sum(
+        m["member_descriptors"] for m in members
+    )
 
 
 def test_an_exceptional_and_a_no_data_batch_have_no_successful_return_in_the_reader(

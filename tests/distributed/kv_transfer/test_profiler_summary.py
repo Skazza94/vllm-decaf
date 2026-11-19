@@ -113,6 +113,12 @@ def generation_of(recorder, selected):
     )
 
 
+def kinds_of(summary):
+    """The problem kinds of a summary, apart from the adapter's health: the bare recorders of these tests have no adapter,
+    hence no ``profiler.json`` (that case has its own test)."""
+    return [p["kind"] for p in summary["problems"] if p["kind"] != "adapter_unhealthy"]
+
+
 def by_transfer(summary, transfer):
     return next(
         item for item in summary["transfers"] if item["transfer"] == transfer
@@ -200,7 +206,7 @@ def test_known_sequence_is_summarized_exactly(recorders):
     summary = summarize([recorder.output_dir, orphan.output_dir])
     # The orphan post's handle was never bound, so the recorder drops the
     # generation (loss) and the summary reports the event it cannot pair.
-    summary_problems = {p["kind"] for p in summary["problems"]}
+    summary_problems = set(kinds_of(summary))
     assert summary_problems == {"capture_loss", "orphan_transfer_event"}
     assert len(summary["transfers"]) == 2
     # The recorder maps local handles to sequential native generations.
@@ -507,7 +513,7 @@ def test_handshake_attempts_by_role(recorders):
     scheduler.record(*fields(EventKind.HANDSHAKE_END, peer="engine-decode"))
     assert scheduler.close().saved
     summary = summarize([worker.output_dir, scheduler.output_dir])
-    kinds = {item["kind"] for item in summary["problems"]}
+    kinds = set(kinds_of(summary))
     assert kinds == {"missing_handshake_begin"}
     states = [(item["peer"], item["state"]) for item in summary["handshakes"]]
     completed = [
@@ -1204,7 +1210,7 @@ def test_loss_and_run_rules(recorders, tmp_path):
     summary = summarize([truncated])
     assert summary["sources"][0]["loss"]
     assert not summary["sources"][0]["loss_detail"]["end_present"]
-    assert [item["kind"] for item in summary["problems"]] == ["capture_loss"]
+    assert kinds_of(summary) == ["capture_loss"]
     other = recorders()
     assert other.wait_ready()
     other.record(*fields(EventKind.REQUEST_BIND, request="req-c"))
@@ -1274,3 +1280,593 @@ def test_cli_writes_the_document(recorders, tmp_path):
     document = json.loads(output.read_text())
     assert document["tool"] == "vllm.kv_profiling.summary"
     assert document["requests"][0]["request"] == "req-c"
+
+
+# ------------------------------------------------------- post groups and write batches
+WORKER = {
+    "role": "worker",
+    "kv_role": "kv_consumer",
+    "engine_id": "engine-decode",
+    "backend": ["Test"],
+    "transport": "tcp",
+    "rank": 0,
+}
+
+
+def bind(record, handle, request, post_pass, selected, *, leg=0, peer="prod-engine"):
+    """A NIXL READ's bind: its first value word is the post pass (never bytes)."""
+    record(
+        *fields(
+            EventKind.TRANSFER_BIND,
+            request,
+            handoff=f"{request}-p",
+            peer=peer,
+            handle=handle,
+            size=post_pass,
+            selected=selected,
+            aux0=leg,
+            aux1=1,
+            subject=0,
+        )
+    )
+
+
+def done(record, handle, size, merged, post_us=10, xfer_us=20):
+    record(
+        *fields(
+            EventKind.COMPLETE_OBSERVED,
+            handle=handle,
+            size=size,
+            merged=merged,
+            aux0=post_us,
+            aux1=xfer_us,
+            subject=1,
+        )
+    )
+
+
+def post_groups_capture(recorders, *, capabilities=True, with_pass=True, close=True):
+    """Pass 1 posts reads 1 and 2 with another record (a notification sent from inside the
+    pass) between them; pass 2 posts read 3 right after, adjacent in the ring with no
+    record between: the sequence alone cannot tell the passes apart. Pass 3 holds a failed
+    unused leg and a completed one."""
+    context = {**WORKER}
+    if capabilities:
+        context["capabilities"] = {"post_pass": True}
+    recorder = recorders(context=context)
+    assert recorder.wait_ready()
+    record = recorder.record
+    pass_of = (lambda n: n) if with_pass else (lambda n: None)
+    bind(record, 1, "req-a", pass_of(1), 10)
+    record(*fields(EventKind.NOTIFY_SEND_RETURN, "req-z"))
+    bind(record, 2, "req-b", pass_of(1), 20)
+    record(*fields(EventKind.POST_RETURN, handle=1))
+    record(*fields(EventKind.POST_RETURN, handle=2))
+    bind(record, 3, "req-c", pass_of(2), 30)
+    record(*fields(EventKind.POST_RETURN, handle=3))
+    bind(record, 4, "req-d", pass_of(3), 40, leg=2)
+    bind(record, 5, "req-d", pass_of(3), 50, leg=1)
+    record(
+        *fields(
+            EventKind.FAILED, handle=4, status=int(Failure.TRANSFER_FAILED), subject=1
+        )
+    )
+    record(*fields(EventKind.POST_RETURN, handle=5))
+    done(record, 1, 100, 5)
+    done(record, 2, 200, 8)
+    done(record, 3, 300, 9)
+    done(record, 5, 500, 11)
+    for handle in (1, 2, 3, 4, 5):
+        record(*fields(EventKind.TRANSFER_RETIRE, handle=handle))
+    if close:
+        assert recorder.close().complete
+        adapter_summary(recorder)
+    return recorder
+
+
+def adapter_summary(recorder, **overrides):
+    """The adapter's ``profiler.json`` next to a synthetic capture (the recorders here are bare: no adapter writes one)."""
+    document = {
+        "hook_errors": 0,
+        "first_error": None,
+        "shutdown_failures": [],
+        "saved": True,
+        "complete": True,
+        **overrides,
+    }
+    (recorder.output_dir / "profiler.json").write_text(json.dumps(document))
+
+
+def edit_events(recorder, keep):
+    path = recorder.output_dir / "events.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows if keep(row)))
+
+
+def group_of(summary, number):
+    return next(g for g in summary["post_groups"] if g["post_pass"] == number)
+
+
+def test_the_sink_names_the_bind_word_the_post_pass_and_leaves_bytes_unset(recorders):
+    recorder = post_groups_capture(recorders)
+    binds = [r for r in rows_of(recorder) if r.get("kind") == "transfer_bind"]
+    assert [r["post_pass"] for r in binds] == [1, 1, 2, 3, 3]
+    assert all(r["bytes"] is None for r in binds)
+    others = [
+        r
+        for r in rows_of(recorder)
+        if r.get("type") == "event" and r["kind"] != "transfer_bind"
+    ]
+    assert others and all("post_pass" not in r for r in others)
+    # A completion's bytes are still bytes.
+    assert {r["bytes"] for r in others if r["kind"] == "complete_observed"} == {
+        100,
+        200,
+        300,
+        500,
+    }
+
+
+def test_post_groups_follow_the_recorded_pass_never_ring_adjacency(recorders):
+    recorder = post_groups_capture(recorders)
+    summary = summarize([recorder.output_dir])
+    assert [g["post_pass"] for g in summary["post_groups"]] == [1, 2, 3]
+    one, two = group_of(summary, 1), group_of(summary, 2)
+    # Pass 1: two reads, split in the ring by another record; pass 2 is adjacent to it.
+    assert (one["reads"], one["requests"], one["completeness"], one["reasons"]) == (
+        2, ["req-a", "req-b"], "exact", [])  # fmt: skip
+    assert (one["bytes"], one["selected_descriptors"], one["merged_descriptors"]) == (
+        300,
+        30,
+        13,
+    )
+    assert (two["reads"], two["bytes"], two["completeness"]) == (1, 300, "exact")
+    assert [
+        m["transfer"] == by_transfer(summary, m["transfer"])["transfer"]
+        for m in one["members"]
+    ]
+    # "First accepted post to last observed completion", never a group transport time.
+    times = {t["transfer"]: t for t in summary["transfers"]}
+    ids = [m["transfer"] for m in one["members"]]
+    assert one["first_post_time_ns"] == min(times[i]["posted_time_ns"] for i in ids)
+    assert (
+        one["completion_span_ns"]
+        == max(times[i]["completed_time_ns"] for i in ids) - one["first_post_time_ns"]
+    )
+    assert one["posting_span_ns"] == max(times[i]["posted_time_ns"] for i in ids) - min(
+        times[i]["prepared_time_ns"] for i in ids)  # fmt: skip
+    assert one["read_xfer_us_sum"] == 40 and one["read_post_us_sum"] == 20
+    # No request is split or doubled by the groups: reads stay first-class transfers.
+    assert len(summary["transfers"]) == 5
+
+
+def test_a_failed_post_and_an_unused_leg_are_members_with_outcomes(recorders):
+    recorder = post_groups_capture(recorders)
+    three = group_of(summarize([recorder.output_dir]), 3)
+    assert (three["reads"], three["requests"]) == (2, ["req-d"])
+    assert three["outcomes"] == {
+        "completed": 1,
+        "failed": 1,
+        "unused": 0,
+        "submission_failed": 1,
+        "incomplete": 0,
+        "not_posted": 1,
+    }
+    assert [(m["leg"], m["state"], m["posted"]) for m in three["members"]] == [
+        ("dram", "failed", False), ("device", "completed", True)]  # fmt: skip
+    # The failed leg was never accepted: the group's totals are not whole, its observed bytes are.
+    assert (
+        three["bytes"] is None
+        and three["bytes_observed"] == 500
+        and three["bytes_observed_reads"] == 1
+    )
+    assert three["completeness"] == "exact"
+    assert three["selected_descriptors"] == 90
+    # Spans cover the accepted posts only.
+    assert (
+        three["posting_span_ns"] is not None and three["completion_span_ns"] is not None
+    )
+
+
+def test_a_lost_member_makes_every_group_observed_only_with_no_whole_pass_total(
+    recorders,
+):
+    recorder = post_groups_capture(recorders)
+    lost = next(
+        r["transfer"]
+        for r in rows_of(recorder)
+        if r.get("kind") == "transfer_bind" and r["selected_descriptors"] == 20
+    )
+    edit_events(recorder, lambda r: r.get("transfer") != lost)
+    summary = summarize([recorder.output_dir])
+    assert any(p["kind"] == "capture_loss" for p in summary["problems"])
+    one = group_of(summary, 1)
+    assert one["completeness"] == "observed_only" and one["reads"] == 1
+    assert one["bytes"] is None and one["bytes_observed"] == 100
+    assert one["posting_span_ns"] is None and one["completion_span_ns"] is None
+    assert any("capture loss" in r for r in one["reasons"])
+    assert all(g["completeness"] == "observed_only" for g in summary["post_groups"])
+
+
+def test_a_capture_that_ends_mid_pass_is_observed_only_only_where_it_may_be_unfinished(
+    recorders,
+):
+    recorder = recorders(context={**WORKER, "capabilities": {"post_pass": True}})
+    assert recorder.wait_ready()
+    record = recorder.record
+    bind(record, 1, "req-a", 1, 10)
+    record(*fields(EventKind.POST_RETURN, handle=1))
+    done(record, 1, 100, 5)
+    bind(record, 2, "req-b", 2, 20)
+    bind(record, 3, "req-c", 2, 30)
+    record(*fields(EventKind.POST_RETURN, handle=2))
+    record(*fields(EventKind.POST_RETURN, handle=3))
+    # the capture ends after pass 2's posts: nothing recorded later is in the file
+    done(record, 2, 200, 8)
+    done(record, 3, 300, 9)
+    assert recorder.close().complete
+    adapter_summary(recorder)
+    last_post = generation_of(recorder, 30)
+    cut = next(
+        r["sequence"]
+        for r in rows_of(recorder)
+        if r.get("kind") == "post_return" and r["transfer"] == last_post
+    )
+    edit_events(
+        recorder, lambda r: r.get("type") != "end" and r.get("sequence", -1) <= cut
+    )
+    summary = summarize([recorder.output_dir])
+    one, two = group_of(summary, 1), group_of(summary, 2)
+    # Pass 1 finished before the end of the capture; pass 2 may not have (a pass counter does not prove it did).
+    assert (one["completeness"], one["bytes"], one["reasons"]) == ("exact", 100, [])
+    assert two["completeness"] == "observed_only" and two["bytes"] is None
+    assert any("no complete end" in r for r in two["reasons"])
+    assert any("no observed completion" in r for r in two["reasons"])
+    assert two["completion_span_ns"] is None and two["outcomes"]["incomplete"] == 2
+
+
+def test_a_capture_without_the_pass_or_its_capability_has_no_groups_and_says_why(
+    recorders,
+):
+    for kwargs in ({"capabilities": False}, {"with_pass": False}):
+        recorder = post_groups_capture(recorders, **kwargs)
+        summary = summarize([recorder.output_dir])
+        assert summary["post_groups"] == []
+        assert any(
+            "post_group unavailable" in n["reason"] for n in summary["not_available"]
+        ), kwargs
+        assert len(summary["transfers"]) == 5
+
+
+MOONCAKE = {
+    "role": "worker",
+    "kv_role": "kv_producer",
+    "engine_id": "engine-prefill",
+    "backend": ["Mooncake"],
+    "transport": "tcp",
+    "connector": "mooncake",
+    "rank": 0,
+    "capabilities": {"batch_member_shares": True},
+}
+
+
+def member(record, handle, request, ok, share):
+    size, selected = share if share else (None, None)
+    record(
+        *fields(
+            EventKind.REQUEST_BIND,
+            request,
+            handoff=f"{request}-t",
+            handle=handle,
+            size=size,
+            selected=selected,
+            status=0 if ok else 1,
+            subject=6,
+        )
+    )
+
+
+def write_batch(
+    record,
+    handle,
+    shares,
+    *,
+    declared=None,
+    posted=None,
+    ok=True,
+    complete=True,
+    no_write=False,
+):
+    """One Mooncake write batch of members ``{request: (bytes, descriptors)}``."""
+    record(
+        *fields(
+            EventKind.TRANSFER_BIND,
+            handle=handle,
+            peer="consumer:1",
+            aux0=declared if declared is not None else len(shares),
+            subject=0,
+        )
+    )
+    total = (
+        posted
+        if posted is not None
+        else (
+            sum(s[0] for s in shares.values() if s),
+            sum(s[1] for s in shares.values() if s),
+        )
+    )
+    if not no_write:
+        record(*fields(EventKind.PREPARED, handle=handle))
+        record(
+            *fields(
+                EventKind.POST_BEGIN, handle=handle, size=total[0], selected=total[1]
+            )
+        )
+        record(*fields(EventKind.POST_RETURN, handle=handle))
+        if ok and complete:
+            record(
+                *fields(
+                    EventKind.COMPLETE_OBSERVED,
+                    handle=handle,
+                    size=total[0],
+                    selected=total[1],
+                    status=0,
+                    subject=1,
+                )
+            )
+        elif not ok:
+            record(
+                *fields(
+                    EventKind.FAILED,
+                    handle=handle,
+                    status=int(Failure.TRANSFER_FAILED),
+                    subject=1,
+                )
+            )
+    for request, share in shares.items():
+        member(record, handle, request, ok, share)
+    record(*fields(EventKind.TRANSFER_RETIRE, handle=handle))
+
+
+def mooncake_summary(recorders, build, **overrides):
+    recorder = recorders(context={**MOONCAKE, **overrides})
+    assert recorder.wait_ready()
+    build(recorder.record)
+    assert recorder.close().complete
+    adapter_summary(recorder)
+    return summarize([recorder.output_dir])
+
+
+def test_write_batch_members_partition_the_batch_exactly(recorders):
+    def build(record):
+        write_batch(
+            record,
+            1,
+            {"d-a": (768, 1), "d-b": (256, 1), "d-c": (512, 2), "d-empty": (0, 0)},
+        )
+
+    summary = mooncake_summary(recorders, build)
+    (batch,) = summary["write_batches"]
+    assert batch["view"] == "write_batch" and batch["write"] == "written"
+    assert (batch["members_declared"], batch["members_recorded"]) == (4, 4)
+    assert (batch["bytes"], batch["descriptors"]) == (1536, 4)
+    assert batch["partition"] == {
+        "status": "exact",
+        "members_bytes": 1536,
+        "members_descriptors": 4,
+        "reasons": [],
+    }
+    assert [(m["request"], m["bytes"], m["descriptors"]) for m in batch["members"]] == [
+        ("d-a", 768, 1), ("d-b", 256, 1), ("d-c", 512, 2), ("d-empty", 0, 0)]  # fmt: skip
+
+
+def test_a_member_off_by_one_or_a_missing_zero_byte_member_is_detected(recorders):
+    off_by_one = mooncake_summary(
+        recorders,
+        lambda r: write_batch(
+            r, 1, {"d-a": (769, 1), "d-b": (256, 1)}, posted=(1024, 2)
+        ),
+    )
+    (batch,) = off_by_one["write_batches"]
+    assert (
+        batch["partition"]["status"] == "mismatch"
+        and "1025 bytes" in batch["partition"]["reasons"][0]
+    )
+    off_descriptor = mooncake_summary(
+        recorders,
+        lambda r: write_batch(
+            r, 1, {"d-a": (768, 2), "d-b": (256, 1)}, posted=(1024, 2)
+        ),
+    )
+    assert off_descriptor["write_batches"][0]["partition"]["status"] == "mismatch"
+    # The sums still match, but a zero-byte member was never recorded: count and identity catch it.
+    missing = mooncake_summary(
+        recorders,
+        lambda r: write_batch(
+            r, 1, {"d-a": (768, 1), "d-b": (256, 1)}, declared=3, posted=(1024, 2)
+        ),
+    )
+    partition = missing["write_batches"][0]["partition"]
+    assert (
+        partition["status"] == "member_mismatch"
+        and "3 members declared, 2 recorded" in partition["reasons"][0]
+    )
+    twice = mooncake_summary(
+        recorders,
+        lambda r: (
+            write_batch(r, 1, {"d-a": (1024, 2)}, declared=2, posted=(1024, 2)) or None
+        ),
+    )
+    assert twice["write_batches"][0]["partition"]["status"] == "member_mismatch"
+
+
+def test_unknown_shares_unposted_batches_and_failed_writes_are_not_exact_and_never_zero(
+    recorders,
+):
+    def build(record):
+        write_batch(
+            record, 1, {"d-a": None, "d-b": None}, posted=(512, 2), ok=False
+        )  # exception before the build ended
+        write_batch(
+            record, 2, {"d-r": (0, 0)}, no_write=True, ok=False
+        )  # every member rejected
+        write_batch(
+            record, 3, {"d-f": (512, 2)}, ok=False
+        )  # the write failed: planned shares kept
+
+    summary = mooncake_summary(recorders, build)
+    unknown, rejected, failed = summary["write_batches"]
+    assert unknown["partition"]["status"] == "shares_unavailable"
+    assert unknown["partition"]["members_bytes"] is None
+    assert [m["bytes"] for m in unknown["members"]] == [None, None]
+    assert (rejected["partition"]["status"], rejected["write"]) == (
+        "not_posted",
+        "incomplete",
+    )
+    assert failed["write"] == "failed" and failed["partition"]["status"] == "exact"
+    assert (failed["bytes"], failed["partition"]["members_bytes"]) == (512, 512)
+
+
+def test_an_unhealthy_or_unknown_adapter_never_gives_an_exact_partition_or_group(
+    recorders,
+):
+    def build(record):
+        write_batch(record, 1, {"d-a": (768, 1), "d-b": (256, 1)})
+
+    def capture(**health):
+        recorder = recorders(context={**MOONCAKE})
+        assert recorder.wait_ready()
+        build(recorder.record)
+        assert recorder.close().complete
+        adapter_summary(recorder, **health)
+        return recorder
+
+    (clean,) = summarize([capture().output_dir])["write_batches"]
+    assert clean["partition"]["status"] == "exact"
+    for health in (
+        {"hook_errors": 1, "first_error": "TypeError"},
+        {"observation_complete": False},
+        {"interrupted_generations": 1},
+        {"inflight_overflow": 2},
+        {"late_hooks": 1},
+        {"shutdown_failures": ["recorder: OSError"]},
+        {"complete": False},
+    ):
+        recorder = capture(**health)
+        summary = summarize([recorder.output_dir])
+        (batch,) = summary["write_batches"]
+        assert batch["partition"]["status"] == "observed_only", health
+        assert any("adapter:" in r for r in batch["partition"]["reasons"]), health
+        assert any(p["kind"] == "adapter_unhealthy" for p in summary["problems"])
+    # no profiler.json at all: unknown is not healthy
+    recorder = capture()
+    (recorder.output_dir / "profiler.json").unlink()
+    summary = summarize([recorder.output_dir])
+    assert summary["write_batches"][0]["partition"]["status"] == "observed_only"
+    assert "profiler.json missing" in summary["sources"][0]["adapter_health"][0]
+
+
+def test_a_submission_failure_and_an_unused_leg_are_told_apart(recorders):
+    recorder = recorders(context={**WORKER, "capabilities": {"post_pass": True}})
+    assert recorder.wait_ready()
+    record = recorder.record
+    bind(record, 1, "req-a", 1, 10, leg=2)
+    bind(record, 2, "req-a", 1, 20, leg=1)
+    # the first leg's post raised, the second was released unused (what the connector records)
+    record(
+        *fields(
+            EventKind.FAILED, handle=1, status=int(Failure.TRANSFER_FAILED), subject=1
+        )
+    )
+    record(
+        *fields(
+            EventKind.FAILED,
+            handle=2,
+            status=int(Failure.TRANSFER_NOT_POSTED),
+            subject=1,
+        )
+    )
+    record(*fields(EventKind.TRANSFER_RETIRE, handle=1))
+    record(*fields(EventKind.TRANSFER_RETIRE, handle=2))
+    bind(record, 3, "req-b", 2, 30)
+    record(*fields(EventKind.POST_RETURN, handle=3))
+    done(record, 3, 300, 9)
+    assert recorder.close().complete
+    adapter_summary(recorder)
+    one = group_of(summarize([recorder.output_dir]), 1)
+    assert one["outcomes"] == {
+        "completed": 0,
+        "failed": 2,
+        "unused": 1,
+        "submission_failed": 1,
+        "incomplete": 0,
+        "not_posted": 2,
+    }
+    assert [(m["leg"], m["failure"]) for m in one["members"]] == [
+        ("dram", "TRANSFER_FAILED"),
+        ("device", "TRANSFER_NOT_POSTED"),
+    ]
+    assert one["completeness"] == "exact" and one["bytes"] is None
+
+
+def test_a_graceful_close_during_an_unfinished_last_pass_is_observed_only(recorders):
+    """The recorder ends cleanly with every row drained, but nothing recorded later shows
+    that the last pass finished posting: a clean end alone proves nothing."""
+    recorder = recorders(context={**WORKER, "capabilities": {"post_pass": True}})
+    assert recorder.wait_ready()
+    record = recorder.record
+    bind(record, 1, "req-a", 1, 10)
+    record(*fields(EventKind.POST_RETURN, handle=1))
+    done(record, 1, 100, 5)
+    bind(record, 2, "req-b", 2, 20)
+    record(*fields(EventKind.POST_RETURN, handle=2))
+    assert recorder.close().complete and rows_of(recorder)[-1]["complete"] is True
+    adapter_summary(recorder)
+    summary = summarize([recorder.output_dir])
+    one, two = group_of(summary, 1), group_of(summary, 2)
+    assert (one["completeness"], one["bytes"]) == ("exact", 100)
+    assert two["completeness"] == "observed_only" and two["bytes"] is None
+    assert any("posting ended" in r for r in two["reasons"])
+    assert two["completion_span_ns"] is None
+
+
+def test_a_capture_with_loss_never_claims_an_exact_partition(recorders):
+    def build(record):
+        write_batch(record, 1, {"d-a": (768, 1), "d-b": (256, 1)})
+
+    recorder = recorders(context={**MOONCAKE})
+    assert recorder.wait_ready()
+    build(recorder.record)
+    assert recorder.close().complete
+    gone = next(
+        r["sequence"] for r in rows_of(recorder) if r.get("kind") == "request_bind"
+    )
+    edit_events(recorder, lambda r: r.get("sequence") != gone)
+    (batch,) = summarize([recorder.output_dir])["write_batches"]
+    assert batch["partition"]["status"] == "member_mismatch"
+
+
+def test_batch_membership_is_an_association_not_a_request_occurrence(recorders):
+    def build(record):
+        record(*fields(EventKind.REQUEST_BIND, "d-a", handoff="d-a-t", subject=7))
+        write_batch(record, 1, {"d-a": (768, 1), "d-b": (256, 1)})
+        write_batch(
+            record, 2, {"d-a": (512, 2)}, ok=False
+        )  # the same request in a later batch whose write failed
+        write_batch(record, 3, {"d-a": None}, posted=(0, 0), ok=False, no_write=True)
+
+    summary = mooncake_summary(recorders, build)
+    (a,) = [r for r in summary["requests"] if r["request"] == "d-a"]
+    assert (a["request_occurrences"], a["repeated_id"]) == (1, False)
+    assert len(a["write_batches"]) == 3
+    # Posted shares, planned-but-unconfirmed shares and unknown shares are kept apart.
+    assert (a["write_bytes_posted"], a["write_descriptors_posted"]) == (768, 1)
+    assert (
+        a["write_bytes_planned_unconfirmed"],
+        a["write_descriptors_planned_unconfirmed"],
+    ) == (512, 2)
+    assert a["write_shares_unknown"] == 1
+    assert [(b["write"], b["basis"]) for b in a["write_batches"]] == [
+        ("written", "posted"), ("failed", "planned"), ("incomplete", "unknown")]  # fmt: skip
+    (b,) = [r for r in summary["requests"] if r["request"] == "d-b"]
+    assert (b["request_occurrences"], b["write_bytes_posted"]) == (1, 256)

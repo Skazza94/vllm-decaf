@@ -50,6 +50,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        if (p := self._kvp) is not None:
+            p.load_pass()
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids, self._physical_blocks_per_logical_kv_block
@@ -714,6 +716,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                         )
         except Exception:
             for handle in handles:
+                # Legs that will never be posted: say so before they are retired.
+                if (p := self._kvp) is not None:
+                    p.transfer_unposted(handle)
                 if not self._try_release_xfer_handle(request_id, handle):
                     self._recving_transfers[request_id].append(handle)
             raise
@@ -727,7 +732,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 if (p := self._kvp) is not None:
                     p.transfer_posted(handle)
             except Exception:
-                for unstarted in handles[i:]:
+                for position, unstarted in enumerate(handles[i:]):
+                    if (p := self._kvp) is not None:
+                        # The leg whose post raised failed; later ones were never posted.
+                        if position == 0:
+                            p.transfer_failed(unstarted)
+                        else:
+                            p.transfer_unposted(unstarted)
                     if not self._try_release_xfer_handle(request_id, unstarted):
                         self._recving_transfers[request_id].append(unstarted)
                 raise
