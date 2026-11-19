@@ -121,17 +121,11 @@ def test_the_default_registry_bound_never_exceeds_the_handle_slots(tmp_path):
         NetworkProfilerConfig(**common, handle_slots=4, inflight_cap=5)
 
 
-def test_an_enabled_level_attaches_through_the_shared_rule(tmp_path, monkeypatch):
-    """The connector never compares a literal level: a level added to the shared
-    configuration's enabled set (as the combined base's will) attaches Mooncake too."""
-    extra = profiler_extra(tmp_path, level="l3")
-    with pytest.raises(ValueError):
-        make_scheduler("kv_producer", extra)
-    monkeypatch.setattr(profiler_config_module, "LEVELS", ("off", "l1", "l3"))
-    monkeypatch.setattr(
-        profiler_config_module, "ENABLED_LEVELS", frozenset({"l1", "l3"})
-    )
-    scheduler = make_scheduler("kv_producer", extra)
+def test_an_enabled_level_attaches_through_the_shared_rule(tmp_path):
+    """The connector never compares a literal level: every level in the shared
+    configuration's enabled set, L3 included, attaches Mooncake too."""
+    assert "l3" in profiler_config_module.ENABLED_LEVELS
+    scheduler = make_scheduler("kv_producer", profiler_extra(tmp_path, level="l3"))
     try:
         assert scheduler._kvp is not None and scheduler._kvp.config.level == "l3"
     finally:
