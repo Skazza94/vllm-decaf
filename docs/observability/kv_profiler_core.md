@@ -295,8 +295,8 @@ itself guarantee that the recorders close.
 
 L3 includes the L1 connector instrumentation (NIXL pull and the Mooncake
 adapter below) and declares an external observer. It is off by default. Transport
-metrics come from the separate L2 collector (below); eBPF probes are not part of
-this level yet. Sampling, JSON formatting
+metrics come from the separate L2 collector (below); eBPF is an opt-in collector
+of this observer (below), unqualified until live validation. Sampling, JSON formatting
 and kernel queries run in a separate endpoint process, never in a transfer
 callback. The native L1 ring ABI and transfer metrics are unchanged.
 
@@ -374,7 +374,11 @@ failure never signals or stops the server.
 The harness's `profiler.level: l3` additionally requires per-node `probes` and
 `observer_cpus` mappings. It launches endpoint-only observer containers with
 shared network/PID namespaces, a read-only profile mount and separate output,
-then collects manifests and logs. The generic CLI contains all probe logic.
+then collects manifests and logs. `observer.stdout.log` and
+`observer.stderr.log` preserve each Docker log stream; `observer.log` labels them
+without implying an order across streams. `endpoint-status.json` records log
+collection failures separately from the observer exit/timeout and cleanup.
+The generic CLI contains all probe logic.
 Current-image availability and real serving shutdown are separate qualification
 steps; installing this code does not establish L3 overhead acceptance.
 
@@ -461,6 +465,61 @@ root. Other drivers without an exposed backing path are refused explicitly.
 Procfs process-root magic links are not used as Docker bind sources. The helper
 uses `docker create` then `docker start`, records the created container ID and
 cleans up that ID even if startup fails; it never removes a name collision.
+
+### Opt-in eBPF collector (unqualified until live validation)
+
+The stdlib observer accepts an optional `probes.ebpf` mapping with `enabled`,
+`privileged_opt_in`, `sets`, `artifacts` and `kernel_audit`. Off is the default:
+there is no native child, eBPF import, capability syscall or automatic privileged
+launch. Off configurations keep their previous configuration identity. Existing
+saved stdlib captures still validate. A requested source can be made mandatory
+with `required: [ebpf]`; unavailable or incomplete required observations prevent
+a complete capture.
+
+The implementation provides native NIXL post attempts and endpoint TCP events.
+It uses only explicitly positive process-scoped uprobe-multi links and disables
+skeleton autoattach. Missing support has no fallback. `provider_wr` is explicitly
+unavailable: the current image lacks an audited provider. Owned fixture parsers
+exercise list and extended-builder contracts, not real-provider coverage.
+
+Artifacts are compiled separately with `tools/kv-profiler-ebpf/build.sh` in the
+accepted tooling image and mounted read-only. The manifest fixes hashes, image,
+limits and target kernel/BTF identity. The compiler/object inspector runs without
+loading or attaching the object. Starting observation additionally requires
+explicit opt-in, effective privilege, controller launch/namespace evidence and
+an audited target-kernel allocation/accounting contract. A raw map-size estimate
+or a claimed privilege flag alone cannot enable it. No SDK, provider or transport
+library is patched or replaced.
+
+The frozen limits include 256 processes, 128 resident thread records per process,
+2,048 total, 4,096 phased uprobe slots, a 16 MiB kernel-map cap, call depth four,
+64 WRs/list and eight SGEs/WR. All limits are joint refusal bounds; overflow,
+missing returns, corrupt metadata and generation changes are explicit failures.
+API attempts have observed epochs, not L1 transfer generations. They never gain
+request/transfer bindings from a shared thread or matching times.
+
+TCP records distinguish event counts and RX skb buffer lengths from wire or KV
+bytes. Zero socket cookies remain namespace-level unknown identities, not guessed
+flows. Snapshot records retain their native read spans. API kernel timestamps
+and endpoint timestamps remain separate; conversion arithmetic does not establish
+runtime clock qualification. The existing probe envelope records delivery time.
+
+The native channel bounds each JSON record to 256 bytes and queues to 4,096
+records. The existing common probe envelope keeps its separate 16 KiB record and
+512-row writer limits. Kernel epoch retirement waits for acknowledgement after
+that writer flushes; live counters are never read-and-zeroed. The observer adds
+the exact owned child's final `wait4` CPU and RSS HWM to its helper accounting.
+An exit reaped outside this path is explicit missing accounting, never replaced
+with cumulative usage from unrelated children. Measured map allocations above
+the audited bound or the frozen cap are failures with observed bytes retained,
+even for optional eBPF sources; missing accounting remains unavailable.
+Shutdown drains buffered output and stderr independently of stdin delivery or
+child exit. An abnormal exit or incomplete drain cannot pass as an optional
+source; owned-child accounting retains its separate completeness status. Missing
+normal-load loss visibility, target-kernel quiescence or privileged cleanup proof
+cannot become a qualified capture. The current native terminal explicitly stays
+incomplete until those live gates are validated; unprivileged tests do not lift
+this restriction. No serving or overhead qualification is implied.
 
 ## Mooncake adapter (L1)
 

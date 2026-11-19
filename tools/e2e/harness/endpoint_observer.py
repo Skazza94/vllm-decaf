@@ -179,8 +179,28 @@ class EndpointObserver:
             status.update(timed_out=True, error=str(error))
             shell.run(["docker", "kill", self.container_id], check=False)
         finally:
-            logs = shell.run(["docker", "logs", self.container_id], check=False)
-            (self.output / "observer.log").write_text(logs)
+            stdout = stderr = b""
+            try:
+                logs = subprocess.run(
+                    ["docker", "logs", self.container_id],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                stdout, stderr = logs.stdout, logs.stderr
+                status["logs_exit_code"] = logs.returncode
+            except (OSError, subprocess.SubprocessError) as error:
+                status["logs_error"] = str(error)
+                if isinstance(error, subprocess.TimeoutExpired):
+                    stdout, stderr = error.stdout or b"", error.stderr or b""
+            (self.output / "observer.stdout.log").write_bytes(stdout)
+            (self.output / "observer.stderr.log").write_bytes(stderr)
+            (self.output / "observer.log").write_bytes(
+                b"=== stdout ===\n"
+                + stdout
+                + b"\n=== stderr (cross-stream order unavailable) ===\n"
+                + stderr
+            )
             inspect = shell.run(["docker", "inspect", self.container_id], check=False)
             (self.output / "container.json").write_text(inspect)
             try:

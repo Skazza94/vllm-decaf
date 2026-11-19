@@ -4,10 +4,9 @@
 
 import hashlib
 import json
-from dataclasses import asdict
 from pathlib import Path
 
-from .config import ProbeConfig
+from .config import ProbeConfig, settings_dict
 from .records import validate
 
 
@@ -271,7 +270,9 @@ def endpoint_capture(directory, core_dir):
         run, endpoint = config["run_id"], config["endpoint"]
         validate_inventory(config["inventory"], run)
         expected_hash = hashlib.sha256(
-            json.dumps(asdict(ProbeConfig(**config["probes"])), sort_keys=True).encode()
+            json.dumps(
+                settings_dict(ProbeConfig(**config["probes"])), sort_keys=True
+            ).encode()
         ).hexdigest()
         package = directory / "observer.pyz"
         package_hash = hashlib.sha256(package.read_bytes()).hexdigest()

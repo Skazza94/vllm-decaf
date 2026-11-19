@@ -10,11 +10,11 @@ import select
 import sys
 import threading
 import time
-from dataclasses import asdict
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from . import netdev, rdma, tcp
+from .config import settings_dict
 from .health import core_completion, validate_inventory
 from .identity import ownership, placement, process_identity
 from .netlink import ObservationError
@@ -75,6 +75,7 @@ class Observer:
         if process_identity(owner_pid) != self.owner:
             os.close(self.pidfd)
             raise ValueError("owner changed while opening pidfd")
+        self.ebpf = None
         self.config, self.run_id, self.role = config, run_id, role
         self.tcp_reader = (
             tcp.SocketReader(config.tcp, config.max_sockets) if config.tcp else None
@@ -83,6 +84,7 @@ class Observer:
         self.process_id = str(uuid4())
         self.stop_event = threading.Event()
         self.failed_required = 0
+        self.ebpf_failures = 0
         self.isolation_failures = 0
         self.verified_processes = set()
         self.inventory = inventory
@@ -109,11 +111,11 @@ class Observer:
                 "endpoint": endpoint,
             },
             "owner": self.owner,
-            "config": asdict(config),
+            "config": settings_dict(config),
             "inventory": inventory,
             "package_sha256": package_sha256,
             "config_sha256": hashlib.sha256(
-                json.dumps(asdict(config), sort_keys=True).encode()
+                json.dumps(settings_dict(config), sort_keys=True).encode()
             ).hexdigest(),
             "affinity": sorted(cpus),
             "irq_policy": irq_policy,
@@ -127,6 +129,7 @@ class Observer:
                 "short_lived_flows": "may_be_unobserved",
                 "ownership": "optional_proc_snapshot",
                 "eBPF": False,
+                "eBPF_requested": bool(config.ebpf.get("enabled", False)),
                 "L2": False,
             },
         }
@@ -137,6 +140,13 @@ class Observer:
         except BaseException:
             os.close(self.pidfd)
             raise
+        if config.ebpf.get("enabled"):
+            from .ebpf import Collector, Settings
+
+            self.ebpf = Collector(
+                Settings(**config.ebpf), inventory, self.writer.directory / "ebpf"
+            )
+            self.ebpf.start()
 
     def emit(
         self, scope, entity, begin, data, transport="unknown", kind="endpoint_metrics"
@@ -165,7 +175,7 @@ class Observer:
                         kind,
                     )
                 return
-        self.writer.put(
+        return self.writer.put(
             event(kind, scope, entity, begin, time.monotonic_ns(), data, transport)
         )
 
@@ -316,6 +326,46 @@ class Observer:
             self.failure("tcp", error, begin)
             self.previous = {}
 
+    def ebpf_row(self, row):
+        if row.get("outcome") == "FAIL":
+            self.ebpf_failures += 1
+        # Native epochs/socket aggregates never become L1 transfer metrics.
+        data = {**row, "exact": False, "transfer_refs": "unbound"}
+        if row.get("type") == "api":
+            data["clock_source"] = "kernel_monotonic"
+            data["time_conversion_qualified"] = False
+            if self.ebpf.monotonic_offset is not None:
+                from .ebpf import convert_time
+
+                data["endpoint_begin_ns"] = convert_time(
+                    row["begin_ns"], self.ebpf.monotonic_offset
+                )
+                data["endpoint_end_ns"] = convert_time(
+                    row["end_ns"], self.ebpf.monotonic_offset
+                )
+        return self.emit(
+            "ebpf",
+            self.endpoint,
+            time.monotonic_ns(),
+            data,
+            "tcp" if row.get("type") in ("tcp", "tcp_namespace") else "unknown",
+        )
+
+    def sample_ebpf(self):
+        if self.ebpf is None:
+            return
+        try:
+            for row in self.ebpf.poll(self.writer):
+                self.ebpf.acknowledge(row, self.ebpf_row(row))
+            if not self.ebpf.status["available"]:
+                self.failure(
+                    "ebpf",
+                    self.ebpf.status.get("reason", "not_ready"),
+                    time.monotonic_ns(),
+                )
+        except (OSError, ValueError, KeyError) as error:
+            self.failure("ebpf", error, time.monotonic_ns())
+
     def sample(self, slow=True):
         begin = time.monotonic_ns()
         isolation = placement(
@@ -341,15 +391,19 @@ class Observer:
                     self.observe(
                         "qp", entity, lambda spec=spec: {"qps": rdma.qps(spec)}, "rdma"
                     )
+        self.sample_ebpf()
         self.samples += 1
         self.emit(
             "observer", self.process_id, begin, self.resources(), kind="probe_resource"
         )
 
     def resources(self):
+        native_cpu = self.ebpf.cpu_s if self.ebpf else 0.0
+        native_rss = self.ebpf.rss_hwm_kib if self.ebpf else 0
         return {
-            "cpu_s": time.process_time() - self.started_cpu,
-            "rss_hwm_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            "cpu_s": time.process_time() - self.started_cpu + native_cpu,
+            "rss_hwm_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            + native_rss,
             "elapsed_ns": time.monotonic_ns() - self.started_ns,
             "samples": self.samples,
             "observation_gaps": self.gaps,
@@ -411,10 +465,16 @@ class Observer:
                     and notice.get("children_closed") is True
                 )
             closure = core_completion(self.input_dir, self.run_id, self.inventory)
+            if self.ebpf:
+                native = self.ebpf.stop(self.writer, self.ebpf_row)
+                self.ebpf_row({"type": "lifecycle", **native})
+                if not native["complete"] and "ebpf" in self.config.required:
+                    self.failed_required += 1
             complete = (
                 controller
                 and closure["all_closed"]
                 and not self.failed_required
+                and not self.ebpf_failures
                 and not self.isolation_failures
                 and not self.gaps
                 and reason == "controller_stop"
@@ -437,10 +497,13 @@ class Observer:
                 {
                     **self.resources(),
                     "required_source_failures": self.failed_required,
+                    "ebpf_failures": self.ebpf_failures,
                     "isolation_failures": self.isolation_failures,
                     "controller_children_closed": controller,
                     "core": closure,
                 },
             )
         finally:
+            if self.ebpf and self.ebpf.child and self.ebpf.running():
+                self.ebpf.stop(self.writer, self.ebpf_row)
             os.close(self.pidfd)

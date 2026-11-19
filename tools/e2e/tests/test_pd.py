@@ -4959,6 +4959,52 @@ class EndpointCaptureChecks(unittest.TestCase):
             self.assertTrue(all("incomplete" in item for item in verdict["problems"]))
 
 
+class EndpointObserverDiagnostics(unittest.TestCase):
+    def test_stderr_only_failure_is_preserved_without_masking_exit_or_cleanup(self):
+        """A fake Docker CLI keeps real subprocess stream handling, without Docker."""
+        from harness.endpoint_observer import EndpointObserver
+
+        for logs_exit in (0, 23):
+            with (
+                self.subTest(logs_exit=logs_exit),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                output = root / "output"
+                output.mkdir()
+                docker = root / "docker"
+                docker.write_text(
+                    f"#!{sys.executable}\n"
+                    "import pathlib, sys\n"
+                    "assert sys.argv[-1] == 'owned-observer'\n"
+                    "action = sys.argv[1]\n"
+                    "if action == 'wait': print(1)\n"
+                    "elif action == 'logs':\n"
+                    "    sys.stderr.buffer.write(b'only-stderr: startup failed\\n')\n"
+                    f"    sys.exit({logs_exit})\n"
+                    "elif action == 'inspect': print('[]')\n"
+                    "elif action == 'rm':\n"
+                    f"    pathlib.Path({str(root / 'removed')!r}).touch()\n"
+                    "else: sys.exit(97)\n"
+                )
+                docker.chmod(0o755)
+                observer = EndpointObserver(
+                    "observer", output, "run", "decode", "owned-observer"
+                )
+                with mock.patch.dict(os.environ, {"PATH": str(root)}):
+                    observer.stop(False)
+                self.assertEqual((output / "observer.stdout.log").read_bytes(), b"")
+                stderr = b"only-stderr: startup failed\n"
+                self.assertEqual((output / "observer.stderr.log").read_bytes(), stderr)
+                self.assertIn(stderr, (output / "observer.log").read_bytes())
+                status = json.loads((output / "endpoint-status.json").read_text())
+                self.assertEqual(status["exit_code"], 1)
+                self.assertEqual(status["logs_exit_code"], logs_exit)
+                self.assertFalse(status["timed_out"])
+                self.assertTrue(status["removed"])
+                self.assertTrue((root / "removed").exists())
+
+
 class EndpointObserverAccounting(unittest.TestCase):
     def test_observer_is_not_a_server_child_and_its_cpu_counts_as_a_helper(self):
         command = (b"/opt/venv/bin/python\0/installed/vllm/kv_profiling/"
@@ -5073,9 +5119,8 @@ class EndpointCaptureIntegrity(unittest.TestCase):
 
             script = (
                 "import sys,json;sys.path.insert(0,sys.argv[1]);"
-                "from endpoint_probes.config import ProbeConfig;"
-                "from dataclasses import asdict;"
-                "print(json.dumps(asdict(ProbeConfig(**json.loads(sys.argv[2]))),"
+                "from endpoint_probes.config import ProbeConfig,settings_dict;"
+                "print(json.dumps(settings_dict(ProbeConfig(**json.loads(sys.argv[2]))),"
                 "sort_keys=True))"
             )
             normalized = subprocess.check_output(

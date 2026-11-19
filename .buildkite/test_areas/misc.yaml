@@ -1133,6 +1133,10 @@ steps:
     - vllm/kv_profiling/
     - csrc/kv_profiler/
     - tests/distributed/kv_transfer/test_endpoint_probes.py
+    - tests/distributed/kv_transfer/endpoint_ebpf_accounting.c
+    - tests/distributed/kv_transfer/endpoint_ebpf_native.c
+    - tests/distributed/kv_transfer/endpoint_ebpf_helpers.h
+    - tests/distributed/kv_transfer/endpoint_ebpf_syscalls.c
     - tests/distributed/kv_transfer/profiled_endpoint.py
     - tests/distributed/kv_transfer/test_profiler_core.py
     - .buildkite/test_areas/misc.yaml

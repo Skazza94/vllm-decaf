@@ -4,7 +4,7 @@
 
 import ipaddress
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 
 def integer(value, low, high, name):
@@ -39,6 +39,7 @@ class ProbeConfig:
     max_sockets: int = 1024
     queue_rows: int = 512
     output_bytes: int = 256 << 20
+    ebpf: dict = field(default_factory=dict)
 
     def __post_init__(self):
         for name in ("interval_s", "slow_interval_s"):
@@ -86,7 +87,18 @@ class ProbeConfig:
                 raise ValueError("RDMA port requires device and port")
             component(spec["device"])
             integer(spec["port"], 1, 255, "RDMA port")
+        if not isinstance(self.ebpf, dict):
+            raise ValueError("ebpf must be a mapping")
+        if self.ebpf.get("enabled", False) is False:
+            if set(self.ebpf) - {"enabled"}:
+                raise ValueError("disabled ebpf accepts only enabled=false")
+        else:
+            from .ebpf import Settings
+
+            Settings(**self.ebpf)
         enabled = set()
+        if self.ebpf.get("enabled"):
+            enabled.add("ebpf")
         if self.tcp:
             enabled.add("tcp")
         if self.interfaces:
@@ -109,3 +121,11 @@ class ProbeConfig:
             raise ValueError("QP queries require explicit RDMA device/ports")
         if self.driver_statistics and not self.interfaces:
             raise ValueError("driver statistics require explicit interfaces")
+
+
+def settings_dict(config):
+    """Preserve the pre-eBPF identity of disabled configurations and saved runs."""
+    result = asdict(config)
+    if not config.ebpf.get("enabled", False):
+        result.pop("ebpf")
+    return result

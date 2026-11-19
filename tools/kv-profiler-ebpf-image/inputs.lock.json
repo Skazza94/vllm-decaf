@@ -1,0 +1,2410 @@
+{
+  "architecture": "amd64",
+  "base_dpkg_status_sha256": "4500544f6fe88cdab753ea69a8c0783bce0c18a839f21d707a581d93a20dd5de",
+  "base_image": "sha256:c25c4f62ca7bc4433e730fc8a6238532dbe8739f13e62018a503f2c43c200dd5",
+  "build_dependency_roots": [
+    "clang-18",
+    "llvm-18",
+    "libelf-dev",
+    "zlib1g-dev",
+    "pkg-config",
+    "gcc-15",
+    "make",
+    "binutils",
+    "tar",
+    "gzip",
+    "coreutils",
+    "dpkg",
+    "libc6-dev",
+    "linux-libc-dev"
+  ],
+  "build_stage_image": "sha256:c25c4f62ca7bc4433e730fc8a6238532dbe8739f13e62018a503f2c43c200dd5",
+  "dependency_closure": {
+    "binutils": {
+      "dependencies": [
+        {
+          "requirement": "binutils-common (= 2.38-4ubuntu2.12)",
+          "selected": "binutils-common"
+        },
+        {
+          "requirement": "libbinutils (= 2.38-4ubuntu2.12)",
+          "selected": "libbinutils"
+        },
+        {
+          "requirement": "binutils-x86-64-linux-gnu (= 2.38-4ubuntu2.12)",
+          "selected": "binutils-x86-64-linux-gnu"
+        }
+      ],
+      "origin": "base",
+      "version": "2.38-4ubuntu2.12"
+    },
+    "binutils-common": {
+      "dependencies": [],
+      "origin": "base",
+      "version": "2.38-4ubuntu2.12"
+    },
+    "binutils-x86-64-linux-gnu": {
+      "dependencies": [
+        {
+          "requirement": "binutils-common (= 2.38-4ubuntu2.12)",
+          "selected": "binutils-common"
+        },
+        {
+          "requirement": "libbinutils (= 2.38-4ubuntu2.12)",
+          "selected": "libbinutils"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libctf-nobfd0 (>= 2.36)",
+          "selected": "libctf-nobfd0"
+        },
+        {
+          "requirement": "libctf0 (>= 2.36)",
+          "selected": "libctf0"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 4.2)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.1.4)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "2.38-4ubuntu2.12"
+    },
+    "clang-18": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libclang-cpp18 (>= 1:18.1.8~++20240731024944+3b5b5c1ec4a3)",
+          "selected": "libclang-cpp18"
+        },
+        {
+          "requirement": "libllvm18 (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144)",
+          "selected": "libllvm18"
+        },
+        {
+          "requirement": "libstdc++6 (>= 11)",
+          "selected": "libstdc++6"
+        },
+        {
+          "requirement": "libstdc++-11-dev",
+          "selected": "libstdc++-11-dev"
+        },
+        {
+          "requirement": "libgcc-11-dev",
+          "selected": "libgcc-11-dev"
+        },
+        {
+          "requirement": "libobjc-11-dev",
+          "selected": "libobjc-11-dev"
+        },
+        {
+          "requirement": "libclang-common-18-dev (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144)",
+          "selected": "libclang-common-18-dev"
+        },
+        {
+          "requirement": "llvm-18-linker-tools (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144)",
+          "selected": "llvm-18-linker-tools"
+        },
+        {
+          "requirement": "libclang1-18 (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144)",
+          "selected": "libclang1-18"
+        },
+        {
+          "requirement": "libc6-dev",
+          "selected": "libc6-dev"
+        },
+        {
+          "requirement": "binutils",
+          "selected": "binutils"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    "coreutils": {
+      "dependencies": [
+        {
+          "requirement": "libacl1 (>= 2.2.23)",
+          "selected": "libacl1"
+        },
+        {
+          "requirement": "libattr1 (>= 1:2.4.44)",
+          "selected": "libattr1"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgmp10 (>= 2:6.2.1+dfsg)",
+          "selected": "libgmp10"
+        },
+        {
+          "requirement": "libselinux1 (>= 3.1~)",
+          "selected": "libselinux1"
+        }
+      ],
+      "origin": "base",
+      "version": "8.32-4.1ubuntu1.4"
+    },
+    "cpp-15": {
+      "dependencies": [
+        {
+          "requirement": "gcc-15-base (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "gcc-15-base"
+        },
+        {
+          "requirement": "cpp-15-x86-64-linux-gnu (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "cpp-15-x86-64-linux-gnu"
+        }
+      ],
+      "origin": "base",
+      "version": "15.2.0-15ubuntu1~22~ppa2"
+    },
+    "cpp-15-x86-64-linux-gnu": {
+      "dependencies": [
+        {
+          "requirement": "gcc-15-base (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "gcc-15-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.35)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgmp10 (>= 2:6.2.1+dfsg)",
+          "selected": "libgmp10"
+        },
+        {
+          "requirement": "libisl23 (>= 0.15)",
+          "selected": "libisl23"
+        },
+        {
+          "requirement": "libmpc3 (>= 1.1.0)",
+          "selected": "libmpc3"
+        },
+        {
+          "requirement": "libmpfr6 (>= 3.1.3)",
+          "selected": "libmpfr6"
+        },
+        {
+          "requirement": "libzstd1 (>= 1.4.0)",
+          "selected": "libzstd1"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.1.4)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "15.2.0-15ubuntu1~22~ppa2"
+    },
+    "debconf": {
+      "dependencies": [
+        {
+          "requirement": "perl-base (>= 5.20.1-3~)",
+          "selected": "perl-base"
+        }
+      ],
+      "origin": "base",
+      "version": "1.5.79ubuntu1"
+    },
+    "dpkg": {
+      "dependencies": [
+        {
+          "requirement": "libbz2-1.0",
+          "selected": "libbz2-1.0"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "liblzma5 (>= 5.2.2)",
+          "selected": "liblzma5"
+        },
+        {
+          "requirement": "libselinux1 (>= 3.1~)",
+          "selected": "libselinux1"
+        },
+        {
+          "requirement": "libzstd1 (>= 1.4.0)",
+          "selected": "libzstd1"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.1.4)",
+          "selected": "zlib1g"
+        },
+        {
+          "requirement": "tar (>= 1.28-1)",
+          "selected": "tar"
+        }
+      ],
+      "origin": "base",
+      "version": "1.21.1ubuntu2.6"
+    },
+    "gcc-11-base": {
+      "dependencies": [],
+      "origin": "locked_deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    "gcc-12-base": {
+      "dependencies": [],
+      "origin": "base",
+      "version": "12.3.0-1ubuntu1~22.04.3"
+    },
+    "gcc-15": {
+      "dependencies": [
+        {
+          "requirement": "gcc-15-x86-64-linux-gnu (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "gcc-15-x86-64-linux-gnu"
+        },
+        {
+          "requirement": "gcc-15-base (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "gcc-15-base"
+        },
+        {
+          "requirement": "cpp-15 (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "cpp-15"
+        },
+        {
+          "requirement": "binutils (>= 2.38)",
+          "selected": "binutils"
+        }
+      ],
+      "origin": "base",
+      "version": "15.2.0-15ubuntu1~22~ppa2"
+    },
+    "gcc-15-base": {
+      "dependencies": [],
+      "origin": "base",
+      "version": "15.2.0-15ubuntu1~22~ppa2"
+    },
+    "gcc-15-x86-64-linux-gnu": {
+      "dependencies": [
+        {
+          "requirement": "cpp-15-x86-64-linux-gnu (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "cpp-15-x86-64-linux-gnu"
+        },
+        {
+          "requirement": "gcc-15-base (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "gcc-15-base"
+        },
+        {
+          "requirement": "libcc1-0 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libcc1-0"
+        },
+        {
+          "requirement": "binutils-x86-64-linux-gnu (>= 2.38)",
+          "selected": "binutils-x86-64-linux-gnu"
+        },
+        {
+          "requirement": "libgcc-15-dev (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libgcc-15-dev"
+        },
+        {
+          "requirement": "libc6 (>= 2.35)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.0)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libgmp10 (>= 2:6.2.1+dfsg)",
+          "selected": "libgmp10"
+        },
+        {
+          "requirement": "libisl23 (>= 0.15)",
+          "selected": "libisl23"
+        },
+        {
+          "requirement": "libmpc3 (>= 1.1.0)",
+          "selected": "libmpc3"
+        },
+        {
+          "requirement": "libmpfr6 (>= 3.1.3)",
+          "selected": "libmpfr6"
+        },
+        {
+          "requirement": "libstdc++6 (>= 5)",
+          "selected": "libstdc++6"
+        },
+        {
+          "requirement": "libzstd1 (>= 1.4.0)",
+          "selected": "libzstd1"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.1.4)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "15.2.0-15ubuntu1~22~ppa2"
+    },
+    "gcc-16-base": {
+      "dependencies": [],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "gzip": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "dpkg (>= 1.15.4) | install-info",
+          "selected": "dpkg"
+        }
+      ],
+      "origin": "base",
+      "version": "1.10-4ubuntu4.2"
+    },
+    "libacl1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "2.3.1-1"
+    },
+    "libasan6": {
+      "dependencies": [
+        {
+          "requirement": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "gcc-11-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1",
+          "selected": "libgcc-s1"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    "libasan8": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.3)",
+          "selected": "libgcc-s1"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libatomic1": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libattr1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.4)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1:2.5.1-1ubuntu0.1"
+    },
+    "libbinutils": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.2.0)",
+          "selected": "zlib1g"
+        },
+        {
+          "requirement": "binutils-common (= 2.38-4ubuntu2.12)",
+          "selected": "binutils-common"
+        }
+      ],
+      "origin": "base",
+      "version": "2.38-4ubuntu2.12"
+    },
+    "libblkid1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "2.37.2-4ubuntu3.6"
+    },
+    "libbrotli1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.29)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.0.9-2ubuntu0.1"
+    },
+    "libbsd0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libmd0 (>= 1.0.3-2)",
+          "selected": "libmd0"
+        }
+      ],
+      "origin": "base",
+      "version": "0.11.5-1"
+    },
+    "libbz2-1.0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.4)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.0.8-5ubuntu0.1"
+    },
+    "libc-dev-bin": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>> 2.35)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libc6 (<< 2.36)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "2.35-0ubuntu3.18"
+    },
+    "libc6": {
+      "dependencies": [
+        {
+          "requirement": "libgcc-s1",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libcrypt1 (>= 1:4.4.10-10ubuntu4)",
+          "selected": "libcrypt1"
+        }
+      ],
+      "origin": "base",
+      "version": "2.35-0ubuntu3.18"
+    },
+    "libc6-dev": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (= 2.35-0ubuntu3.18)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libc-dev-bin (= 2.35-0ubuntu3.18)",
+          "selected": "libc-dev-bin"
+        },
+        {
+          "requirement": "linux-libc-dev",
+          "selected": "linux-libc-dev"
+        },
+        {
+          "requirement": "libcrypt-dev",
+          "selected": "libcrypt-dev"
+        },
+        {
+          "requirement": "rpcsvc-proto",
+          "selected": "rpcsvc-proto"
+        },
+        {
+          "requirement": "libtirpc-dev",
+          "selected": "libtirpc-dev"
+        },
+        {
+          "requirement": "libnsl-dev",
+          "selected": "libnsl-dev"
+        }
+      ],
+      "origin": "base",
+      "version": "2.35-0ubuntu3.18"
+    },
+    "libcc1-0": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.15)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.0)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libstdc++6 (>= 13)",
+          "selected": "libstdc++6"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libclang-common-18-dev": {
+      "dependencies": [],
+      "origin": "locked_deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    "libclang-cpp18": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libllvm18 (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144)",
+          "selected": "libllvm18"
+        },
+        {
+          "requirement": "libstdc++6 (>= 12)",
+          "selected": "libstdc++6"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    "libclang1-18": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libllvm18",
+          "selected": "libllvm18"
+        },
+        {
+          "requirement": "libstdc++6 (>= 11)",
+          "selected": "libstdc++6"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    "libcom-err2": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.17)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.46.5-2ubuntu1.2"
+    },
+    "libcrypt-dev": {
+      "dependencies": [
+        {
+          "requirement": "libcrypt1 (= 1:4.4.27-1)",
+          "selected": "libcrypt1"
+        }
+      ],
+      "origin": "base",
+      "version": "1:4.4.27-1"
+    },
+    "libcrypt1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.25)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1:4.4.27-1"
+    },
+    "libctf-nobfd0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.2.0)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "2.38-4ubuntu2.12"
+    },
+    "libctf0": {
+      "dependencies": [
+        {
+          "requirement": "libbinutils (= 2.38-4ubuntu2.12)",
+          "selected": "libbinutils"
+        },
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.2.0)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "2.38-4ubuntu2.12"
+    },
+    "libcurl4": {
+      "dependencies": [
+        {
+          "requirement": "libbrotli1 (>= 0.6.0)",
+          "selected": "libbrotli1"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgssapi-krb5-2 (>= 1.17)",
+          "selected": "libgssapi-krb5-2"
+        },
+        {
+          "requirement": "libidn2-0 (>= 0.6)",
+          "selected": "libidn2-0"
+        },
+        {
+          "requirement": "libldap-2.5-0 (>= 2.5.4)",
+          "selected": "libldap-2.5-0"
+        },
+        {
+          "requirement": "libnghttp2-14 (>= 1.12.0)",
+          "selected": "libnghttp2-14"
+        },
+        {
+          "requirement": "libpsl5 (>= 0.16.0)",
+          "selected": "libpsl5"
+        },
+        {
+          "requirement": "librtmp1 (>= 2.4+20131018.git79459a2-3~)",
+          "selected": "librtmp1"
+        },
+        {
+          "requirement": "libssh-4 (>= 0.9.0)",
+          "selected": "libssh-4"
+        },
+        {
+          "requirement": "libssl3 (>= 3.0.0~~alpha1)",
+          "selected": "libssl3"
+        },
+        {
+          "requirement": "libzstd1 (>= 1.4.0)",
+          "selected": "libzstd1"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.1.4)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "7.81.0-1ubuntu1.30"
+    },
+    "libdb5.3": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "5.3.28+dfsg1-0.8ubuntu3"
+    },
+    "libdpkg-perl": {
+      "dependencies": [
+        {
+          "requirement": "perl:any",
+          "selected": "perl"
+        },
+        {
+          "requirement": "dpkg (>= 1.18.11)",
+          "selected": "dpkg"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "1.21.1ubuntu2.6"
+    },
+    "libedit2": {
+      "dependencies": [
+        {
+          "requirement": "libbsd0 (>= 0.1.3)",
+          "selected": "libbsd0"
+        },
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libtinfo6 (>= 6)",
+          "selected": "libtinfo6"
+        }
+      ],
+      "origin": "base",
+      "version": "3.1-20210910-1build1"
+    },
+    "libelf-dev": {
+      "dependencies": [
+        {
+          "requirement": "libelf1 (= 0.186-1ubuntu0.1)",
+          "selected": "libelf1"
+        },
+        {
+          "requirement": "zlib1g-dev",
+          "selected": "zlib1g-dev"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "0.186-1ubuntu0.1"
+    },
+    "libelf1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.1.4)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "0.186-1ubuntu0.1"
+    },
+    "libffi8": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.27)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "3.4.2-4"
+    },
+    "libgc1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libstdc++6 (>= 4.1.1)",
+          "selected": "libstdc++6"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "1:8.0.6-1.1build1"
+    },
+    "libgcc-11-dev": {
+      "dependencies": [
+        {
+          "requirement": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "gcc-11-base"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libgomp1 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libgomp1"
+        },
+        {
+          "requirement": "libitm1 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libitm1"
+        },
+        {
+          "requirement": "libatomic1 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libatomic1"
+        },
+        {
+          "requirement": "libasan6 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libasan6"
+        },
+        {
+          "requirement": "liblsan0 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "liblsan0"
+        },
+        {
+          "requirement": "libtsan0 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libtsan0"
+        },
+        {
+          "requirement": "libubsan1 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libubsan1"
+        },
+        {
+          "requirement": "libquadmath0 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libquadmath0"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    "libgcc-15-dev": {
+      "dependencies": [
+        {
+          "requirement": "gcc-15-base (= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "gcc-15-base"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libgomp1 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libgomp1"
+        },
+        {
+          "requirement": "libitm1 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libitm1"
+        },
+        {
+          "requirement": "libatomic1 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libatomic1"
+        },
+        {
+          "requirement": "libasan8 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libasan8"
+        },
+        {
+          "requirement": "liblsan0 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "liblsan0"
+        },
+        {
+          "requirement": "libtsan2 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libtsan2"
+        },
+        {
+          "requirement": "libubsan1 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libubsan1"
+        },
+        {
+          "requirement": "libhwasan0 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libhwasan0"
+        },
+        {
+          "requirement": "libquadmath0 (>= 15.2.0-15ubuntu1~22~ppa2)",
+          "selected": "libquadmath0"
+        }
+      ],
+      "origin": "base",
+      "version": "15.2.0-15ubuntu1~22~ppa2"
+    },
+    "libgcc-s1": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.35)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libgdbm-compat4": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgdbm6 (>= 1.16)",
+          "selected": "libgdbm6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.23-1"
+    },
+    "libgdbm6": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.23-1"
+    },
+    "libglib2.0-0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libffi8 (>= 3.4)",
+          "selected": "libffi8"
+        },
+        {
+          "requirement": "libmount1 (>= 2.35.2-7~)",
+          "selected": "libmount1"
+        },
+        {
+          "requirement": "libpcre3",
+          "selected": "libpcre3"
+        },
+        {
+          "requirement": "libselinux1 (>= 3.1~)",
+          "selected": "libselinux1"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.2.2)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "2.72.4-0ubuntu2.11"
+    },
+    "libgmp10": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "2:6.2.1+dfsg-3ubuntu1"
+    },
+    "libgnutls30": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgmp10 (>= 2:6.2.1+dfsg)",
+          "selected": "libgmp10"
+        },
+        {
+          "requirement": "libhogweed6 (>= 3.6)",
+          "selected": "libhogweed6"
+        },
+        {
+          "requirement": "libidn2-0 (>= 2.0.0)",
+          "selected": "libidn2-0"
+        },
+        {
+          "requirement": "libnettle8 (>= 3.7~)",
+          "selected": "libnettle8"
+        },
+        {
+          "requirement": "libp11-kit0 (>= 0.23.18.1)",
+          "selected": "libp11-kit0"
+        },
+        {
+          "requirement": "libtasn1-6 (>= 4.14)",
+          "selected": "libtasn1-6"
+        },
+        {
+          "requirement": "libunistring2 (>= 0.9.7)",
+          "selected": "libunistring2"
+        }
+      ],
+      "origin": "base",
+      "version": "3.7.3-4ubuntu1.9"
+    },
+    "libgomp1": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libgssapi-krb5-2": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libcom-err2 (>= 1.43.9)",
+          "selected": "libcom-err2"
+        },
+        {
+          "requirement": "libk5crypto3 (>= 1.16)",
+          "selected": "libk5crypto3"
+        },
+        {
+          "requirement": "libkrb5-3 (= 1.19.2-2ubuntu0.10)",
+          "selected": "libkrb5-3"
+        },
+        {
+          "requirement": "libkrb5support0 (>= 1.15~beta1)",
+          "selected": "libkrb5support0"
+        }
+      ],
+      "origin": "base",
+      "version": "1.19.2-2ubuntu0.10"
+    },
+    "libhogweed6": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgmp10 (>= 2:6.2.1+dfsg)",
+          "selected": "libgmp10"
+        },
+        {
+          "requirement": "libnettle8",
+          "selected": "libnettle8"
+        }
+      ],
+      "origin": "base",
+      "version": "3.7.3-1build2"
+    },
+    "libhwasan0": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.3)",
+          "selected": "libgcc-s1"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libicu70": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.3.1)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libstdc++6 (>= 5.2)",
+          "selected": "libstdc++6"
+        }
+      ],
+      "origin": "base",
+      "version": "70.1-2"
+    },
+    "libidn2-0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libunistring2 (>= 0.9.7)",
+          "selected": "libunistring2"
+        }
+      ],
+      "origin": "base",
+      "version": "2.3.2-2build1"
+    },
+    "libisl23": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgmp10 (>= 2:6.2.1+dfsg)",
+          "selected": "libgmp10"
+        }
+      ],
+      "origin": "base",
+      "version": "0.24-2build1"
+    },
+    "libitm1": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libk5crypto3": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libkrb5support0 (>= 1.16)",
+          "selected": "libkrb5support0"
+        }
+      ],
+      "origin": "base",
+      "version": "1.19.2-2ubuntu0.10"
+    },
+    "libkeyutils1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.6.1-2ubuntu3"
+    },
+    "libkrb5-3": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libcom-err2 (>= 1.43.9)",
+          "selected": "libcom-err2"
+        },
+        {
+          "requirement": "libk5crypto3 (>= 1.18.2)",
+          "selected": "libk5crypto3"
+        },
+        {
+          "requirement": "libkeyutils1 (>= 1.5.9)",
+          "selected": "libkeyutils1"
+        },
+        {
+          "requirement": "libkrb5support0 (= 1.19.2-2ubuntu0.10)",
+          "selected": "libkrb5support0"
+        },
+        {
+          "requirement": "libssl3 (>= 3.0.0~~alpha1)",
+          "selected": "libssl3"
+        }
+      ],
+      "origin": "base",
+      "version": "1.19.2-2ubuntu0.10"
+    },
+    "libkrb5support0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.19.2-2ubuntu0.10"
+    },
+    "libldap-2.5-0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgnutls30 (>= 3.7.2)",
+          "selected": "libgnutls30"
+        },
+        {
+          "requirement": "libsasl2-2 (>= 2.1.27+dfsg2)",
+          "selected": "libsasl2-2"
+        }
+      ],
+      "origin": "base",
+      "version": "2.5.20+dfsg-0ubuntu0.22.04.1"
+    },
+    "libllvm18": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libedit2 (>= 2.11-20080614-0)",
+          "selected": "libedit2"
+        },
+        {
+          "requirement": "libffi8 (>= 3.4)",
+          "selected": "libffi8"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.3)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libstdc++6 (>= 12)",
+          "selected": "libstdc++6"
+        },
+        {
+          "requirement": "libtinfo6 (>= 6)",
+          "selected": "libtinfo6"
+        },
+        {
+          "requirement": "libxml2 (>= 2.7.4)",
+          "selected": "libxml2"
+        },
+        {
+          "requirement": "libzstd1 (>= 1.4.0)",
+          "selected": "libzstd1"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.2.0)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    "liblsan0": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.3)",
+          "selected": "libgcc-s1"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "liblzma5": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "5.2.5-2ubuntu1.2"
+    },
+    "libmd0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.0.4-1build1"
+    },
+    "libmount1": {
+      "dependencies": [
+        {
+          "requirement": "libblkid1 (>= 2.17.2)",
+          "selected": "libblkid1"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libselinux1 (>= 3.1~)",
+          "selected": "libselinux1"
+        }
+      ],
+      "origin": "base",
+      "version": "2.37.2-4ubuntu3.6"
+    },
+    "libmpc3": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.4)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgmp10 (>= 2:6.2.1+dfsg)",
+          "selected": "libgmp10"
+        },
+        {
+          "requirement": "libmpfr6 (>= 4.0.0)",
+          "selected": "libmpfr6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.2.1-2build1"
+    },
+    "libmpfr6": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgmp10 (>= 2:6.2.1+dfsg)",
+          "selected": "libgmp10"
+        }
+      ],
+      "origin": "base",
+      "version": "4.1.0-3build3"
+    },
+    "libnettle8": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.17)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "3.7.3-1build2"
+    },
+    "libnghttp2-14": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.17)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.43.0-1ubuntu0.4"
+    },
+    "libnsl-dev": {
+      "dependencies": [
+        {
+          "requirement": "libnsl2 (= 1.3.0-2build2)",
+          "selected": "libnsl2"
+        },
+        {
+          "requirement": "libtirpc-dev",
+          "selected": "libtirpc-dev"
+        }
+      ],
+      "origin": "base",
+      "version": "1.3.0-2build2"
+    },
+    "libnsl2": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libtirpc3 (>= 1.0.2)",
+          "selected": "libtirpc3"
+        }
+      ],
+      "origin": "base",
+      "version": "1.3.0-2build2"
+    },
+    "libobjc-11-dev": {
+      "dependencies": [
+        {
+          "requirement": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "gcc-11-base"
+        },
+        {
+          "requirement": "libgcc-11-dev (= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libgcc-11-dev"
+        },
+        {
+          "requirement": "libobjc4 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libobjc4"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    "libobjc4": {
+      "dependencies": [
+        {
+          "requirement": "gcc-12-base (= 12.3.0-1ubuntu1~22.04.3)",
+          "selected": "gcc-12-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgc1 (>= 1:7.2d)",
+          "selected": "libgc1"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.0)",
+          "selected": "libgcc-s1"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "12.3.0-1ubuntu1~22.04.3"
+    },
+    "libp11-kit0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libffi8 (>= 3.4)",
+          "selected": "libffi8"
+        }
+      ],
+      "origin": "base",
+      "version": "0.24.0-6ubuntu0.1"
+    },
+    "libpcre2-8-0": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "10.39-3ubuntu0.2"
+    },
+    "libpcre3": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "2:8.39-13ubuntu0.22.04.1"
+    },
+    "libperl5.34": {
+      "dependencies": [
+        {
+          "requirement": "libbz2-1.0",
+          "selected": "libbz2-1.0"
+        },
+        {
+          "requirement": "libc6 (>= 2.35)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libcrypt1 (>= 1:4.1.0)",
+          "selected": "libcrypt1"
+        },
+        {
+          "requirement": "libdb5.3",
+          "selected": "libdb5.3"
+        },
+        {
+          "requirement": "libgdbm-compat4 (>= 1.18-3)",
+          "selected": "libgdbm-compat4"
+        },
+        {
+          "requirement": "libgdbm6 (>= 1.18-3)",
+          "selected": "libgdbm6"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.2.2.3)",
+          "selected": "zlib1g"
+        },
+        {
+          "requirement": "perl-modules-5.34 (>= 5.34.0-3ubuntu1.10)",
+          "selected": "perl-modules-5.34"
+        }
+      ],
+      "origin": "base",
+      "version": "5.34.0-3ubuntu1.10"
+    },
+    "libpfm4": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "4.11.1+git32-gd0b85fb-1ubuntu0.1"
+    },
+    "libpsl5": {
+      "dependencies": [
+        {
+          "requirement": "libidn2-0 (>= 0.16)",
+          "selected": "libidn2-0"
+        },
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libunistring2 (>= 0.9.7)",
+          "selected": "libunistring2"
+        }
+      ],
+      "origin": "base",
+      "version": "0.21.0-1.2build2"
+    },
+    "libquadmath0": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.23)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "librtmp1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgmp10 (>= 2:6.2.1+dfsg)",
+          "selected": "libgmp10"
+        },
+        {
+          "requirement": "libgnutls30 (>= 3.7.2)",
+          "selected": "libgnutls30"
+        },
+        {
+          "requirement": "libhogweed6",
+          "selected": "libhogweed6"
+        },
+        {
+          "requirement": "libnettle8",
+          "selected": "libnettle8"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.1.4)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "2.4+20151223.gitfa8646d.1-2build4"
+    },
+    "libsasl2-2": {
+      "dependencies": [
+        {
+          "requirement": "libsasl2-modules-db (>= 2.1.27+dfsg2-3ubuntu1.2)",
+          "selected": "libsasl2-modules-db"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "2.1.27+dfsg2-3ubuntu1.2"
+    },
+    "libsasl2-modules-db": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libdb5.3",
+          "selected": "libdb5.3"
+        }
+      ],
+      "origin": "base",
+      "version": "2.1.27+dfsg2-3ubuntu1.2"
+    },
+    "libselinux1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libpcre2-8-0 (>= 10.22)",
+          "selected": "libpcre2-8-0"
+        }
+      ],
+      "origin": "base",
+      "version": "3.3-1build2"
+    },
+    "libssh-4": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgssapi-krb5-2 (>= 1.17)",
+          "selected": "libgssapi-krb5-2"
+        },
+        {
+          "requirement": "libssl3 (>= 3.0.0~~alpha1)",
+          "selected": "libssl3"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.1.4)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "0.9.6-2ubuntu0.22.04.8"
+    },
+    "libssl3": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "debconf (>= 0.5) | debconf-2.0",
+          "selected": "debconf"
+        }
+      ],
+      "origin": "base",
+      "version": "3.0.2-0ubuntu1.30"
+    },
+    "libstdc++-11-dev": {
+      "dependencies": [
+        {
+          "requirement": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "gcc-11-base"
+        },
+        {
+          "requirement": "libgcc-11-dev (= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libgcc-11-dev"
+        },
+        {
+          "requirement": "libstdc++6 (>= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "libstdc++6"
+        },
+        {
+          "requirement": "libc6-dev (>= 2.13-0ubuntu6)",
+          "selected": "libc6-dev"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    "libstdc++6": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 4.3)",
+          "selected": "libgcc-s1"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libtasn1-6": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "4.18.0-4ubuntu0.2"
+    },
+    "libtinfo6": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.33)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "6.3-2ubuntu0.3"
+    },
+    "libtirpc-common": {
+      "dependencies": [],
+      "origin": "base",
+      "version": "1.3.2-2ubuntu0.1"
+    },
+    "libtirpc-dev": {
+      "dependencies": [
+        {
+          "requirement": "libtirpc3 (= 1.3.2-2ubuntu0.1)",
+          "selected": "libtirpc3"
+        }
+      ],
+      "origin": "base",
+      "version": "1.3.2-2ubuntu0.1"
+    },
+    "libtirpc3": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgssapi-krb5-2 (>= 1.17)",
+          "selected": "libgssapi-krb5-2"
+        },
+        {
+          "requirement": "libtirpc-common (>= 1.3.2-2ubuntu0.1)",
+          "selected": "libtirpc-common"
+        }
+      ],
+      "origin": "base",
+      "version": "1.3.2-2ubuntu0.1"
+    },
+    "libtsan0": {
+      "dependencies": [
+        {
+          "requirement": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3)",
+          "selected": "gcc-11-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1",
+          "selected": "libgcc-s1"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    "libtsan2": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.4)",
+          "selected": "libgcc-s1"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libubsan1": {
+      "dependencies": [
+        {
+          "requirement": "gcc-16-base (= 16-20260315-1ubuntu1~22~ppa1)",
+          "selected": "gcc-16-base"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.3)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libstdc++6 (>= 4.1.1)",
+          "selected": "libstdc++6"
+        }
+      ],
+      "origin": "base",
+      "version": "16-20260315-1ubuntu1~22~ppa1"
+    },
+    "libunistring2": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.0-1"
+    },
+    "libxml2": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libicu70 (>= 70.1-1~)",
+          "selected": "libicu70"
+        },
+        {
+          "requirement": "liblzma5 (>= 5.1.1alpha+20120614)",
+          "selected": "liblzma5"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.2.3.3)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "base",
+      "version": "2.9.13+dfsg-1ubuntu0.14"
+    },
+    "libzstd1": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.4.8+dfsg-3build1"
+    },
+    "linux-libc-dev": {
+      "dependencies": [],
+      "origin": "base",
+      "version": "5.15.0-203.213"
+    },
+    "llvm-18": {
+      "dependencies": [
+        {
+          "requirement": "llvm-18-runtime (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144)",
+          "selected": "llvm-18-runtime"
+        },
+        {
+          "requirement": "llvm-18-linker-tools (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144)",
+          "selected": "llvm-18-linker-tools"
+        },
+        {
+          "requirement": "libc6 (>= 2.35)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libcurl4 (>= 7.16.2)",
+          "selected": "libcurl4"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.3)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libllvm18",
+          "selected": "libllvm18"
+        },
+        {
+          "requirement": "libpfm4",
+          "selected": "libpfm4"
+        },
+        {
+          "requirement": "libstdc++6 (>= 12)",
+          "selected": "libstdc++6"
+        },
+        {
+          "requirement": "libtinfo6 (>= 6)",
+          "selected": "libtinfo6"
+        },
+        {
+          "requirement": "libzstd1 (>= 1.4.0)",
+          "selected": "libzstd1"
+        },
+        {
+          "requirement": "zlib1g (>= 1:1.2.0)",
+          "selected": "zlib1g"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    "llvm-18-linker-tools": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libllvm18",
+          "selected": "libllvm18"
+        },
+        {
+          "requirement": "libstdc++6 (>= 11)",
+          "selected": "libstdc++6"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    "llvm-18-runtime": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libgcc-s1 (>= 3.3)",
+          "selected": "libgcc-s1"
+        },
+        {
+          "requirement": "libllvm18",
+          "selected": "libllvm18"
+        },
+        {
+          "requirement": "libstdc++6 (>= 12)",
+          "selected": "libstdc++6"
+        },
+        {
+          "requirement": "libtinfo6 (>= 6)",
+          "selected": "libtinfo6"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    "make": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "4.3-4.1build1"
+    },
+    "perl": {
+      "dependencies": [
+        {
+          "requirement": "dpkg (>= 1.17.17)",
+          "selected": "dpkg"
+        },
+        {
+          "requirement": "perl-base (= 5.34.0-3ubuntu1.10)",
+          "selected": "perl-base"
+        },
+        {
+          "requirement": "perl-modules-5.34 (>= 5.34.0-3ubuntu1.10)",
+          "selected": "perl-modules-5.34"
+        },
+        {
+          "requirement": "libperl5.34 (= 5.34.0-3ubuntu1.10)",
+          "selected": "libperl5.34"
+        }
+      ],
+      "origin": "base",
+      "version": "5.34.0-3ubuntu1.10"
+    },
+    "perl-base": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.35)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libcrypt1 (>= 1:4.1.0)",
+          "selected": "libcrypt1"
+        },
+        {
+          "requirement": "dpkg (>= 1.17.17)",
+          "selected": "dpkg"
+        }
+      ],
+      "origin": "base",
+      "version": "5.34.0-3ubuntu1.10"
+    },
+    "perl-modules-5.34": {
+      "dependencies": [
+        {
+          "requirement": "dpkg (>= 1.17.17)",
+          "selected": "dpkg"
+        },
+        {
+          "requirement": "perl-base (>= 5.34.0-1)",
+          "selected": "perl-base"
+        }
+      ],
+      "origin": "base",
+      "version": "5.34.0-3ubuntu1.10"
+    },
+    "pkg-config": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libglib2.0-0 (>= 2.16.0)",
+          "selected": "libglib2.0-0"
+        },
+        {
+          "requirement": "libdpkg-perl",
+          "selected": "libdpkg-perl"
+        }
+      ],
+      "origin": "locked_deb",
+      "version": "0.29.2-1ubuntu3"
+    },
+    "rpcsvc-proto": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1.4.2-0ubuntu6"
+    },
+    "tar": {
+      "dependencies": [
+        {
+          "requirement": "libacl1 (>= 2.2.23)",
+          "selected": "libacl1"
+        },
+        {
+          "requirement": "libc6 (>= 2.34)",
+          "selected": "libc6"
+        },
+        {
+          "requirement": "libselinux1 (>= 3.1~)",
+          "selected": "libselinux1"
+        }
+      ],
+      "origin": "base",
+      "version": "1.34+dfsg-1ubuntu0.1.22.04.6"
+    },
+    "zlib1g": {
+      "dependencies": [
+        {
+          "requirement": "libc6 (>= 2.14)",
+          "selected": "libc6"
+        }
+      ],
+      "origin": "base",
+      "version": "1:1.2.11.dfsg-2ubuntu9.2"
+    },
+    "zlib1g-dev": {
+      "dependencies": [
+        {
+          "requirement": "zlib1g (= 1:1.2.11.dfsg-2ubuntu9.2)",
+          "selected": "zlib1g"
+        },
+        {
+          "requirement": "libc6-dev | libc-dev",
+          "selected": "libc6-dev"
+        }
+      ],
+      "origin": "base",
+      "version": "1:1.2.11.dfsg-2ubuntu9.2"
+    }
+  },
+  "install_plan": {
+    "new": 20,
+    "removed": 0,
+    "upgraded": 0
+  },
+  "packages": [
+    {
+      "architecture": "amd64",
+      "bytes": 215826,
+      "depends": "",
+      "filename": "gcc-11-base_11.4.0-1ubuntu1~22.04.3_amd64.deb",
+      "package": "gcc-11-base",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "a0445a3889fd4441cc3b3a125d6d1589de3d2628ca4e92a352170ed0fea4d18b",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-11/gcc-11-base_11.4.0-1ubuntu1%7e22.04.3_amd64.deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 2283168,
+      "depends": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3), libc6 (>= 2.34), libgcc-s1",
+      "filename": "libasan6_11.4.0-1ubuntu1~22.04.3_amd64.deb",
+      "package": "libasan6",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "eb98f62bf6c7234132beab59113c249db40acfbd1c9965308ee612de1a6e819e",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-11/libasan6_11.4.0-1ubuntu1%7e22.04.3_amd64.deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 2259536,
+      "depends": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3), libc6 (>= 2.34), libgcc-s1",
+      "filename": "libtsan0_11.4.0-1ubuntu1~22.04.3_amd64.deb",
+      "package": "libtsan0",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "2fc0cb78e86d4635c8ed17f4a2816762050c48cb928df739bbe145dfb472957a",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-11/libtsan0_11.4.0-1ubuntu1%7e22.04.3_amd64.deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 2517422,
+      "depends": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3), libgcc-s1 (>= 11.4.0-1ubuntu1~22.04.3), libgomp1 (>= 11.4.0-1ubuntu1~22.04.3), libitm1 (>= 11.4.0-1ubuntu1~22.04.3), libatomic1 (>= 11.4.0-1ubuntu1~22.04.3), libasan6 (>= 11.4.0-1ubuntu1~22.04.3), liblsan0 (>= 11.4.0-1ubuntu1~22.04.3), libtsan0 (>= 11.4.0-1ubuntu1~22.04.3), libubsan1 (>= 11.4.0-1ubuntu1~22.04.3), libquadmath0 (>= 11.4.0-1ubuntu1~22.04.3)",
+      "filename": "libgcc-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb",
+      "package": "libgcc-11-dev",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "35ed68622daf796ac010f63c73abd8aff851fc6d862038461b053b55dbec93a6",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-11/libgcc-11-dev_11.4.0-1ubuntu1%7e22.04.3_amd64.deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 2100928,
+      "depends": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3), libgcc-11-dev (= 11.4.0-1ubuntu1~22.04.3), libstdc++6 (>= 11.4.0-1ubuntu1~22.04.3), libc6-dev (>= 2.13-0ubuntu6)",
+      "filename": "libstdc++-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb",
+      "package": "libstdc++-11-dev",
+      "pre_depends": "",
+      "provides": "libstdc++-dev",
+      "sha256": "58e0cd2d1f758e75426eaa47a5e7228d1c86180500ed68d162bcbf7b0a1c5dd0",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gcc-11/libstdc%2b%2b-11-dev_11.4.0-1ubuntu1%7e22.04.3_amd64.deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 96760,
+      "depends": "libc6 (>= 2.34), libstdc++6 (>= 4.1.1)",
+      "filename": "libgc1_1:8.0.6-1.1build1_amd64.deb",
+      "package": "libgc1",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "1779ab41418db7e740e50f3d9d2ba21023c6fa02f25dc518ae49f06226a802cc",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/libg/libgc/libgc1_8.0.6-1.1build1_amd64.deb",
+      "version": "1:8.0.6-1.1build1"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 48654,
+      "depends": "gcc-12-base (= 12.3.0-1ubuntu1~22.04.3), libc6 (>= 2.34), libgc1 (>= 1:7.2d), libgcc-s1 (>= 3.0)",
+      "filename": "libobjc4_12.3.0-1ubuntu1~22.04.3_amd64.deb",
+      "package": "libobjc4",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "f3346404ee0c5d90aca8b3d7483d105d8677f564f28d6fdd71da0a62669f64cc",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/g/gcc-12/libobjc4_12.3.0-1ubuntu1%7e22.04.3_amd64.deb",
+      "version": "12.3.0-1ubuntu1~22.04.3"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 195992,
+      "depends": "gcc-11-base (= 11.4.0-1ubuntu1~22.04.3), libgcc-11-dev (= 11.4.0-1ubuntu1~22.04.3), libobjc4 (>= 11.4.0-1ubuntu1~22.04.3)",
+      "filename": "libobjc-11-dev_11.4.0-1ubuntu1~22.04.3_amd64.deb",
+      "package": "libobjc-11-dev",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "6eea41999ee0f34a05fd70ad09b941a1f7b827e19159f79dc7796fd6c9c17c71",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/g/gcc-11/libobjc-11-dev_11.4.0-1ubuntu1%7e22.04.3_amd64.deb",
+      "version": "11.4.0-1ubuntu1~22.04.3"
+    },
+    {
+      "architecture": "all",
+      "bytes": 236718,
+      "depends": "perl:any, dpkg (>= 1.18.11)",
+      "filename": "libdpkg-perl_1.21.1ubuntu2.6_all.deb",
+      "package": "libdpkg-perl",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "5cea0fc1b24772bbda3cdcf9acfd6caefb2d03d1136616f3d5b4cd8caf71eb19",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/d/dpkg/libdpkg-perl_1.21.1ubuntu2.6_all.deb",
+      "version": "1.21.1ubuntu2.6"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 64406,
+      "depends": "libelf1 (= 0.186-1ubuntu0.1), zlib1g-dev",
+      "filename": "libelf-dev_0.186-1ubuntu0.1_amd64.deb",
+      "package": "libelf-dev",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "c4aeee4339737e2177426dba4b548a55d16e54a3a63bc34e783b92bba3aa49b1",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/e/elfutils/libelf-dev_0.186-1ubuntu0.1_amd64.deb",
+      "version": "0.186-1ubuntu0.1"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 344846,
+      "depends": "libc6 (>= 2.14)",
+      "filename": "libpfm4_4.11.1+git32-gd0b85fb-1ubuntu0.1_amd64.deb",
+      "package": "libpfm4",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "645121d1d37d46b06fc584e7bcaa0536172f624b7973046210fb265f69089d94",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/libp/libpfm4/libpfm4_4.11.1%2bgit32-gd0b85fb-1ubuntu0.1_amd64.deb",
+      "version": "4.11.1+git32-gd0b85fb-1ubuntu0.1"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 48218,
+      "depends": "libc6 (>= 2.34), libglib2.0-0 (>= 2.16.0), libdpkg-perl",
+      "filename": "pkg-config_0.29.2-1ubuntu3_amd64.deb",
+      "package": "pkg-config",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "69da4190d948d0bf7444ead040791b7924bd1a08a10ec13cd7f0bb9baab09c53",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/pkg-config/pkg-config_0.29.2-1ubuntu3_amd64.deb",
+      "version": "0.29.2-1ubuntu3"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 27619560,
+      "depends": "libc6 (>= 2.34), libedit2 (>= 2.11-20080614-0), libffi8 (>= 3.4), libgcc-s1 (>= 3.3), libstdc++6 (>= 12), libtinfo6 (>= 6), libxml2 (>= 2.7.4), libzstd1 (>= 1.4.0), zlib1g (>= 1:1.2.0)",
+      "filename": "libllvm18_1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144_amd64.deb",
+      "package": "libllvm18",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "c1e09f8da408cb1eb39a92ddf849d81b2fe258668a827843d3da4ee9c59354ab",
+      "url": "https://apt.llvm.org/jammy/pool/main/l/llvm-toolchain-18/libllvm18_18.1.8%7e%2b%2b20240731024944%2b3b5b5c1ec4a3-1%7eexp1%7e20240731145000.144_amd64.deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 13631854,
+      "depends": "libc6 (>= 2.34), libllvm18 (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144), libstdc++6 (>= 12)",
+      "filename": "libclang-cpp18_1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144_amd64.deb",
+      "package": "libclang-cpp18",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "0dace71f4e75a1845cc62c78c9113d7068405d4545b35c01b639d40d6fd9577a",
+      "url": "https://apt.llvm.org/jammy/pool/main/l/llvm-toolchain-18/libclang-cpp18_18.1.8%7e%2b%2b20240731024944%2b3b5b5c1ec4a3-1%7eexp1%7e20240731145000.144_amd64.deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 766222,
+      "depends": "",
+      "filename": "libclang-common-18-dev_1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144_amd64.deb",
+      "package": "libclang-common-18-dev",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "828b9a2b64634845374757a87ac4f2c0ddf362497e3ac52a3290393ee4d8971c",
+      "url": "https://apt.llvm.org/jammy/pool/main/l/llvm-toolchain-18/libclang-common-18-dev_18.1.8%7e%2b%2b20240731024944%2b3b5b5c1ec4a3-1%7eexp1%7e20240731145000.144_amd64.deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 1385740,
+      "depends": "libc6 (>= 2.34), libllvm18, libstdc++6 (>= 11)",
+      "filename": "llvm-18-linker-tools_1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144_amd64.deb",
+      "package": "llvm-18-linker-tools",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "b2336c56bfeaf71d6b68276953201c16cec99708882ccfd85f7c93f695fbe79b",
+      "url": "https://apt.llvm.org/jammy/pool/main/l/llvm-toolchain-18/llvm-18-linker-tools_18.1.8%7e%2b%2b20240731024944%2b3b5b5c1ec4a3-1%7eexp1%7e20240731145000.144_amd64.deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 7899978,
+      "depends": "libc6 (>= 2.34), libllvm18, libstdc++6 (>= 11)",
+      "filename": "libclang1-18_1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144_amd64.deb",
+      "package": "libclang1-18",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "1588b2bad6efedd7afd2cbd23ad515ae3a26dd2d9d41b5ba002ab76c8389ce7f",
+      "url": "https://apt.llvm.org/jammy/pool/main/l/llvm-toolchain-18/libclang1-18_18.1.8%7e%2b%2b20240731024944%2b3b5b5c1ec4a3-1%7eexp1%7e20240731145000.144_amd64.deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 149910,
+      "depends": "libc6 (>= 2.34), libclang-cpp18 (>= 1:18.1.8~++20240731024944+3b5b5c1ec4a3), libllvm18 (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144), libstdc++6 (>= 11), libstdc++-11-dev, libgcc-11-dev, libobjc-11-dev, libclang-common-18-dev (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144), llvm-18-linker-tools (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144), libclang1-18 (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144), libc6-dev, binutils",
+      "filename": "clang-18_1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144_amd64.deb",
+      "package": "clang-18",
+      "pre_depends": "",
+      "provides": "c++-compiler, c-compiler, objc-compiler",
+      "sha256": "dd79eea36f41d2ea0d609ce1bcfa4e8e6a2afe6dd5ec6528c36ac96dd51fdcdd",
+      "url": "https://apt.llvm.org/jammy/pool/main/l/llvm-toolchain-18/clang-18_18.1.8%7e%2b%2b20240731024944%2b3b5b5c1ec4a3-1%7eexp1%7e20240731145000.144_amd64.deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 610416,
+      "depends": "libc6 (>= 2.34), libgcc-s1 (>= 3.3), libllvm18, libstdc++6 (>= 12), libtinfo6 (>= 6)",
+      "filename": "llvm-18-runtime_1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144_amd64.deb",
+      "package": "llvm-18-runtime",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "567013d64bf73db69f454a8114374204d19dac86ed5795e2ebd46a1b4a8d7736",
+      "url": "https://apt.llvm.org/jammy/pool/main/l/llvm-toolchain-18/llvm-18-runtime_18.1.8%7e%2b%2b20240731024944%2b3b5b5c1ec4a3-1%7eexp1%7e20240731145000.144_amd64.deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    },
+    {
+      "architecture": "amd64",
+      "bytes": 25493624,
+      "depends": "llvm-18-runtime (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144), llvm-18-linker-tools (= 1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144), libc6 (>= 2.35), libcurl4 (>= 7.16.2), libgcc-s1 (>= 3.3), libllvm18, libpfm4, libstdc++6 (>= 12), libtinfo6 (>= 6), libzstd1 (>= 1.4.0), zlib1g (>= 1:1.2.0)",
+      "filename": "llvm-18_1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144_amd64.deb",
+      "package": "llvm-18",
+      "pre_depends": "",
+      "provides": "",
+      "sha256": "1c978be5cf514d152668eb16f98200f228ee8b0590111ec1bc936b2a4f8da177",
+      "url": "https://apt.llvm.org/jammy/pool/main/l/llvm-toolchain-18/llvm-18_18.1.8%7e%2b%2b20240731024944%2b3b5b5c1ec4a3-1%7eexp1%7e20240731145000.144_amd64.deb",
+      "version": "1:18.1.8~++20240731024944+3b5b5c1ec4a3-1~exp1~20240731145000.144"
+    }
+  ],
+  "roots": [
+    "clang-18",
+    "llvm-18",
+    "libelf-dev",
+    "zlib1g-dev",
+    "pkg-config"
+  ],
+  "sources": [
+    {
+      "bytes": 488240,
+      "commit": "e1bd72cee842b415b87e632425d04aa773344654",
+      "filename": "bpftool.tar.gz",
+      "name": "bpftool",
+      "sha256": "52b7d2b0f3153b2d4564b3c952180eb65b2120bd469b14ca45f10347631dc7c8",
+      "url": "https://codeload.github.com/libbpf/bpftool/tar.gz/e1bd72cee842b415b87e632425d04aa773344654"
+    },
+    {
+      "bytes": 1045862,
+      "commit": "da08818f4f3b6a8f6d15617184de9a6c34c5b642",
+      "filename": "libbpf.tar.gz",
+      "name": "libbpf",
+      "sha256": "3da0a843e5d8f07dccfe0dec22d79cf53f1ecb23384425d701e3d88bd2bf8da5",
+      "url": "https://codeload.github.com/libbpf/libbpf/tar.gz/da08818f4f3b6a8f6d15617184de9a6c34c5b642"
+    }
+  ]
+}

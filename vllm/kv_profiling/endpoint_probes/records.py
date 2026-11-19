@@ -105,6 +105,7 @@ class Writer:
         self.queue = queue.Queue(config.queue_rows)
         self.maximum = config.output_bytes
         self.sequence = 0
+        self.saved_sequence = 0
         self.dropped = 0
         self.error = None
         self.footer = None
@@ -132,7 +133,8 @@ class Writer:
             self.dropped += 1
             return
         try:
-            self.queue.put_nowait(raw)
+            self.queue.put_nowait((self.sequence, raw))
+            return self.sequence
         except queue.Full:
             self.dropped += 1
 
@@ -173,14 +175,16 @@ class Writer:
                 self.ready.set()
                 size = len(raw)
                 while True:
-                    raw = self.queue.get()
-                    if raw is None:
+                    item = self.queue.get()
+                    if item is None:
                         break
+                    ticket, raw = item
                     size += len(raw)
                     if size > self.maximum:
                         raise ValueError("probe output byte limit")
                     stream.write(raw)
                     stream.flush()
+                    self.saved_sequence = ticket
                 if self.error:
                     raise RuntimeError(self.error)
                 stream.write((json.dumps(self.footer) + "\n").encode())
