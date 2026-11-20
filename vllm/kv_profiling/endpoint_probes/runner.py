@@ -35,6 +35,7 @@ SPLITTABLE = (
     "unavailable",
     "unreadable",
     "absent",
+    "unreadable_irqs",
 )
 ROW_BUDGET = (16 << 10) - 64
 

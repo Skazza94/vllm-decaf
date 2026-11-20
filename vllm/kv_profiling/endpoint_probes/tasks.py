@@ -10,11 +10,13 @@ interrupts) is reported unavailable, never as zero.
 """
 
 import os
+import re
 from pathlib import Path
 
 from .netlink import ObservationError
 
 TICKS_PER_S = os.sysconf("SC_CLK_TCK")
+_DECIMAL = re.compile(r"[0-9]+")
 _PROC_LIMIT = 4 << 20  # /proc/interrupts grows with CPUs and IRQs
 
 
@@ -226,16 +228,109 @@ def _cpu_ids(header: str, path: Path) -> list[int]:
     order (offline CPUs have no column, so a column index is not a CPU ID)."""
     labels = header.split()
     if not labels or any(
-        not (label.startswith("CPU") and label[3:].isdigit()) for label in labels
+        not (label.startswith("CPU") and _decimal(label[3:])) for label in labels
     ):
         raise ObservationError(f"unrecognized CPU header in {path}")
     return [int(label[3:]) for label in labels]
 
 
 def _counts(values: list[str], cpus: list[int], what: str) -> list[int]:
-    if len(values) < len(cpus) or not all(v.isdigit() for v in values[: len(cpus)]):
+    if len(values) < len(cpus) or not all(_decimal(v) for v in values[: len(cpus)]):
         raise ObservationError(f"{what} does not match the CPU header")
     return [int(v) for v in values[: len(cpus)]]
+
+
+def _proc_irqs(lines: list[str], owners: dict, path: Path):
+    """The owned IRQs' rows of /proc/interrupts, (irq, CPU IDs, counts, name),
+    and the header's CPU count."""
+    if not owners:
+        return [], 0, []
+    cpus = _cpu_ids(lines[0] if lines else "", path)
+    rows = []
+    for line in lines[1:]:
+        label, _, rest = line.partition(":")
+        if not _decimal(label.strip()) or int(label) not in owners:
+            continue
+        irq, parts = int(label), rest.split()
+        counts = _counts(parts, cpus, f"interrupt {irq}")
+        rows.append((irq, cpus, counts, " ".join(parts[len(cpus) :])))
+    return rows, len(cpus), []
+
+
+def _decimal(text) -> bool:
+    """ASCII decimal digits only (``str.isdigit`` also accepts ``²``)."""
+    return bool(_DECIMAL.fullmatch(text))
+
+
+def possible_cpus(sys: Path) -> list[int]:
+    """The kernel's possible CPU IDs (``0-3,8``), in order: one per-IRQ count
+    each, offline CPUs included. The line must be complete (newline-ended)
+    and its ranges ascending and non-overlapping, with both ends present."""
+    path = sys / "devices/system/cpu/possible"
+    with path.open("rb") as stream:
+        raw = stream.read(1 << 16)
+    text = raw.decode("ascii", errors="replace")
+    cpus: list[int] = []
+    parts = text[:-1].split(",") if text.endswith("\n") else []
+    for part in parts:
+        first, dash, last = part.partition("-")
+        if not _decimal(first) or (dash and not _decimal(last)):
+            cpus = []
+            break
+        low, high = int(first), int(last) if dash else int(first)
+        if high < low or (cpus and low <= cpus[-1]):
+            cpus = []
+            break
+        cpus += range(low, high + 1)
+    if not cpus:
+        raise ObservationError(f"unrecognized possible CPU list {text!r}")
+    return cpus
+
+
+def _sysfs_irqs(owners: dict, sys: Path, masked: Path):
+    """The owned IRQs from /sys/kernel/irq/<irq>/, (irq, CPU IDs, counts,
+    name): ``per_cpu_count`` holds one count per possible CPU, in the order of
+    /sys/devices/system/cpu/possible, written by the kernel into one page and
+    newline-terminated, so a row without its newline, at the page limit, or
+    with another number of counts is incomplete. An IRQ without a directory is
+    missing; one whose counts cannot be read is in the errors, the others kept.
+    """
+    root = sys / "kernel/irq"
+    if not root.is_dir():
+        raise ObservationError(
+            f"{masked} is empty (masked by the container runtime?) and {root} "
+            "is unavailable"
+        )
+    cpus = possible_cpus(sys)
+    page = os.sysconf("SC_PAGE_SIZE")
+    rows, errors = [], []
+    for irq in sorted(owners):
+        try:
+            with (root / str(irq) / "per_cpu_count").open("rb") as stream:
+                raw = stream.read(page + 1)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            errors.append({"irq": irq, "error": type(error).__name__})
+            continue
+        counts = raw.decode("ascii", errors="replace").rstrip("\n").split(",")
+        if (
+            not raw.endswith(b"\n")
+            or len(raw) >= page
+            or len(counts) != len(cpus)
+            or not all(_decimal(v) for v in counts)
+        ):
+            errors.append(
+                {"irq": irq, "error": "incomplete or malformed per_cpu_count"}
+            )
+            continue
+        try:  # the handler names: optional, never a reason to drop the counts
+            with (root / str(irq) / "actions").open("rb") as stream:
+                name = stream.read(4096).decode(errors="replace").strip()
+        except OSError:
+            name = ""
+        rows.append((irq, cpus, [int(v) for v in counts], name))
+    return rows, len(cpus), errors
 
 
 def nic_interrupts(
@@ -249,9 +344,10 @@ def nic_interrupts(
     """The endpoint NICs' interrupts per CPU ID (the device's MSI interrupts,
     from sysfs), cumulative, busiest CPUs first. A device without an MSI list
     (virtual, not PCI) or with an empty one is named in ``unavailable``; an
-    interrupt sysfs lists but /proc/interrupts does not show is in ``missing``
-    (missing coverage, a source failure). Host scope: /proc/interrupts is not
-    namespaced."""
+    interrupt sysfs lists but the counts do not show is in ``missing`` (missing
+    coverage, a source failure). The counts come from /proc/interrupts or, when
+    a container runtime masks it (an empty file), from /sys/kernel/irq
+    (``source``). Host scope: neither is namespaced."""
     proc, sys = Path(proc or "/proc"), Path(sys or "/sys")
     owners: dict[int, list[str]] = {}
     unavailable, unreadable, absent = [], [], []
@@ -276,16 +372,17 @@ def nic_interrupts(
         for irq in listed:
             owners.setdefault(irq, []).append(f"{kind}:{name}")
     path = proc / "interrupts"
-    lines = _read_proc(path).splitlines()
-    cpus = _cpu_ids(lines[0] if lines else "", path) if owners else []
-    irqs, seen = [], set()
-    for line in lines[1:] if owners else ():
-        label, _, rest = line.partition(":")
-        if not label.strip().isdigit() or int(label) not in owners:
-            continue
-        irq = int(label)
-        parts = rest.split()
-        counts = _counts(parts, cpus, f"interrupt {irq}")
+    text = _read_proc(path)
+    if owners and not text.strip():
+        # A container runtime may mask /proc/interrupts (an empty file); the
+        # kernel's per-IRQ sysfs counts are the same counters.
+        rows, cpu_count, errors = _sysfs_irqs(owners, sys, path)
+        path, source = sys / "kernel/irq", "sys_kernel_irq"
+    else:
+        rows, cpu_count, errors = _proc_irqs(text.splitlines(), owners, path)
+        source = "proc_interrupts"
+    irqs, seen = [], {error["irq"] for error in errors}
+    for irq, cpus, counts, name in rows:
         seen.add(irq)
         nonzero = sorted(
             ((cpu, count) for cpu, count in zip(cpus, counts) if count),
@@ -295,7 +392,7 @@ def nic_interrupts(
             {
                 "irq": irq,
                 "owners": owners[irq],
-                "name": " ".join(parts[len(cpus) :]),
+                "name": name,
                 "total": sum(counts),
                 "per_cpu": {
                     str(cpu): count for cpu, count in nonzero[:max_cpus_per_irq]
@@ -314,8 +411,11 @@ def nic_interrupts(
         problems.append(f"{len(unreadable)} MSI interrupt lists unreadable")
     if absent:
         problems.append(f"{len(absent)} configured devices absent")
+    if errors:
+        problems.append(f"{len(errors)} interrupt counters unreadable")
     return {
-        "cpu_count": len(cpus),
+        "source": source,
+        "cpu_count": cpu_count,
         "irqs": irqs[:max_irqs],
         "irqs_truncated": len(irqs) > max_irqs,
         "unavailable": unavailable,
@@ -324,6 +424,8 @@ def nic_interrupts(
         "missing": missing[:MAX_LISTED],
         "missing_count": len(missing),
         "missing_truncated": len(missing) > MAX_LISTED,
+        "unreadable_irqs": errors[:MAX_LISTED],
+        "unreadable_irqs_count": len(errors),
         "coverage_problem": "; ".join(problems) or None,
         "host_scope": True,
     }
@@ -335,7 +437,9 @@ def net_softirqs(cpus_per_item: int = 32, proc=None):
     count. A softirq the kernel does not list is in ``missing``."""
     path = Path(proc or "/proc") / "softirqs"
     lines = _read_proc(path).splitlines()
-    cpus = _cpu_ids(lines[0] if lines else "", path)
+    if not lines:
+        raise ObservationError(f"{path} is empty (masked by the container runtime?)")
+    cpus = _cpu_ids(lines[0], path)
     items, found = [], set()
     for line in lines[1:]:
         name, _, rest = line.partition(":")

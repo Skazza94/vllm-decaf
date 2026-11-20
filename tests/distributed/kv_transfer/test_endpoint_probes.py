@@ -2141,3 +2141,115 @@ def test_single_entries_of_different_lists_are_split_into_separate_rows():
                 assert rebuilt[index] is None, "an item in two rows"
                 rebuilt[index] = item
         assert rebuilt == values
+
+
+def test_a_masked_proc_interrupts_reads_the_kernel_irq_sysfs_counts(tmp_path):
+    """Container runtimes may mask /proc/interrupts (an empty file): the NICs'
+    interrupts come from /sys/kernel/irq per CPU ID, an IRQ without its sysfs
+    directory is missing, and with neither source the failure says why."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    proc.mkdir()
+    (proc / "interrupts").write_text("")
+    (sys_root / "class/net/nic0/device/msi_irqs/30").mkdir(parents=True)
+    (sys_root / "class/infiniband/dev0/device/msi_irqs/31").mkdir(parents=True)
+    with pytest.raises(ObservationError, match="is empty .masked"):
+        tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)
+    irq = sys_root / "kernel/irq/30"
+    irq.mkdir(parents=True)
+    (sys_root / "devices/system/cpu").mkdir(parents=True)
+    (sys_root / "devices/system/cpu/possible").write_text("0-2\n")
+    (irq / "per_cpu_count").write_text("0,2,10\n")
+    (irq / "actions").write_text("nic0-comp0\n")
+    data = tasks.nic_interrupts(["nic0"], ["dev0"], proc=proc, sys=sys_root)
+    assert data["source"] == "sys_kernel_irq" and data["cpu_count"] == 3
+    (one,) = data["irqs"]
+    assert (one["irq"], one["name"], one["per_cpu"]) == (
+        30, "nic0-comp0", {"2": 10, "1": 2})  # fmt: skip
+    assert [m["irq"] for m in data["missing"]] == [31]
+    assert data["coverage_problem"].startswith("1 listed interrupts absent")
+    (proc / "interrupts").write_text("    CPU0\n 30:   7   PCI-MSI nic0\n")
+    assert tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)["source"] == (
+        "proc_interrupts")  # fmt: skip
+    (proc / "softirqs").write_text("")
+    with pytest.raises(ObservationError, match="is empty .masked"):
+        tasks.net_softirqs(proc=proc)
+
+
+
+def test_sysfs_interrupt_counts_follow_the_possible_cpus_and_complete_rows(tmp_path):
+    """Per-IRQ sysfs counts are one per possible CPU, in that order: with
+    possible CPUs 0,3-4 they map as the /proc row does; a row with another
+    number of counts, without its newline or at the page limit is incomplete,
+    and an unreadable IRQ is reported while the readable ones are kept; a
+    /proc header with no owned row still gives its CPU count."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    proc.mkdir()
+    (proc / "interrupts").write_text("")
+    for irq in (30, 31):
+        (sys_root / f"class/net/nic0/device/msi_irqs/{irq}").mkdir(parents=True)
+        (sys_root / f"kernel/irq/{irq}").mkdir(parents=True)
+    (sys_root / "devices/system/cpu").mkdir(parents=True)
+    (sys_root / "devices/system/cpu/possible").write_text("0,3-4\n")
+    assert tasks.possible_cpus(sys_root) == [0, 3, 4]
+    (sys_root / "kernel/irq/30/per_cpu_count").write_text("0,2,10\n")
+    page = os.sysconf("SC_PAGE_SIZE")
+    for bad in ("0,2\n", "0,2,1", "x,2,1\n", "0,1," + "9" * page):
+        (sys_root / "kernel/irq/31/per_cpu_count").write_text(bad)
+        data = tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)
+        assert [(i["irq"], i["per_cpu"]) for i in data["irqs"]] == [
+            (30, {"4": 10, "3": 2})
+        ], bad
+        assert data["unreadable_irqs"] == [
+            {"irq": 31, "error": "incomplete or malformed per_cpu_count"}
+        ]
+        assert data["missing"] == [] and "1 interrupt counters unreadable" in (
+            data["coverage_problem"])  # fmt: skip
+    (sys_root / "kernel/irq/31/per_cpu_count").unlink()
+    (sys_root / "kernel/irq/31/per_cpu_count").mkdir()  # unreadable as a file
+    data = tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)
+    assert [i["irq"] for i in data["irqs"]] == [30]
+    assert data["unreadable_irqs"][0]["irq"] == 31
+    (proc / "interrupts").write_text("  CPU0  CPU3  CPU4\n  29:  1  1  1  other\n")
+    data = tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)
+    assert data["cpu_count"] == 3 and data["missing_count"] == 2
+
+
+
+def test_a_possible_cpu_list_or_counter_that_is_not_exact_never_moves_counts(
+    tmp_path,
+):
+    """A cut, overlapping or unordered possible-CPU list fails instead of
+    assigning counts to other CPUs; a non-ASCII digit in one IRQ's counts or
+    an undecodable handler name affects that IRQ only."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    proc.mkdir()
+    (proc / "interrupts").write_text("")
+    for irq in (30, 31):
+        (sys_root / f"class/net/nic0/device/msi_irqs/{irq}").mkdir(parents=True)
+        (sys_root / f"kernel/irq/{irq}").mkdir(parents=True)
+    (sys_root / "devices/system/cpu").mkdir(parents=True)
+    possible = sys_root / "devices/system/cpu/possible"
+    for bad in ("0-1,3", "0,3,3\n", "3,0\n", "0-\n", "0-1,\n", "2-1\n", "0-1,²\n"):
+        possible.write_text(bad)
+        with pytest.raises(ObservationError, match="possible CPU list"):
+            tasks.possible_cpus(sys_root)
+    possible.write_text("0-1,31\n")
+    assert tasks.possible_cpus(sys_root) == [0, 1, 31]
+    (sys_root / "kernel/irq/30/per_cpu_count").write_text("1,0,10\n")
+    (sys_root / "kernel/irq/31/per_cpu_count").write_text("1,²,10\n")
+    data = tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)
+    assert [(i["irq"], i["per_cpu"]) for i in data["irqs"]] == [
+        (30, {"31": 10, "0": 1})
+    ]
+    assert [e["irq"] for e in data["unreadable_irqs"]] == [31]
+    (sys_root / "kernel/irq/31/per_cpu_count").write_text("0,4,0\n")
+    (sys_root / "kernel/irq/31/actions").write_bytes(b"nic0-\xff\n")
+    data = tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)
+    assert [i["irq"] for i in data["irqs"]] == [30, 31]
+    assert data["irqs"][1]["name"] == "nic0-�" and data["unreadable_irqs"] == []

@@ -431,7 +431,11 @@ that exist but cannot be read in `unreadable_files`; both are source failures
 offline CPUs do not shift counts), the interrupts of the configured interfaces
 and RDMA devices (their MSI interrupts listed in sysfs, read from
 `/proc/interrupts`, busiest CPU first) and the host's `NET_RX` and `NET_TX`
-softirqs (`/proc/softirqs`). Both files are host-wide, not per namespace. An
+softirqs (`/proc/softirqs`). Both files are host-wide, not per namespace. Some
+container runtimes mask `/proc/interrupts` (an empty file): the interrupts are
+then read from `/sys/kernel/irq/<irq>/per_cpu_count` (one count per CPU ID) and
+`source` says which was read; an empty `/proc/softirqs`, or a masked
+`/proc/interrupts` without `/sys/kernel/irq`, is a source failure that says so. An
 interface with no MSI list, or an empty one (virtual or not PCI), is listed as
 unavailable. Missing coverage is a source failure, beside the counters that were
 read: a configured device that does not exist (`absent`), an interrupt sysfs
