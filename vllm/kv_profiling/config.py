@@ -47,6 +47,8 @@ class NetworkProfilerConfig:
     clock_end_budget_s: float = 2
     batch_records: int = 256
     shutdown_timeout_s: float = 2
+    step_window_s: float = 1.0
+    """Length of the step rollup windows (0 disables the rollups)."""
     clock_bind: str | None = None
     """Mooncake producer: ``host:port`` its scheduler's clock server binds."""
     clock_peers: dict[str, str] = field(default_factory=dict)
@@ -105,6 +107,12 @@ class NetworkProfilerConfig:
             or not 0 < self.shutdown_timeout_s <= 10
         ):
             raise ValueError("shutdown_timeout_s must be finite in (0, 10]")
+        if (
+            type(self.step_window_s) not in (int, float)
+            or not math.isfinite(self.step_window_s)
+            or not 0 <= self.step_window_s <= 60
+        ):
+            raise ValueError("step_window_s must be finite in [0, 60]")
         import json
 
         if (

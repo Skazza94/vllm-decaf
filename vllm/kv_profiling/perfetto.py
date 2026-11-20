@@ -8,9 +8,12 @@ from pathlib import Path
 from .clock import ClockGroup, ClockMapping
 from .schema import (
     COLLECTOR_KIND_NAMES,
+    PHASE_VALUE_NAMES,
     VALUE_NAMES,
     DictionaryDecoder,
     Failure,
+    RequestPhase,
+    StepSubject,
     Subject,
 )
 
@@ -136,6 +139,8 @@ def _semantics(row, meta=None):
             }
         }
     kind, subject = row["kind"], row["subject"]
+    if kind in ("request_phase", "step_span"):
+        return {}  # their value words carry their own names (_TIMELINE_FIELDS)
     aux0, aux1 = row["aux0"], row["aux1"]
     if meta is not None and _is_mooncake(meta):
         return _mooncake_semantics(row)
@@ -211,7 +216,80 @@ def _mooncake_semantics(row):
     return {}
 
 
+# The renamed value words of the request phase and step span kinds.
+_TIMELINE_FIELDS = (
+    *PHASE_VALUE_NAMES,
+    "scope",
+    "begin_ns",
+    "end_ns",
+    "steps",
+    "marked_steps",
+    "window_begin_ns",
+    "window_end_ns",
+    "busy_ns",
+    "max_ns",
+    "empty_steps",
+    "max_requests",
+)
+
+
+def _step_events(events, pid, tid, ts, row, origin):
+    """A marked step as a slice from the hook's own begin/end readings, and a rollup
+    window as counters; the same for every connector. With a calibration both recorded
+    endpoints are projected, so the displayed duration includes the clock drift;
+    without one the readings are shifted from the row's timestamp inside the
+    process's own clock. The simulated device clock is a separate track."""
+    subject = row["subject"]
+    if subject == int(StepSubject.STEP):
+        begin, end = row["begin_ns"], row["end_ns"]
+        if begin is not None and end is not None and end >= begin:
+            ends = row.get("_projected_ends")
+            if ends is not None and None not in ends:
+                start = float((ends[0].time_ns - origin) / 1000)
+                duration = float((ends[1].time_ns - ends[0].time_ns) / 1000)
+            else:
+                start = ts + (begin - row["time_ns"]) / 1000
+                duration = (end - begin) / 1000
+            events.append(
+                {
+                    "ph": "X",
+                    "pid": pid,
+                    "tid": tid,
+                    "ts": start,
+                    "dur": duration,
+                    "name": "step host span (shared batch)",
+                    "args": {"step": row["step"], "scope": str(row["scope"])},
+                }
+            )
+    elif subject in (int(StepSubject.WORKER_WINDOW), int(StepSubject.SCHEDULER_WINDOW)):
+        begin, end = row["window_begin_ns"], row["window_end_ns"]
+        counters = {"steps": row["steps"], "empty_steps": row["empty_steps"]}
+        worker = subject == int(StepSubject.WORKER_WINDOW)
+        if worker and end and begin is not None and end > begin:
+            counters["busy_fraction"] = (row["busy_ns"] or 0) / (end - begin)
+        events.append(
+            {
+                "ph": "C",
+                "pid": pid,
+                "tid": tid,
+                "ts": ts,
+                "name": "step window",
+                "args": {k: v for k, v in counters.items() if v is not None},
+            }
+        )
+
+
 def _event_name(row, meta=None):
+    if row["kind"] == "request_phase":
+        try:
+            return f"request_phase:{RequestPhase(row['subject']).name.lower()}"
+        except ValueError:
+            return "request_phase"
+    if row["kind"] == "step_span":
+        try:
+            return f"step_span:{StepSubject(row['subject']).name.lower()}"
+        except ValueError:
+            return "step_span"
     if meta is not None and _is_mooncake(meta):
         kind, subject = row["kind"], row["subject"]
         if kind == "complete_observed":
@@ -432,6 +510,18 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                 else ("wall", meta["clock_id"])
             )
             buckets.add(bucket)
+            if (
+                group is not None
+                and row["kind"] == "step_span"
+                and row["subject"] == int(StepSubject.STEP)
+            ):
+                # A slice is drawn between its own two projected endpoints, so a
+                # calibration's drift shows in its duration.
+                clock = alias.get(meta["clock_id"], meta["clock_id"])
+                row["_projected_ends"] = (
+                    group.project(clock, row["begin_ns"]),
+                    group.project(clock, row["end_ns"]),
+                )
             streams.append((bucket, meta, row, decoder, projection, loss))
         if not buckets:
             aligned = group is not None and (
@@ -544,7 +634,8 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                 "subject": str(row["subject"]),
                 "status": row["status"],
                 "unbound_handle": row["unbound_handle"],
-                **{name: row[name] for name in VALUE_NAMES},
+                **{name: row.get(name) for name in VALUE_NAMES},
+                **{name: row[name] for name in _TIMELINE_FIELDS if name in row},
                 **_semantics(row, meta),
                 "transport": _tagged_transport(row["transport"], meta),
                 "loss": loss,
@@ -601,6 +692,9 @@ def export_traces(paths, output_dir: str, group: ClockGroup | None = None):
                                 },
                             }
                         )
+            if row["kind"] == "step_span":
+                _step_events(events, pid, tid, ts, row, origin)
+                continue
             if mooncake:
                 _mooncake_intervals(
                     events,

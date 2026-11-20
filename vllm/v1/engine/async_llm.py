@@ -251,6 +251,7 @@ class AsyncLLM(EngineClient):
                 )
 
         self.kv_frontend_profiler = attach_kv_frontend_profiler(self.vllm_config)
+        self.output_processor.kv_profiler = self.kv_frontend_profiler
 
     @classmethod
     def from_vllm_config(

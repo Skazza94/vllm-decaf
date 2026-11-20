@@ -48,6 +48,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
               asynchronously (between scheduler steps).
 
         """
+        if (p := self._kvp) is not None:
+            p.load_expected(request.request_id, num_computed_tokens)
         params = request.kv_transfer_params
         logger.debug(
             "NIXLConnector get_num_new_matched_tokens: "
@@ -108,6 +110,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
+        if (p := self._kvp) is not None:
+            p.load_prepared(request.request_id, num_external_tokens)
         params = request.kv_transfer_params
         logger.debug(
             "NIXLConnector update_state_after_alloc: "
@@ -212,6 +216,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         """Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        if (p := self._kvp) is not None:
+            p.request_done(request)
         from vllm.v1.request import RequestStatus
 
         params = request.kv_transfer_params

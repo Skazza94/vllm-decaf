@@ -789,6 +789,11 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_not_processed: set[TransferId] = set()
         # D side: lease renewals to send this step, by remote P engine.
         self.lease_heartbeats: dict[EngineId, LeaseHeartbeat] = {}
+        # The profiler's step marker (0: no profiler on the scheduler): the
+        # scheduler's step ordinal, its generation and the step's flags.
+        self.profiler_step: int = 0
+        self.profiler_scope: int = 0
+        self.profiler_flags: int = 0
 
     def add_new_req(
         self,
@@ -990,6 +995,15 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        if (w := self.connector_worker) is not None and (p := w._kvp) is not None:
+            p.step_begin(connector_metadata)
+
+    def finish_forward(self) -> None:
+        if (w := self.connector_worker) is not None and (p := w._kvp) is not None:
+            p.step_end()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
@@ -1121,7 +1135,13 @@ class MooncakeConnectorScheduler:
             cdiv(n_tokens, block_size) + 1 if n_tokens else 0
             for n_tokens, block_size in sw_sizes_tokens
         ]
-        self._kvp = _attach_profiler(vllm_config, "scheduler", engine_id, 0)
+        self._kvp = _attach_profiler(
+            vllm_config,
+            "scheduler",
+            engine_id,
+            0,
+            {"bounded_replay": self._bounded_replay},
+        )
 
     def close_profiler(self) -> None:
         if (p := self._kvp) is not None:
@@ -1195,6 +1215,8 @@ class MooncakeConnectorScheduler:
             params["_p_side_truncated"] = True
 
     def on_new_request(self, request: "Request") -> None:
+        if (p := self._kvp) is not None:
+            p.request_queued(request)
         params = request.kv_transfer_params
         if (
             params is not None
@@ -1258,6 +1280,8 @@ class MooncakeConnectorScheduler:
               asynchronously (between scheduler steps).
 
         """
+        if (p := self._kvp) is not None:
+            p.load_expected(request.request_id, num_computed_tokens)
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector get_num_new_matched_tokens: "
@@ -1285,6 +1309,8 @@ class MooncakeConnectorScheduler:
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
+        if (p := self._kvp) is not None:
+            p.load_prepared(request.request_id, num_external_tokens)
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector update_state_after_alloc: "
@@ -1400,6 +1426,8 @@ class MooncakeConnectorScheduler:
             meta.reqs_not_processed = self._reqs_not_processed
             self._reqs_not_processed = set()
 
+        if (p := self._kvp) is not None:
+            p.schedule_step(scheduler_output, meta)
         return meta
 
     def request_finished(
@@ -1410,6 +1438,8 @@ class MooncakeConnectorScheduler:
         """Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        if (p := self._kvp) is not None:
+            p.request_done(request)
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector request_finished, req_id=%s, request_status=%s, "

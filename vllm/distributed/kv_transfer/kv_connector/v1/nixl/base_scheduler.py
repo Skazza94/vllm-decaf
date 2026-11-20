@@ -202,7 +202,10 @@ class NixlBaseConnectorScheduler:
             0,
             self._TRANSFER_MODE,
             (self.side_channel_host, self.side_channel_port),
-            {"dp_rank": parallel_config.data_parallel_index},
+            {
+                "dp_rank": parallel_config.data_parallel_index,
+                "bounded_replay": self._bounded_replay,
+            },
         )
 
     def shutdown(self):
@@ -216,6 +219,8 @@ class NixlBaseConnectorScheduler:
 
     def on_new_request(self, request: "Request") -> None:
         """Track a request that may need heartbeats."""
+        if (p := self._kvp) is not None:
+            p.request_queued(request)
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_decode"):
             self._truncate_request_for_prefill(request)
@@ -557,6 +562,8 @@ class NixlBaseConnectorScheduler:
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
 
+        if (p := self._kvp) is not None:
+            p.schedule_step(scheduler_output, meta)
         return meta
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
@@ -564,7 +571,7 @@ class NixlBaseConnectorScheduler:
         for req_id in connector_output.finished_recving or ():
             self._stop_heartbeat(req_id)
             if (p := self._kvp) is not None:
-                p.recv_finished(req_id)
+                p.recv_finished(req_id, req_id in connector_output.failed_recving)
         if (p := self._kvp) is not None:
             p.releases_requested(connector_output.finished_sending)
 

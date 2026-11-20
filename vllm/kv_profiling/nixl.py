@@ -15,6 +15,7 @@ import os
 import threading
 import weakref
 
+from .compute import TimelineMixin, timeline_context
 from .config import NetworkProfilerConfig, profiler_config
 from .core import open_recorder
 from .peers import PeerClocks
@@ -179,11 +180,12 @@ class _Profiler:
             )
 
 
-class NixlProfiler(_Profiler):
+class NixlProfiler(TimelineMixin, _Profiler):
     """One per NIXL scheduler or worker process."""
 
     def __init__(self, config, recorder, *, rank: int, engine_id: str):
         super().__init__(config, recorder)
+        self._timeline_init(config.step_window_s)
         self.rank = rank
         self.engine_id = engine_id
         self.peers: PeerClocks | None = None
@@ -445,12 +447,15 @@ class NixlProfiler(_Profiler):
         except Exception as exc:
             self._error(exc)
 
-    def recv_finished(self, request_id):
+    def recv_finished(self, request_id, failed=False):
+        """The scheduler's aggregation of finished receives: not proof of success, since
+        a failed request also reports finished (``failed``: it is in the connector
+        output's failed-receive set, status 1 as Mooncake's)."""
         try:
             self._record(
                 _COMPLETE_OBSERVED, self.rank, request_id, None, None, None,
                 None, None, None, None, None, None, None,
-                self._transport, 0, _SCHEDULER,
+                self._transport, 1 if failed else 0, _SCHEDULER,
             )  # fmt: skip
         except Exception as exc:
             self._error(exc)
@@ -469,6 +474,12 @@ class NixlProfiler(_Profiler):
         except Exception as exc:
             self._error(exc)
 
+    def _before_close(self) -> None:
+        self._timeline_close()
+
+    def _extra_summary(self) -> dict:
+        return self._timeline_summary()
+
     def _close_helpers(self) -> list:
         failures = []
         if self.peers is not None:
@@ -484,11 +495,20 @@ class NixlProfiler(_Profiler):
         return failures
 
 
-class FrontendProfiler(_Profiler):
-    """Binds the exact header, API ids and engine ids where they coexist."""
+class FrontendProfiler(TimelineMixin, _Profiler):
+    """Binds the exact header, API ids and engine ids where they coexist, and records
+    when the first token output and the final output reached the frontend."""
 
     def __init__(self, config, recorder):
         super().__init__(config, recorder)
+        self.rank = 0
+        self._timeline_init(config.step_window_s)
+
+    def _before_close(self) -> None:
+        self._timeline_close()
+
+    def _extra_summary(self) -> dict:
+        return self._timeline_summary()
 
     def api_request(self, base, header, parent, body_given):
         """Header, base and parent API id of one request.
@@ -568,6 +588,7 @@ def capabilities(role: str) -> dict:
         "selected_descriptors": True,
         "nixl_post_xfer_durations": True,
         "post_pass": role == "worker",
+        "compute_timeline": True,
         "nixl_offset": True,
         "handoff_blocks": True,
         "block_return": False,
@@ -603,6 +624,8 @@ def attach_nixl(
         "kv_role": kv.kv_role if kv is not None else None,
         "engine_id": engine_id,
         "rank": rank,
+        "connector": "nixl",
+        **timeline_context(vllm_config, role),
         **(context or {}),
     }
     config = _profiler_config(vllm_config, context)
@@ -661,10 +684,13 @@ def attach_frontend(vllm_config) -> FrontendProfiler | None:
     """Return a frontend profiler, owned and closed by the engine that calls this."""
     import dataclasses
 
-    config = _profiler_config(vllm_config, {"role": "frontend"})
+    kv = vllm_config.kv_transfer_config
+    config = _profiler_config(
+        vllm_config,
+        {"role": "frontend", "kv_role": kv.kv_role if kv is not None else None},
+    )
     if config is None:
         return None
-    kv = vllm_config.kv_transfer_config
     if kv is not None and kv.kv_connector == "MooncakeConnector":
         from .mooncake import capabilities as mooncake_capabilities
 

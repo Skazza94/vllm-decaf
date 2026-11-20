@@ -18,6 +18,7 @@ import json
 import math
 from pathlib import Path
 
+from . import timeline
 from .clock import ClockGroup, ClockMapping
 from .perfetto import _clock_aliases, _load
 from .schema import Failure, Subject
@@ -188,7 +189,11 @@ class _Source:
         self._build_write_batches()
         self._build_post_groups()
         for row in self.events:
-            if id(row) not in self.classified and row["kind"] != "model_step":
+            if id(row) not in self.classified and row["kind"] not in (
+                "model_step",
+                "request_phase",
+                "step_span",
+            ):
                 self.unclassified += 1
 
     def _adapter_health(self):
@@ -691,6 +696,7 @@ class _Source:
                 members.append(
                     {
                         "request": self._name(row["request_ref"]),
+                        "transfer_id": self._name(row["handoff_ref"]),
                         "ok": row["status"] == 0,
                         "bytes": row["bytes"],
                         "descriptors": row["selected_descriptors"],
@@ -757,6 +763,15 @@ class _Source:
                     "batch": item["transfer"],
                     "state": item["state"],
                     "write": self._batch_write(item),
+                    "times": {
+                        "bound_ns": item.get("prepared_time_ns"),
+                        "executor_pickup_ns": item.get("executor_pickup_time_ns"),
+                        "write_begin_ns": item.get("post_begin_time_ns"),
+                        "write_returned_ns": item.get("posted_time_ns"),
+                        "completed_ns": item.get("completed_time_ns"),
+                        "failed_ns": item.get("failed_time_ns"),
+                    },
+                    "engine_id": self.engine_id,
                     "consumer": item["peer"],
                     "consumer_tp_rank": item["source_rank"],
                     "members_declared": item["declared_members"],
@@ -1043,9 +1058,15 @@ class _Source:
                     {
                         "direction": "outgoing",
                         "time_ns": row["time_ns"],
+                        "sequence": row["sequence"],
                         "generation": row["aux0"],
                         "blocks": row["aux1"],
                         "engine": self._name(row["peer_ref"]),
+                        # Mooncake's outgoing handoff names the shared transfer
+                        # ID, which is what a consumer's handoff names too.
+                        "transfer_id": (
+                            self._name(row["handoff_ref"]) if self.mooncake else None
+                        ),
                     }
                 )
             else:
@@ -1053,8 +1074,17 @@ class _Source:
                     {
                         "direction": "incoming",
                         "time_ns": row["time_ns"],
+                        "sequence": row["sequence"],
                         "producer_engine": self._name(row["peer_ref"]),
-                        "producer_request": self._name(row["handoff_ref"]),
+                        # NIXL's incoming handoff carries the producer's request;
+                        # Mooncake's carries the shared transfer ID (the
+                        # producer's request is then found through it).
+                        "producer_request": (
+                            None if self.mooncake else self._name(row["handoff_ref"])
+                        ),
+                        "transfer_id": (
+                            self._name(row["handoff_ref"]) if self.mooncake else None
+                        ),
                     }
                 )
         release = [
@@ -1225,7 +1255,10 @@ def _join_producers(sources):
     unavailable = []
     for consumer_source, entry, handoff in incoming:
         peer = handoff.get("producer_engine")
-        remote = handoff.get("producer_request")
+        by_transfer = consumer_source.mooncake
+        # NIXL joins on (producer engine, producer request); Mooncake, whose handoff
+        # carries the shared transfer ID instead, on (producer engine, transfer ID).
+        remote = handoff.get("transfer_id" if by_transfer else "producer_request")
         scope = (
             f"source {consumer_source.index} request {entry['request']!r} "
             f"occurrence {entry['request_occurrence']}"
@@ -1251,20 +1284,33 @@ def _join_producers(sources):
             (producer_source, producer_entry, producer_handoff)
             for producer_source, producer_entry, producer_handoff in outgoing
             if producer_source.engine_id == peer
-            and producer_entry["request"] == remote
+            and producer_source.mooncake == by_transfer
+            and (
+                producer_handoff.get("transfer_id") == remote
+                if by_transfer
+                else producer_entry["request"] == remote
+            )
         ]
         # Occurrence ordinals are local; they are not correlation evidence
         # across processes. If several outgoing handoffs carry the same
         # recorded identity, the join stays ambiguous until recorded
         # generation/correlation information can disambiguate them.
         matches = all_matches
+        producer_request = (
+            matches[0][1]["request"] if by_transfer and len(matches) == 1 else remote
+        )
         joins.append(
             {
                 "consumer_source": consumer_source.index,
                 "consumer_process_id": consumer_source.meta["process_id"],
                 "consumer_request": entry["request"],
                 "consumer_occurrence": entry["request_occurrence"],
-                "producer_request": remote,
+                "consumer_handoff_sequence": handoff["sequence"],
+                "producer_request": None if by_transfer and not matches else (
+                    producer_request
+                ),
+                "transfer_id": remote if by_transfer else None,
+                "join_key": "transfer_id" if by_transfer else "request",
                 "producer_engine": peer,
                 "producer_sources": sorted(
                     {producer.index for producer, _, _ in matches}
@@ -1288,7 +1334,13 @@ def _join_producers(sources):
     reused = {}
     for join in joins:
         reused.setdefault(
-            (join["producer_engine"], join["producer_request"]), []
+            (
+                join["producer_engine"],
+                join["transfer_id"]
+                if join["join_key"] == "transfer_id"
+                else join["producer_request"],
+            ),
+            [],
         ).append(join)
     for (peer, remote), shared in reused.items():
         if len(shared) > 1:
@@ -1557,6 +1609,14 @@ _NOT_AVAILABLE = [
         "scope": "all",
         "reason": "socket and queue-pair identities are not recorded",
     },
+    {
+        "scope": "timelines",
+        "reason": "the scheduler-side first-token instant, a step's device "
+        "completion (a step ends at the runner's finish_forward, the host-side "
+        "end of the forward), queueing before the serving layer's entry (HTTP "
+        "accept and parse), and the times of unmarked decode steps are not "
+        "recorded; the first token is the frontend's first non-empty output",
+    },
 ]
 
 
@@ -1699,6 +1759,7 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
     joins, join_unavailable = _join_producers(sources)
     not_available.extend(join_unavailable)
     spans = _cross_process_spans(sources, joins, group, alias, not_available)
+    timelines = timeline.build(sources, joins, group, alias, problems, not_available)
     transferred = [
         {
             key: value
@@ -1747,6 +1808,8 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
             item for source in sources for item in source.handshakes
         ],
         "joins": joins,
+        "timelines": timelines["timelines"],
+        "kv_writes": timelines["kv_writes"],
         "cross_process_spans": spans,
         "aggregates": _aggregates(sources, [
             item for source in sources for item in source.transfers

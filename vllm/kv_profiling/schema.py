@@ -42,6 +42,53 @@ class EventKind(IntEnum):
     ENDPOINT_METRICS = 22
     PROBE_STATUS = 23
     PROBE_RESOURCE = 24
+    # Wall-clock request timeline (native kinds; 25-28 belong to the collector).
+    REQUEST_PHASE = 29
+    STEP_SPAN = 30
+
+
+class RequestPhase(IntEnum):
+    """REQUEST_PHASE ``subject``: one transition of one request.
+
+    Scheduler rows: QUEUED .. FINISHED. Frontend rows: FIRST_TOKEN_OUTPUT and
+    OUTPUT_FINISHED.
+    """
+
+    QUEUED = 1
+    # The connector was told blocks are allocated for an external load. Not the
+    # scheduler's park transition: that precedes it when the load is deferred and
+    # follows it on the immediate path.
+    LOAD_PREPARED = 2
+    ADMITTED = 3
+    PREFILL_CHUNK = 4
+    PREFILL_DONE = 5
+    PREEMPTED = 6
+    FINISHED = 7
+    FIRST_TOKEN_OUTPUT = 8
+    OUTPUT_FINISHED = 9
+
+
+class StepSubject(IntEnum):
+    """STEP_SPAN ``subject``."""
+
+    # One marked step on one worker: real begin and end clock readings.
+    STEP = 1
+    # A worker's rollup of the steps of one time window.
+    WORKER_WINDOW = 2
+    # The scheduler's rollup of the steps of one time window.
+    SCHEDULER_WINDOW = 3
+
+
+# ADMITTED ``status``.
+ADMITTED_FIRST = 0
+ADMITTED_RESUMED = 1
+# FINISHED / OUTPUT_FINISHED ``status``.
+FINISH_DONE = 0
+FINISH_ABORTED = 1
+FINISH_ERROR = 2
+# The step marker's flags (connector metadata ``profiler_flags``).
+MARK_PHASE = 1
+MARK_EMPTY = 2
 
 
 class Transport(IntEnum):
@@ -62,6 +109,40 @@ VALUE_NAMES = (
     "aux0",
     "aux1",
 )
+
+
+# Names of the value words of the timeline kinds, in VALUE_NAMES order: decode_record
+# renames them (the original names are removed, as for ``post_pass``).
+PHASE_VALUE_NAMES = (
+    "step",
+    "computed_tokens",
+    "scheduled_tokens",
+    "prefill_tokens",
+    "output_tokens",
+    "external_tokens",
+    "prompt_tokens",
+)
+STEP_VALUE_NAMES = {
+    StepSubject.STEP: ("step", "scope", "begin_ns", "end_ns", None, None, None),
+    StepSubject.WORKER_WINDOW: (
+        "steps",
+        "marked_steps",
+        "window_begin_ns",
+        "window_end_ns",
+        "busy_ns",
+        "max_ns",
+        "empty_steps",
+    ),
+    StepSubject.SCHEDULER_WINDOW: (
+        "steps",
+        "scheduled_tokens",
+        "window_begin_ns",
+        "window_end_ns",
+        "max_requests",
+        "empty_steps",
+        "marked_steps",
+    ),
+}
 
 
 class Subject(IntEnum):
@@ -206,6 +287,19 @@ def decode_record(raw: bytes) -> dict[str, Any]:
             for i, name in enumerate(VALUE_NAMES)
         },
     }
+    if kind in (EventKind.REQUEST_PHASE, EventKind.STEP_SPAN):
+        if kind == EventKind.REQUEST_PHASE:
+            names = PHASE_VALUE_NAMES
+        else:
+            try:
+                names = STEP_VALUE_NAMES[StepSubject(row["subject"])]
+            except ValueError:
+                names = None
+        if names is not None:
+            values = [row.pop(name) for name in VALUE_NAMES]
+            for name, value in zip(names, values):
+                if name is not None:
+                    row[name] = value
     if kind == EventKind.TRANSFER_BIND:
         # TRANSFER_BIND carries no byte count (bytes belong to the completion): its
         # first value word is the NIXL worker's post pass, never payload accounting.

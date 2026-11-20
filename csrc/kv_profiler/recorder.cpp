@@ -100,6 +100,11 @@ bool same(const KvprofIdentity& a, const KvprofIdentity& b) {
   return a.length == b.length && a.encoding == b.encoding &&
          !memcmp(a.data, b.data, a.length);
 }
+// 2-21 are the transfer kinds (20, the modeled step, is offline only); 29-30 are the
+// request phase and step span kinds. 22-28 belong to the offline collector.
+inline bool valid_kind(uint64_t kind) {
+  return (kind >= 2 && kind <= 21 && kind != 20) || kind == 29 || kind == 30;
+}
 }  // namespace
 
 extern "C" int kvprof_record(void* mapping, const KvprofEvent* e) {
@@ -107,7 +112,7 @@ extern "C" int kvprof_record(void* mapping, const KvprofEvent* e) {
   const uint64_t pid = uint64_t(getpid());
   if (h->owner != pid) return -1;
   h->counters[ATTEMPTS].fetch_add(1, std::memory_order_relaxed);
-  if (e->kind < 2 || e->kind > 21 || e->kind == 20 || e->transport > 3 ||
+  if (!valid_kind(e->kind) || e->transport > 3 ||
       e->status > 255 || e->subject > 0xFFFFFFFFULL || (e->valid & ~127u) ||
       ((e->kind == 6 || e->kind == 21) && !e->has_handle))
     return drop(h, BAD_ID);
@@ -485,7 +490,7 @@ PyObject* record(Ring* self, PyObject* const* args, Py_ssize_t n) {
   KvprofEvent e{};
   char strings[3][MAX_ID];
   if (!number(args[0], e.kind) || !number(args[1], e.context)) return nullptr;
-  if (e.kind < 2 || e.kind > 21 || e.kind == 20) {
+  if (!valid_kind(e.kind)) {
     PyErr_SetString(PyExc_ValueError, "invalid event kind");
     return nullptr;
   }

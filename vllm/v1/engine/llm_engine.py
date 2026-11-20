@@ -157,6 +157,7 @@ class LLMEngine:
         self.reset_mm_cache()
 
         self.kv_frontend_profiler = attach_kv_frontend_profiler(self.vllm_config)
+        self.output_processor.kv_profiler = self.kv_frontend_profiler
         if self.kv_frontend_profiler is not None:
             from vllm.kv_profiling.nixl import close_with_owner
 

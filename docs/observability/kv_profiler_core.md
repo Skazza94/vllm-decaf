@@ -247,6 +247,134 @@ is the scheduler's permission only. A missing end record means completeness
 is unknown, not that the capture is empty: rows flushed before the stop are
 summarized, rows left in a ring that was never closed are lost.
 
+## Request timeline and decode stall attribution
+
+Two native record kinds carry the wall-clock compute timeline of a request at L1. They
+are recorded by both connector adapters (NIXL and Mooncake) and by the frontend, at
+points that already run once per request or per prefill chunk; nothing is recorded per
+token or per descriptor. The modeled step track of `import_modeled_steps` (kind 20)
+is a different, simulated clock: the summary never adds it to or compares it with these
+wall-clock records.
+
+**`request_phase`** (kind 29), one row per transition. The `subject` is the phase and
+the value words are named per phase (`step`, `computed_tokens`, `scheduled_tokens`,
+`prefill_tokens`, `output_tokens`, `external_tokens`, `prompt_tokens`):
+
+| phase | recorded by | meaning |
+|---|---|---|
+| `queued` | scheduler | the engine core accepted the request |
+| `load_prepared` | scheduler | the connector was told blocks are allocated for an external load. This is the connector's submission preparation, not the scheduler's park: it follows the park when the load is deferred and precedes it on the immediate path |
+| `admitted` | scheduler | the request is in `scheduled_new_reqs`: its first schedule, a decode node's admission once the KV is in, or a re-send after preemption (`status` 1). `prefill_tokens` is the effective prefill length, which includes generated tokens on a resume |
+| `prefill_chunk`, `prefill_done` | scheduler | a middle chunk; the step that schedules the last token of the effective prefill |
+| `preempted`, `finished` | scheduler | preemption; `request_finished` (`status` 0 done, 1 aborted, 2 error) |
+| `first_token_output` | frontend | the first output with a non-empty token list of this request state (once per child; streaming input records its first chunk's first token only) |
+| `output_finished` | frontend | the final output was processed (`status` 0), the request was aborted (1: aborted locally, or the engine delivered an abort) or failed (2: an error finish, or rejected on arrival); frontend processing, not delivery to the client |
+
+**`step_span`** (kind 30). The scheduler marks, in the connector metadata, the steps that
+carry a phase transition (`profiler_step`, `profiler_scope`, `profiler_flags`: its step
+ordinal, its generation, and whether the step is marked or carried no tokens). A worker
+records one `step` row per marked step with the hook's own clock readings, taken when the
+connector received the step's metadata and when the runner called `finish_forward`
+(`begin_ns`, `end_ns`; the row's timestamp is its publication time and is never a step
+bound). Every other step only feeds a rollup row per time window (`step_window_s`, 1 s by
+default, 0 disables; driven by the step hooks, no thread or timer, flushed at close) with
+the steps, their busy and maximum time, and the zero-token polls counted apart. The row
+count scales with request transitions and prefill chunks, never with decode tokens.
+
+A step's end is the runner's `finish_forward`: the host-side end of the forward, which on
+asynchronous device execution is the dispatch return rather than device completion, and in a
+simulated worker excludes the device deadline wait that follows. The summary therefore calls
+the span `step_host_span`, shared by every request in the step's batch, and never compute.
+
+The summary's `timelines` has one entry per scheduler-side request occurrence, joined from
+the scheduler, the workers of the same engine (by the marker's scheduler generation, so a
+restart that reuses step numbers never joins the old one) and the frontend (by the existing
+identity edges). Its fields:
+
+- `api`: the serving layer's entry (`arrival_ns`, not the HTTP accept), `first_token_output_ns`,
+  `output_finished_ns` and their token counts;
+- `scheduler`: the phase times, every admission (`later_admissions` lists those after the
+  first token, which stay out of the first-token stall), preemptions;
+- `tokens`: `tokens_remaining_at_admission` is `prefill_tokens - computed_at_admission`; it is
+  not the number of tokens a failed load invalidated, which no hook sees
+  (`tokens_attributed_to_failure` stays `None`);
+- `kv.outcome`: `received`, `load_failed` (a failure was reported), `load_failed_recomputed` (a
+  failure and an admission after the load that starts below the whole prefix a successful load
+  leaves cached, which is the evidence of recomputation), `local_hit`, `none` or `unknown`.
+  `recomputation_shown` is true or false from that rule (false when no admission followed the
+  load) and `null` when the records cannot establish it. The rule counts the local prefix: the
+  connector's external token count is incremental to the tokens the local cache held when it was
+  asked (`local_cached_at_load`, recorded at `load_prepared`); a successful load resumes at
+  `min(local + external, prefill_length - 1)`, the last prompt token staying with the scheduler,
+  and an admission below that is the evidence. A replay policy moves that position, so with one
+  the result is `null`. Receives, failures, frontend rows and handoffs
+  belong to the occurrence they fall in: by sequence inside the scheduler, and in other processes
+  by time. Occurrences of one request ID in captures of the same KV role are related: one that
+  certainly ended (its scheduler finish) before another was queued is sequential (a restart, the
+  next use of a completed ID); anything else is concurrent (independent engines that overlap, a
+  missing finish, clocks that cannot be compared). A row of another process belongs to an
+  occurrence from its queueing on, the next sequential occurrence taking it from its own queueing
+  (the boundary row is the successor's); with a concurrent occurrence of the same ID that may
+  have started, and within the clocks' uncertainty of a boundary, it belongs to neither. The API
+  entry is matched through the call the prompt belongs to, not through the external ID alone: a
+  call records its entry, then one parent-to-item bind per prompt, and the engine binds of its
+  prompts come after all of its item binds. The events of one parent are cut into blocks, each
+  open until its engine binds balance its item binds and every entry in it has its first prompt.
+  A block holding exactly one entry and no item ID twice belongs to that call, so all its engine
+  binds have that entry; a block with several entries could give any prompt to any of them
+  (ambiguous), and one with none (an entry that was not recorded) or that never closes assigns
+  nothing. With an item stage the engine binds name the prompt IDs, without one the parent; a client ID can equal another call's generated prompt ID (clients `batch` and `batch-0`), so the two are never mixed, and a parent whose ID is also some call's prompt ID and that some call used directly (an entry with no first-prompt bind, judged per entry: a later indexed call reusing the ID does not make the earlier direct one indexed) cannot tell its engine binds from that call's (ambiguous), and neither can the parent that owns the colliding prompt: its engine binds cannot be counted either, so none of that parent's prompts is assigned. Calls whose events do not overlap another's are exact; nothing is guessed beyond the recorded order (an entry belongs to the first call whose prompts follow it: which of two calls an entry belongs to cannot be told when an entry-less call's events fall between that entry and its own prompts), and the
+  unavailable arrival falls back to the scheduler-queue basis. A parent used both ways (prompts declared under it and engine binds directly under its ID beyond any prompts of that ID) and a prompt ID some engine bind of which comes before the prompt declaration it would need (the k-th bind before the k-th declaration: a direct call's) assign nothing; the comparison is by time, not by totals, because a declaration that belongs to a call whose entry was not recorded, or a bind the capture ended before, would make the totals look balanced. A parent with no item stage pairs each engine bind with the entry before it when exactly one is waiting (none waiting: an entry-less call's, nothing assigned; several waiting: ambiguous, each ambiguous bind consuming one unknown waiting entry). A call whose engine bind never
+  arrives (for example one rejected before the engine) keeps later calls with the same client ID
+  from being matched. Of the entries paired with an engine ID that was itself reused,
+  the occurrence's must precede its queueing, follow the start of a sequential predecessor, and
+  not be possibly a concurrent occurrence's.
+  Worker failures are assigned to the request only from workers that recorded the scheduler
+  generation's marker; others are listed apart (`failures_unlinked`). A failed load is paired
+  with its first admission after the load, whichever later admission finishes the prefill.
+  An explicit abort or error keeps
+  its terminal `state` even before admission;
+- `kv_writes` (Mooncake): the producers' write batches, each listed once from the producer's own
+  records with its recorded call and completion times (`times`), bytes, descriptors and members
+  (decode request, transfer ID, share), whether or not the consumer capture is present; each member
+  lists the consumer occurrences linked to it through the producer engine, the transfer ID of that
+  occurrence's incoming handoff and the member row, only when exactly one incoming handoff names that
+  (producer engine, transfer ID, request): a reused identity leaves the write in the inventory
+  without a link. `kv.writes` on a consumer timeline references the
+  batch and the request's share, so the write and its bytes are counted once in aggregate;
+- `steps`: per step the per-rank spans, the expected and present ranks (from the scheduler's
+  recorded parallel layout), `complete`, and the shared `host_span_ns` and skews, withheld with
+  the reason when a rank's capture or row is missing, the layout is unknown or the clocks differ;
+- `intervals_ns` and `stall`: buckets over the basis start (`api_arrival`, or `scheduler_queued`
+  when the frontend rows are missing) to the first token output: `pre_engine`, `queue`,
+  `waiting_for_kv`, `earlier_admissions` (the work of admissions before the one that finished the
+  prefill, up to their preemption), `preempted` (the wait from each preemption to the next
+  admission), `step_host_span`, `between_steps`, `after_step_to_first_token` (sampling, output
+  transport and frontend processing; never charged to compute) and `other`. Every interval between
+  two recorded boundaries is counted in one bucket; a negative remainder is a problem, never
+  clipped. `first_step_host_span` and `prefill_done_step_host_span` are different steps when the
+  prefill ran in chunks, and each step carries its own `scheduler_to_step_begin_ns`;
+- `decode_window`: exact frontend times and, only for a normal finish with both token counts,
+  `mean_time_per_token_after_first_ns`; no inter-output mean is derived. `node_cadence` is the
+  workers' rollup windows lying entirely inside the window, node-level and shared by the batch;
+- `cross_node`: the producer join (NIXL on producer engine and request; Mooncake on producer
+  engine and transfer ID), the signed `consumer_queued_minus_producer_handoff_ns` (a concurrently
+  launched consumer can queue before the producer's handoff), `ordering` and `producer_pending_ns`
+  with the calibration's uncertainty; without a calibration or a shared clock domain they are
+  unavailable.
+
+Every interval is computed inside one clock domain or between calibrated clocks; whatever the
+records cannot carry goes to the timeline's `unavailable` and the summary's `not_available`,
+unmatched rows to `problems`. A figure that sums rows or depends on a row's absence is withheld
+when any capture it depends on (the scheduler, the frontend used, the workers of the engine) has
+loss, a missing or incomplete end record or an unhealthy adapter: the timeline is `observed_only`
+with that capture listed under `quality`, its totals are reported under `*_observed` names, and
+each step keeps every worker observation (`rank_observations`) with the shared span only observed.
+Only the workers that recorded the current scheduler generation's marker count for a step.
+A step is complete only with exactly one row for each expected rank (a rank recorded twice is
+ambiguous) from healthy captures on one clock domain. A cross-node block and a decode window list
+the quality of the producer or frontend capture they use.
+
 ## UCX protocol selection
 
 With `UCX_PROTO_INFO=y`, UCX logs a table the first time it selects protocols

@@ -26,6 +26,7 @@ GIL and does no I/O).
 
 import threading
 
+from .compute import TimelineMixin, timeline_context
 from .config import NetworkProfilerConfig
 from .core import open_recorder
 from .nixl import _Profiler, close_with_owner
@@ -77,11 +78,12 @@ _BOUND, _PREPARED_PHASE, _POSTING, _POSTED, _TERMINAL = range(5)
 _UNMAPPED_CAP = 16
 
 
-class MooncakeProfiler(_Profiler):
+class MooncakeProfiler(TimelineMixin, _Profiler):
     """One per Mooncake scheduler or worker process."""
 
     def __init__(self, config, recorder, *, rank: int, engine_id: str, kv_role: str):
         super().__init__(config, recorder)
+        self._timeline_init(config.step_window_s)
         self.rank = rank
         self.engine_id = engine_id
         self.kv_role = kv_role
@@ -575,6 +577,7 @@ class MooncakeProfiler(_Profiler):
         either recorded first (its generation is then interrupted here, or already
         retired) or finds the profiler closed and records nothing.
         """
+        self._timeline_close()
         with self._glock:
             self._closing = True
             live = list(self._live)
@@ -606,6 +609,7 @@ class MooncakeProfiler(_Profiler):
             and not self.hook_errors
         )
         return {
+            **self._timeline_summary(),
             "connector": "mooncake",
             "kv_role": self.kv_role,
             "observation_complete": bool(complete),
@@ -646,6 +650,7 @@ def capabilities(role: str, kv_role: str | None, config=None) -> dict:
     return {
         "attached": True,
         "connector": "mooncake",
+        "compute_timeline": True,
         "kv_role": kv_role,
         "socket": False,
         "qp": False,
@@ -694,6 +699,7 @@ def attach_mooncake(
         "engine_id": engine_id,
         "rank": rank,
         "connector": "mooncake",
+        **timeline_context(vllm_config, role),
         **(context or {}),
     }
     config = profiler_config(kv.kv_connector_extra_config, context)

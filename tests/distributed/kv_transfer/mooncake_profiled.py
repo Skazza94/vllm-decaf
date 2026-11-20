@@ -190,13 +190,17 @@ async def serve(
     )
 
 
-def events_of(profiler) -> list[dict]:
-    """The closed capture's events with their identities resolved, in order."""
+def events_of(profiler, *, timeline=False) -> list[dict]:
+    """The closed capture's events with their identities resolved, in order. The request
+    timeline rows (``request_phase``, ``step_span``) are left out unless asked for: these
+    tests are about the transfer chain."""
     profiler.close()
     meta, events, decoder, _, missing = _load(profiler.output_dir / "events.jsonl")
     assert not missing
     out = []
     for e in events:
+        if not timeline and e["kind"] in ("request_phase", "step_span"):
+            continue
         out.append(
             {
                 "kind": e["kind"],
