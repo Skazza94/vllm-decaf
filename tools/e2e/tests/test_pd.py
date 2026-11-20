@@ -91,6 +91,71 @@ class ProfilerConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "endpoint node"):
             pd.server_command(run, "prefill", ["10.100.0.1"], profile_id="id-1")
 
+    def test_a_profiled_ucx_server_logs_ucx_protocol_selection(self):
+        """UCX's protocol tables are on exactly when a UCX server is profiled; a run's
+        own UCX_PROTO_INFO wins."""
+        ucx = pd.Server(connector="nixl", timing="linear", nixl_backend="ucx")
+        profiled = self.run_with(server=ucx, profiler=pd.Profiler())
+        for role in ("prefill", "decode"):
+            command = pd.server_command(profiled, role, ["10.100.0.1"], profile_id="id-1")
+            self.assertIn("UCX_PROTO_INFO=y", command)
+            self.assertIn("UCX_LOG_FILE=stderr", command)
+            self.assertFalse([c for c in pd.server_command(self.run_with(server=ucx), role, ["10.100.0.1"])
+                              if c.startswith("UCX_PROTO_INFO")])
+            self.assertFalse([c for c in pd.server_command(self.run_with(profiler=pd.Profiler()), role,
+                                                           ["10.100.0.1"], profile_id="id-1")
+                              if c.startswith("UCX_PROTO_INFO")])
+        override = self.run_with(profiler=pd.Profiler(), server=pd.Server(
+            connector="nixl", timing="linear", nixl_backend="ucx", env={"UCX_PROTO_INFO": "used"}))
+        self.assertEqual([c for c in pd.server_command(override, "prefill", ["10.100.0.1"], profile_id="id-1")
+                          if c.startswith("UCX_PROTO_INFO")], ["UCX_PROTO_INFO=used"])
+
+    def test_ucx_protocol_tables_are_parsed_per_node_and_joined_to_recorders(self):
+        """After a profiled UCX run, each server log's tables land in ucx-protocols/<role>/<node>.json,
+        with each process joined by PID to its recorder; a log without tables is unavailable."""
+        import tempfile
+        table = "\n".join("[1700000000.000001] [node:42  :0]   " + line for line in (
+            "+--------+-------------+----------+", "| vllm inter-node cfg#1           |",
+            "| remote memory read by ucp_get*(multi) into host memory from host |",
+            "+--------+-------------+----------+", "| Range  | Description | Config   |",
+            "+--------+-------------+----------+", "| 0..inf | zero-copy   | tcp/kv0  |",
+            "+--------+-------------+----------+"))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for role, node, text in (("prefill", "p", "INFO start\n" + table + "\n"), ("decode", "d", "INFO\n")):
+                (output / "logs" / role / node).mkdir(parents=True)
+                (output / "logs" / role / node / f"{role}.log").write_text(text)
+            recorder = output / "profiles" / "prefill" / "p" / "run" / "proc"
+            recorder.mkdir(parents=True)
+            (recorder / "events.jsonl").write_text(json.dumps(
+                {"pid": 42, "run_id": "run", "process_id": "proc", "context": {"role": "worker", "rank": 0}}) + "\n")
+            malformed = recorder.parent / "other"
+            malformed.mkdir()  # an unrelated, malformed recorder entry: skipped, never fatal
+            (malformed / "events.jsonl").write_text(json.dumps({"pid": 7, "run_id": "run", "context": 7}) + "\n")
+            def docker_cp(argv, check=False):  # the containers' final logs: prefill's has one more table
+                source, local = argv[2], Path(argv[3])
+                self.assertEqual(source.split(":", 1)[1], f"{pd.WORK}/logs/{local.name.split('.')[0]}.log")
+                if "p" in source.split(":", 1)[0]:
+                    local.write_text("INFO start\n" + table + "\n" + table.replace("cfg#1", "cfg#2") + "\n")
+                    return ""
+                # decode's copy fails, as shell.run reports it: the earlier copy is parsed
+                raise pd.shell.CommandError(argv, 1, "no such container")
+
+            with mock.patch.object(pd.shell, "run", side_effect=docker_cp):
+                pd.ucx_protocols(self.run_with(), {"p": "c-p", "d": "c-d"}, output, "run")
+            prefill = json.loads((output / "ucx-protocols" / "prefill" / "p.json").read_text())
+            endpoint, after_stop = prefill["endpoint_configurations"]
+            self.assertEqual((endpoint["locality"], endpoint["ep_config"], endpoint["recorder"]["process_id"]),
+                             ("inter-node", 1, "proc"))
+            self.assertEqual(after_stop["ep_config"], 2)  # only in the log copied after the stop
+            self.assertEqual(prefill["log"], {"path": "logs/prefill/p/prefill.final.log", "after_stop": True})
+            self.assertEqual(endpoint["operations"][0]["ranges"][0]["lanes"][0]["device"], "kv0")
+            self.assertNotIn("unavailable", prefill)
+            self.assertEqual((prefill["tables"], prefill["recorders_skipped"]), (2, 1))
+            decode = json.loads((output / "ucx-protocols" / "decode" / "d.json").read_text())
+            self.assertEqual(decode["unavailable"], "no UCX_PROTO_INFO table in the server log")
+            self.assertEqual(decode["log"], {"path": "logs/decode/d/decode.log", "after_stop": False})
+
     def test_off_leaves_the_connector_configuration_unchanged(self):
         run = self.run_with()
         for role in ("prefill", "decode"):

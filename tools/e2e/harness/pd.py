@@ -1094,6 +1094,14 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         **connector_env,
         **({"VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": str(PROFILER_SHUTDOWN_GRACE_S)}
            if run.profiler is not None else {}),
+        # A profiled UCX server logs UCX's protocol selection tables (lanes and
+        # protocol per message size, per endpoint configuration) as it selects;
+        # parsed after the run into ucx-protocols/ (vllm/kv_profiling/ucx_protocols.py).
+        # UCX's log goes to stderr: unbuffered, so each table is one write that
+        # neither another process's output cuts nor a worker's exit loses
+        # (on stdout, a block-buffered stream, both happen).
+        **({"UCX_PROTO_INFO": "y", "UCX_LOG_FILE": "stderr"}
+           if run.profiler is not None and ucx else {}),
         # TENT's metrics, read from inside the node.
         "TENT_METRICS_HTTP_HOST": "127.0.0.1",
         "TENT_METRICS_HTTP_PORT": str(TENT_METRICS_PORT),
@@ -1286,6 +1294,8 @@ def execute(run: Run, output: Path | None = None) -> dict:
                             observers.remove(observer)
                 stop_orderly(run, container, output, on_endpoint_closed=endpoint_closed)
                 _collect_profiles(run, container, output, profile_id)
+                if uses_ucx(run.server):
+                    ucx_protocols(run, container, output, profile_id)
             if run.workload.measure:
                 # From the servers' own step logs, the samplers' files and (profiled)
                 # the writers' manifests: setup, workload and shutdown apart.
@@ -4508,6 +4518,47 @@ def _collect_profiles(run: Run, container: dict[str, str], output: Path, profile
             local = output / "profiles" / role / node
             local.mkdir(parents=True, exist_ok=True)
             shell.run(["docker", "cp", f"{container[node]}:{PROFILES}/.", str(local)], check=False)
+
+
+def ucx_protocols(run: Run, container: dict[str, str], output: Path, profile_id: str | None) -> None:
+    """Each profiled UCX server's protocol selection tables, parsed from its
+    log into ``ucx-protocols/<role>/<node>.json`` and joined by PID to the
+    node's recorders of this run. The log is copied again after the orderly
+    stop (``logs/<role>/<node>/<role>.final.log``): UCX prints
+    ``UCX_PROTO_INFO=used`` counts as workers are destroyed, after the run's
+    logs were collected. A log without tables (UCX_PROTO_INFO overridden, or a
+    UCX that prints none) is recorded as unavailable, and a node whose log
+    cannot be read or parsed never keeps the other nodes from being written."""
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "ucx_protocols", REPOSITORY / "vllm" / "kv_profiling" / "ucx_protocols.py")
+    parser = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parser)
+    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+        for node in side.nodes:
+            logs = output / "logs" / role / node
+            log = logs / f"{role}.final.log"
+            logs.mkdir(parents=True, exist_ok=True)
+            log.unlink(missing_ok=True)
+            try:
+                shell.run(["docker", "cp", f"{container[node]}:{WORK}/logs/{role}.log", str(log)])
+                copied = log.is_file()
+            except Exception:  # best effort (failed or timed out): the earlier copy is parsed
+                copied = False
+            if not copied:
+                log = logs / f"{role}.log"  # the copy taken before the stop
+            target = output / "ucx-protocols" / role / f"{node}.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                result = parser.summarize([log], output / "profiles" / role / node, profile_id)
+                if not result["tables"]:
+                    result["unavailable"] = "no UCX_PROTO_INFO table in the server log"
+            except Exception as error:  # this node only; never the run's other nodes
+                result = {"unavailable": f"{type(error).__name__}: {error}"}
+            result["log"] = {"path": str(log.relative_to(output)), "after_stop": copied}
+            target.write_text(json.dumps(result, indent=2) + "\n")
 
 
 def _collect(run: Run, container: dict[str, str], output: Path) -> None:

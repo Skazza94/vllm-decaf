@@ -236,6 +236,51 @@ is the scheduler's permission only. A missing end record means completeness
 is unknown, not that the capture is empty: rows flushed before the stop are
 summarized, rows left in a ring that was never closed are lost.
 
+## UCX protocol selection
+
+With `UCX_PROTO_INFO=y`, UCX logs a table the first time it selects protocols
+for an endpoint configuration and an operation: for each message-size range,
+the protocol (for example `short`, `zero-copy`, or `software emulation` for a
+remote read over a transport without one) and the lanes it uses, with the share
+of the bytes each lane carries. `UCX_PROTO_INFO=used` logs the same tables with
+per-range selection counts when a worker is destroyed. Set `UCX_LOG_FILE=stderr`
+as well: stderr is unbuffered, so each table is written whole as it is
+selected. On a block-buffered stdout redirected to a file, tables can be cut by
+other processes' output or lost when a process exits.
+
+```console
+.venv/bin/python -m vllm.kv_profiling.ucx_protocols server.log \
+  [--profiles /profiles] [--run-id RUN] [--output ucx.json]
+```
+
+The parser groups each table by its log prefix (time, host, PID and UCX thread,
+kept as printed, e.g. `a` for UCX's async thread), so several processes can share
+one log. A table is recognized by its frame, whatever its title says, so a
+damaged table is counted and loses only itself: the next one is still parsed.
+It reports the tables per process, UCX context, locality (`self`, `intra-node`
+or `inter-node`) and endpoint configuration (`cfg#N`), the fields UCX prints.
+UCX numbers `cfg#N` per UCP worker and does not print the worker, so worker
+identity stays unresolved: a grouping may hold several workers' tables.
+`worker_collision_detected` marks a grouping where that is visible (one label
+with two localities, or one operation selected twice); its absence does not
+mean one worker.
+Each range has its `start` and `end` in bytes (`null` for unbounded), the
+protocol `description` (`estimated` when UCX marks it `(?)`), the raw `config`,
+and the parsed `lanes` (`transport`, `device`, `path`, `share_percent`).
+`--profiles` joins each PID to the recorder that process ran (role, rank,
+engine), restricted to one profiler run with `--run-id`. A PID that matches
+more than one recorder (a PID reused across runs) stays unjoined, with
+`recorder_candidates` counting the matches. The log and the profiles must come
+from the same node. Unreadable or malformed recorder metadata is skipped and
+listed (`recorders_skipped`), never fatal. `UCX_PROTO_INFO=used` counts are printed as workers are
+destroyed, so parse a log copied after the servers stopped.
+
+UCX names no peer in these tables. Endpoints to peers reached the same way
+share one configuration, so a configuration stands for every such peer. The
+tables reflect what UCX selected, not how many bytes each protocol moved. A
+table that does not parse is counted under `unparsed`, with its reason, never
+dropped silently.
+
 ## Qualification boundaries
 
 The focused core tests use real recorder mappings, native publishers, helper
