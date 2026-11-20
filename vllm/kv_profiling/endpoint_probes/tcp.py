@@ -45,6 +45,25 @@ def tcp_info(data):
     return result
 
 
+INET_DIAG_SHUTDOWN = 8
+
+
+def record_kind(state, timer, inode, attrs):
+    """A full socket's record, or one of the kernel's compact records, which
+    carry no TCP_INFO: a time-wait socket (``inet_twsk_diag_fill``: its
+    substate, TIME_WAIT or FIN_WAIT2, timer 3) or a request socket
+    (``inet_req_diag_fill``: SYN_RECV, timer 1). Both have inode 0 and no
+    TCP_INFO (at most INET_DIAG_MARK, for a reader with CAP_NET_ADMIN); every
+    full socket's record carries INET_DIAG_SHUTDOWN."""
+    if INET_DIAG_SHUTDOWN in attrs or inode != 0:
+        return "full"
+    if timer == 3 and state in (5, 6):
+        return "time_wait"
+    if timer == 1 and state == 3:
+        return "request"
+    return "full"
+
+
 def decode_socket(body):
     if len(body) < 72:
         raise ObservationError("short inet_diag_msg")
@@ -54,11 +73,17 @@ def decode_socket(body):
     width = 4 if family == socket.AF_INET else 16
     src, dst = struct.unpack_from("!HH", body, 4)
     cookie = struct.unpack_from("=II", body, 44)
-    info = dict(attributes(body[72:])).get(2, b"")
+    attrs = dict(attributes(body[72:]))
+    info = attrs.get(2, b"")
+    timer, inode = body[2], struct.unpack_from("=I", body, 68)[0]
+    kind = record_kind(state, timer, inode, attrs)
     return {
         "family": family,
         "protocol": "tcp",
         "state": state,
+        "timer": timer,
+        "record": kind,
+        "tcp_info_expected": kind == "full",
         "local_ip": socket.inet_ntop(family, body[8 : 8 + width]),
         "local_port": src,
         "peer_ip": socket.inet_ntop(family, body[24 : 24 + width]),

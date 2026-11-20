@@ -404,7 +404,12 @@ explicit `local_ips` and `peer_ips`; optional `local_ports`, `peer_ports` and
 filters. Interface names and RDMA `{device, port}` entries are explicit endpoint
 allowlists. No intermediate-network observation or packet modification occurs.
 `required` names enabled sources (`tcp`, `netdev`, `driver`, `rdma`, `qp`,
-`threads`, `interrupts`).
+`threads`, `interrupts`). The kernel reports request sockets (`SYN_RECV`,
+timer 1) and time-wait sockets (`FIN_WAIT2` or `TIME_WAIT` after close, timer 3)
+as compact records: inode 0 and no `TCP_INFO` (at most `INET_DIAG_MARK`, for a
+reader with `CAP_NET_ADMIN`). They
+are recorded as `record: request` or `time_wait`, with `tcp_info_expected:
+false`. A required TCP source fails only when a full socket lacks `TCP_INFO`.
 Declare requirements before a capture: unsupported optional sources stay
 visible as unavailable; failures of required sources invalidate that capture.
 

@@ -350,7 +350,11 @@ class Observer:
                     row["continuity"] = "counter_reset"
                 now[identity] = values
                 self.emit("socket", identity, begin, row, "tcp")
-                if "tcp" in self.config.required and not row["tcp_info_length"]:
+                if (
+                    "tcp" in self.config.required
+                    and row["tcp_info_expected"]
+                    and not row["tcp_info_length"]
+                ):
                     self.failure("tcp", "TCP_INFO unavailable", begin)
             self.emit(
                 "tcp_poll",

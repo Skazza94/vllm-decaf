@@ -2253,3 +2253,70 @@ def test_a_possible_cpu_list_or_counter_that_is_not_exact_never_moves_counts(
     data = tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)
     assert [i["irq"] for i in data["irqs"]] == [30, 31]
     assert data["irqs"][1]["name"] == "nic0-�" and data["unreadable_irqs"] == []
+
+
+
+
+def _tcp_required_failures(tmp_path, rows):
+    from vllm.kv_profiling.endpoint_probes.runner import Observer
+
+    observer = Observer.__new__(Observer)
+    observer.config = ProbeConfig(tcp={"local_ips": ["127.0.0.1"],
+                                       "peer_ips": ["127.0.0.1"]},
+                                  required=["tcp"])  # fmt: skip
+    observer.tcp_reader = type("Reader", (), {"read": lambda self: rows})()
+    observer.input_dir, observer.run_id, observer.role = tmp_path, str(uuid4()), "d"
+    observer.metadata = {"net_namespace": os.readlink("/proc/self/ns/net"),
+                         "affinity": []}  # fmt: skip
+    observer.previous, observer.failed_required, observer.endpoint = {}, 0, "d"
+    observer.writer = type("Sink", (), {"put": lambda self, row: None})()
+    observer.sample_tcp()
+    return observer.failed_required
+
+
+def test_the_kernels_compact_socket_records_are_not_required_failures(tmp_path):
+    """The kernel reports request sockets (SYN_RECV, timer 1) and time-wait
+    sockets (FIN_WAIT2 or TIME_WAIT, timer 3) as compact records without
+    TCP_INFO: real ones are read here, and none fails a required TCP source;
+    a full socket (FIN_WAIT2 while open) carries TCP_INFO and still fails
+    the source when it lacks it."""
+    loopback = {"local_ips": ["127.0.0.1"], "peer_ips": ["127.0.0.1"]}
+
+    def only(selectors, state, **expect):
+        wait_for(lambda: [(r["state"], r["record"]) for r in tcp.sockets(selectors)]
+                 == [(state, expect["record"])])  # fmt: skip
+        (row,) = tcp.sockets(selectors)
+        assert {k: row[k] for k in expect} == expect
+        return row
+
+    with socket.socket() as listener, socket.socket() as client:
+        listener.setsockopt(socket.IPPROTO_TCP, socket.TCP_DEFER_ACCEPT, 5)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        client.connect(listener.getsockname())  # no data: the accept is deferred
+        request = only({**loopback, "local_ports": [listener.getsockname()[1]],
+                        "peer_ports": [client.getsockname()[1]]}, 3,
+                       record="request", timer=1, inode=0, tcp_info_length=0,
+                       tcp_info_expected=False)  # fmt: skip
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        client = socket.socket()
+        # Orphaned FIN_WAIT2 becomes a time-wait record only when its timeout
+        # is at most TIME_WAIT's (60 s); pin it, whatever the host's default.
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_LINGER2, 12)
+        client.connect(listener.getsockname())
+        server, _ = listener.accept()
+        selectors = {**loopback, "local_ports": [client.getsockname()[1]]}
+        client.shutdown(socket.SHUT_WR)
+        assert server.recv(1) == b""
+        full = only(selectors, 5, record="full", tcp_info_expected=True)
+        assert full["tcp_info_length"] > 0 and full["inode"] > 0
+        client.close()  # orphaned in FIN_WAIT2: a time-wait record
+        fin_wait2 = only(selectors, 5, record="time_wait", timer=3, inode=0,
+                         tcp_info_length=0, tcp_info_expected=False)  # fmt: skip
+        server.close()
+        time_wait = only(selectors, 6, record="time_wait", timer=3, inode=0,
+                         tcp_info_length=0, tcp_info_expected=False)  # fmt: skip
+    assert _tcp_required_failures(tmp_path, [request, fin_wait2, time_wait]) == 0
+    assert _tcp_required_failures(tmp_path, [{**full, "tcp_info_length": 0}]) == 1
