@@ -35,6 +35,11 @@ class ProbeConfig:
     rdma_ports: list[dict] = field(default_factory=list)
     rdma_required_families: list[str] = field(default_factory=lambda: ["counters"])
     qp: bool = False
+    # Per-thread CPU, run-queue wait and context switches of the serving
+    # processes; the NICs' interrupts and the host's network softirqs per CPU.
+    threads: bool = False
+    max_threads: int = 256
+    interrupts: bool = False
     required: list[str] = field(default_factory=list)
     max_sockets: int = 1024
     queue_rows: int = 512
@@ -51,8 +56,10 @@ class ProbeConfig:
         integer(self.max_sockets, 1, 1024, "max_sockets")
         integer(self.queue_rows, 1, 512, "queue_rows")
         integer(self.output_bytes, 4096, 1 << 30, "output_bytes")
-        if type(self.driver_statistics) is not bool or type(self.qp) is not bool:
-            raise ValueError("driver_statistics and qp must be booleans")
+        for name in ("driver_statistics", "qp", "threads", "interrupts"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+        integer(self.max_threads, 1, 1024, "max_threads")
         if not isinstance(self.tcp, dict) or set(self.tcp) - {
             "local_ips",
             "peer_ips",
@@ -109,6 +116,10 @@ class ProbeConfig:
             enabled.add("rdma")
             if self.qp:
                 enabled.add("qp")
+        if self.threads:
+            enabled.add("threads")
+        if self.interrupts:
+            enabled.add("interrupts")
         if not isinstance(self.required, list) or set(self.required) - enabled:
             raise ValueError("required sources must be explicitly enabled")
         if (

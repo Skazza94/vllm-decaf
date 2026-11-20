@@ -1535,3 +1535,609 @@ def test_a_kernel_without_time_namespaces_is_one_clock_domain(tmp_path, monkeypa
 
     monkeypatch.setattr(os, "readlink", readlink)
     assert runner._time_namespace() is None
+
+
+def _fake_stat(pid, comm, start_ticks, cpu=3, utime=7, stime=2):
+    # Fields 3.. after the command, in the kernel's order (proc(5)).
+    after = ["S"] + ["0"] * 49
+    after[11], after[12], after[19], after[36] = (
+        str(utime), str(stime), str(start_ticks), str(cpu))  # fmt: skip
+    return f"{pid} ({comm}) " + " ".join(after) + "\n"
+
+
+def test_thread_probe_reports_each_thread_and_unavailable_counters_as_none(tmp_path):
+    """Per-thread CPU and scheduling come from the kernel's own counters; a
+    kernel without schedstats yields None (unavailable), never zero, and a
+    command with spaces and parentheses does not shift the fields."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    base = tmp_path / "proc/40"
+    (base / "task/40").mkdir(parents=True)
+    (base / "task/41").mkdir()
+    (base / "task/42").mkdir()  # exits before its stat is read
+    (base / "stat").write_text(_fake_stat(40, "vllm", 900))
+    (base / "task/40/stat").write_text(_fake_stat(40, "vllm", 900, cpu=1))
+    (base / "task/40/schedstat").write_text("5000 1200 9\n")
+    (base / "task/40/status").write_text(
+        "Name:\tvllm\nvoluntary_ctxt_switches:\t11\nnonvoluntary_ctxt_switches:\t4\n"
+    )
+    (base / "task/41/stat").write_text(_fake_stat(41, "a) (b c", 905, utime=30))
+    data = tasks.process_threads(40, 900, proc=tmp_path / "proc")
+    assert data["exited"] is False and data["threads_total"] == 3
+    assert data["vanished_between_reads"] == 1
+    main, other = data["threads"]
+    assert (main["tid"], main["processor"], main["run_ns"], main["wait_ns"]) == (
+        40, 1, 5000, 1200)  # fmt: skip
+    assert (main["voluntary_ctxt_switches"], main["nonvoluntary_ctxt_switches"]) == (
+        11, 4)  # fmt: skip
+    assert (other["comm"], other["utime_ticks"], other["start_ticks"]) == (
+        "a) (b c", 30, 905)  # fmt: skip
+    assert other["run_ns"] is None and other["voluntary_ctxt_switches"] is None
+    assert data["coverage_problem"] is None  # an absent schedstat is not an error
+    # A reused PID (another generation) is the serving process having exited.
+    assert tasks.process_threads(40, 899, proc=tmp_path / "proc")["exited"] is True
+    assert tasks.process_threads(77, 1, proc=tmp_path / "proc")["exited"] is True
+
+
+def test_interrupt_probe_reads_only_the_endpoint_nics_and_bounds_rows(tmp_path):
+    """Only the configured NICs' MSI interrupts are reported, busiest CPU first;
+    a NIC without MSI interrupts is named unavailable; network softirqs on any
+    CPU count stay within the probe row limit."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+    from vllm.kv_profiling.endpoint_probes.runner import Observer
+
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    proc.mkdir()
+    (sys_root / "class/net/nic0/device/msi_irqs/30").mkdir(parents=True)
+    (sys_root / "class/infiniband/dev0/device/msi_irqs/31").mkdir(parents=True)
+    (sys_root / "class/net/veth0").mkdir(parents=True)
+    (proc / "interrupts").write_text(
+        "           CPU0       CPU1       CPU2\n"
+        "  29:          5          0          0   PCI-MSI other-device\n"
+        "  30:          1          0         90   PCI-MSI nic0-rx-0\n"
+        "  31:          0          4          0   PCI-MSI dev0-comp\n"
+        " NMI:          0          0          0   Non-maskable interrupts\n"
+    )
+    data = tasks.nic_interrupts(
+        ["nic0", "veth0"], ["dev0"], proc=proc, sys=sys_root
+    )
+    assert [(i["irq"], i["owners"], i["per_cpu"]) for i in data["irqs"]] == [
+        (30, ["interface:nic0"], {"2": 90, "0": 1}),
+        (31, ["rdma_device:dev0"], {"1": 4}),
+    ]
+    assert [u.get("interface") for u in data["unavailable"]] == ["veth0"]
+    cpus = 1024
+    (proc / "softirqs").write_text(
+        "".join(f" CPU{c}" for c in range(cpus)) + "\n"
+        + "".join(
+            f"{name}:" + f" {10**19}" * cpus + "\n"
+            for name in ("HI", "NET_TX", "NET_RX")
+        )
+    )  # fmt: skip
+    softirqs = tasks.net_softirqs(proc=proc)
+    assert softirqs["cpu_count"] == cpus
+    assert {i["name"] for i in softirqs["softirqs"]} == {"NET_TX", "NET_RX"}
+    assert sum(len(i["counts"]) for i in softirqs["softirqs"]) == 2 * cpus
+
+    rows = []
+
+    class Sink:
+        def put(self, row):
+            rows.append(row)
+
+    observer = Observer.__new__(Observer)
+    observer.writer = Sink()
+    observer.emit("interrupts", "softirqs", 0, softirqs)
+    threads = [{"tid": t, "comm": "x" * 15, **dict.fromkeys(
+        ("start_ticks", "processor", "utime_ticks", "stime_ticks", "run_ns",
+         "wait_ns", "timeslices", "voluntary_ctxt_switches",
+         "nonvoluntary_ctxt_switches"), 10**19)} for t in range(1024)]  # fmt: skip
+    observer.emit("threads", "worker/1", 0, {"threads": threads, "units": {}})
+    assert max(len(json.dumps(row)) for row in rows) < (16 << 10) - 512
+    parts = [r["observation"] for r in rows]
+    assert sum(len(p["threads"]) for p in parts if "threads" in p) == 1024
+    assert sum(len(p["softirqs"]) for p in parts if "softirqs" in p) == 64
+
+
+@pytest.mark.parametrize("absent_nic", [False, True])
+def test_real_cli_records_the_serving_threads_and_host_network_interrupts(
+    tmp_path, absent_nic
+):
+    """Through the observer CLI: every serving process of the inventory is
+    sampled thread by thread from outside it, and the interrupt sources are
+    observed (a loopback NIC has no MSI interrupts: unavailable, not a failure;
+    a configured NIC that does not exist fails the required source)."""
+    allowed = sorted(os.sched_getaffinity(0))
+    assert len(allowed) >= 2, "probe tests require separate owner/observer CPUs"
+    owner, inventory, endpoint_dir = start_recorded_endpoint(tmp_path, allowed[0])
+    run_id = inventory[0]["run_id"]
+    settings = ProbeConfig(
+        interval_s=0.1,
+        interfaces=["lo", "absent-nic0"] if absent_nic else ["lo"],
+        threads=True,
+        interrupts=True,
+        required=["threads", "interrupts"],
+    )
+    config = {
+        "probes": asdict(settings),
+        "inventory": inventory,
+        "run_id": run_id,
+        "endpoint": "d",
+        "role": "decode",
+        "owner_pid": owner.pid,
+        "owner_start": process_identity(owner.pid)["start_ticks"],
+        "cpus": [allowed[-1]],
+        "input_dir": str(endpoint_dir / "profiles"),
+        "output_dir": str(tmp_path / "output"),
+        "irq_policy": "virtual_not_applicable",
+        "stop_file": str(tmp_path / "stop"),
+        "endpoint_complete_file": str(tmp_path / "children"),
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    process = subprocess.Popen(
+        [sys.executable, str(Path(probe.__file__)), "--config",
+         str(tmp_path / "config.json")],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    try:
+
+        def sampled():
+            paths = list((tmp_path / "output").glob("*/*/events.jsonl"))
+            return bool(paths) and paths[0].read_text().count('"softirqs"') >= 2
+
+        wait_for(sampled, timeout=20)
+        (endpoint_dir / "close").touch()
+        wait_for(lambda: (endpoint_dir / "closed").exists(), timeout=20)
+        (tmp_path / "children").write_text(
+            json.dumps({"run_id": run_id, "endpoint": "d", "children_closed": True})
+        )
+        (tmp_path / "stop").touch()
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == (2 if absent_nic else 0), (stdout, stderr)
+        path = next((tmp_path / "output").glob("*/*/manifest.json"))
+        manifest = json.loads(path.read_text())
+        assert manifest["complete"] is not absent_nic
+        rows = [
+            json.loads(line)
+            for line in path.with_name("events.jsonl").read_text().splitlines()
+        ]
+        threads = [r for r in rows if r.get("scope") == "threads"]
+        pids = {meta["pid"] for meta in inventory} | {owner.pid}
+        assert {r["observation"]["pid"] for r in threads} == pids
+        live = [r["observation"] for r in threads if not r["observation"]["exited"]]
+        assert live and all(d["threads"] for d in live)
+        tids = {t["tid"] for d in live for t in d["threads"]}
+        assert process.pid not in tids, "the observer samples only serving threads"
+        nic = [r["observation"] for r in rows if r.get("entity") == "nic"]
+        assert nic and nic[0]["irqs"] == []
+        assert nic[0]["unavailable"][0]["interface"] == "lo"
+        failures = [r for r in rows if r.get("scope") == "source"
+                    and r.get("entity") in ("threads", "interrupts")]  # fmt: skip
+        if absent_nic:
+            assert nic[0]["absent"] == [{"interface": "absent-nic0"}]
+            assert manifest["end"]["stats"]["required_source_failures"] > 0
+            assert {r["observation"]["error"] for r in failures} == {
+                "1 configured devices absent"
+            }
+            return
+        softirqs = next(r["observation"] for r in rows if r.get("entity") == "softirqs")
+        assert {i["name"] for i in softirqs["softirqs"]} == {"NET_RX", "NET_TX"}
+        assert not failures
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        if owner.poll() is None:
+            (endpoint_dir / "exit").touch()
+            owner.wait(10)
+
+
+def _fake_thread_tree(root, pid, start, tids):
+    base = root / str(pid)
+    (base / "task").mkdir(parents=True)
+    (base / "stat").write_text(_fake_stat(pid, "vllm", start))
+    for tid, (thread_start, run_ns) in tids.items():
+        task = base / "task" / str(tid)
+        task.mkdir()
+        (task / "stat").write_text(_fake_stat(tid, "vllm", thread_start))
+        (task / "schedstat").write_text(f"{run_ns} 1 1\n")
+        (task / "status").write_text("voluntary_ctxt_switches:\t1\n")
+    return base
+
+
+def _hook_reads(monkeypatch, after):
+    """Run ``after(path, name)`` once a pinned read of ``name`` completes."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    real = tasks._read_at
+
+    def read(directory, name, limit=4096):
+        value = real(directory, name, limit)
+        after(Path(os.readlink(f"/proc/self/fd/{directory}")), name)
+        return value
+
+    monkeypatch.setattr(tasks, "_read_at", read)
+
+
+def test_a_process_replaced_after_its_identity_read_is_not_reported(
+    tmp_path, monkeypatch
+):
+    """The process is pinned by its /proc directory: a replacement under the
+    same PID right after the generation check is never read as the serving
+    process."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc = tmp_path / "proc"
+    _fake_thread_tree(proc, 40, 900, {40: (900, 5000)})
+    swapped = []
+
+    def replace(path, name):
+        if path == proc / "40" and name == "stat" and not swapped:
+            swapped.append((proc / "40").rename(tmp_path / "old-40"))
+            _fake_thread_tree(proc, 40, 950, {40: (950, 1), 41: (951, 1)})
+
+    _hook_reads(monkeypatch, replace)
+    data = tasks.process_threads(40, 900, proc=proc)
+    assert swapped
+    assert [(t["tid"], t["start_ticks"], t["run_ns"]) for t in data["threads"]] == [
+        (40, 900, 5000)
+    ]
+
+
+def test_a_reused_thread_id_never_mixes_two_threads_counters(tmp_path, monkeypatch):
+    """Each thread is pinned by its own directory: a TID reused between its stat
+    and schedstat reads cannot pair one thread's start with another's counters."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc = tmp_path / "proc"
+    base = _fake_thread_tree(proc, 40, 900, {40: (900, 1), 41: (905, 5000)})
+    swapped = []
+
+    def reuse(path, name):
+        if path.name == "41" and name == "stat" and not swapped:
+            swapped.append((base / "task/41").rename(tmp_path / "old-41"))
+            (base / "task/41").mkdir()
+            (base / "task/41/stat").write_text(_fake_stat(41, "new", 990))
+            (base / "task/41/schedstat").write_text("99999 9 9\n")
+
+    _hook_reads(monkeypatch, reuse)
+    thread = tasks.process_threads(40, 900, proc=proc)["threads"][1]
+    assert swapped
+    assert (thread["start_ticks"], thread["run_ns"]) == (905, 5000)
+
+
+def test_long_or_unreadable_task_files_keep_the_other_measurements(
+    tmp_path, monkeypatch
+):
+    """A long status (many supplementary groups) is read; an optional file that
+    cannot be read leaves the thread's other counters; a thread that cannot be
+    read for permissions is counted as unreadable, not as exited."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc = tmp_path / "proc"
+    base = _fake_thread_tree(
+        proc, 40, 900, {40: (900, 10), 41: (901, 20), 42: (902, 30)}
+    )
+    groups = " ".join(str(1000000 + g) for g in range(600))
+    (base / "task/40/status").write_text(
+        f"Groups:\t{groups}\nvoluntary_ctxt_switches:\t7\n"
+        "nonvoluntary_ctxt_switches:\t3\n"
+    )
+    assert (base / "task/40/status").stat().st_size > 4096
+    (base / "task/41/status").write_text("x" * (128 << 10))
+    real = tasks._read_at
+
+    def read(directory, name, limit=4096):
+        path = Path(os.readlink(f"/proc/self/fd/{directory}"))
+        if path.name == "42" and name == "stat":
+            raise PermissionError(13, "Permission denied")
+        return real(directory, name, limit)
+
+    monkeypatch.setattr(tasks, "_read_at", read)
+    data = tasks.process_threads(40, 900, proc=proc)
+    long_status, oversize = data["threads"]
+    assert long_status["voluntary_ctxt_switches"] == 7
+    assert long_status["nonvoluntary_ctxt_switches"] == 3
+    assert oversize["run_ns"] == 20 and oversize["voluntary_ctxt_switches"] is None
+    assert oversize["unavailable"] == [{"file": "status", "error": "ObservationError"}]
+    assert data["vanished_between_reads"] == 0
+    assert data["unreadable"] == {"PermissionError": 1}
+    assert data["unreadable_files"] == {"status:ObservationError": 1}
+    assert data["coverage_problem"] == "1 threads unreadable; 1 thread files unreadable"
+
+
+def test_interrupt_counts_keep_the_cpu_ids_their_header_names(tmp_path):
+    """With offline CPUs the columns are not CPU IDs: counts are attributed to
+    the CPU each header label names, and a row that does not match it fails."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    proc.mkdir()
+    (sys_root / "class/net/nic0/device/msi_irqs/30").mkdir(parents=True)
+    (proc / "interrupts").write_text(
+        "       CPU0  CPU3  CPU7\n  30:     0     2    10   PCI-MSI nic0\n"
+    )
+    (proc / "softirqs").write_text(
+        "       CPU0  CPU3  CPU7\nNET_TX:   1  2  3\nNET_RX:   4  5  6\n"
+    )
+    irq = tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)
+    assert irq["cpu_count"] == 3 and irq["irqs"][0]["per_cpu"] == {"7": 10, "3": 2}
+    softirqs = tasks.net_softirqs(proc=proc)["softirqs"]
+    assert {i["name"]: (i["cpus"], i["counts"]) for i in softirqs} == {
+        "NET_TX": ([0, 3, 7], [1, 2, 3]),
+        "NET_RX": ([0, 3, 7], [4, 5, 6]),
+    }
+    (proc / "interrupts").write_text("       CPU0  CPU3  CPU7\n  30:   0   2\n")
+    with pytest.raises(ObservationError, match="does not match the CPU header"):
+        tasks.nic_interrupts(["nic0"], proc=proc, sys=sys_root)
+    (proc / "softirqs").write_text("       CPU0  CPU3  CPU7\nNET_RX:   4  5\n")
+    with pytest.raises(ObservationError, match="does not match the CPU header"):
+        tasks.net_softirqs(proc=proc)
+
+
+def test_missing_interrupt_coverage_fails_a_required_source(tmp_path):
+    """An interrupt sysfs lists but /proc/interrupts lacks, an unreadable
+    /proc/interrupts, or a missing network softirq is a required-source
+    failure; a device without (or with an empty) MSI list is only unavailable."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+    from vllm.kv_profiling.endpoint_probes.runner import Observer
+
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    proc.mkdir()
+    (sys_root / "class/net/nic0/device/msi_irqs/30").mkdir(parents=True)
+    (sys_root / "class/net/nic1/device/msi_irqs").mkdir(parents=True)
+    (sys_root / "class/net/lo").mkdir(parents=True)
+    rows = []
+
+    class Sink:
+        def put(self, row):
+            rows.append(row)
+
+    def observer():
+        o = Observer.__new__(Observer)
+        o.writer, o.seen_identities, o.failed_required = Sink(), {}, 0
+        o.config = ProbeConfig(interfaces=["nic0"], interrupts=True,
+                               required=["interrupts"])  # fmt: skip
+        return o
+
+    def nic(names):
+        return lambda: tasks.nic_interrupts(names, proc=proc, sys=sys_root)
+
+    header = "       CPU0  CPU1\n"
+    (proc / "interrupts").write_text(header + "  30:   1   2   PCI-MSI nic0\n")
+    (proc / "softirqs").write_text(header + "NET_TX:  1  2\nNET_RX:  3  4\n")
+    ok = observer()
+    ok.observe("interrupts", "nic", nic(["nic0", "nic1", "lo"]))
+    ok.observe("interrupts", "softirqs", lambda: tasks.net_softirqs(proc=proc))
+    assert ok.failed_required == 0
+    reasons = rows[0]["observation"]["unavailable"]
+    assert reasons == [
+        {"interface": "nic1", "reason": "empty MSI interrupt list"},
+        {"interface": "lo", "reason": "no MSI interrupt list"},
+    ]
+    rows.clear()
+    absent = observer()
+    absent.observe("interrupts", "nic", nic(["nic0", "lo", "no-such-nic"]))
+    assert absent.failed_required == 1  # a configured device that does not exist
+    (observed,) = [r for r in rows if r["kind"] == "endpoint_metrics"]
+    assert observed["observation"]["absent"] == [{"interface": "no-such-nic"}]
+    for interrupts, softirqs in (
+        (header, header + "NET_TX:  1  2\nNET_RX:  3  4\n"),  # IRQ 30 absent
+        ("", header + "NET_TX:  1  2\nNET_RX:  3  4\n"),  # no CPU header
+        (header + "  30:   1   2   PCI-MSI nic0\n", header + "NET_TX:  1  2\n"),
+    ):
+        (proc / "interrupts").write_text(interrupts)
+        (proc / "softirqs").write_text(softirqs)
+        rows.clear()
+        failing = observer()
+        failing.observe("interrupts", "nic", nic(["nic0"]))
+        failing.observe("interrupts", "softirqs", lambda: tasks.net_softirqs(proc=proc))
+        assert failing.failed_required == 1, rows
+        assert [r["observation"]["available"] for r in rows
+                if r["kind"] == "probe_status"] == [False]  # fmt: skip
+
+
+
+def _probe_rows(data, source, entity, config):
+    """One observation through the observer's emit and failure paths, checked
+    against the real writer's validation and row limit."""
+    from vllm.kv_profiling.endpoint_probes.runner import Observer
+
+    rows, dropped = [], []
+
+    class Sink:
+        def put(self, row):
+            validate(row)
+            raw = json.dumps({**row, "sequence": 0}, allow_nan=False) + "\n"
+            (dropped if len(raw.encode()) > 16 << 10 else rows).append(row)
+
+    observer = Observer.__new__(Observer)
+    observer.writer, observer.seen_identities, observer.failed_required = (
+        Sink(), {}, 0)  # fmt: skip
+    observer.config = config
+    observer.observe(source, entity, lambda: data)
+    return rows, dropped, observer.failed_required
+
+
+def test_many_missing_interrupts_keep_the_visible_counters_and_a_bounded_reason(
+    tmp_path,
+):
+    """256 vectors shared by a NIC and its RDMA device with one visible: the
+    visible IRQ's counters and a short failure survive the writer, the missing
+    vectors are an exact count with a bounded sample, and nothing is dropped."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    proc.mkdir()
+    for path in ("class/net/nic0/device/msi_irqs",
+                 "class/infiniband/dev0/device/msi_irqs"):  # fmt: skip
+        for irq in range(1000, 1256):
+            (sys_root / path / str(irq)).mkdir(parents=True)
+    (proc / "interrupts").write_text(
+        "       CPU0  CPU1\n 1000:   5   6   PCI-MSI nic0-comp0\n"
+    )
+    data = tasks.nic_interrupts(["nic0"], ["dev0"], proc=proc, sys=sys_root)
+    assert data["missing_count"] == 255 and data["missing_truncated"]
+    assert len(data["missing"]) == tasks.MAX_LISTED
+    config = ProbeConfig(interfaces=["nic0"], interrupts=True)  # optional source
+    rows, dropped, required_failures = _probe_rows(data, "interrupts", "nic", config)
+    assert dropped == [] and required_failures == 0
+    (irq,) = [i for r in rows if r["kind"] == "endpoint_metrics"
+              for i in r["observation"]["irqs"]]  # fmt: skip
+    assert (irq["irq"], irq["total"]) == (1000, 11)
+    (status,) = [r for r in rows if r["kind"] == "probe_status"]
+    assert status["observation"]["error"] == (
+        f"255 listed interrupts absent from {proc / 'interrupts'}"
+    )
+
+
+def test_access_errors_fail_a_required_source_and_keep_what_was_read(
+    tmp_path, monkeypatch
+):
+    """An MSI list or every live thread's stat that cannot be read is a source
+    failure; the counters that were read are kept."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    proc.mkdir()
+    (sys_root / "class/net/nic0/device/msi_irqs/30").mkdir(parents=True)
+    (sys_root / "class/net/nic1/device/msi_irqs/31").mkdir(parents=True)
+    (proc / "interrupts").write_text("       CPU0\n  30:   4   PCI-MSI nic0\n")
+    real_list = tasks._msi_list
+
+    def msi_list(path):
+        if "nic1" in str(path):
+            raise PermissionError(13, "Permission denied")
+        return real_list(path)
+
+    monkeypatch.setattr(tasks, "_msi_list", msi_list)
+    data = tasks.nic_interrupts(["nic0", "nic1"], proc=proc, sys=sys_root)
+    assert data["unreadable"] == [{"interface": "nic1", "error": "PermissionError"}]
+    config = ProbeConfig(interfaces=["nic0"], interrupts=True, threads=True,
+                         required=["interrupts", "threads"])  # fmt: skip
+    rows, _, failures = _probe_rows(data, "interrupts", "nic", config)
+    assert failures == 1
+    assert [i["irq"] for r in rows if r["kind"] == "endpoint_metrics"
+            for i in r["observation"]["irqs"]] == [30]  # fmt: skip
+
+    _fake_thread_tree(proc, 40, 900, {40: (900, 1), 41: (901, 2)})
+    real_read = tasks._read_at
+
+    def read(directory, name, limit=4096):
+        path = Path(os.readlink(f"/proc/self/fd/{directory}"))
+        if name == "stat" and path.parent.name == "task":
+            raise PermissionError(13, "Permission denied")
+        return real_read(directory, name, limit)
+
+    monkeypatch.setattr(tasks, "_read_at", read)
+    threads = tasks.process_threads(40, 900, proc=proc)
+    assert threads["exited"] is False and threads["threads"] == []
+    assert threads["unreadable"] == {"PermissionError": 2}
+    _, _, failures = _probe_rows(threads, "threads", "worker/40", config)
+    assert failures == 1
+
+
+def test_a_process_that_exits_while_its_tasks_are_listed_is_recorded_as_exited(
+    monkeypatch,
+):
+    """A real child exits after its task directory is opened and before the
+    listing: the empty listing is confirmed through the pinned process as an
+    exit, not reported as a live process without threads."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    start = process_identity(child.pid)["start_ticks"]
+    real_list = tasks._list_tasks
+
+    def list_after_exit(tasks_fd):
+        child.kill()
+        child.wait()
+        return real_list(tasks_fd)
+
+    monkeypatch.setattr(tasks, "_list_tasks", list_after_exit)
+    try:
+        data = tasks.process_threads(child.pid, start)
+        assert child.returncode is not None
+        assert data["exited"] is True and data["threads"] == []
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+
+def test_a_shared_pci_function_splits_into_rows_the_writer_keeps(tmp_path):
+    """Eight interfaces and an RDMA device sharing 256 vectors, eight visible on
+    32 CPUs: rows over the writer's limit are split on their largest list, each
+    part labelled with its range, so every visible counter and the diagnostic
+    survive and nothing is dropped."""
+    from vllm.kv_profiling.endpoint_probes import tasks
+
+    proc, sys_root = tmp_path / "proc", tmp_path / "sys"
+    proc.mkdir()
+    names = [f"ens{n}f0np0-long-name" for n in range(8)]
+    paths = [f"class/net/{n}/device/msi_irqs" for n in names]
+    paths.append("class/infiniband/rdma-device-long-name-0/device/msi_irqs")
+    for path in paths:
+        for irq in range(1000, 1256):
+            (sys_root / path / str(irq)).mkdir(parents=True)
+    cpus = 32
+    lines = ["".join(f"  CPU{c}" for c in range(cpus))]
+    for irq in range(1000, 1008):
+        lines.append(f" {irq}:" + f" {10**15 + irq}" * cpus + f"  PCI-MSI {irq}-comp")
+    (proc / "interrupts").write_text("\n".join(lines) + "\n")
+    data = tasks.nic_interrupts(
+        names, ["rdma-device-long-name-0"], proc=proc, sys=sys_root
+    )
+    assert len(json.dumps(data)) > 16 << 10  # one row could not hold it
+    config = ProbeConfig(interfaces=names, interrupts=True)  # optional source
+    rows, dropped, _ = _probe_rows(data, "interrupts", "nic", config)
+    assert dropped == []
+    metrics = [r["observation"] for r in rows if r["kind"] == "endpoint_metrics"]
+    assert sorted(i["irq"] for m in metrics for i in m["irqs"]) == list(
+        range(1000, 1008)
+    )
+    assert all(len(i["per_cpu"]) == cpus for m in metrics for i in m["irqs"])
+    # Every listed item is in exactly one row: no visible IRQ counted twice.
+    missing = [e["irq"] for m in metrics for e in m["missing"]]
+    assert len(metrics) > 1 and missing == sorted(set(missing)) and len(missing) == 32
+    assert all(m["missing_count"] == 248 for m in metrics)
+    (status,) = [r for r in rows if r["kind"] == "probe_status"]
+    assert status["observation"]["error"].startswith("248 listed interrupts absent")
+
+
+def test_single_entries_of_different_lists_are_split_into_separate_rows():
+    """Two lists of one entry each, together over the row limit, are put in
+    separate rows with their ranges; reassembling every split row by its
+    slices gives back each list exactly once, with nothing dropped."""
+    config = ProbeConfig(interfaces=["nic0"], interrupts=True)
+    big = "x" * 8600
+    data = {"irqs": [{"irq": 30, "name": big}],
+            "unreadable": [{"interface": "nic1", "error": big}]}  # fmt: skip
+    rows, dropped, _ = _probe_rows(data, "interrupts", "nic", config)
+    assert dropped == []
+    parts = [r["observation"] for r in rows]
+    assert [(p["slices"]["irqs"], p["slices"]["unreadable"]) for p in parts] == [
+        ([0, 1, 1], [0, 0, 1]),
+        ([1, 1, 1], [0, 1, 1]),
+    ]
+    assert [i["irq"] for p in parts for i in p["irqs"]] == [30]
+    assert [u["interface"] for p in parts for u in p["unreadable"]] == ["nic1"]
+
+    mixed = {
+        "irqs": [{"irq": n, "name": "y" * 900} for n in range(37)],
+        "missing": [{"irq": n, "owners": ["z" * 700]} for n in range(23)],
+        "unavailable": [{"interface": "lo", "reason": "w" * 5000}],
+        "absent": [],
+    }
+    rows, dropped, _ = _probe_rows(mixed, "interrupts", "nic", config)
+    assert dropped == [] and len(rows) > 2
+    for key, values in mixed.items():
+        rebuilt = [None] * len(values)
+        for part in (r["observation"] for r in rows):
+            start, end, total = part["slices"].get(key, (0, len(values), len(values)))
+            assert total == len(values) and len(part[key]) == end - start
+            for index, item in zip(range(start, end), part[key]):
+                assert rebuilt[index] is None, "an item in two rows"
+                rebuilt[index] = item
+        assert rebuilt == values

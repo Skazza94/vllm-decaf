@@ -352,14 +352,53 @@ callback. The native L1 ring ABI and transfer metrics are unchanged.
 
 Use `network_profiler.level: l3`, the same run UUID as L1, and a `probes` object.
 `probes` accepts `interval_s` (default 1), `slow_interval_s` (default 5), `tcp`,
-`interfaces`, `driver_statistics`, `rdma_ports`, `qp` and `required`. TCP needs
+`interfaces`, `driver_statistics`, `rdma_ports`, `qp`, `threads`, `max_threads`
+(default 256), `interrupts` and `required`. TCP needs
 explicit `local_ips` and `peer_ips`; optional `local_ports`, `peer_ports` and
 `exclude_ports` narrow discovery. Both address families have kernel and user
 filters. Interface names and RDMA `{device, port}` entries are explicit endpoint
 allowlists. No intermediate-network observation or packet modification occurs.
-`required` names enabled sources (`tcp`, `netdev`, `driver`, `rdma`, `qp`).
+`required` names enabled sources (`tcp`, `netdev`, `driver`, `rdma`, `qp`,
+`threads`, `interrupts`).
 Declare requirements before a capture: unsupported optional sources stay
 visible as unavailable; failures of required sources invalidate that capture.
+
+`threads: true` samples every thread of the endpoint's serving processes (each
+process in the recorder inventory, and the owner) from `/proc/<pid>/task/*`: the
+thread name, the CPU it last ran on, user and system CPU ticks, the scheduler's
+time on CPU and time runnable but waiting for a CPU (`schedstat`), timeslices,
+and voluntary and involuntary context switches, all cumulative kernel counters
+(rates are the reader's). Thread IDs match the `tid` of L1 records, so a transfer
+can be read beside the CPU and scheduling of the thread that posted it. A kernel
+without schedstats reports those fields as `null`, never zero, and names the
+file under the thread's `unavailable`. Each process and thread is read through
+its own `/proc` directory, so one sample never mixes two processes or two
+threads that reused an ID. A serving process that exited (or whose PID now
+belongs to another process) is reported as `exited`, not as a failure; threads
+that exit mid-sample are counted in `vanished_between_reads`. An empty task
+listing is confirmed through the pinned process: an exit is `exited`. Threads
+that cannot be read (permissions) are counted in `unreadable`, and thread files
+that exist but cannot be read in `unreadable_files`; both are source failures
+(`coverage_problem`), while the threads that were read are kept. At most
+`max_threads` threads per process are read; `truncated` says when more exist.
+
+`interrupts: true` samples, per CPU ID (as the file headers name them, so
+offline CPUs do not shift counts), the interrupts of the configured interfaces
+and RDMA devices (their MSI interrupts listed in sysfs, read from
+`/proc/interrupts`, busiest CPU first) and the host's `NET_RX` and `NET_TX`
+softirqs (`/proc/softirqs`). Both files are host-wide, not per namespace. An
+interface with no MSI list, or an empty one (virtual or not PCI), is listed as
+unavailable. Missing coverage is a source failure, beside the counters that were
+read: a configured device that does not exist (`absent`), an interrupt sysfs
+lists that `/proc/interrupts` lacks (at most 32 in `missing`, with the exact
+`missing_count` and `missing_truncated`), an MSI list that exists but cannot be
+read (`unreadable`), a missing network softirq, or a row that does not match its
+CPU header.
+
+An observation too large for one probe row (16 KiB) is split into several rows:
+the items of its lists, taken as one sequence, are halved as often as needed.
+Each row's `slices` gives, per list, the `[start, end, total]` range it carries
+(possibly empty); every item is in exactly one row.
 
 For example, the probe settings for a TCP endpoint might be:
 

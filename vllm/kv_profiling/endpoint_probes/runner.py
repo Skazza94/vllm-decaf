@@ -13,12 +13,30 @@ import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from . import netdev, rdma, tcp
+from . import netdev, rdma, tasks, tcp
 from .config import settings_dict
 from .health import core_completion, validate_inventory
 from .identity import ownership, placement, process_identity
 from .netlink import ObservationError
 from .records import Writer, event
+
+# Lists an observation row may carry, split when a row exceeds the budget: the
+# writer's 16 KiB row limit less room for the sequence number it adds.
+SPLITTABLE = (
+    "fields",
+    "qps",
+    "disappeared",
+    "ownership_unavailable",
+    "snapshots",
+    "threads",
+    "irqs",
+    "softirqs",
+    "missing",
+    "unavailable",
+    "unreadable",
+    "absent",
+)
+ROW_BUDGET = (16 << 10) - 64
 
 
 def _time_namespace():
@@ -98,6 +116,16 @@ class Observer:
         self.isolation_failures = 0
         self.verified_processes = set()
         self.inventory = inventory
+        # The endpoint's serving processes: every recorder's process in the
+        # inventory and the owner, each with the generation it was verified with.
+        targets = {}
+        for meta in inventory:
+            targets.setdefault(meta["pid"], {
+                "pid": meta["pid"], "start_ticks": meta["start_ticks"],
+                "role": meta["context"]["role"]})  # fmt: skip
+        targets.setdefault(owner_pid, {
+            "pid": owner_pid, "start_ticks": owner_start, "role": "owner"})  # fmt: skip
+        self.thread_targets = list(targets.values())
         self.samples = self.gaps = 0
         self.previous = {}
         self.seen_identities = {}
@@ -161,33 +189,34 @@ class Observer:
     def emit(
         self, scope, entity, begin, data, transport="unknown", kind="endpoint_metrics"
     ):
-        for key in (
-            "fields",
-            "qps",
-            "disappeared",
-            "ownership_unavailable",
-            "snapshots",
-        ):
-            values = data.get(key)
-            if isinstance(values, list) and len(values) > 32:
-                for index in range(0, len(values), 32):
-                    self.emit(
-                        scope,
-                        entity,
-                        begin,
-                        {
-                            **data,
-                            key: values[index : index + 32],
-                            "part": index // 32,
-                            "parts": (len(values) + 31) // 32,
-                        },
-                        transport,
-                        kind,
-                    )
-                return
-        return self.writer.put(
-            event(kind, scope, entity, begin, time.monotonic_ns(), data, transport)
-        )
+        row = event(kind, scope, entity, begin, time.monotonic_ns(), data, transport)
+        if len(json.dumps(row, allow_nan=False)) <= ROW_BUDGET:
+            return self.writer.put(row)
+        # Over the writer's row limit: split the row's list items (all splittable
+        # lists, in order, as one sequence) in half, recursively, until every row
+        # fits. Each row's "slices" gives, per list, the exact [start, end, total]
+        # range it carries, so every item is in exactly one row.
+        lists = [
+            key for key in SPLITTABLE if isinstance(data.get(key), list) and data[key]
+        ]
+        count = sum(len(data[key]) for key in lists)
+        if count < 2:
+            return self.writer.put(row)  # one indivisible item: the writer counts it
+        slices = data.get("slices", {})
+        result = None
+        for low, high in ((0, count // 2), (count // 2, count)):
+            part = {**data, "slices": dict(slices)}
+            offset = 0
+            for key in lists:
+                values = data[key]
+                first, _, whole = slices.get(key, (0, len(values), len(values)))
+                begin_at = min(max(low - offset, 0), len(values))
+                end_at = min(max(high - offset, 0), len(values))
+                part[key] = values[begin_at:end_at]
+                part["slices"][key] = [first + begin_at, first + end_at, whole]
+                offset += len(values)
+            result = self.emit(scope, entity, begin, part, transport, kind)
+        return result
 
     def failure(self, source, error, begin):
         required = source in self.config.required
@@ -217,6 +246,10 @@ class Observer:
                         + ", ".join(absent),
                         begin,
                     )
+            # Missing coverage or access errors fail the source (the required
+            # rule applies); the counters that were read are still recorded.
+            if source in ("threads", "interrupts") and data.get("coverage_problem"):
+                self.failure(source, data["coverage_problem"], begin)
             # Counter continuity applies only to documented cumulative metrics.
             key = source + ":" + entity
             current = (
@@ -404,6 +437,28 @@ class Observer:
                     self.observe(
                         "qp", entity, lambda spec=spec: {"qps": rdma.qps(spec)}, "rdma"
                     )
+        if self.config.threads:
+            for target in self.thread_targets:
+                self.observe(
+                    "threads",
+                    f"{target['role']}/{target['pid']}",
+                    lambda t=target: {
+                        "role": t["role"],
+                        **tasks.process_threads(
+                            t["pid"], t["start_ticks"], self.config.max_threads
+                        ),
+                    },
+                )
+        if self.config.interrupts:
+            self.observe(
+                "interrupts",
+                "nic",
+                lambda: tasks.nic_interrupts(
+                    self.config.interfaces,
+                    [spec["device"] for spec in self.config.rdma_ports],
+                ),
+            )
+            self.observe("interrupts", "softirqs", tasks.net_softirqs)
         self.sample_ebpf()
         self.samples += 1
         self.emit(
