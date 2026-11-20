@@ -1,13 +1,24 @@
 # KV profiler (experimental)
 
-This library is the core of the KV network profiler. The NIXL pull connector
-and the frontend attach to it at level L1 (see "NIXL adapter" below); nothing
-else does. Without `kv_connector_extra_config["network_profiler"]` nothing is
-imported, started or recorded.
+This library is the core of the KV network profiler. The NIXL pull connector,
+the Mooncake connector and the frontend attach to it (see the adapters below).
+Without `kv_connector_extra_config["network_profiler"]` the serving processes
+start no profiler helpers and record no events.
 
-The native recorder requires Linux tmpfs and GIL-enabled CPython. GPU/RDMA
-execution, real-node overhead and exact socket/QP attribution are not qualified
-by the core tests.
+The native recorder requires Linux tmpfs and GIL-enabled CPython.
+
+Overhead was measured with a two-node serving A/B of one workload, profiler off
+against on, on latency and throughput: the NIXL pull connector over UCX/TCP at
+concurrency one.
+
+- L1 and L2 passed every check.
+- L3 passed throughput and every mean latency. Its 95% upper bounds for p99 time
+  to first token and p99 end-to-end latency exceeded the gate's limits, and L3 was
+  accepted after review of those results.
+
+Other workloads, connectors and transports are not covered by these measurements.
+Not yet qualified: GPU execution, RDMA transports, live eBPF attachment, and exact
+socket/QP attribution.
 
 ## Explicit library lifecycle
 
@@ -289,8 +300,9 @@ contention, wrap, retirement, failure/recovery and clock/export semantics.
 
 They do not validate connector attachment, forwarding through vectorcall and
 ordinary calls, native stats serialization under an observer, data transfer,
-or production overhead. Keep the separately pinned timing/image baseline for
-later serving A/B tests. No connector behavior or pairing is changed here.
+or overhead: the connector and harness tests cover attachment and transfers, and
+overhead is covered only by the serving A/B above, for its tested workload. No
+connector behavior or pairing is changed here.
 
 ## NIXL adapter (L1)
 
@@ -561,8 +573,9 @@ statistics (4,096), netlink dumps (4 MiB), queued rows (512 × 16 KiB), output s
 and polling rates. Large counter sets are chunked. It skips missed ticks rather
 than catching up, records gaps/loss and never fabricates completeness. Final
 manifests retain observer CPU/RSS accounting separately from serving and L1
-helpers. Off-vs-L3 serving overhead, complete capture closure and real RDMA-node
-validation must pass their frozen acceptance protocol before qualification.
+helpers. Off-vs-L3 serving overhead was measured only for the workload described
+at the top of this page, where its p99 latency bounds exceeded the gate and it
+was accepted after review. Real RDMA-node validation remains open.
 
 ### Capture inventory and deployment snapshot
 
