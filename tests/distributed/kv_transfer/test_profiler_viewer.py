@@ -12,6 +12,7 @@ loaded by file path exactly as it runs; it must import neither ``vllm`` nor
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -715,6 +716,9 @@ def test_page_click_handlers(viewer_module, l1_run):
     node_src = Path(__file__).with_name("_viewer_page_test.mjs")
     if not node_src.exists():
         pytest.fail("page test harness missing")
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is not installed: the page's JavaScript cannot run here")
     page = (VIEWER.parent / "viewer.html").resolve()
     run, _ = l1_run
     payload = {
@@ -727,7 +731,7 @@ def test_page_click_handlers(viewer_module, l1_run):
         ),
     }
     out = subprocess.run(
-        ["/usr/bin/node", str(node_src), str(page)],
+        [node, str(node_src), str(page)],
         input=json.dumps(payload), capture_output=True, text=True,
         timeout=120,
     )
@@ -1374,3 +1378,211 @@ def test_irq_reset_and_incomplete_poll_clears_baseline(viewer_module,
                     row(1, counts[1], reset=True),
                     row(2, counts[2]),
                     row(3, counts[3])]) == [(2, 10.0), (3, 5.0)]
+
+
+
+
+def test_request_timeline_fields_come_from_the_summary_timelines(l1_run):
+    """Phase 4's per-request fields are the summary's timelines, never estimated.
+    A row's scheduler occurrence is the one whose record sequences contain its
+    own incoming handoff (no join needed); the prefill window is the producer occurrence owning the
+    outgoing handoff of the row's one confirmed, unreused join. The KV-wait bar
+    runs from the load preparation to the KV receipt on the scheduler's clock;
+    frontend times use the frontend's clock and are not drawn when it does not
+    project. Every missing value has its own reason."""
+    run, _ = l1_run
+    key = run.request_rows[0]["key"]
+    process, request, occurrence = (key["scheduler_process_id"], key["request"],
+                                    key["occurrence"])  # fmt: skip
+    ms = 1_000_000
+    reference = run.reference_clock
+    base = len(run.summary.get("sources") or [])
+    a_i, b_i, sched_i, front_i = base, base + 1, base + 2, base + 3
+
+    def consumer(seq_first, seq_end, wait_ms, **changes):
+        entry = {
+            "node_role": "consumer", "process_id": process, "request": request,
+            "request_occurrence": 0, "state": "complete", "quality": [],
+            "source": sched_i, "sequences": {"first": seq_first, "end": seq_end},
+            "api": {"arrival_ns": 100 * ms, "first_token_output_ns": 150 * ms,
+                    "output_finished_ns": 300 * ms, "source": front_i},
+            "scheduler": {"queued_ns": 101 * ms, "load_prepared_ns": 102 * ms,
+                          "kv_received_ns": 105 * ms},
+            "stall": {"basis": "api_arrival", "waiting_for_kv_ns": wait_ms * ms},
+            "intervals_ns": {"queued_to_admitted": 5 * ms},
+            "decode_window": {"first_token_output_ns": 150 * ms,
+                              "output_finished_ns": 300 * ms,
+                              "mean_time_per_token_after_first_ns": 10 * ms},
+        }  # fmt: skip
+        entry.update(changes)
+        return entry
+
+    def producer(source, seq_first, seq_end, window_ms, role="producer"):
+        return {"node_role": role, "source": source, "request": "P",
+                "request_occurrence": 0,
+                "sequences": {"first": seq_first, "end": seq_end},
+                "intervals_ns": {"prefill_window": window_ms * ms}}  # fmt: skip
+
+    def join(**changes):
+        entry = {"consumer_process_id": process, "consumer_request": request,
+                 "consumer_occurrence": occurrence, "consumer_source": sched_i,
+                 "consumer_handoff_sequence": 25, "producer_request": "P",
+                 "producer_sources": [b_i], "producer_handoff_sequence": 70,
+                 "joined": True, "ambiguous": False}  # fmt: skip
+        entry.update(changes)
+        return entry
+
+    requests = list(run.summary.get("requests") or [])
+    mine = (process, request, occurrence)
+
+    def fields(frontend_clock, timelines, joins, incoming=(25,)):
+        others = [
+            r for r in requests
+            if (r.get("process_id"), r.get("request"),
+                r.get("request_occurrence")) != mine
+        ]  # fmt: skip
+        run.summary["requests"] = others + [{
+            "process_id": process, "request": request,
+            "request_occurrence": occurrence,
+            "handoffs": [{"direction": "incoming", "sequence": seq}
+                         for seq in incoming]}]  # fmt: skip
+        run.summary["sources"] = (run.summary.get("sources") or [])[:base] + [
+            {"process_id": "producer-a", "clock_id": "clock-a"},
+            {"process_id": "producer-b", "clock_id": "clock-b"},
+            {"process_id": process, "clock_id": reference},
+            {"process_id": "frontend", "clock_id": frontend_clock}]
+        run.summary["timelines"] = list(timelines)
+        run.summary["joins"] = list(joins)
+        run._index_timelines()
+        return run._timeline_for(process, request, occurrence)
+
+    # An aborted local run of the ID (sequences 10..20), then the pull (20..):
+    # the incoming handoff (25) places the row in the second occurrence.
+    local = consumer(10, 20, 0, request_occurrence=0)
+    pull = consumer(20, None, 363, request_occurrence=1)
+    producers = [producer(a_i, 60, None, 99), producer(b_i, 60, None, 40)]
+    t = fields(reference, [local, pull, *producers], [join()])
+    assert t["available"] is True
+    assert (t["kv_wait_ms"], t["admission_ms"], t["decode_window_ms"],
+            t["ttft_ms"], t["prefill_ms"], t["time_per_token_ms"]) == (
+        363.0, 5.0, 150.0, 50.0, 40.0, 10.0)  # fmt: skip
+    kinds = {s["kind"]: s for s in t["spans"]}
+    assert list(kinds) == ["waiting for KV", "to first token", "decode"]
+    assert kinds["waiting for KV"]["t1"] - kinds["waiting for KV"]["t0"] == 3 * ms
+    # A frontend clock that does not project: the frontend's bars are not drawn.
+    t = fields("unprojectable-clock", [pull, *producers], [join()])
+    assert [s["kind"] for s in t["spans"]] == ["waiting for KV"]
+    # Two producer occurrences of P in B: the outgoing handoff (70) picks one;
+    # a kv_both scheduler named by the join is a producer too.
+    twice = [producer(b_i, 50, 65, 7), producer(b_i, 65, None, 9, role="both")]
+    assert fields(reference, [pull, *twice], [join()])["prefill_ms"] == 9.0
+    # A lone producer timeline that does not own the handoff, a reused identity,
+    # or an unconfirmed join: no prefill window, each with its own reason.
+    t = fields(reference, [pull, producer(b_i, 80, None, 40)], [join()])
+    assert t["prefill_ms"] is None
+    assert t["reasons"]["prefill_ms"] == (
+        "no producer occurrence owns the outgoing handoff")  # fmt: skip
+    t = fields(reference, [pull, *producers], [join(identity_reused=True)])
+    assert t["prefill_ms"] is None and "reused" in t["reasons"]["prefill_ms"]
+    t = fields(reference, [pull, *producers], [join(ambiguous=True)])
+    assert t["reasons"]["prefill_ms"] == "the handoff join is not confirmed"
+    # Without an API arrival basis, no TTFT, with its own reason.
+    queued = consumer(20, None, 0, stall={"basis": "scheduler_queued",
+                                          "waiting_for_kv_ns": 0})  # fmt: skip
+    t = fields(reference, [queued], [join()])
+    assert t["ttft_ms"] is None and "scheduler_queued" in t["reasons"]["ttft_ms"]
+    assert t["kv_wait_ms"] == 0.0  # a measured zero is a value
+    # The producer's capture absent: the row's own incoming handoff still places
+    # the decode occurrence; the prefill window is unavailable.
+    t = fields(reference, [local, pull], [])
+    assert t["kv_wait_ms"] == 363.0 and t["prefill_ms"] is None
+    assert t["reasons"]["prefill_ms"] == "no handoff join for this occurrence"
+    # No incoming handoff: one scheduler occurrence is unambiguous, two are not.
+    assert fields(reference, [pull], [], incoming=())["kv_wait_ms"] == 363.0
+    t = fields(reference, [local, pull], [], incoming=())
+    assert t == {"available": False, "reason": "several scheduler occurrences "
+                 "and no incoming handoff to place this row"}  # fmt: skip
+    t = fields(reference, [], [])
+    assert t["available"] is False and "no request timeline" in t["reason"]
+    assert run.features()["ttft"] == "not recorded in this run's captures"
+
+
+def test_a_saved_summary_without_the_timeline_sequences_is_rebuilt(l1_run):
+    """A summary saved before the timelines carried their record sequences
+    cannot place rows: the viewer rebuilds from the captures instead of
+    serving it, even when its input fingerprints match."""
+    run, _ = l1_run
+    l1 = [capture for capture in run.captures if capture.layer == "l1"]
+    saved = json.loads(json.dumps(run.summary))
+    saved["viewer_input_fingerprints"] = run.input_fingerprints()
+    saved["timelines"] = [{"request": "r", "sequences": {"first": 0, "end": None}}]
+    saved["joins"] = []
+    assert run._verify_saved(saved, l1)[1] == "verified (input fingerprints)"
+    for old in ({**saved, "timelines": [{"request": "r"}]},
+                {k: v for k, v in saved.items() if k != "timelines"},
+                {**saved, "joins": [{"consumer_request": "r"}]}):
+        served, reason = run._verify_saved(old, l1)
+        assert served is None and "predates the timeline record sequences" in reason
+
+
+def test_page_shows_the_timeline_columns_axis_and_header(viewer_module, l1_run):
+    """The page plots a request's timeline phases inside its detail window,
+    sorts durations as numbers and lists a field as unavailable only when it
+    is."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is not installed: the page's JavaScript cannot run here")
+    run, _ = l1_run
+    data = run.api_data()
+    records = run.api_records(run.request_rows[0]["key"]["scheduler_process_id"],
+                              run.request_rows[0]["key"]["request"], 0)
+    # Two pairs: pair A's rows measured a zero TTFT, pair B's recorded none
+    # (the fixture's row and a copy of it under its own key).
+    data["pairs"] = ["pair-A", "pair-B"]
+    copy = json.loads(json.dumps(data["requests"][0]))
+    copy["key"] = {**copy["key"], "request": copy["key"]["request"] + "-copy"}
+    copy["display"] = copy["display"] + "-copy"
+    data["requests"].append(copy)
+    # The selected request is the records payload's own row ("logical").
+    for row in [*data["requests"], records["logical"]]:
+        far = max((s["t1"] for s in row["spans"] if s.get("t1")), default=0) + 10**9
+        row["timeline"] = {
+            "available": True, "kv_wait_ms": 0.0, "admission_ms": 5.0,
+            "decode_window_ms": 150.0, "ttft_ms": None, "prefill_ms": 3.0,
+            "reasons": {"ttft_ms": "no API arrival or first token output recorded"},
+            "spans": [{"t0": far, "t1": far + 10**8, "kind": "decode"}],
+        }  # fmt: skip
+    for index, row in enumerate(data["requests"]):
+        row["pair"] = "pair-A" if index % 2 == 0 else "pair-B"
+        row["timeline"] = {**row["timeline"],
+                           "ttft_ms": 0.0 if row["pair"] == "pair-A" else None}
+    meta = run.api_run()
+    meta["features"] = dict.fromkeys(meta["features"], "consumer timeline: x")
+    payload = {"run": meta, "data": data, "config": run.api_config(),
+               "records": records}
+    out = subprocess.run(
+        [node, str(Path(__file__).with_name("_viewer_page_test.mjs")),
+         str((VIEWER.parent / "viewer.html").resolve())],
+        input=json.dumps(payload), capture_output=True, text=True, timeout=120,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    report = json.loads(out.stdout)
+    assert report["phaseCount"] == 1 and report["plotCoversPhases"] is True
+    assert report["numericSort"] == [2, 10, 100]
+    # Availability is counted from the displayed rows: a measured zero KV wait
+    # is present, a TTFT no row carries is listed as unavailable.
+    n = len(data["requests"])
+    n_a = sum(1 for row in data["requests"] if row["pair"] == "pair-A")
+    n_b = n - n_a
+    assert n_a and n_b
+    assert f"KV wait {n}/{n}" in report["header"]
+    assert f"TTFT {n_a}/{n}" in report["header"]
+    by_pair = report["headerByPair"]
+    # Pair B alone: no row carries a TTFT; pair A alone: measured zeros count.
+    assert f"TTFT 0/{n_b}" in by_pair["pair-B"]
+    assert "unavailable <b>TTFT</b>" in by_pair["pair-B"]
+    assert f"TTFT {n_a}/{n_a}" in by_pair["pair-A"]
+    assert "unavailable <b>none</b>" in by_pair["pair-A"]
+    assert f"TTFT {n_a}/{n}" in by_pair[""]
+    assert "3.00" in report["tableHtml"]
+    assert "no API arrival or first token output recorded" in report["tableHtml"]

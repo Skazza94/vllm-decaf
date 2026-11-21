@@ -50,6 +50,21 @@ function fakeElement(id) {
       },
     });
   }
+  if (id === "pairs") {
+    let markup = "";
+    Object.defineProperty(el, "innerHTML", {
+      get() { return markup; },
+      set(value) {
+        markup = value;
+        this._rows = [...value.matchAll(/<button[^>]*data-k="([^"]*)"[^>]*>/g)]
+          .map((m, i) => {
+            const button = fakeElement("pairButton" + i);
+            button.dataset.k = m[1];
+            return button;
+          });
+      },
+    });
+  }
   if (id === "runsel") {
     el.value = "0";
   }
@@ -127,6 +142,25 @@ try {
       s.t0 == null || s.t1 == null ||
       (detailWindow.t0 <= s.t0 && s.t1 <= detailWindow.t1));
     report.plotWindow = detailWindow;
+    // the compute timeline's phases are inside the plotted window too
+    const phases = ((sel.timeline || {}).available && sel.timeline.spans) || [];
+    report.phaseCount = phases.length;
+    report.plotCoversPhases = phases.every(s =>
+      detailWindow.t0 <= s.t0 && s.t1 <= detailWindow.t1);
+    // durations sort as numbers, not as text
+    report.numericSort = [100, 2, 10].sort(cmpSort);
+    report.header = document.getElementById("runkv").innerHTML;
+    report.tableHtml = document.getElementById("tbl").innerHTML;
+    // the header follows the pair filter: click each pair, then "all pairs"
+    const headerAfter = key => {
+      const button = document.getElementById("pairs").querySelectorAll("button")
+        .find(b => b.dataset.k === key);
+      if (!button) return null;
+      button.listeners.click[0]();
+      return document.getElementById("runkv").innerHTML;
+    };
+    report.headerByPair = Object.fromEntries(
+      [...D.pairs, ""].map(key => [key, headerAfter(key)]));
   `;
   const combined = scripts.join("\n;\n") + "\n;\n" + driver;
   const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;

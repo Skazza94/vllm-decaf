@@ -659,6 +659,10 @@ class Timelines:
             "request": request,
             "request_occurrence": index,
             "repeated_id": total > 1,
+            # The scheduler capture's record sequences this occurrence owns: from
+            # its first row to the next occurrence's first (end None: to the end).
+            # A handoff of this request lies in exactly one occurrence's range.
+            "sequences": {"first": span.lo, "end": span.hi},
         }
         queued = phases["queued"][0] if phases["queued"] else None
         if queued is None:

@@ -352,6 +352,15 @@ class Run:
         live_procs = sorted(c.process_id for c in l1)
         if saved_procs != live_procs:
             return None, "recorded sources differ from the captures present"
+        # A summary saved before the timeline record sequences existed cannot
+        # place a row in its scheduler occurrence: rebuild from the captures.
+        if "timelines" not in saved or any(
+            "sequences" not in t for t in saved.get("timelines") or []
+        ) or any(
+            "producer_handoff_sequence" not in j for j in saved.get("joins") or []
+        ):
+            return None, ("the saved summary predates the timeline record "
+                          "sequences this viewer needs")  # fmt: skip
         fingerprints = saved.get("viewer_input_fingerprints")
         if not isinstance(fingerprints, dict):
             return None, "no input fingerprints: rebuilding is preferred"
@@ -471,8 +480,225 @@ class Run:
         if saved is not None and self.summary_source is None:
             self.summary_source = {"source": "rebuilt"}
         self.summary = saved
+        self._index_timelines()
         self._collect_layer_rows()
         self._assemble()
+
+    # ------------------------------------------------- request timelines
+    def _index_timelines(self):
+        """The summary's per-request timelines (phase 4), by scheduler source and
+        request ID. A ``both`` scheduler is a consumer and a producer."""
+        self.timelines = self.summary.get("timelines") or []
+        self.consumer_timelines, self.producer_timelines = {}, {}
+        for entry in self.timelines:
+            key = (entry.get("source"), entry.get("request"))
+            role = entry.get("node_role")
+            if role in ("consumer", "both"):
+                self.consumer_timelines.setdefault(key, []).append(entry)
+            if role in ("producer", "both"):
+                self.producer_timelines.setdefault(key, []).append(entry)
+        self.process_clock = {
+            capture.meta.get("process_id"): capture.meta.get("clock_id")
+            for capture in self.captures
+            if capture.layer == "l1"
+        }
+
+    @staticmethod
+    def _owns(entry, sequence):
+        """Whether a timeline's scheduler occurrence owns a record sequence."""
+        span = entry.get("sequences") or {}
+        if sequence is None or span.get("first") is None:
+            return False
+        return span["first"] <= sequence and (
+            span.get("end") is None or sequence < span["end"]
+        )
+
+    @staticmethod
+    def _ns_ms(value):
+        return None if value is None else round(value / 1e6, 3)
+
+    def _source_clock(self, index):
+        sources = self.summary.get("sources") or []
+        if isinstance(index, int) and 0 <= index < len(sources):
+            return sources[index].get("clock_id")
+        return None
+
+    def _joins_for(self, process_id, request, occurrence):
+        return [
+            j for j in self.summary.get("joins") or []
+            if (j.get("consumer_process_id"), j.get("consumer_request"),
+                j.get("consumer_occurrence")) == (process_id, request, occurrence)
+        ]  # fmt: skip
+
+    def _incoming_handoffs(self, process_id, request, occurrence):
+        """The record sequences of the connector occurrence's own incoming
+        handoffs, as the summary's request entry lists them (no join needed:
+        the producer's capture may be absent)."""
+        return [
+            handoff.get("sequence")
+            for entry in self.summary.get("requests") or []
+            if (entry.get("process_id"), entry.get("request"),
+                entry.get("request_occurrence")) == (process_id, request, occurrence)
+            for handoff in entry.get("handoffs") or []
+            if handoff.get("direction") == "incoming"
+            and handoff.get("sequence") is not None
+        ]  # fmt: skip
+
+    def _consumer_timeline(self, process_id, request, occurrence):
+        """(the scheduler occurrence's timeline, None) or (None, reason).
+
+        A row is a connector occurrence; its scheduler occurrence is the one
+        whose record sequences contain the row's own incoming handoff (the two
+        numberings can differ: a local run of the same ID before the pull is
+        a scheduler occurrence of its own). Without a handoff, only an ID that
+        the scheduler ran once is unambiguous."""
+        listed = self.summary.get("sources") or []
+        sources = {i for i, source in enumerate(listed)
+                   if source.get("process_id") == process_id}  # fmt: skip
+        named = [timeline for index in sources
+                 for timeline in self.consumer_timelines.get((index, request), [])]
+        if not named:
+            return None, "no timeline for this scheduler request"
+        incoming = self._incoming_handoffs(process_id, request, occurrence)
+        if len(incoming) > 1:
+            return None, "several incoming handoffs for this occurrence"
+        if incoming:
+            owners = [t for t in named if self._owns(t, incoming[0])]
+            if len(owners) == 1:
+                return owners[0], None
+            reason = (
+                "no scheduler occurrence contains the incoming handoff" if not owners
+                else "several scheduler occurrences contain the handoff"
+            )  # fmt: skip
+            return None, reason
+        if len(named) == 1:
+            return named[0], None
+        return None, ("several scheduler occurrences and no incoming handoff "
+                      "to place this row")  # fmt: skip
+
+    def _producer_timeline(self, joins):
+        """(the producer timeline, None) through the occurrence's one confirmed
+        handoff join, or (None, reason): the producer scheduler it names and the
+        producer occurrence that owns the outgoing handoff's record sequence."""
+        if not joins:
+            return None, "no handoff join for this occurrence"
+        if len(joins) > 1:
+            return None, "several handoff joins for this occurrence"
+        join = joins[0]
+        if not join.get("joined") or join.get("ambiguous"):
+            return None, "the handoff join is not confirmed"
+        if join.get("identity_reused"):
+            return None, ("the producer's identity is reused: several consumers "
+                          "claim one outgoing handoff")  # fmt: skip
+        producers = join.get("producer_sources") or []
+        if len(producers) != 1:
+            return None, "the handoff names no single producer scheduler"
+        sequence = join.get("producer_handoff_sequence")
+        if sequence is None:
+            return None, "the outgoing handoff's record sequence is unknown"
+        key = (producers[0], join.get("producer_request"))
+        named = self.producer_timelines.get(key, [])
+        owners = [t for t in named if self._owns(t, sequence)]
+        if len(owners) != 1:
+            reason = (
+                "no producer occurrence owns the outgoing handoff" if not owners
+                else "several producer occurrences own the outgoing handoff"
+            )  # fmt: skip
+            return None, reason
+        return owners[0], None
+
+    def _timeline_for(self, process_id, request, occurrence):
+        """A request row's compute timeline, read from the summary's own
+        timelines and never estimated: each value with its basis, or with its
+        own reason when it is unavailable (``reasons``)."""
+        if not self.timelines:
+            reason = "the run's captures record no request timeline"
+            return {"available": False, "reason": reason}
+        joins = self._joins_for(process_id, request, occurrence)
+        entry, why = self._consumer_timeline(process_id, request, occurrence)
+        if entry is None:
+            return {"available": False, "reason": why}
+        api = entry.get("api") or {}
+        stall = entry.get("stall") or {}
+        intervals = entry.get("intervals_ns") or {}
+        window = entry.get("decode_window") or {}
+        scheduler = entry.get("scheduler") or {}
+        reasons = {}
+        result = {
+            "available": True,
+            "node_role": entry.get("node_role"),
+            "state": entry.get("state"),
+            "quality": entry.get("quality"),
+            "kv_wait_ms": self._ns_ms(stall.get("waiting_for_kv_ns")),
+            "admission_ms": self._ns_ms(intervals.get("queued_to_admitted")),
+            "decode_window_ms": None,
+            "time_per_token_ms": self._ns_ms(
+                window.get("mean_time_per_token_after_first_ns")
+            ),
+            "ttft_ms": None,
+            "ttft_basis": None,
+            "prefill_ms": None,
+            "prefill_basis": None,
+            "stall": stall,
+            "reasons": reasons,
+        }
+        if result["kv_wait_ms"] is None:
+            reasons["kv_wait_ms"] = "the timeline's stall has no KV wait"
+        if result["admission_ms"] is None:
+            reasons["admission_ms"] = "no admission after the queue entry"
+        if (window.get("first_token_output_ns") is not None
+                and window.get("output_finished_ns") is not None):  # fmt: skip
+            result["decode_window_ms"] = self._ns_ms(
+                window["output_finished_ns"] - window["first_token_output_ns"]
+            )
+        else:
+            reasons["decode_window_ms"] = "no first token output or finish recorded"
+        if stall.get("basis") != "api_arrival":
+            reasons["ttft_ms"] = (f"the stall basis is {stall.get('basis')!r}, "
+                                  "not the API arrival")  # fmt: skip
+        elif api.get("arrival_ns") is None or api.get("first_token_output_ns") is None:
+            reasons["ttft_ms"] = "no API arrival or first token output recorded"
+        else:
+            result["ttft_ms"] = self._ns_ms(
+                api["first_token_output_ns"] - api["arrival_ns"]
+            )
+            result["ttft_basis"] = "this node's API entry to its first token output"
+        producer, why = self._producer_timeline(joins)
+        if producer is not None:
+            value = (producer.get("intervals_ns") or {}).get("prefill_window")
+            result["prefill_ms"] = self._ns_ms(value)
+            result["prefill_basis"] = "the producer's scheduler, its own clock"
+            if value is None:
+                reasons["prefill_ms"] = "the producer timeline has no prefill window"
+        else:
+            result["prefill_basis"] = why
+            reasons["prefill_ms"] = why
+        # Lane spans on the reference clock. Scheduler times are projected with
+        # the scheduler's clock, frontend times with the frontend's (api.source);
+        # a point that does not project is not drawn.
+        scheduler_clock = (self._source_clock(entry.get("source"))
+                           or self.process_clock.get(process_id))  # fmt: skip
+        frontend_clock = self._source_clock(api.get("source"))
+
+        def at(clock, value):
+            if value is None or clock is None:
+                return None
+            return self.project(clock, value)[0]
+
+        points = {
+            "load_prepared": at(scheduler_clock, scheduler.get("load_prepared_ns")),
+            "kv_received": at(scheduler_clock, scheduler.get("kv_received_ns")),
+            "first_token": at(frontend_clock, api.get("first_token_output_ns")),
+            "finished": at(frontend_clock, api.get("output_finished_ns")),
+        }
+        spans = []
+        for kind, a, b in (("waiting for KV", "load_prepared", "kv_received"),
+                           ("to first token", "kv_received", "first_token"),
+                           ("decode", "first_token", "finished")):  # fmt: skip
+            if points[a] is not None and points[b] is not None:
+                spans.append({"t0": points[a], "t1": points[b], "kind": kind})
+        result["spans"] = spans
+        return result
 
     # ------------------------------------------------- layer rows (L2 / L3)
     def _collect_layer_rows(self):
@@ -2137,6 +2363,9 @@ class Run:
             "spans": spans,
             "first_record": self._request_first_time(row),
             "arrive": arrival,
+            "timeline": self._timeline_for(
+                source.get("process_id"), request, occurrence
+            ),
             "prep_ms": prep_ms,
             "read_ms": read_ms,
             "gbs": gpss,
@@ -2409,12 +2638,18 @@ class Run:
 
     # ------------------------------------------------------------- payloads
     def features(self):
+        """Where each request-timeline field comes from in this run."""
+        if not getattr(self, "timelines", None):
+            reason = "not recorded in this run's captures"
+            return dict.fromkeys(
+                ("prefill_window", "kv_wait", "decode_admission", "decode_window",
+                 "ttft"), reason)  # fmt: skip
         return {
-            "prefill_window": "not recorded (phase 4)",
-            "kv_wait": "not recorded (phase 4)",
-            "decode_admission": "not recorded (phase 4)",
-            "decode_window": "not recorded (phase 4)",
-            "ttft": "not recorded (phase 4)",
+            "prefill_window": "producer timeline: intervals_ns.prefill_window",
+            "kv_wait": "consumer timeline: stall.waiting_for_kv_ns",
+            "decode_admission": "consumer timeline: intervals_ns.queued_to_admitted",
+            "decode_window": "consumer timeline: decode_window, first token to finish",
+            "ttft": "consumer timeline: api.arrival_ns to api.first_token_output_ns",
         }
 
     def api_run(self):

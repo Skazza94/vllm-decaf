@@ -334,6 +334,10 @@ identity edges). Its fields:
   with its first admission after the load, whichever later admission finishes the prefill.
   An explicit abort or error keeps
   its terminal `state` even before admission;
+- `sequences`: the record sequences of the scheduler capture this occurrence owns, from
+  its first row to the next occurrence's first (`end` `null`: to the end). A handoff of
+  the request lies in exactly one occurrence's range; each join carries its incoming and
+  outgoing handoff sequences (`consumer_handoff_sequence`, `producer_handoff_sequence`);
 - `kv_writes` (Mooncake): the producers' write batches, each listed once from the producer's own
   records with its recorded call and completion times (`times`), bytes, descriptors and members
   (decode request, transfer ID, share), whether or not the consumer capture is present; each member
@@ -454,9 +458,37 @@ unavailable/absent state. The metrics follow what the records measure:
   batch's measured totals; the frontend's recorded parent edges fold its
   client, composed and engine ids into one row, and entries attaching to
   nothing are listed separately with the reason.
-- Not yet recorded (prefill window, KV wait, decode admission and window,
-  TTFT) render unavailable until phase 4 supplies the timestamps — never
-  estimated.
+- The request timeline columns come from the summary's `timelines` (see
+  "Request timeline and decode stall attribution"), never estimated:
+  - from the decode node's own timeline: KV wait (`stall.waiting_for_kv_ns`),
+    decode admission (`intervals_ns.queued_to_admitted`), the decode window
+    (first token output to the finish), and that node's TTFT (its API entry to
+    its first token output, only with an `api_arrival` basis);
+  - the prefill window (`intervals_ns.prefill_window`), measured on the
+    producer's own clock, only through the row's one confirmed handoff join
+    (`joins`) whose producer identity is not reused: the producer scheduler it
+    names (`producer_sources`, a `producer` or `both` scheduler), and the producer
+    occurrence whose record sequences contain the outgoing handoff
+    (`producer_handoff_sequence`).
+
+  A row is a connector occurrence. Its scheduler occurrence is the timeline
+  whose `sequences` contain the row's own incoming handoff (the record
+  sequence the summary's request entry lists, so no join and no producer
+  capture is needed): the two numberings can differ, for example when a local
+  run of the same ID precedes the pull. A row without a handoff is placed only
+  when the scheduler ran that ID once. A saved `summary.json` without the
+  timeline `sequences` or the joins' `producer_handoff_sequence` is rebuilt
+  from the captures.
+
+  The detail lane draws the decode node's phases: waiting for KV (load prepared
+  to KV received, on the scheduler's clock), to the first token, and decode
+  (first token to finish, on the frontend's clock, `api.source`). Each point is
+  projected onto the reference clock; one that does not project is not drawn,
+  and the plotted window covers the phases and the transfers. A missing,
+  repeated or ambiguous timeline, join or value leaves that value unavailable,
+  with its own reason. The run header counts, per field, the displayed rows
+  that carry it (a measured zero counts) and lists a field no displayed row
+  carries as unavailable.
 
 ## UCX protocol selection
 

@@ -1084,6 +1084,33 @@ def test_mooncake_joins_on_the_transfer_id_when_request_and_transfer_ids_differ(
     assert all(j["producer_engine"] == "engine-p" and j["matches"] == 1 for j in joins)
 
 
+def test_every_join_places_its_handoffs_in_one_occurrence_by_record_sequence(rig):
+    """Each timeline names the scheduler record sequences it owns, and each join
+    the record sequences of its two handoffs: the incoming one lies in exactly
+    one consumer occurrence (the one the summary joined to the producer), the
+    outgoing one in exactly one producer occurrence."""
+    mooncake_pair(rig)
+    summary = summarize([rig.tmp_path])
+
+    def owners(source, request, sequence):
+        return [
+            t for t in summary["timelines"]
+            if t["source"] == source and t["request"] == request
+            and t["sequences"]["first"] <= sequence
+            and (t["sequences"]["end"] is None or sequence < t["sequences"]["end"])
+        ]  # fmt: skip
+
+    assert summary["joins"]
+    for join in summary["joins"]:
+        (consumer,) = owners(join["consumer_source"], join["consumer_request"],
+                             join["consumer_handoff_sequence"])  # fmt: skip
+        assert consumer["cross_node"]["producer_request"] == join["producer_request"]
+        assert join["producer_handoff_sequence"] is not None
+        (producer,) = owners(join["producer_sources"][0], join["producer_request"],
+                             join["producer_handoff_sequence"])  # fmt: skip
+        assert producer["node_role"] == "producer"
+
+
 def test_one_write_batch_with_two_transfer_ids_is_counted_once_and_referenced_by_both(
     rig,
 ):

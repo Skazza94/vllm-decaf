@@ -1318,6 +1318,11 @@ def _join_producers(sources):
                 "producer_handoff_time_ns": (
                     matches[0][2]["time_ns"] if len(matches) == 1 else None
                 ),
+                # The outgoing handoff's record sequence in its producer capture,
+                # which places it in one producer timeline's ``sequences``.
+                "producer_handoff_sequence": (
+                    matches[0][2].get("sequence") if len(matches) == 1 else None
+                ),
                 "matches": len(matches),
                 "ambiguous": len(matches) > 1,
                 "joined": len(matches) == 1,

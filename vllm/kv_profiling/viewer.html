@@ -188,6 +188,19 @@ async function load() {
   dv.width = 1;
 }
 
+// Per timeline field, how many of the displayed rows carry a value (a measured
+// zero counts); a field no displayed row carries is listed as unavailable.
+const TIMELINE_FIELDS = [["prefill_ms", "prefill"], ["kv_wait_ms", "KV wait"],
+  ["admission_ms", "admit"], ["decode_window_ms", "decode"], ["ttft_ms", "TTFT"]];
+function timelineAvailability() {
+  const rows = D.requests.filter(shown);
+  const has = (r, f) => !!(r.timeline && r.timeline.available && r.timeline[f] != null);
+  const counts = TIMELINE_FIELDS.map(([f, label]) => [label, rows.filter(r => has(r, f)).length]);
+  return [
+    ["timeline fields", counts.map(([label, n]) => `${label} ${n}/${rows.length}`).join(" · ")],
+    ["unavailable", counts.filter(([, n]) => n === 0).map(([label]) => label).join(", ") || "none"],
+  ];
+}
 function runkv() {
   const k = D.runkv;
   const items = [
@@ -197,7 +210,7 @@ function runkv() {
     ["READ GB/s p50/p99", k.gbs_p50 == null ? UNAVAIL
       : `${k.gbs_p50.toFixed(2)}/${k.gbs_p99 == null ? UNAVAIL : k.gbs_p99.toFixed(2)}`],
     ["slow READs", k.slow_reads],
-    ["unavailable", META.features ? Object.keys(META.features).join(", ") : ""],
+    ...timelineAvailability(),
   ].concat(META.absent_sources.length
     ? [["absent sources", META.absent_sources.join(", ")]] : [])
     .concat(k.observations
@@ -217,7 +230,7 @@ function pairs() {
     + D.pairs.map(k => { const [c, open] = pairCounts(k);
         return btn(k, `${k} · ${c} · ${open} open`); }).join("");
   $("pairs").querySelectorAll("button").forEach(b => b.addEventListener(
-    "click", () => { pairSel = b.dataset.k || null; pairs(); draw(); table(); }));
+    "click", () => { pairSel = b.dataset.k || null; pairs(); draw(); table(); runkv(); }));
 }
 function pairCounts(k) {
   let total = 0, open = 0;
@@ -507,8 +520,11 @@ const COLS = [
   ["cpu", "ReadThr CPU % · shared", r => r.posting_thread_cpu == null ? UNAVAIL : Math.round(r.posting_thread_cpu * 100)],
   ["rtt", "RTT max µs · cand.", r => r.rtt_max_us_cand == null ? UNAVAIL : Math.round(r.rtt_max_us_cand), null, r => r.candidate_basis],
   ["retx", "retx · cand.", r => r.retx_cand == null ? UNAVAIL : r.retx_cand, r => (r.retx_cand ?? 0) > 0, r => r.candidate_basis],
-  ["kvwait", "KV wait", () => `<span class="na">${UNAVAIL}</span>`],
-  ["ttft", "TTFT", () => `<span class="na">${UNAVAIL}</span>`],
+  ["prefill", "prefill ms", r => tl(r, "prefill_ms")],
+  ["kvwait", "KV wait ms", r => tl(r, "kv_wait_ms")],
+  ["admit", "admit ms", r => tl(r, "admission_ms")],
+  ["decode", "decode ms", r => tl(r, "decode_window_ms")],
+  ["ttft", "TTFT ms · node", r => tl(r, "ttft_ms")],
 ];
 const sortVal = {
   display: r => r.display, pair: r => r.pair || "", read_threads: r => r.read_threads[0] ?? -1,
@@ -518,15 +534,32 @@ const sortVal = {
   gbs: r => r.gbs.length ? Math.max(...r.gbs) : -1, conc: r => r.peak_concurrency ?? -1,
   mib: r => r.mib ?? -1, descriptors: r => r.descriptors ?? -1, state: r => r.state,
   cpu: r => r.posting_thread_cpu ?? -1, rtt: r => r.rtt_max_us_cand ?? -1,
-  retx: r => r.retx_cand ?? -1, kvwait: () => 0, ttft: () => 0,
+  retx: r => r.retx_cand ?? -1,
+  prefill: r => r.timeline?.prefill_ms ?? -1,
+  kvwait: r => r.timeline?.kv_wait_ms ?? -1,
+  admit: r => r.timeline?.admission_ms ?? -1,
+  decode: r => r.timeline?.decode_window_ms ?? -1,
+  ttft: r => r.timeline?.ttft_ms ?? -1,
 };
+// Numbers compare as numbers (2 < 10 < 100), anything else as text.
+function cmpSort(a, b) {
+  if (typeof a === "number" && typeof b === "number") return a < b ? -1 : a > b ? 1 : 0;
+  const x = String(a), y = String(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+// A request-timeline value (phase 4), or n/r with the reason it is unavailable.
+function tl(r, field) {
+  const t = r.timeline || {};
+  const v = t.available ? t[field] : null;
+  if (v == null) return `<span class="na" title="${esc((t.reasons || {})[field] || t.reason || "not recorded")}">${UNAVAIL}</span>`;
+  return ms(v);
+}
 function isSlow(row) {
   return row.read_ms.some(v => kSlow(v));
 }
 function table() {
   const rows = D.requests.filter(shown)
-    .sort((a, b) => sortDir * (String(sortVal[sortKey](a)) < String(sortVal[sortKey](b)) ? -1
-      : String(sortVal[sortKey](a)) > String(sortVal[sortKey](b)) ? 1 : 0));
+    .sort((a, b) => sortDir * cmpSort(sortVal[sortKey](a), sortVal[sortKey](b)));
   $("tcount").textContent =
     `${rows.length} requests${pairSel ? " · " + (D.pair_labels?.[pairSel] || pairSel) : ""}`
     + (D.runkv.observations ? ` · ${D.runkv.observations} other observations listed separately` : "")
@@ -590,11 +623,14 @@ function zoomDetail() {
   const W = Math.max(600, dv.parentElement.clientWidth), dpr = window.devicePixelRatio || 1;
   // the plotted window is sized from the measured endpoints of the request's
   // own operations, so a READ 277 ms after the first record still draws
+  // ...and of its compute timeline's phases (phase 4), when they project
+  const phases = (q.timeline && q.timeline.available && q.timeline.spans) || [];
+  const allSpans = q.spans.concat(phases);
   const spanT0 = Math.min(
     q.first_record ?? Infinity,
-    ...q.spans.map(s => s.t0).filter(t => t != null));
+    ...allSpans.map(s => s.t0).filter(t => t != null));
   const spanT1 = Math.max(
-    ...q.spans.map(s => s.t1).filter(t => t != null),
+    ...allSpans.map(s => s.t1).filter(t => t != null),
     (q.spans.length ? q.spans[0].t0 : null) ?? (q.first_record ?? 0));
   const view_span = Math.max(1, (spanT1 - spanT0) * 1.6);
   const t0 = spanT0 - view_span * 0.2;
@@ -609,7 +645,7 @@ function zoomDetail() {
   for (const [i, r] of D.rtt.entries()) rows.push(["L3", `RTT · ${r.label}`, { rtt: r }]);
   for (const c of D.collector) rows.push(["L2", `collector · ${c.label}`, { coll: c }]);
   rows.push(["L3", "eBPF events", "ev"]);
-  rows.push(["—", "prefill / KV wait / decode / TTFT", "nr"]);
+  rows.push(["L1", "decode node · KV wait / to first token / decode", "timeline"]);
   const H = rows.length * RH + 22;
   dv.width = W * dpr; dv.height = H * dpr; dv.style.width = W + "px"; dv.style.height = H + "px";
   dx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -638,9 +674,19 @@ function zoomDetail() {
         dx.fillRect(a, y + 5, b - a, RH - 10);
       }
       if (!(q.spans || []).length) { dx.fillStyle = C.absent; dx.fillText("no completed transfer with a measured interval", LB + 6, y + RH / 2); }
-    } else if (what === "nr") {
-      dx.fillStyle = C.absent;
-      dx.fillText("not recorded in this phase (columns stay unavailable)", LB + 6, y + RH / 2);
+    } else if (what === "timeline") {
+      const t = q.timeline || {};
+      const spans = t.available ? (t.spans || []) : [];
+      const colour = { "waiting for KV": C.slow, "to first token": C.flight, "decode": C.muted };
+      for (const span of spans) {
+        const a = X(span.t0), b = Math.max(a + 1, X(span.t1));
+        dx.fillStyle = colour[span.kind] || C.fg;
+        dx.fillRect(a, y + 5, b - a, RH - 10);
+      }
+      if (!spans.length) {
+        dx.fillStyle = C.absent;
+        dx.fillText(t.available ? "phase times not on the reference clock" : (t.reason || "not recorded"), LB + 6, y + RH / 2);
+      }
     } else if (what === "ev") {
       if (D.ebpf.coverage === "disabled") { dx.fillStyle = C.absent; dx.fillText("disabled — no records exist", LB + 6, y + RH / 2); }
       for (const e of D.ebpf.events) {
