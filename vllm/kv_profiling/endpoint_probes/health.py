@@ -293,13 +293,19 @@ def endpoint_capture(directory, core_dir):
         problems.extend(health["problems"])
         meta = health["metadata"]
         context = meta.get("context", {})
-        front = next(
+        # Every frontend (one API server, or one a DP rank) shares the
+        # observer's boot and namespaces. The owner is the process the
+        # controller configured: the frontend itself when there is one, else
+        # the API servers' common parent (the serving process).
+        fronts = [
             item
             for item in config["inventory"]
             if item["context"]["role"] == "frontend"
-        )
+        ]
+        owner = meta.get("owner", {})
         if (
-            context.get("role") != "endpoint_observer"
+            not fronts
+            or context.get("role") != "endpoint_observer"
             or meta.get("clock_source") != "CLOCK_MONOTONIC"
             or not isinstance(meta.get("clock_id"), str)
             or not meta["clock_id"]
@@ -309,11 +315,19 @@ def endpoint_capture(directory, core_dir):
             )
             or any(
                 meta.get(key) != front[key]
+                for front in fronts
                 for key in ("boot_id", "net_namespace", "pid_namespace")
             )
+            or (owner.get("pid"), owner.get("start_ticks"))
+            != (config.get("owner_pid"), config.get("owner_start"))
+            or (
+                len(fronts) == 1
+                and (owner.get("pid"), owner.get("start_ticks"))
+                != (fronts[0]["pid"], fronts[0]["start_ticks"])
+            )
             or any(
-                meta.get("owner", {}).get(key) != front[key]
-                for key in ("pid", "start_ticks", "net_namespace", "pid_namespace")
+                owner.get(key) != fronts[0][key]
+                for key in ("net_namespace", "pid_namespace")
             )
         ):
             problems.append("observer namespace/clock/owner identity mismatch")

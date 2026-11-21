@@ -211,6 +211,9 @@ def engine_registry(captures):
         letter = _CLOCK.get(ctx.get("kv_role"), "P" if ctx.get("role") ==
                             "scheduler" else "?")
         label = f"{letter}{ctx.get('rank', ctx.get('tp_rank', '?'))}"
+        if ctx.get("dp_rank") is not None:
+            # data parallelism: each DP rank is its own engine
+            label += f"·dp{ctx['dp_rank']}"
         registry.setdefault(engine, {
             "label": label, "engine_id": engine,
             "kv_role": ctx.get("kv_role"), "role": ctx.get("role"),
@@ -252,6 +255,27 @@ class Run:
         return int(projection.time_ns), projection.uncertainty_ns, (
             projection.drift_known
         )
+
+    @staticmethod
+    def _mapping_mismatch(capture, manifest, peer, payload):
+        """Why a mapping is not the capture's own of this peer, or None."""
+        clock = capture.meta.get("clock_id")
+        if manifest.get("local_generation") != clock:
+            return (f"manifest local generation {manifest.get('local_generation')}"
+                    f" is not its capture's clock {clock}")
+        if manifest.get("run_id") not in (None, capture.meta.get("run_id")):
+            return f"manifest of run {manifest.get('run_id')}"
+        for anchor in ("start", "end"):
+            for sample in payload.get(anchor) or []:
+                if (sample.get("run_id") != capture.meta.get("run_id")
+                        or sample.get("local_generation") != clock
+                        or sample.get("remote_generation")
+                        != peer.get("remote_generation")):
+                    return (f"{anchor} sample of run {sample.get('run_id')}, "
+                            f"{sample.get('local_generation')} -> "
+                            f"{sample.get('remote_generation')}: not this "
+                            f"capture's mapping of its peer")
+        return None
 
     def _load_calibrations(self, l1_captures):
         """Mapping files named by ok peers of each capture's manifest."""
@@ -312,25 +336,85 @@ class Run:
                     entry.update(aligned=False, reason=f"unreadable: {error}")
                     self.calibration_status.append(entry)
                     continue
+                # Its samples must be this capture's clock and run against
+                # the peer the manifest names, before the mapping is ranked
+                # or relabelled: another clock's mapping would shift the peer.
+                mismatch = self._mapping_mismatch(capture, manifest, peer,
+                                                  payload)
+                if mismatch:
+                    entry.update(aligned=False, reason=mismatch)
+                    self._problem("calibration_identity",
+                                  f"{path}: {mismatch}")
+                    self.calibration_status.append(entry)
+                    continue
                 entry.update(aligned=True, mapping=mapping,
                              drift_known=mapping.end is not None)
                 self.calibration_status.append(entry)
-                raw.append((entry, mapping, normalized))
+                raw.append((entry, mapping, normalized, payload))
         if not raw:
             return {}
-        local = {e["local_generation"] for e, _, _ in raw}
-        if len(local) != 1 or None in local:
-            raise ViewerError(f"mixed calibration local generations: {local}")
+        local = {e["local_generation"] for e, _, _, _ in raw}
+        if None in local:
+            raise ViewerError("a calibration names no local generation")
+        if len(local) > 1:
+            # Data parallelism: each scheduler of an instance calibrates its
+            # own clock against every peer. Schedulers of one clock domain
+            # read one monotonic clock, so any of them maps a peer onto the
+            # reference: per peer, the best mapping across them is used
+            # (complete anchors first, then the reference scheduler's own,
+            # then the lowest clock id), relabelled to the reference, for
+            # the summary and the viewer alike. Several clock domains among
+            # them are genuinely mixed and refused.
+            meta = {c.meta.get("clock_id"): c for c in l1_captures}
+            if any(g not in meta for g in local):
+                raise ViewerError(
+                    f"calibration local generations without a capture: {local}"
+                )
+            domains = {_clock_identity(meta[g].meta) for g in local}
+            if len(domains) != 1:
+                raise ViewerError(f"mixed calibration clock domains: {local}")
+            consumers = sorted(g for g in local
+                               if meta[g].context.get("kv_role") == "kv_consumer")
+            reference = (consumers or sorted(local))[0]
+            by_peer = {}
+            for item in raw:
+                by_peer.setdefault(item[0]["remote_generation"], []).append(item)
+            chosen = []
+            for items in by_peer.values():
+                items.sort(key=lambda item: (
+                    not item[0]["drift_known"],
+                    item[0]["local_generation"] != reference,
+                    item[0]["local_generation"],
+                ))
+                best = items[0]
+                for other in items[1:]:
+                    other[0]["used"] = False
+                    other[0]["reason"] = ("another scheduler of the same clock "
+                                          "domain maps this peer")
+                entry, mapping, normalized, payload = best
+                if entry["local_generation"] != reference:
+                    payload = {
+                        **payload,
+                        **{anchor: [{**sample, "local_generation": reference}
+                                    for sample in payload.get(anchor) or []]
+                           for anchor in ("start", "end")},
+                    }  # fmt: skip
+                    mapping = CLOCK.ClockMapping.from_json(payload)
+                    normalized.write_text(json.dumps(payload))
+                    entry["relabelled_to"] = reference
+                chosen.append((entry, mapping, normalized, payload))
+            raw = chosen
+            local = {reference}
         self.reference_clock = next(iter(local))
-        unknown = [e for e, _, _ in raw if not e["drift_known"]]
+        unknown = [e for e, _, _, _ in raw if not e["drift_known"]]
         if unknown:
             self._problem(
                 "start_only_calibration",
                 f"{len(unknown)} mapping(s) without an end anchor: offset "
                 "projection with uncertainty, drift unknown",
             )
-        self.calibration_files = [path for _, _, path in raw]
-        return {e["remote_generation"]: m for e, m, _ in raw
+        self.calibration_files = [path for _, _, path, _ in raw]
+        return {e["remote_generation"]: m for e, m, _, _ in raw
                 if e["remote_generation"]}
 
     # ------------------------------------------------------------ summary
@@ -775,9 +859,13 @@ class Run:
             by_label.setdefault(entry["label"], []).append(engine)
         for label, engines in by_label.items():
             if len(engines) > 1:
+                # the shortest engine-id prefix that tells them apart
+                width = next((n for n in range(6, max(map(len, engines)) + 1)
+                              if len({e[:n] for e in engines}) == len(engines)),
+                             None)  # fmt: skip
                 for engine in engines:
                     self.registry[engine]["label"] = (
-                        label + "·" + engine[:6]
+                        label + "·" + (engine[:width] if width else engine)
                     )
         self._build_transports()
         self._build_requests()
@@ -2395,11 +2483,13 @@ class Run:
         if not pair or "→" not in pair:
             return pair or "?"
         producer, consumer = pair.split("→", 1)
+        # an engine without a capture keeps its whole id: a prefix can be
+        # shared by data-parallel engines (``<id>_dp0``, ``<id>_dp1``)
         left = self.registry.get(producer, {}).get("label") or (
-            f"engine-{producer[:6]}" if producer != "?" else "?"
+            f"engine-{producer}" if producer != "?" else "?"
         )
         right = self.registry.get(consumer, {}).get("label") or (
-            f"engine-{consumer[:6]}" if consumer != "?" else "?"
+            f"engine-{consumer}" if consumer != "?" else "?"
         )
         return f"{left}→{right}"
 

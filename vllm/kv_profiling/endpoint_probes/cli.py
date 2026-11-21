@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from .config import ProbeConfig
-from .health import endpoint_capture, inventory, validate_inventory
+from .health import core_completion, endpoint_capture, inventory, validate_inventory
 from .netdev import read_small
 from .runner import Observer
 
@@ -24,6 +24,11 @@ def main():
     )
     parser.add_argument("--check-capture")
     parser.add_argument("--core-dir")
+    parser.add_argument(
+        "--check-core",
+        help="validate a node's recorder captures (with --run-id): streams, "
+        "terminal rows and manifests",
+    )
     parser.add_argument("--inventory")
     parser.add_argument("--run-id")
     args = parser.parse_args()
@@ -32,6 +37,10 @@ def main():
         validate_inventory(result, args.run_id)
         print(json.dumps(result))
         return 0
+    if args.check_core:
+        result = core_completion(args.check_core, args.run_id)
+        print(json.dumps(result))
+        return 0 if result["all_closed"] else 2
     if args.check_capture:
         result = endpoint_capture(args.check_capture, args.core_dir)
         print(json.dumps(result))

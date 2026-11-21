@@ -1587,3 +1587,105 @@ def test_page_shows_the_timeline_columns_axis_and_header(viewer_module, l1_run):
     assert f"TTFT {n_a}/{n}" in by_pair[""]
     assert "3.00" in report["tableHtml"]
     assert "no API arrival or first token output recorded" in report["tableHtml"]
+
+
+def test_several_schedulers_of_one_clock_domain_use_one_calibration(
+    viewer_module, tmp_path
+):
+    """With data parallelism each scheduler of an instance calibrates its own
+    clock against every peer. Schedulers of one clock domain need only one of
+    them: the viewer keeps one scheduler's mappings and marks the others as not
+    needed. Calibrations from different clock domains are refused."""
+    import shutil
+    from uuid import uuid4
+
+    def second_scheduler(base, boot):
+        shutil.copytree(base / "a", base / "e")
+        path = base / "e" / "events.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        clock = str(uuid4())
+        rows[0] = {**rows[0], "process_id": str(uuid4()), "clock_id": clock,
+                   "boot_id": boot}  # fmt: skip
+        write_capture(path, rows)
+        manifest = json.loads((base / "e" / "calibration.json").read_text())
+        (base / "e" / "calibration.json").write_text(
+            json.dumps({**manifest, "local_generation": clock}))
+        mapping = json.loads((base / "e" / "calibration-0.json").read_text())
+        for anchor in ("start", "end"):
+            mapping[anchor] = [{**sample, "local_generation": clock}
+                               for sample in mapping[anchor]]
+        (base / "e" / "calibration-0.json").write_text(json.dumps(mapping))
+        return rows[0]["clock_id"]
+
+    base = write_l1_transfer_fixture(tmp_path / "same")
+    first = json.loads((base / "a" / "events.jsonl").read_text().splitlines()[0])
+    second = second_scheduler(base, first["boot_id"])
+    run = viewer_module.ViewerApp([str(base)]).run(0)
+    assert run.reference_clock in (first["clock_id"], second)
+    used = {e["local_generation"]: e.get("used", True) for e in run.calibration_status}
+    assert sorted(used.values()) == [False, True]
+    assert used[run.reference_clock] is True
+
+    # The reference scheduler lost its end samples: its sibling's complete
+    # mapping of the same peer is used, relabelled to the reference clock,
+    # so drift stays known.
+    base = write_l1_transfer_fixture(tmp_path / "lost-end")
+    first = json.loads((base / "a" / "events.jsonl").read_text().splitlines()[0])
+    sibling = second_scheduler(base, first["boot_id"])
+    reference = min(first["clock_id"], sibling)
+    owner = "a" if reference == first["clock_id"] else "e"
+    lossy = base / owner / "calibration-0.json"
+    lossy.write_text(json.dumps({**json.loads(lossy.read_text()), "end": []}))
+    run = viewer_module.ViewerApp([str(base)]).run(0)
+    assert run.reference_clock == reference
+    chosen = [e for e in run.calibration_status if e.get("used", True)]
+    assert len(chosen) == 1 and chosen[0]["local_generation"] != reference
+    assert chosen[0]["relabelled_to"] == reference and chosen[0]["drift_known"]
+
+    base = write_l1_transfer_fixture(tmp_path / "mixed")
+    second_scheduler(base, "another-boot")
+    with pytest.raises(viewer_module.ViewerError,
+                       match="mixed calibration clock domains"):
+        viewer_module.ViewerApp([str(base)])
+
+
+def test_a_mapping_of_another_clock_is_refused_before_selection(
+    viewer_module, tmp_path
+):
+    """A mapping file is used only when its samples are its capture's clock
+    and run against the peer its manifest names: a sibling file from another
+    clock would shift the peer. It is reported and left unused, and the valid
+    start-only reference mapping projects the peer with drift unknown."""
+    import shutil
+    from uuid import uuid4
+
+    base = write_l1_transfer_fixture(tmp_path)
+    first = json.loads((base / "a" / "events.jsonl").read_text().splitlines()[0])
+    shutil.copytree(base / "a", base / "e")
+    rows = [json.loads(line) for line in
+            (base / "e" / "events.jsonl").read_text().splitlines()]
+    sibling = "ffffffff-ffff-4fff-bfff-ffffffffffff"  # the reference is the lowest
+    rows[0] = {**rows[0], "process_id": str(uuid4()), "clock_id": sibling}
+    write_capture(base / "e" / "events.jsonl", rows)
+    manifest = json.loads((base / "e" / "calibration.json").read_text())
+    (base / "e" / "calibration.json").write_text(
+        json.dumps({**manifest, "local_generation": sibling}))
+    path = base / "a" / "calibration-0.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "end": []}))
+    foreign = json.loads((base / "e" / "calibration-0.json").read_text())
+    unrecorded = str(uuid4())
+    for anchor in ("start", "end"):
+        foreign[anchor] = [{**sample, "local_generation": unrecorded,
+                            "t1": sample["t1"] + 700_000_000,
+                            "t4": sample["t4"] + 700_000_000}
+                           for sample in foreign[anchor]]
+    (base / "e" / "calibration-0.json").write_text(json.dumps(foreign))
+    run = viewer_module.ViewerApp([str(base)]).run(0)
+    refused = [e for e in run.calibration_status if not e.get("aligned")]
+    assert [e["local_generation"] for e in refused] == [sibling]
+    assert "not this capture's mapping" in refused[0]["reason"]
+    assert any(p["kind"] == "calibration_identity" for p in run.problems)
+    used = [e for e in run.calibration_status
+            if e.get("aligned") and e.get("used", True)]
+    assert [e["local_generation"] for e in used] == [first["clock_id"]]
+    assert used[0]["drift_known"] is False

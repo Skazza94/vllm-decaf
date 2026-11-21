@@ -33,6 +33,7 @@ class EndpointObserver:
         probes,
         expected_workers,
         expected_schedulers,
+        expected_frontends=1,
     ):
         output = Path(output).resolve()
         output.mkdir(parents=True, exist_ok=False)
@@ -64,12 +65,14 @@ class EndpointObserver:
             for role in ("frontend", "scheduler", "worker")
         }
         if counts != {
-            "frontend": 1,
+            "frontend": expected_frontends,
             "scheduler": expected_schedulers,
             "worker": expected_workers,
         }:
             raise ValueError("endpoint capture inventory count mismatch")
-        owner = next(m for m in inventory if m["context"]["role"] == "frontend")
+        owner = endpoint_owner(
+            container, [m for m in inventory if m["context"]["role"] == "frontend"]
+        )
         description = json.loads(shell.run(["docker", "inspect", container]))[0]
         input_path, input_strategy = profile_backing(description)
         (output / "profile-input.json").write_text(
@@ -208,6 +211,33 @@ class EndpointObserver:
                 status["removed"] = True
             finally:
                 (self.output / "endpoint-status.json").write_text(json.dumps(status))
+
+
+def _stat(container, pid):
+    """(parent PID, start ticks) of a process in the container, from its stat
+    (fields after the command's final ')': state, ppid, ..., starttime)."""
+    fields = topology.exec_in(container, ["cat", f"/proc/{pid}/stat"]).rsplit(")", 1)[1]
+    fields = fields.split()
+    return int(fields[1]), int(fields[19])
+
+
+def endpoint_owner(container, frontends):
+    """The process the observer follows: the frontend itself when it is the
+    server's process (one API server), else the API server processes' one
+    common parent, the ``vllm serve`` process that runs until the end (data
+    parallelism runs an API server a DP rank, each a child)."""
+    if len(frontends) == 1:
+        return {"pid": frontends[0]["pid"], "start_ticks": frontends[0]["start_ticks"]}
+    parents = set()
+    for frontend in frontends:
+        parent, start = _stat(container, frontend["pid"])
+        if start != frontend["start_ticks"]:
+            raise ValueError("an API server's process changed before the observer")
+        parents.add(parent)
+    if len(parents) != 1:
+        raise ValueError("the API servers have no single parent process")
+    (parent,) = parents
+    return {"pid": parent, "start_ticks": _stat(container, parent)[1]}
 
 
 def profile_backing(description):

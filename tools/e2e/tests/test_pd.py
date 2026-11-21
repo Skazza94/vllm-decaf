@@ -156,6 +156,154 @@ class ProfilerConfig(unittest.TestCase):
             self.assertEqual(decode["unavailable"], "no UCX_PROTO_INFO table in the server log")
             self.assertEqual(decode["log"], {"path": "logs/decode/d/decode.log", "after_stop": False})
 
+    def test_a_profiled_data_parallel_server_gets_a_shutdown_window(self):
+        """With data parallelism each API server is a child process that vLLM's
+        default ``--shutdown-timeout 0`` force-kills right after SIGTERM, before
+        its frontend recorder closes: profiled DP servers get the profiler's
+        grace; unprofiled or DP-1 servers are unchanged."""
+        def flag(run, role):
+            command = pd.server_command(run, role, ["10.100.0.1"], profile_id="id-1")
+            i = command.index("--shutdown-timeout") if "--shutdown-timeout" in command else None
+            return None if i is None else command[i + 1]
+
+        dp = {"prefill": pd.Side("p", "data0", data_parallel_size=2),
+              "decode": pd.Side("d", "data0", data_parallel_size=2)}  # fmt: skip
+        profiled = self.run_with(profiler=pd.Profiler(), **dp)
+        for role in ("prefill", "decode"):
+            self.assertEqual(flag(profiled, role), str(pd.PROFILER_SHUTDOWN_GRACE_S))
+            self.assertIsNone(flag(self.run_with(profiler=pd.Profiler()), role))
+            command = pd.server_command(self.run_with(**dp), role, ["10.100.0.1"])
+            self.assertNotIn("--shutdown-timeout", command)
+
+    def test_every_recorder_of_each_dp_rank_must_be_present_and_closed(self):
+        """Per server node: a frontend per API server slot of the launch, a
+        scheduler per DP rank and a worker per (DP rank, TP rank) on its rank's
+        engine, all of the side's KV role, each whole (stream, terminal row,
+        manifest) and closed. A missing recorder, a lost terminal row, no
+        profiler.json, hook errors, a worker on another rank's engine, the other
+        side's frontend, a repeated slot or swapped endpoints fail the run."""
+        import shutil
+        import tempfile
+        import uuid
+
+        stats = dict.fromkeys(("head", "tail", "drop_full", "drop_contention",
+                               "drop_ids", "drop_handles", "drop_identity",
+                               "drop_conflict", "drop_closed", "unknown_handles"),
+                              0)  # fmt: skip
+
+        def recorders(root, run_id, role, node, dp):
+            kv = {"kv_role": "kv_producer" if role == "prefill" else "kv_consumer"}
+            for d in range(dp):
+                engine = f"{node}-engine_dp{d}"
+                for context in (
+                    {"role": "frontend", "api_server": f"ApiServer_{d}", **kv},
+                    {"role": "scheduler", "engine_id": engine, "rank": 0, "dp_rank": d, **kv},
+                    {"role": "worker", "engine_id": engine, "rank": 0, "dp_rank": d, **kv},
+                ):  # fmt: skip
+                    process = str(uuid.uuid4())
+                    meta = {"schema": 1, "type": "metadata", "run_id": run_id,
+                            "process_id": process, "pid": 10 + d, "start_ticks": 100,
+                            "clock_id": str(uuid.uuid4()), "clock_source": "CLOCK_MONOTONIC",
+                            "boot_id": "b", "net_namespace": "n", "pid_namespace": "p",
+                            "time_namespace": "t", "context": context}  # fmt: skip
+                    folder = root / "profiles" / role / node / run_id / process
+                    folder.mkdir(parents=True)
+                    end = {"schema": 1, "type": "end", "complete": True, "stats": stats}
+                    (folder / "events.jsonl").write_text(
+                        json.dumps(meta) + "\n" + json.dumps(end) + "\n")
+                    (folder / "manifest.json").write_text(json.dumps(
+                        {**meta, "saved": True, "complete": True, "stats": stats}))
+                    (folder / "profiler.json").write_text(
+                        json.dumps({"complete": True, "hook_errors": 0}))
+
+        def captures(root, side):
+            for path in sorted(root.glob(f"profiles/{side}/*/*/events.jsonl")):
+                yield path.parent, json.loads(path.read_text().splitlines()[0])["context"]
+
+        def find(root, side, **match):
+            return next(f for f, c in captures(root, side)
+                        if all(c.get(k) == v for k, v in match.items()))
+
+        def edit_context(folder, **changes):
+            rows = [json.loads(line) for line in (folder / "events.jsonl").read_text().splitlines()]
+            rows[0]["context"].update(changes)
+            (folder / "events.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+            manifest = json.loads((folder / "manifest.json").read_text())
+            (folder / "manifest.json").write_text(
+                json.dumps({**manifest, "context": rows[0]["context"]}))
+
+        def other_side_frontend(root):
+            shutil.rmtree(find(root, "decode/d", api_server="ApiServer_1"))
+            source = find(root, "prefill/p", api_server="ApiServer_1")
+            shutil.copytree(source, root / "profiles/decode/d" / source.parent.name / source.name)
+
+        def swapped(root):
+            profiles = root / "profiles"
+            (profiles / "prefill/p").rename(profiles / "held")
+            (profiles / "decode/d").rename(profiles / "prefill/p")
+            (profiles / "held").rename(profiles / "decode/d")
+
+        worker = lambda root: find(root, "decode/d", role="worker", dp_rank=0)  # noqa: E731
+        faults = {
+            "clean": lambda root: None,
+            "missing": lambda root: shutil.rmtree(find(root, "decode/d", role="frontend")),
+            "no terminal row": lambda root: (worker(root) / "events.jsonl").write_text(
+                (worker(root) / "events.jsonl").read_text().splitlines()[0] + "\n"),
+            "never closed": lambda root: (worker(root) / "profiler.json").unlink(),
+            "hook errors": lambda root: (worker(root) / "profiler.json").write_text(
+                json.dumps({"complete": True, "hook_errors": 1})),
+            "other engine": lambda root: edit_context(worker(root), engine_id="d-engine_dp1"),
+            "other side's frontend": other_side_frontend,
+            "repeated slot": lambda root: edit_context(
+                find(root, "decode/d", api_server="ApiServer_1"), api_server="ApiServer_0"),
+            "swapped endpoints": swapped,
+        }
+        dp = {"prefill": pd.Side("p", "data0", data_parallel_size=2),
+              "decode": pd.Side("d", "data0", data_parallel_size=2)}  # fmt: skip
+        run = self.run_with(profiler=pd.Profiler(), **dp)
+        self.assertEqual(pd.api_server_slots(run, run.decode), ["ApiServer_0", "ApiServer_1"])
+        self.assertEqual(pd.api_server_slots(self.run_with(), self.run_with().decode),
+                         ["MainProcess"])  # fmt: skip
+        for label, fault in faults.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
+                root, run_id = Path(tmp), str(uuid.uuid4())
+                (root / "profiler.json").write_text(json.dumps({"run_id": run_id}))
+                for role, node in (("prefill", "p"), ("decode", "d")):
+                    recorders(root, run_id, role, node, 2)
+                fault(root)
+                verdict = {"problems": []}
+                pd.check_profiles(root, run, verdict)
+                found = verdict["problems"]
+                self.assertEqual(found == [], label == "clean", found)
+                if label != "swapped endpoints":
+                    self.assertTrue(all(p.startswith("decode d") for p in found), found)
+
+    def test_the_observer_owner_is_the_api_servers_common_parent(self):
+        """One API server is its own owner; several (data parallelism) give
+        their one common parent, checked against each server's start ticks."""
+        from harness import endpoint_observer
+
+        stats = {11: (7, 201), 12: (7, 202), 7: (1, 150), 13: (8, 203)}
+
+        def exec_in(container, command, **kwargs):
+            pid = int(command[1].split("/")[2])
+            parent, start = stats[pid]
+            fields = ["S", str(parent)] + ["0"] * 17 + [str(start)]
+            return f"{pid} (vllm) " + " ".join(fields) + "\n"
+
+        with mock.patch.object(endpoint_observer.topology, "exec_in", exec_in):
+            owner = endpoint_observer.endpoint_owner(
+                "c", [{"pid": 11, "start_ticks": 201}, {"pid": 12, "start_ticks": 202}])
+            self.assertEqual(owner, {"pid": 7, "start_ticks": 150})
+            self.assertEqual(endpoint_observer.endpoint_owner(
+                "c", [{"pid": 11, "start_ticks": 201}]), {"pid": 11, "start_ticks": 201})
+            with self.assertRaisesRegex(ValueError, "no single parent"):
+                endpoint_observer.endpoint_owner(
+                    "c", [{"pid": 11, "start_ticks": 201}, {"pid": 13, "start_ticks": 203}])
+            with self.assertRaisesRegex(ValueError, "changed"):
+                endpoint_observer.endpoint_owner(
+                    "c", [{"pid": 11, "start_ticks": 999}, {"pid": 12, "start_ticks": 202}])
+
     def test_off_leaves_the_connector_configuration_unchanged(self):
         run = self.run_with()
         for role in ("prefill", "decode"):
@@ -5153,7 +5301,10 @@ class EndpointObserverAccounting(unittest.TestCase):
 
 
 class EndpointCaptureIntegrity(unittest.TestCase):
-    def create(self, output):
+    def create(self, output, frontends=1, owner=(1, 100), recorded_owner=None):
+        """A complete synthetic L3 capture. ``frontends`` API servers (each its
+        own process when there are several, as under data parallelism), the
+        observer configured with ``owner`` and recording ``recorded_owner``."""
         import hashlib
         import uuid
         from harness.endpoint_observer import bundle
@@ -5178,15 +5329,19 @@ class EndpointCaptureIntegrity(unittest.TestCase):
             source_root = Path(os.environ.get("KV_PROFILER_SOURCE_ROOT", pd.REPOSITORY))
             digest = bundle(directory / "observer.pyz", source_root=source_root)
             entries = []
-            for capture_role in ("frontend", "scheduler", "worker"):
+            roles = ["frontend"] * frontends + ["scheduler", "worker"]
+            for index, capture_role in enumerate(roles):
                 process = str(uuid.uuid4())
+                pid, start = ((10 + index, 200 + index)
+                              if capture_role == "frontend" and frontends > 1
+                              else (1, 100))  # fmt: skip
                 meta = {
                     "schema": 1,
                     "type": "metadata",
                     "run_id": run_id,
                     "process_id": process,
-                    "pid": 1,
-                    "start_ticks": 100,
+                    "pid": pid,
+                    "start_ticks": start,
                     "clock_id": str(uuid.uuid4()),
                     "clock_source": "CLOCK_MONOTONIC",
                     "boot_id": "boot",
@@ -5241,8 +5396,8 @@ class EndpointCaptureIntegrity(unittest.TestCase):
                 "cpus": profiler.observer_cpus[node],
                 "inventory": entries,
                 "package_sha256": digest,
-                "owner_pid": 1,
-                "owner_start": 100,
+                "owner_pid": owner[0],
+                "owner_start": owner[1],
             }
             (directory / "config.json").write_text(json.dumps(config))
             # Get normalized defaults from the same immutable, stdlib-only package.
@@ -5288,8 +5443,8 @@ class EndpointCaptureIntegrity(unittest.TestCase):
                 "inventory": entries,
                 "affinity": profiler.observer_cpus[node],
                 "owner": {
-                    "pid": 1,
-                    "start_ticks": 100,
+                    "pid": (recorded_owner or owner)[0],
+                    "start_ticks": (recorded_owner or owner)[1],
                     "net_namespace": "net",
                     "pid_namespace": "pid",
                 },
@@ -5441,6 +5596,30 @@ class EndpointCaptureIntegrity(unittest.TestCase):
                 verdict = {"problems": []}
                 check_captures(out, run, verdict)
                 self.assertTrue(verdict["problems"], fault)
+
+
+    def test_an_observer_of_several_api_servers_follows_their_parent(self):
+        """With data parallelism each API server is a child process with its
+        frontend recorder: the observer's owner is their common parent, the
+        process the controller configured. A recorded owner other than the
+        configured one fails, and with a single API server the owner is still
+        the frontend itself."""
+        from harness.endpoint_observer import check_captures
+
+        cases = (
+            ("parent of two API servers", {"frontends": 2}, True),
+            ("recorded owner is not the configured one",
+             {"frontends": 2, "recorded_owner": (99, 999)}, False),
+            ("one API server, owner not the frontend",
+             {"frontends": 1, "owner": (5, 500)}, False),
+        )  # fmt: skip
+        for label, kwargs, clean in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary)
+                run = self.create(output, **kwargs)
+                verdict = {"problems": []}
+                check_captures(output, run, verdict)
+                self.assertEqual(verdict["problems"] == [], clean, verdict["problems"])
 
 
 class EndpointProfileBacking(unittest.TestCase):

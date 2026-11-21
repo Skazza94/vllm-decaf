@@ -35,6 +35,9 @@ import inspect
 import json
 import math
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import time
 import uuid
 
@@ -1139,6 +1142,12 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         *(["--data-parallel-multi-port-external-lb", "--data-parallel-size-local", str(side.data_parallel_size),
            "--data-parallel-supervisor-port", str(DP_SUPERVISOR_PORT)] if rank_routed(run, side) else []),
         "--generation-config", "vllm", "--enforce-eager",
+        # A profiled instance with data parallelism runs an API server process a
+        # DP rank, each with its frontend recorder. At vLLM's default
+        # ``--shutdown-timeout 0`` the API servers are force-killed right after
+        # SIGTERM, before their recorders close: give them the profiler's grace.
+        *(["--shutdown-timeout", str(PROFILER_SHUTDOWN_GRACE_S)]
+          if run.profiler is not None and side.data_parallel_size > 1 else []),
         *(["--language-model-only"] if s.language_model_only else []),
         *(["--trust-remote-code"] if s.trust_remote_code else []),
         # Off for the byte checks unless asked (then a block's pattern is
@@ -1236,7 +1245,11 @@ def execute(run: Run, output: Path | None = None) -> dict:
                         expected_workers=sum(side.node_of(dp) == node
                             for dp, _ in side.ranks(side.tp(run.server))),
                         expected_schedulers=sum(side.node_of(dp) == node
-                            for dp, tp in side.ranks(side.tp(run.server)) if tp == 0)))
+                            for dp, tp in side.ranks(side.tp(run.server)) if tp == 0),
+                        # An API server a local DP rank with data parallelism.
+                        expected_frontends=(sum(side.node_of(dp) == node
+                                                for dp in range(side.data_parallel_size))
+                                            if side.data_parallel_size > 1 else 1)))
         base_url = front.start(container, address)
         if run.collector is not None:
             from . import collector
@@ -1330,6 +1343,8 @@ def execute(run: Run, output: Path | None = None) -> dict:
            for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
           for role in ("prefill", "decode")],
         routers, run, tent, ports or None, exempt)
+    if run.profiler is not None:
+        check_profiles(output, run, verdict)
     if run.profiler is not None and run.profiler.level == "l3":
         from .endpoint_observer import check_captures
 
@@ -1348,6 +1363,114 @@ def execute(run: Run, output: Path | None = None) -> dict:
     if verdict["problems"]:
         raise AssertionError(f"run {run.name} failed its checks ({output}): {'; '.join(verdict['problems'])}")
     return verdict
+
+
+def check_profiles(output: Path, run: Run, verdict: dict) -> None:
+    """Every recorder of a profiled run is present and closed.
+
+    Per server node: the run's captures only, all of its side's KV role, one
+    frontend per API server slot the launch makes (its recorded process
+    name), one scheduler per local DP rank (an instance: one each) and a
+    worker per (DP rank, TP rank) on its rank's engine; each capture's
+    stream, terminal row and
+    manifest whole (the observer package's ``core_completion``), and its
+    ``profiler.json`` complete with no hook errors. A recorder that never
+    closed lost its unflushed rows; a missing one, its requests."""
+    from .endpoint_observer import bundle
+
+    problems = verdict["problems"]
+    try:
+        run_id = json.loads((output / "profiler.json").read_text())["run_id"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        problems.append(f"profiles: no run id ({error})")
+        return
+    with tempfile.TemporaryDirectory() as scratch:
+        package = Path(scratch) / "observer.pyz"
+        bundle(package)
+        for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+            tp = side.tp(run.server)
+            dp = 1 if side.instances else side.data_parallel_size
+            for node in side.nodes:
+                problems.extend(_node_profiles(output / "profiles" / role / node,
+                                               f"{role} {node}", run_id, package, dp, tp,
+                                               "kv_producer" if role == "prefill" else "kv_consumer",
+                                               api_server_slots(run, side)))  # fmt: skip
+
+
+def api_server_slots(run: Run, side: Side) -> list[str]:
+    """The process names of a node's frontends, as vLLM names them: the
+    serving process itself with one API server; ``ApiServer_<i>`` for each
+    DP rank's API server; ``APIServer_DPRank_<r>`` for each rank's own
+    server (rank routing)."""
+    if side.instances or side.data_parallel_size == 1:
+        return ["MainProcess"]
+    prefix = "APIServer_DPRank_" if rank_routed(run, side) else "ApiServer_"
+    return [f"{prefix}{d}" for d in range(side.data_parallel_size)]
+
+
+def _node_profiles(directory: Path, where: str, run_id: str, package: Path,
+                   dp: int, tp: int, kv_role: str, slots: list[str]) -> list[str]:
+    problems = []
+    runs = sorted(p.name for p in directory.glob("*") if p.is_dir())
+    if runs != [run_id]:
+        return [f"{where}: recorder captures of runs {runs}, expected [{run_id}]"]
+    result = subprocess.run([sys.executable, str(package), "--check-core", str(directory),
+                             "--run-id", run_id], capture_output=True, text=True, timeout=60)
+    try:
+        core = json.loads(result.stdout)
+    except ValueError:
+        return [f"{where}: recorder check failed: {result.stderr.strip()[-300:]}"]
+    problems += [f"{where}: {p}" for p in core["problems"]]
+    contexts = {}
+    for path in sorted((directory / run_id).glob("*/events.jsonl")):
+        name = f"{where} {path.parent.name[:8]}"
+        try:
+            with path.open() as stream:
+                contexts[path.parent] = context = json.loads(stream.readline())["context"]
+            closed = json.loads(path.with_name("profiler.json").read_text())
+        except FileNotFoundError:
+            problems.append(f"{name}: the recorder never closed (no profiler.json)")
+            continue
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            problems.append(f"{name}: unreadable capture ({error})")
+            continue
+        if not closed.get("complete") or closed.get("hook_errors"):
+            problems.append(f"{name} ({context.get('role')}): recorder incomplete "
+                            f"(complete {closed.get('complete')}, hook_errors "
+                            f"{closed.get('hook_errors')})")
+    by_role = {}
+    for context in contexts.values():
+        by_role.setdefault(context.get("role"), []).append(context)
+    count = {"frontend": dp, "scheduler": dp, "worker": dp * tp}
+    for recorder, want in count.items():
+        have = len(by_role.get(recorder, []))
+        if have != want:
+            problems.append(f"{where}: {have} {recorder} recorder capture(s), expected {want}")
+    if set(by_role) - set(count):
+        problems.append(f"{where}: unexpected recorder roles {sorted(set(by_role) - set(count))}")
+    roles = sorted({str(c.get("kv_role")) for c in contexts.values()} - {kv_role})
+    if roles:
+        problems.append(f"{where}: recorders of KV role {roles}, expected only {kv_role}")
+    names = sorted(str(c.get("api_server")) for c in by_role.get("frontend", []))
+    if names != sorted(slots):
+        problems.append(f"{where}: frontend processes {names}, expected {sorted(slots)}")
+    engines = {}
+    for context in by_role.get("scheduler", []):
+        engines.setdefault(context.get("dp_rank") or 0, set()).add(context.get("engine_id"))
+    if sorted(engines) != list(range(dp)) or any(len(e) != 1 or None in e for e in engines.values()) \
+            or len({next(iter(e)) for e in engines.values()}) != len(engines):
+        problems.append(f"{where}: scheduler DP ranks/engines {sorted(engines)}, expected one "
+                        f"distinct engine per DP rank 0..{dp - 1}")
+    workers = sorted(((c.get("dp_rank") or 0), c.get("rank")) for c in by_role.get("worker", []))
+    if workers != [(d, r) for d in range(dp) for r in range(tp)]:
+        problems.append(f"{where}: worker (DP rank, rank) {workers}, expected each of "
+                        f"{dp} x {tp} once")
+    for context in by_role.get("worker", []):
+        if {context.get("engine_id")} != engines.get(context.get("dp_rank") or 0):
+            problems.append(f"{where}: worker of DP rank {context.get('dp_rank') or 0} on "
+                            f"another engine ({context.get('engine_id')})")
+            break
+    return problems
 
 
 def recheck(output: str | Path) -> dict:
@@ -1375,6 +1498,8 @@ def recheck(output: str | Path) -> dict:
         None if not uses_tent(run.server) else json.loads((output / "tent.json").read_text()),
         json.loads(ports.read_text()) if ports.exists() else None,
         control_saved)
+    if run.profiler is not None:
+        check_profiles(output, run, verdict)
     if run.profiler is not None and run.profiler.level == "l3":
         from .endpoint_observer import check_captures
 

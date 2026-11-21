@@ -255,13 +255,15 @@ function lanesFor() {
   const ps = [...new Set(D.pairs.map(p => p.split("→")[0]))].sort();
   for (const p of ps) L.push({ k: "inflight", p, n: `${p} · transfers in flight`, h: 30 });
   L.push({ k: "bytes", n: "pair goodput · GB/s (100 ms, uniform-spread estimate)", h: 46 });
-  const byEngine = {};
+  // one lane per engine (its id; data-parallel engines share labels' letters)
+  const byEngine = {}, labelOf = {};
   for (const s of D.thread_strips) {
-    const key = s.engine_label || s.engine || "?";
+    const key = s.engine || s.engine_label || "?";
     byEngine[key] = (byEngine[key] || 0) + 1;
+    labelOf[key] = s.engine_label || key;
   }
   for (const engine of Object.keys(byEngine).sort())
-    L.push({ k: "strips", engine, n: `${engine} · shared thread activity per interval`, h: Math.min(byEngine[engine], 10) * 7 + 8 });
+    L.push({ k: "strips", engine, n: `${labelOf[engine]} · shared thread activity per interval`, h: Math.min(byEngine[engine], 10) * 7 + 8 });
   L.push({ k: "rtt", n: "TCP_INFO RTT µs per socket five-tuple and incarnation", h: 34 });
   L.push({ k: "irq", n: "NIC IRQs + softirqs per s (host-wide context)", h: 30 });
   L.push({ k: "ebpf", n: `eBPF events (${D.ebpf.coverage})`, h: 16 });
@@ -350,7 +352,7 @@ function draw() {
       cx.fillStyle = C.muted; cx.fillText("12 GB/s", LBL + 3, y + 8);
     } else if (l.k === "strips") {
       const list = D.thread_strips.filter(s =>
-        (s.engine_label || s.engine || "?") === l.engine).slice(0, 10);
+        (s.engine || s.engine_label || "?") === l.engine).slice(0, 10);
       const rh = (l.h - 8) / list.length;
       cx.font = "9.5px " + css("--font-data");
       list.forEach((strip, i) => {
@@ -365,7 +367,7 @@ function draw() {
           cx.globalAlpha = 1;
         }
         cells.push({ y0: yy, y1: yy + rh, strip,
-          name: `${l.engine} · ${strip.label}${strip.start_ticks_unverified ? " · start-ticks unverified" : ""}` });
+          name: `${strip.engine_label || l.engine} · ${strip.label}${strip.start_ticks_unverified ? " · start-ticks unverified" : ""}` });
       });
       cx.fillStyle = C.muted; cx.font = "10.5px " + css("--font-data");
       if (rh >= 7 && list.length <= 6) {

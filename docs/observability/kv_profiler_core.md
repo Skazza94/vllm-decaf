@@ -386,6 +386,16 @@ the quality of the producer or frontend capture they use.
   [--port N] [--host H]
 ```
 
+With data parallelism each scheduler of an instance calibrates its own clock
+against every peer. Schedulers of one clock domain read one clock, so any of
+them maps a peer. A mapping is considered only when its samples carry its
+capture's run and clock and the peer its manifest names (otherwise it is
+reported and unused); per peer the viewer uses one mapping (complete anchors first,
+then the reference scheduler's own), relabelled to the reference clock, for the
+summary and the page alike, and marks the others as not used. Calibrations from
+different clock domains are refused. Engine labels carry the recorded DP rank
+(`P0·dp1`), and thread lanes are grouped by engine.
+
 The accepted page (`viewer.html`, beside the server) over one run directory's
 captures: per-request rows, the request × time lanes, the record detail and a
 run switch when several RUN_DIRs are given, each labelled by the transport its
@@ -643,6 +653,21 @@ cleanup grace; set it above the profiler's close deadlines (two recorders,
 is a shared shutdown budget that in-flight requests can consume, so it does not by
 itself guarantee that the recorders close.
 
+With data parallelism vLLM runs an API server process for each DP rank (its
+`--api-server-count` default), each with its own frontend recorder. At
+`--shutdown-timeout 0` the serving process force-kills them right after SIGTERM,
+before they close: their recorders keep only their metadata row, which records
+the timeout in effect (`shutdown_timeout_s`, `close_at_shutdown`). Every
+frontend records its process name as `api_server`: `MainProcess` with one API
+server, `ApiServer_<i>` with several, `APIServer_DPRank_<r>` for a DP rank's own
+server. Give such deployments a positive `--shutdown-timeout`, above
+the recorders' close deadlines; the e2e harness passes the profiler's shutdown
+grace for every profiled server with data parallelism, and fails a run unless
+each server node has exactly the frontends of its launch's API server slots, a
+scheduler per DP rank and a worker per (DP rank, TP rank) on its rank's engine,
+all of the side's KV role, each whole and closed (the observer package's
+`--check-core`: stream, terminal row and manifest).
+
 ## Endpoint observations at L3
 
 L3 includes the L1 connector instrumentation (NIXL pull and the Mooncake
@@ -745,7 +770,7 @@ vLLM/Torch in the observer:
 | Field | Meaning |
 |---|---|
 | `run_id`, `endpoint`, `role` | Shared UUID, endpoint ID, `prefill` or `decode` |
-| `owner_pid`, `owner_start` | Shared-namespace server PID and proc start ticks |
+| `owner_pid`, `owner_start` | Shared-namespace server PID and proc start ticks: the frontend's process with one API server, else the API servers' common parent (the serving process); the capture check compares the observer's recorded owner with them |
 | `cpus` | Nonempty observer CPU list, disjoint from serving CPUs |
 | `irq_policy` | `operator_verified` or `virtual_not_applicable` |
 | `input_dir`, `output_dir` | Read-only L1 root and separate probe output |

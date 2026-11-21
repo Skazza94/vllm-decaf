@@ -680,6 +680,28 @@ def _build(
     return profiler
 
 
+def _api_server_context(vllm_config) -> dict:
+    """Where this frontend runs, in its metadata (the row that survives a lost
+    capture): its process name (``MainProcess``, vLLM's ``ApiServer_<i>`` with
+    several API servers, ``APIServer_DPRank_<r>`` for a rank's own server).
+    Several API servers are child processes that, at ``--shutdown-timeout 0``,
+    vLLM force-kills right after SIGTERM, before their recorders close: the
+    metadata then says why."""
+    import multiprocessing
+
+    name = multiprocessing.current_process().name
+    if not name.startswith("ApiServer_"):
+        return {"api_server": name}
+    timeout = getattr(vllm_config, "shutdown_timeout", None)
+    return {
+        "api_server": name,
+        "shutdown_timeout_s": timeout,
+        "close_at_shutdown": "not guaranteed: force-killed at --shutdown-timeout 0"
+        if timeout == 0
+        else "within --shutdown-timeout",
+    }
+
+
 def attach_frontend(vllm_config) -> FrontendProfiler | None:
     """Return a frontend profiler, owned and closed by the engine that calls this."""
     import dataclasses
@@ -704,6 +726,7 @@ def attach_frontend(vllm_config) -> FrontendProfiler | None:
         **config.context,
         "transport": config.transport,
         "capabilities": caps,
+        **_api_server_context(vllm_config),
     }
     config = dataclasses.replace(config, context=context)
     from .snapshot import snapshot

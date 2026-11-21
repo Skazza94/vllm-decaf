@@ -1843,3 +1843,37 @@ def test_a_recorder_that_cannot_start_leaves_no_ring_directory(tmp_path, monkeyp
         assert list(shared.iterdir()) == []
     finally:
         shutil.rmtree(shared, ignore_errors=True)
+
+
+
+def test_a_frontend_in_an_api_server_child_records_its_shutdown_risk(monkeypatch):
+    """With data parallelism each API server is a child process; at vLLM's
+    default --shutdown-timeout 0 it is force-killed before its recorder closes.
+    The frontend's metadata (the row that survives) says so; every frontend
+    records its process name (the harness checks the launch's slots)."""
+    import multiprocessing
+    from types import SimpleNamespace
+
+    from vllm.kv_profiling.nixl import _api_server_context
+
+    class Process:
+        def __init__(self, name):
+            self.name = name
+
+    def running_as(name):
+        monkeypatch.setattr(multiprocessing, "current_process", lambda: Process(name))
+
+    running_as("MainProcess")
+    assert _api_server_context(SimpleNamespace(shutdown_timeout=0)) == {
+        "api_server": "MainProcess"
+    }
+    running_as("APIServer_DPRank_1")
+    assert _api_server_context(SimpleNamespace(shutdown_timeout=0)) == {
+        "api_server": "APIServer_DPRank_1"
+    }
+    running_as("ApiServer_1")
+    risky = _api_server_context(SimpleNamespace(shutdown_timeout=0))
+    assert risky["api_server"] == "ApiServer_1" and risky["shutdown_timeout_s"] == 0
+    assert risky["close_at_shutdown"].startswith("not guaranteed")
+    safe = _api_server_context(SimpleNamespace(shutdown_timeout=30))
+    assert safe["close_at_shutdown"] == "within --shutdown-timeout"
