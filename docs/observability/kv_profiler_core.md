@@ -375,6 +375,89 @@ A step is complete only with exactly one row for each expected rank (a rank reco
 ambiguous) from healthy captures on one clock domain. A cross-node block and a decode window list
 the quality of the producer or frontend capture they use.
 
+## The request explorer (viewer)
+
+```console
+.venv/bin/python <vllm>/kv_profiling/viewer.py RUN_DIR [RUN_DIR ...]
+  [--port N] [--host H]
+```
+
+The accepted page (`viewer.html`, beside the server) over one run directory's
+captures: per-request rows, the request × time lanes, the record detail and a
+run switch when several RUN_DIRs are given, each labelled by the transport its
+records carry. The server is standard library only and imports no vLLM or
+torch: the pairing is the summary's own, loaded by path (as with
+`ucx_protocols.py`), and `vllm/__init__.py` never executes.
+
+Captures are found by their own metadata row, never by directory names: L1
+recorder captures feed `summarize` (naming the calibration mappings from the
+captures' `calibration.json` manifests, never raw manifest files); the L2
+collector's kinds 25–28 and the L3 observer's `probe_schema` sidecars are
+decoded and deduplicated by the server, which never mixes them into the
+summary. Identical copies of one capture fold; conflicting rows for one
+process generation are named problems. A saved `summary.json` is used only
+when its `viewer_input_fingerprints` (per L1 capture content hashes plus the
+hashes of every calibration manifest, its resolved named mapping file and
+each L1 `profiler.json`, published at `/api/run`) still match; without
+fingerprints the run is rebuilt. The inventory reports a capture aligned
+when a projection from its clock actually succeeds.
+
+Time lanes project onto one reference clock (the consumer scheduler's when
+calibrated): same boot, time namespace and clock source are one clock; other
+clocks project through the manifest-named mappings only, and a start-only
+mapping means offset projection with uncertainty and unknown drift. A clock
+with no evidence of alignment contributes no lanes — absent, never shifted by
+a guess.
+
+Every value the page shows is served from the records or an explicit
+unavailable/absent state. The metrics follow what the records measure:
+
+- A transfer's interval is the connector's own: acceptance to terminal for an
+  asynchronous NIXL READ, call entry to return for a synchronous Mooncake
+  WRITE with its terminal status qualifying its bytes. Peak concurrency
+  sweeps those intervals — over the run and within each bin (two sequential
+  transfers in one bin peak at one); per-pair goodput spreads completed
+  payload bytes uniformly over the measured spans, labelled an estimate;
+  NIXL's own `xfer_us` is used for per-transfer throughput where the
+  connector recorded it.
+- Cumulative rates (thread CPU, collector counters) divide the delta between
+  consecutive readings of the same series by the sampling interval (reading
+  start to reading start when both are recorded, end to end otherwise),
+  never by the time spent reading the source; the tick rate comes from the
+  enclosing observation, both reading endpoints are projected, and a strip
+  draws over the interval its rate covers — from the previous reading's
+  end to this reading's end. A decrease, the writer's
+  `discontinuity`/`partial` flags or a `reset_generation` change start a new
+  generation; rates keep each field's own unit, and the registered-buffer
+  gauge is carried as its sampled byte value, never differenced into a
+  rate.
+- NIC IRQ and softirq rates difference each entity per CPU independently
+  (the writer's parallel `cpus`/`counts` arrays read as recorded); a CPU
+  absent from the prior reading never credits its earlier count.
+- Thread strips join an L1 process only by boot id, namespaces, pid, process
+  start ticks and the thread's own lifetime (a strip rides the connecting
+  transport's own worker); utilization is labelled shared thread activity
+  over its sampled interval. Socket RTT is a per-five-tuple,
+  per-incarnation series read from the writer's `transport.tcp`, never a
+  pair; requests get RTT and retransmit values only through a unique
+  probe-join candidate whose samples overlap the transfer's own measured
+  window (retransmits counted by their event type), labelled in the table.
+- eBPF events are placed only with a qualified time conversion, enablement
+  is read from the writer's own `config.ebpf`, and the run's coverage is
+  reported disabled, partial or complete (zero events included).
+- Frontend arrival stays separate from the first observed record; a logical
+  request is the consumer scheduler's request keyed by its process
+  generation, request id and occurrence (two generations reusing one id
+  stay two rows); transports attach to their own request's row only (an
+  unrelated request and a reused id never share), a Mooncake batch attaches
+  once to each member request's row with that member's own share of the
+  batch's measured totals; the frontend's recorded parent edges fold its
+  client, composed and engine ids into one row, and entries attaching to
+  nothing are listed separately with the reason.
+- Not yet recorded (prefill window, KV wait, decode admission and window,
+  TTFT) render unavailable until phase 4 supplies the timestamps — never
+  estimated.
+
 ## UCX protocol selection
 
 With `UCX_PROTO_INFO=y`, UCX logs a table the first time it selects protocols
