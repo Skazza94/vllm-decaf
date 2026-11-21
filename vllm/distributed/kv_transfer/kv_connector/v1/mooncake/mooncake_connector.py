@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import functools
 import itertools
 import logging
 import os
@@ -117,6 +118,31 @@ if TYPE_CHECKING:
 
 ReqId = str  # Internal scheduler request ID
 TransferId = str  # KV transfer coordination ID (shared by P/D)
+
+
+def _attach_profiler(vllm_config, role, engine_id, rank, context=None):
+    """The KV network profiler of this scheduler or worker, or None.
+
+    None when the shared configuration attaches nothing.
+
+    Nothing of ``vllm.kv_profiling`` is imported unless the connector extra
+    configuration has a ``network_profiler`` namespace; the shared validated
+    configuration then decides whether its level is enabled.
+    """
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    if "network_profiler" not in extra:
+        return None
+    from vllm.kv_profiling.mooncake import attach_mooncake
+
+    parallel = vllm_config.parallel_config
+    return attach_mooncake(
+        vllm_config,
+        role,
+        engine_id=engine_id,
+        rank=rank,
+        context={"dp_rank": parallel.data_parallel_index, **(context or {})},
+    )
+
 
 # Follow NIXL (`nixl/base_worker.py`): HMA packed pages can put more than one
 # KV group on a single allocation. group_index=-1 flattens every group's block
@@ -763,6 +789,11 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_not_processed: set[TransferId] = set()
         # D side: lease renewals to send this step, by remote P engine.
         self.lease_heartbeats: dict[EngineId, LeaseHeartbeat] = {}
+        # The profiler's step marker (0: no profiler on the scheduler): the
+        # scheduler's step ordinal, its generation and the step's flags.
+        self.profiler_step: int = 0
+        self.profiler_scope: int = 0
+        self.profiler_flags: int = 0
 
     def add_new_req(
         self,
@@ -964,6 +995,15 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_block_ids_with_load_errors()
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        if (w := self.connector_worker) is not None and (p := w._kvp) is not None:
+            p.step_begin(connector_metadata)
+
+    def finish_forward(self) -> None:
+        if (w := self.connector_worker) is not None and (p := w._kvp) is not None:
+            p.step_end()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
@@ -985,6 +1025,12 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
     def wait_for_save(self):
         pass
+
+    def shutdown(self):
+        """Close this role's profiler, if any; nothing else is torn down here."""
+        for part in (self.connector_scheduler, self.connector_worker):
+            if part is not None:
+                part.close_profiler()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """Return worker-local transfer stats since the last call.
@@ -1020,6 +1066,8 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
 class MooncakeConnectorScheduler:
     """Implementation of Scheduler side methods."""
+
+    _kvp = None
 
     def __init__(
         self,
@@ -1087,6 +1135,18 @@ class MooncakeConnectorScheduler:
             cdiv(n_tokens, block_size) + 1 if n_tokens else 0
             for n_tokens, block_size in sw_sizes_tokens
         ]
+        self._kvp = _attach_profiler(
+            vllm_config,
+            "scheduler",
+            engine_id,
+            0,
+            {"bounded_replay": self._bounded_replay},
+        )
+
+    def close_profiler(self) -> None:
+        if (p := self._kvp) is not None:
+            self._kvp = None
+            p.close()
 
     def _transfer_block_ids(
         self,
@@ -1155,6 +1215,8 @@ class MooncakeConnectorScheduler:
             params["_p_side_truncated"] = True
 
     def on_new_request(self, request: "Request") -> None:
+        if (p := self._kvp) is not None:
+            p.request_queued(request)
         params = request.kv_transfer_params
         if (
             params is not None
@@ -1162,6 +1224,20 @@ class MooncakeConnectorScheduler:
             and (self._has_mamba or self._bounded_replay)
         ):
             self._truncate_mamba_request_for_prefill(request)
+
+        if (p := self._kvp) is not None and params is not None:
+            if params.get("do_remote_decode"):
+                p.request_bound(request.request_id)
+            if (
+                params.get("do_remote_prefill")
+                and params.get("transfer_id")
+                and params.get("remote_engine_id")
+            ):
+                p.handoff_in(
+                    request.request_id,
+                    params["transfer_id"],
+                    params["remote_engine_id"],
+                )
 
         if (
             self._kv_lease_duration is not None
@@ -1182,6 +1258,10 @@ class MooncakeConnectorScheduler:
         # Failed pulls are reported here too.
         for req_id in connector_output.finished_recving or ():
             self._lease_reqs.pop(req_id, None)
+            if (p := self._kvp) is not None:
+                p.recv_finished(req_id, req_id in connector_output.failed_recving)
+        if (p := self._kvp) is not None:
+            p.releases_requested(connector_output.finished_sending)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -1200,6 +1280,8 @@ class MooncakeConnectorScheduler:
               asynchronously (between scheduler steps).
 
         """
+        if (p := self._kvp) is not None:
+            p.load_expected(request.request_id, num_computed_tokens)
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector get_num_new_matched_tokens: "
@@ -1227,6 +1309,8 @@ class MooncakeConnectorScheduler:
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
+        if (p := self._kvp) is not None:
+            p.load_prepared(request.request_id, num_external_tokens)
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector update_state_after_alloc: "
@@ -1342,6 +1426,8 @@ class MooncakeConnectorScheduler:
             meta.reqs_not_processed = self._reqs_not_processed
             self._reqs_not_processed = set()
 
+        if (p := self._kvp) is not None:
+            p.schedule_step(scheduler_output, meta)
         return meta
 
     def request_finished(
@@ -1352,6 +1438,8 @@ class MooncakeConnectorScheduler:
         """Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        if (p := self._kvp) is not None:
+            p.request_done(request)
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector request_finished, req_id=%s, request_status=%s, "
@@ -1396,12 +1484,22 @@ class MooncakeConnectorScheduler:
                 request,
                 self.get_sw_clipped_blocks(block_ids),
             )
+            if (p := self._kvp) is not None:
+                p.handoff_out(
+                    request.request_id,
+                    params["transfer_id"],
+                    self._reqs_need_send[request.request_id][1],
+                )
 
         return delay_free_blocks, None
 
 
 class MooncakeConnectorWorker:
     """Implementation of Worker side methods."""
+
+    _kvp = None
+    # The write batch (profiler, handle) an executor thread is running.
+    _send_batch = threading.local()
 
     def __init__(
         self,
@@ -1631,6 +1729,19 @@ class MooncakeConnectorWorker:
         self._xfer_resp_decoder = msgspec.msgpack.Decoder(MooncakeXferResponse)
         self._heartbeat_decoder = msgspec.msgpack.Decoder(MooncakeLeaseHeartbeat)
 
+        self._kvp = _attach_profiler(
+            vllm_config,
+            "worker",
+            engine_id,
+            self.tp_rank,
+            {"tp_rank": self.tp_rank, "pp_rank": self.pp_rank},
+        )
+
+    def close_profiler(self) -> None:
+        if (p := self._kvp) is not None:
+            self._kvp = None
+            p.close()
+
     def _sync_block_size_with_kernel(self) -> None:
         # When speculative decoding (e.g. Eagle) is enabled, the main model
         # and draft model may use different attention backends with different
@@ -1662,6 +1773,7 @@ class MooncakeConnectorWorker:
 
     def shutdown(self):
         """Cleanup background threads on destruction."""
+        self.close_profiler()
         self.async_zmq_ctx.term()
         if not self.is_kv_consumer:
             self._sender_executor.shutdown(wait=False)
@@ -1830,6 +1942,8 @@ class MooncakeConnectorWorker:
                 status=MooncakeXferResponseStatus.ERROR,
                 err_msg=mismatch,
             )
+            if (p := self._kvp) is not None:
+                p.send_rejected(meta.req_blocks)
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
@@ -1845,6 +1959,8 @@ class MooncakeConnectorWorker:
                 status=MooncakeXferResponseStatus.ERROR,
                 err_msg=msg,
             )
+            if (p := self._kvp) is not None:
+                p.send_rejected(meta.req_blocks)
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
         if _pp_mismatch_hides_packed_layers(
@@ -1865,6 +1981,8 @@ class MooncakeConnectorWorker:
                 status=MooncakeXferResponseStatus.ERROR,
                 err_msg=msg,
             )
+            if (p := self._kvp) is not None:
+                p.send_rejected(meta.req_blocks)
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
         if meta.layout_id and not meta.kv_caches_base_addr:
@@ -1889,6 +2007,8 @@ class MooncakeConnectorWorker:
                     status=MooncakeXferResponseStatus.ERROR,
                     err_msg=prep_err,
                 )
+                if (p := self._kvp) is not None:
+                    p.send_rejected(meta.req_blocks)
                 await sock.send_multipart((identity, self._encoder.encode(response)))
                 return
         validation_err = _validate_asymmetric_region_lengths(
@@ -1908,6 +2028,8 @@ class MooncakeConnectorWorker:
                 status=MooncakeXferResponseStatus.ERROR,
                 err_msg=validation_err,
             )
+            if (p := self._kvp) is not None:
+                p.send_rejected(meta.req_blocks)
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
         expired_reqs: list[ReqId] = []
@@ -1939,6 +2061,8 @@ class MooncakeConnectorWorker:
                 err_msg="KV expired on P side before the pull.",
                 layout_id=meta.layout_id,
             )
+            if (p := self._kvp) is not None:
+                p.expired_before_pull({d: meta.req_blocks[d] for d in expired_reqs})
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
         async def wait_and_ret(
@@ -1972,6 +2096,8 @@ class MooncakeConnectorWorker:
                     err_msg="Timeout waiting for P side ready.",
                     layout_id=meta.layout_id,
                 )
+                if (p := self._kvp) is not None:
+                    p.ready_timeout(pending_reqs)
                 await sock.send_multipart((identity, self._encoder.encode(response)))
                 break
 
@@ -2000,88 +2126,145 @@ class MooncakeConnectorWorker:
                         "Request %s expired before sending on P side.", d_req_id
                     )
 
-            (
-                src_ptrs,
-                dst_ptrs,
-                lengths,
-                err_reqs,
-                err_msg,
-            ) = await self._build_transfer_params(
-                ready_reqs,
-                meta,
-                local_regions,
-                remote_regions,
-            )
-            plan = self._sender_plan
-            err_req_set = set(err_reqs)
-            ok_ready_reqs = [
-                (d_req_id, send_meta)
-                for d_req_id, send_meta in ready_reqs
-                if d_req_id not in err_req_set
-            ]
-
-            if not src_ptrs and ok_ready_reqs:
-                # A replica of a replicated producer: answered, nothing written.
-                self.xfer_stats.record_zero_payload(
-                    meta.remote_tp_rank, sorted(d for d, _ in ok_ready_reqs), plan
-                )
-            if src_ptrs:
-                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-                # The write can start once its last request is ready.
-                ready_at = max(
-                    (
-                        send_meta.ready_time
-                        for _, send_meta in ok_ready_reqs
-                        if send_meta.ready_time is not None
-                    ),
-                    default=None,
-                )
-                ret_value = await self.sender_loop.run_in_executor(
-                    self._sender_executor,
-                    self._send_blocks_to,
+            batch = None
+            shares = None
+            if (p := self._kvp) is not None and ready_reqs:
+                batch = p.batch_bind(
+                    f"{meta.remote_hostname}:{meta.remote_port}",
                     meta.remote_tp_rank,
-                    plan,
-                    remote_session,
+                    len(ready_reqs),
+                )
+            try:
+                (
                     src_ptrs,
                     dst_ptrs,
                     lengths,
-                    ready_at,
+                    err_reqs,
+                    err_msg,
+                ) = await self._build_transfer_params(
+                    ready_reqs,
+                    meta,
+                    local_regions,
+                    remote_regions,
+                    observe=batch is not None,
                 )
+                plan = self._sender_plan
+                # Taken before anything awaits: never read another batch's build.
+                spans, self._sender_spans = getattr(self, "_sender_spans", None), None
+                if batch is not None and spans is not None:
+                    shares = p.member_shares(spans, lengths)
+                err_req_set = set(err_reqs)
+                rejected = set(err_reqs) if batch is not None else ()
+                ok_ready_reqs = [
+                    (d_req_id, send_meta)
+                    for d_req_id, send_meta in ready_reqs
+                    if d_req_id not in err_req_set
+                ]
 
-                if ret_value != 0:
-                    transfer_err_msg = f"Mooncake transfer engine returned {ret_value}"
-                    err_msg = (
-                        transfer_err_msg
-                        if err_msg is None
-                        else f"{err_msg}; {transfer_err_msg}"
+                if not src_ptrs and ok_ready_reqs:
+                    # A replica of a replicated producer: answered, nothing written.
+                    self.xfer_stats.record_zero_payload(
+                        meta.remote_tp_rank, sorted(d for d, _ in ok_ready_reqs), plan
                     )
-                    err_reqs = list(err_reqs)
-                    for d_req_id, _ in ok_ready_reqs:
-                        err_reqs.append(d_req_id)
-                        err_req_set.add(d_req_id)
-                    ok_ready_reqs = []
+                    if batch is not None:
+                        p.batch_no_data(batch)
+                elif not src_ptrs and batch is not None:
+                    p.batch_rejected(batch)
+                if src_ptrs:
+                    remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                    # The write can start once its last request is ready.
+                    ready_at = max(
+                        (
+                            send_meta.ready_time
+                            for _, send_meta in ok_ready_reqs
+                            if send_meta.ready_time is not None
+                        ),
+                        default=None,
+                    )
+                    ret_value = await self.sender_loop.run_in_executor(
+                        self._sender_executor,
+                        self._send_blocks_to
+                        if batch is None
+                        else functools.partial(self._send_blocks_profiled, p, batch),
+                        meta.remote_tp_rank,
+                        plan,
+                        remote_session,
+                        src_ptrs,
+                        dst_ptrs,
+                        lengths,
+                        ready_at,
+                    )
 
-            for d_req_id, send_meta in ready_reqs:
-                send_meta.sending -= 1
+                    if ret_value != 0:
+                        transfer_err_msg = (
+                            f"Mooncake transfer engine returned {ret_value}"
+                        )
+                        err_msg = (
+                            transfer_err_msg
+                            if err_msg is None
+                            else f"{err_msg}; {transfer_err_msg}"
+                        )
+                        err_reqs = list(err_reqs)
+                        for d_req_id, _ in ok_ready_reqs:
+                            err_reqs.append(d_req_id)
+                            err_req_set.add(d_req_id)
+                        ok_ready_reqs = []
 
-                if d_req_id in err_req_set:
-                    continue
+                for d_req_id, send_meta in ready_reqs:
+                    send_meta.sending -= 1
 
-                send_meta.sent += 1
-                if (
-                    send_meta.sent == send_meta.need_send
-                    and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
-                ):
-                    self.finished_sending_reqs.add(send_meta.p_req_id)
+                    if batch is not None:
+                        p.batch_member(
+                            batch,
+                            d_req_id,
+                            send_meta.transfer_id,
+                            d_req_id not in err_req_set,
+                            None if shares is None else shares.get(d_req_id),
+                        )
+                        if d_req_id in err_req_set:
+                            p.member_failed(
+                                d_req_id, send_meta.transfer_id, d_req_id in rejected
+                            )
 
-            response = MooncakeXferResponse(
-                status=response_status,
-                ok_reqs=[d_req_id for d_req_id, _ in ok_ready_reqs] or None,
-                err_reqs=err_reqs or None,
-                err_msg=err_msg,
-                layout_id=meta.layout_id,
-            )
-            await sock.send_multipart((identity, self._encoder.encode(response)))
+                    if d_req_id in err_req_set:
+                        continue
+
+                    send_meta.sent += 1
+                    if (
+                        send_meta.sent == send_meta.need_send
+                        and self.reqs_need_send.pop(send_meta.transfer_id, None)
+                        is not None
+                    ):
+                        self.finished_sending_reqs.add(send_meta.p_req_id)
+                        if p is not None:
+                            p.senders_done(send_meta.p_req_id)
+
+                response = MooncakeXferResponse(
+                    status=response_status,
+                    ok_reqs=[d_req_id for d_req_id, _ in ok_ready_reqs] or None,
+                    err_reqs=err_reqs or None,
+                    err_msg=err_msg,
+                    layout_id=meta.layout_id,
+                )
+                await sock.send_multipart((identity, self._encoder.encode(response)))
+            except BaseException as exc:
+                if batch is not None:
+                    p.batch_exception(
+                        batch,
+                        isinstance(exc, asyncio.CancelledError),
+                        [
+                            (
+                                d_req,
+                                sent.transfer_id,
+                                None if shares is None else shares.get(d_req),
+                            )
+                            for d_req, sent in ready_reqs
+                        ],
+                    )
+                raise
+            finally:
+                if batch is not None:
+                    p.batch_retire(batch)
 
     def resolve_need_send(
         self,
@@ -2135,10 +2318,17 @@ class MooncakeConnectorWorker:
         agent_meta: MooncakeXferMetadata,
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
+        observe: bool | None = None,
     ) -> tuple[list[int], list[int], list[int], list[ReqId], str | None]:
         src_ptrs = []
         dst_ptrs = []
         lengths = []
+        # Reset per build: a build that raises never leaves an earlier batch's spans.
+        self._sender_spans = None
+        # Where each request's descriptors start in the flat lists (observed only).
+        if observe is None:
+            observe = self._kvp is not None
+        starts: list[tuple[ReqId, int]] | None = [] if observe else None
         # Each region's plan (sends, source and destination offsets, length).
         plans: set[tuple[bool, int, int, int]] = set()
         err_reqs: list[ReqId] = []
@@ -2146,6 +2336,8 @@ class MooncakeConnectorWorker:
         remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
 
         for d_req_id, send_meta in ready_reqs:
+            if starts is not None:
+                starts.append((d_req_id, len(lengths)))
             _, remote_block_ids_per_group = agent_meta.req_blocks[d_req_id]
 
             if not remote_block_ids_per_group or all(
@@ -2342,6 +2534,12 @@ class MooncakeConnectorWorker:
         # Read by the caller right after this returns (one event loop: no
         # other response's coroutine runs in between).
         self._sender_plan = [list(p) for p in sorted(plans)]
+        if starts is not None:
+            # (decode request, first, end): a partition of the flat lists.
+            ends = [first for _, first in starts[1:]] + [len(lengths)]
+            self._sender_spans = [
+                (d_req_id, first, end) for (d_req_id, first), end in zip(starts, ends)
+            ]
         return src_ptrs, dst_ptrs, lengths, err_reqs, err_msg
 
     def _bind_sender_thread_device(self) -> None:
@@ -2349,6 +2547,18 @@ class MooncakeConnectorWorker:
         correct CUDA device.  CUDA device selection is thread-local, so
         without this, NVLink transfers fail for TP ranks > 0."""
         current_platform.set_device(self.device_id)
+
+    def _send_blocks_profiled(
+        self, profiler, batch, peer: int, plan: list, *args
+    ) -> int:
+        """`_send_blocks_to` for a batch the profiler observes: the executor thread
+        picked it up (PREPARED), and the write inside records its own interval."""
+        self._send_batch.value = (profiler, batch)
+        try:
+            profiler.batch_prepared(batch)
+            return self._send_blocks_to(peer, plan, *args)
+        finally:
+            self._send_batch.value = None
 
     def _send_blocks_to(self, peer: int, plan: list, *args) -> int:
         """`_send_blocks` on this executor thread, its consumer TP rank and
@@ -2377,35 +2587,46 @@ class MooncakeConnectorWorker:
             None,
             None,
         )
+        total = sum(lengths)
+        count = len(src_ptrs)
+        batch = getattr(self._send_batch, "value", None)
+        if batch is not None:
+            batch[0].write_begin(batch[1], total, count)
         started = time.monotonic()
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
         )
         duration = time.perf_counter() - start_time
+        if batch is not None:
+            batch[0].write_returned(batch[1])
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
-                total_bytes=sum(lengths),
-                num_descs=len(src_ptrs),
+                total_bytes=total,
+                num_descs=count,
                 wait_s=None if ready_at is None else max(0.0, started - ready_at),
                 end=time.monotonic(),
                 peer=peer,
                 plan=plan,
             )
             logger.debug("Sending to %s done, took %s", remote_session, duration)
+            if batch is not None:
+                batch[0].write_complete(batch[1], total, count, round(duration * 1e9))
         else:
             self.xfer_stats.record_failed_transfer(
-                total_bytes=sum(lengths), num_descs=len(src_ptrs), start=started, peer=peer
+                total_bytes=total, num_descs=count, start=started, peer=peer
             )
             logger.warning(
                 "Sending to %s failed (ret=%s) after %s (%d descriptors, %d bytes)",
                 remote_session,
                 ret_value,
                 duration,
-                len(src_ptrs),
-                sum(lengths),
+                count,
+                total,
             )
+            if batch is not None:
+                batch[0].write_failed(batch[1], ret_value)
         return ret_value
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -2703,6 +2924,8 @@ class MooncakeConnectorWorker:
                         send_meta.p_req_id,
                     )
                 self.xfer_stats.record_kv_expired_req()
+                if (p := self._kvp) is not None:
+                    p.lease_expired(send_meta.p_req_id)
                 finished_sending_reqs.add(send_meta.p_req_id)
                 expired_transfer_id.append(transfer_id)
 
@@ -2880,6 +3103,8 @@ class MooncakeConnectorWorker:
             pull_meta.failed = True
             failed.append(req_id)
             self.xfer_stats.record_failed_recv()
+            if (p := self._kvp) is not None:
+                p.recv_failed(pull_meta.d_req_id, pull_meta.transfer_id)
 
             invalid = {b for group in pull_meta.local_block_ids for b in group}
             if not invalid:
@@ -2906,6 +3131,8 @@ class MooncakeConnectorWorker:
             pull_meta.pull_tasks_count -= 1
         if pull_meta.pull_tasks_count == 0 and any(pull_meta.local_block_ids):
             self.finished_recving_reqs.add(pull_meta.d_req_id)
+            if not pull_meta.failed and (p := self._kvp) is not None:
+                p.recv_complete(pull_meta.d_req_id, pull_meta.transfer_id)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Drain the blocks whose remote KV load failed since the last call."""
@@ -3111,7 +3338,11 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
     ):
         remote_bootstrap_addr = next(iter(pull_metas.values())).remote_bootstrap_addr
+        if (p := self._kvp) is not None:
+            p.bootstrap_begin(remote_engine_id)
         await self._query_bootstrap(remote_bootstrap_addr)
+        if (p := self._kvp) is not None:
+            p.bootstrap_end(remote_engine_id, remote_engine_id in self._remote_agents)
 
         if remote_engine_id not in self._remote_agents:
             self._handle_failed_recv(
@@ -3147,6 +3378,8 @@ class MooncakeConnectorWorker:
                 )
                 send_meta.ready_time = time.monotonic()
                 send_meta.ready.set()
+                if (p := self._kvp) is not None:
+                    p.identity(p_req_id, transfer_id)
             else:
                 # From update_state_after_alloc(),
                 # but not reach request_finished() yet

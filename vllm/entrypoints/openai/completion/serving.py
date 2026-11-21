@@ -189,7 +189,19 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
         engine_inputs = result
 
-        request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
+        base_id = self._base_request_id(raw_request, request.request_id)
+        request_id = f"cmpl-{base_id}"
+        if (
+            kvp := getattr(self.engine_client, "kv_frontend_profiler", None)
+        ) is not None:
+            kvp.api_request(
+                base_id,
+                None
+                if raw_request is None
+                else raw_request.headers.get("X-Request-Id"),
+                request_id,
+                "request_id" in request.model_fields_set,
+            )
         created_time = int(time.time())
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
@@ -226,6 +238,10 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 )
 
             request_id_item = f"{request_id}-{i}"
+            if (
+                kvp := getattr(self.engine_client, "kv_frontend_profiler", None)
+            ) is not None:
+                kvp.parent_item(request_id, request_id_item)
 
             self._log_inputs(
                 request_id_item,

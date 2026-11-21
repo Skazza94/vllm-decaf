@@ -1,0 +1,47 @@
+{
+  "mode": "tcp_tracepoints",
+  "hooks": [
+    "tcp_retransmit_skb",
+    "tcp_send_reset",
+    "tcp_receive_reset",
+    "inet_sock_set_state"
+  ],
+  "excluded_hooks": [
+    "tcp_probe"
+  ],
+  "maps": {
+    "events": {
+      "type": "RINGBUF",
+      "max_entries": 1048576
+    },
+    "control": {
+      "type": "ARRAY",
+      "max_entries": 1,
+      "key_bytes": 4,
+      "value_bytes": 256
+    },
+    "loss_counts": {
+      "type": "ARRAY",
+      "max_entries": 1,
+      "key_bytes": 4,
+      "value_bytes": 256
+    }
+  },
+  "ring_and_array_value_capacity_bytes": 1049088,
+  "capacity_is_physical_charge": false,
+  "memory_audit_gate": false,
+  "local_ports_max": 32,
+  "peer_ports_max": 32,
+  "event_binary_bytes_max": 256,
+  "output_json_bytes_max": 2048,
+  "output_queue_max_records": 4096,
+  "programs": 4,
+  "links": 4,
+  "instruction_limit_per_program": 16384,
+  "instruction_limit_total": 65536,
+  "stack_target_bytes": 256,
+  "helper_fd_limit": 64,
+  "loss_sample_ms": 1000,
+  "runtime_environment_pins": false,
+  "artifact_self_hashes": true
+}

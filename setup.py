@@ -1557,6 +1557,8 @@ if _is_cuda() or _is_hip():
 if not _is_xpu():
     ext_modules.append(CMakeExtension(name="vllm.spinloop"))
     ext_modules.append(CMakeExtension(name="vllm.fs_io_C"))
+    if sys.platform.startswith("linux") and not is_freethreaded():
+        ext_modules.append(CMakeExtension(name="vllm._kv_profiler"))
 
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))

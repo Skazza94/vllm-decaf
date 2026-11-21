@@ -182,6 +182,10 @@ class StreamingUpdate:
 
 
 class RequestState:
+    # Set once the frontend KV profiler has recorded this request's first non-empty
+    # output (see ``OutputProcessor.kv_profiler``).
+    first_token_seen = False
+
     def __init__(
         self,
         request_id: str,
@@ -554,6 +558,10 @@ class RequestState:
 class OutputProcessor:
     """Process EngineCoreOutputs into RequestOutputs."""
 
+    # The frontend KV profiler (``vllm.kv_profiling``), set by the engine that owns
+    # this processor when one is attached; None records nothing.
+    kv_profiler = None
+
     def __init__(
         self,
         tokenizer: TokenizerLike | None,
@@ -635,6 +643,8 @@ class OutputProcessor:
         for request_id in internal_req_ids:
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
+                if (kvp := self.kv_profiler) is not None:
+                    kvp.output_aborted(req_state)
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
@@ -768,6 +778,8 @@ class OutputProcessor:
             if error is not None and req_state.queue is not None:
                 # Rejected on arrival, e.g. by a paused engine; nothing was run.
                 req_state.queue.put(error.to_exception())
+                if (kvp := self.kv_profiler) is not None:
+                    kvp.output_failed(req_state)
                 self._finish_request(req_state)
                 if req_state.streaming_input:
                     # Input chunks sent since may re-create the session.
@@ -801,6 +813,14 @@ class OutputProcessor:
                 if req_state.remote_prefill_cached_tokens is not None:
                     req_state.num_cached_tokens = req_state.remote_prefill_cached_tokens
                 req_state.is_prefilling = False
+
+            if (
+                (kvp := self.kv_profiler) is not None
+                and new_token_ids
+                and not req_state.first_token_seen
+            ):
+                req_state.first_token_seen = True
+                kvp.first_token_output(req_state, new_token_ids)
 
             if engine_core_output.spec_decode_metrics is not None:
                 req_state.spec_decode_metrics = engine_core_output.spec_decode_metrics
@@ -877,6 +897,8 @@ class OutputProcessor:
                     else:
                         req_state.input_chunk_queue = None
                 else:
+                    if (kvp := self.kv_profiler) is not None:
+                        kvp.output_finished(req_state, finish_reason)
                     self._finish_request(req_state)
                     if req_state.streaming_input or not engine_core_output.finished:
                         # EngineCore may still have the request: a stop string

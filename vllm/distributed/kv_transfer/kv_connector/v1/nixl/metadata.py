@@ -291,6 +291,11 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         # process/boot-local): workers must rebase the remaining TTL onto
         # their own clock via this reference. 0.0 = unset (legacy metadata).
         self.scheduler_clock: float = 0.0
+        # The profiler's step marker (0: no profiler on the scheduler): the
+        # scheduler's step ordinal, its generation and the step's flags.
+        self.profiler_step: int = 0
+        self.profiler_scope: int = 0
+        self.profiler_flags: int = 0
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         # Heartbeat data grouped by remote engine, sent by D worker to P.

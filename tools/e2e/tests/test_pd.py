@@ -38,6 +38,444 @@ RUN = pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", "dat
              workload=pd.Workload(num_prompts=2))
 
 
+class ProfilerConfig(unittest.TestCase):
+    """The KV network profiler's run options: both servers get one run ID and
+    the connector's ``network_profiler`` namespace; off, nothing changes."""
+
+    NIXL = pd.Server(connector="nixl", timing="linear")
+
+    def run_with(self, **changes):
+        return pd.Run(**{**{f: getattr(RUN, f) for f in RUN.__dataclass_fields__},
+                         "server": self.NIXL, **changes})
+
+    def extra(self, run, role, profile_id="id-1"):
+        command = pd.server_command(run, role, ["10.100.0.1"], profile_id=profile_id)
+        transfer = json.loads(command[command.index("--kv-transfer-config") + 1])
+        return transfer["kv_connector_extra_config"]
+
+    def test_both_servers_share_one_profile_id_and_the_options(self):
+        run = self.run_with(profiler=pd.Profiler(clock_port_offset=2000, flush="background"))
+        expected = {"level": "l1", "run_id": "id-1", "output_dir": pd.PROFILES, "transport": "tcp",
+                    "clock_port_offset": 2000, "flush": "background", "shutdown_timeout_s": 10}
+        for role in ("prefill", "decode"):
+            self.assertEqual(self.extra(run, role)["network_profiler"], expected)
+
+    def test_a_profiled_server_gets_the_shutdown_grace_its_recorders_close_in(self):
+        """vLLM kills an engine process at once unless a worker-shutdown grace is set: the profiled
+        servers get one, above two recorders' close deadlines and under the orderly stop's wait."""
+        grace = "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=30"
+        for role in ("prefill", "decode"):
+            command = pd.server_command(self.run_with(profiler=pd.Profiler()), role, ["10.100.0.1"], profile_id="id-1")
+            self.assertIn(grace, command)
+            self.assertNotIn(grace, pd.server_command(self.run_with(), role, ["10.100.0.1"]))
+        self.assertGreater(pd.PROFILER_SHUTDOWN_GRACE_S, 2 * self.extra(
+            self.run_with(profiler=pd.Profiler()), "prefill")["network_profiler"]["shutdown_timeout_s"])
+        import inspect
+        self.assertLess(pd.PROFILER_SHUTDOWN_GRACE_S, inspect.signature(pd.stop_orderly).parameters["timeout"].default)
+        override = self.run_with(profiler=pd.Profiler(), server=pd.Server(
+            connector="nixl", timing="linear", env={"VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": 5}))
+        command = pd.server_command(override, "prefill", ["10.100.0.1"], profile_id="id-1")
+        self.assertEqual([c for c in command if c.startswith("VLLM_WORKER_SHUTDOWN")],
+                         ["VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=5"])
+
+    def test_l3_passes_only_the_named_endpoints_probe_settings(self):
+        run = self.run_with(profiler=pd.Profiler(
+            level="l3", probes={"p": {"interfaces": ["lo"]}},
+            observer_cpus={"p": [13]}))
+        command = pd.server_command(run, "prefill", ["10.100.0.1"],
+                                    profile_id="id-1", node="p")
+        extra = json.loads(command[command.index("--kv-transfer-config") + 1])
+        settings = extra["kv_connector_extra_config"]["network_profiler"]
+        self.assertEqual(settings["level"], "l3")
+        self.assertEqual(settings["probes"], {"interfaces": ["lo"]})
+        with self.assertRaisesRegex(ValueError, "endpoint node"):
+            pd.server_command(run, "prefill", ["10.100.0.1"], profile_id="id-1")
+
+    def test_a_profiled_ucx_server_logs_ucx_protocol_selection(self):
+        """UCX's protocol tables are on exactly when a UCX server is profiled; a run's
+        own UCX_PROTO_INFO wins."""
+        ucx = pd.Server(connector="nixl", timing="linear", nixl_backend="ucx")
+        profiled = self.run_with(server=ucx, profiler=pd.Profiler())
+        for role in ("prefill", "decode"):
+            command = pd.server_command(profiled, role, ["10.100.0.1"], profile_id="id-1")
+            self.assertIn("UCX_PROTO_INFO=y", command)
+            self.assertIn("UCX_LOG_FILE=stderr", command)
+            self.assertFalse([c for c in pd.server_command(self.run_with(server=ucx), role, ["10.100.0.1"])
+                              if c.startswith("UCX_PROTO_INFO")])
+            self.assertFalse([c for c in pd.server_command(self.run_with(profiler=pd.Profiler()), role,
+                                                           ["10.100.0.1"], profile_id="id-1")
+                              if c.startswith("UCX_PROTO_INFO")])
+        override = self.run_with(profiler=pd.Profiler(), server=pd.Server(
+            connector="nixl", timing="linear", nixl_backend="ucx", env={"UCX_PROTO_INFO": "used"}))
+        self.assertEqual([c for c in pd.server_command(override, "prefill", ["10.100.0.1"], profile_id="id-1")
+                          if c.startswith("UCX_PROTO_INFO")], ["UCX_PROTO_INFO=used"])
+
+    def test_ucx_protocol_tables_are_parsed_per_node_and_joined_to_recorders(self):
+        """After a profiled UCX run, each server log's tables land in ucx-protocols/<role>/<node>.json,
+        with each process joined by PID to its recorder; a log without tables is unavailable."""
+        import tempfile
+        table = "\n".join("[1700000000.000001] [node:42  :0]   " + line for line in (
+            "+--------+-------------+----------+", "| vllm inter-node cfg#1           |",
+            "| remote memory read by ucp_get*(multi) into host memory from host |",
+            "+--------+-------------+----------+", "| Range  | Description | Config   |",
+            "+--------+-------------+----------+", "| 0..inf | zero-copy   | tcp/kv0  |",
+            "+--------+-------------+----------+"))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for role, node, text in (("prefill", "p", "INFO start\n" + table + "\n"), ("decode", "d", "INFO\n")):
+                (output / "logs" / role / node).mkdir(parents=True)
+                (output / "logs" / role / node / f"{role}.log").write_text(text)
+            recorder = output / "profiles" / "prefill" / "p" / "run" / "proc"
+            recorder.mkdir(parents=True)
+            (recorder / "events.jsonl").write_text(json.dumps(
+                {"pid": 42, "run_id": "run", "process_id": "proc", "context": {"role": "worker", "rank": 0}}) + "\n")
+            malformed = recorder.parent / "other"
+            malformed.mkdir()  # an unrelated, malformed recorder entry: skipped, never fatal
+            (malformed / "events.jsonl").write_text(json.dumps({"pid": 7, "run_id": "run", "context": 7}) + "\n")
+            def docker_cp(argv, check=False):  # the containers' final logs: prefill's has one more table
+                source, local = argv[2], Path(argv[3])
+                self.assertEqual(source.split(":", 1)[1], f"{pd.WORK}/logs/{local.name.split('.')[0]}.log")
+                if "p" in source.split(":", 1)[0]:
+                    local.write_text("INFO start\n" + table + "\n" + table.replace("cfg#1", "cfg#2") + "\n")
+                    return ""
+                # decode's copy fails, as shell.run reports it: the earlier copy is parsed
+                raise pd.shell.CommandError(argv, 1, "no such container")
+
+            with mock.patch.object(pd.shell, "run", side_effect=docker_cp):
+                pd.ucx_protocols(self.run_with(), {"p": "c-p", "d": "c-d"}, output, "run")
+            prefill = json.loads((output / "ucx-protocols" / "prefill" / "p.json").read_text())
+            endpoint, after_stop = prefill["endpoint_configurations"]
+            self.assertEqual((endpoint["locality"], endpoint["ep_config"], endpoint["recorder"]["process_id"]),
+                             ("inter-node", 1, "proc"))
+            self.assertEqual(after_stop["ep_config"], 2)  # only in the log copied after the stop
+            self.assertEqual(prefill["log"], {"path": "logs/prefill/p/prefill.final.log", "after_stop": True})
+            self.assertEqual(endpoint["operations"][0]["ranges"][0]["lanes"][0]["device"], "kv0")
+            self.assertNotIn("unavailable", prefill)
+            self.assertEqual((prefill["tables"], prefill["recorders_skipped"]), (2, 1))
+            decode = json.loads((output / "ucx-protocols" / "decode" / "d.json").read_text())
+            self.assertEqual(decode["unavailable"], "no UCX_PROTO_INFO table in the server log")
+            self.assertEqual(decode["log"], {"path": "logs/decode/d/decode.log", "after_stop": False})
+
+    def test_off_leaves_the_connector_configuration_unchanged(self):
+        run = self.run_with()
+        for role in ("prefill", "decode"):
+            self.assertNotIn("network_profiler", self.extra(run, role))
+        with self.assertRaisesRegex(ValueError, "profile ID"):
+            pd.server_command(self.run_with(profiler=pd.Profiler()), "prefill", ["10.100.0.1"])
+
+    def test_a_run_file_can_name_the_profiler_and_rejects_the_rest(self):
+        raw = {"name": "t", "topology": "t", "model": "x", "prefill": {"node": "p", "kv_network": "data0"},
+               "decode": {"node": "d", "kv_network": "data0"}, "client": "c", "control_network": "control",
+               "router": {"gateway": "gw"}, "server": {"connector": "nixl", "timing": "linear"}}
+        with mock.patch.object(pd.models, "resolve", return_value=Path("/m")):
+            run = pd.parse({**raw, "profiler": {"clock_port_offset": 1500}}, Path("/r.yaml"))
+            self.assertEqual(run.profiler, pd.Profiler(clock_port_offset=1500))
+            self.assertIsNone(pd.parse(raw, Path("/r.yaml")).profiler)
+            for bad, message in (({"profiler": {"transport": "rdma"}}, "profiler.transport"),
+                                 ({"profiler": {"clock_port_offset": 0}}, "clock_port_offset"),
+                                 ({"profiler": {"nope": 1}}, "unexpected keyword"),
+                                 ({"profiler": {"level": "l3"}, "server": {"connector": "mooncake", "timing": "linear"}},
+                                  "profiler is L1 with data_parallel_size 1"),
+                                 ({"profiler": {}, "server": {"connector": "mooncake", "timing": "linear"},
+                                   "decode": {"node": "d", "kv_network": "data0", "data_parallel_size": 2}},
+                                  "profiler is L1 with data_parallel_size 1")):
+                with self.assertRaisesRegex(ValueError, message):
+                    pd.parse({**raw, **bad}, Path("/r.yaml"))
+            mooncake = pd.parse({**raw, "profiler": {}, "server": {"connector": "mooncake", "timing": "linear"}},
+                                Path("/r.yaml"))
+            self.assertEqual(mooncake.profiler, pd.Profiler())
+
+    MOONCAKE = pd.Server(connector="mooncake", timing="linear")
+    INSTANCES = {"prefill": {"p0": {"control": "10.250.0.2"}, "p1": {"control": "10.250.0.3"}},
+                 "decode": {"d0": {"control": "10.250.0.4"}}}
+
+    def test_profiled_mooncake_servers_pin_engine_ids_and_clock_endpoints_on_the_control_network(self):
+        run = self.run_with(server=self.MOONCAKE, profiler=pd.Profiler(clock_port_offset=1500))
+        identities = pd.profile_identities(run, self.INSTANCES)
+        self.assertEqual(identities["prefill"]["p1"], {"engine_id": "prefill-p1",
+                                                       "clock": f"10.250.0.3:{pd.BOOTSTRAP_PORT + 1500}"})
+
+        def transfer(role, node):
+            command = pd.server_command(run, role, ["10.100.0.1"], profile_id="id-1", node=node, identities=identities)
+            return json.loads(command[command.index("--kv-transfer-config") + 1])
+
+        producer = transfer("prefill", "p1")
+        profile = producer["kv_connector_extra_config"]["network_profiler"]
+        self.assertEqual((producer["engine_id"], profile["clock_bind"]), ("prefill-p1", identities["prefill"]["p1"]["clock"]))
+        self.assertNotIn("clock_peers", profile)
+        self.assertNotIn("clock_port_offset", profile)
+        consumer = transfer("decode", "d0")
+        profile = consumer["kv_connector_extra_config"]["network_profiler"]
+        self.assertEqual(consumer["engine_id"], "decode-d0")
+        self.assertEqual(profile["clock_peers"], {"prefill-p0": f"10.250.0.2:{pd.BOOTSTRAP_PORT + 1500}",
+                                                  "prefill-p1": f"10.250.0.3:{pd.BOOTSTRAP_PORT + 1500}"})
+        self.assertNotIn("clock_bind", profile)
+        for missing in ({"node": None}, {"identities": None}):
+            with self.assertRaisesRegex(ValueError, "needs its node and the instances' identities"):
+                pd.server_command(run, "prefill", ["10.100.0.1"], profile_id="id-1",
+                                  **{"node": "p0", "identities": identities, **missing})
+        # Off, or under NIXL, no engine ID is pinned and nothing of the clock is added.
+        plain = pd.server_command(self.run_with(server=self.MOONCAKE), "prefill", ["10.100.0.1"])
+        self.assertNotIn("engine_id", json.loads(plain[plain.index("--kv-transfer-config") + 1]))
+        nixl = pd.server_command(self.run_with(profiler=pd.Profiler()), "prefill", ["10.100.0.1"], profile_id="id-1")
+        self.assertNotIn("engine_id", json.loads(nixl[nixl.index("--kv-transfer-config") + 1]))
+
+    def test_a_saved_profiled_run_loads_again(self):
+        run = self.run_with(profiler=pd.Profiler(), model=Path("/m"))
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "run.json").write_text(json.dumps(asdict(run), default=str))
+            self.assertEqual(pd.saved_run(directory).profiler, pd.Profiler())
+
+    def test_the_chat_endpoint_is_a_workload_option(self):
+        chat = self.run_with(workload=pd.Workload(endpoint="chat", num_prompts=2))
+        command = pd.bench_command(chat, "http://gw")
+        self.assertEqual(command[command.index("--backend") + 1:command.index("--backend") + 4:2],
+                         ["openai-chat", "/v1/chat/completions"])
+        plain = pd.bench_command(RUN, "http://gw")
+        self.assertEqual(plain[plain.index("--endpoint") + 1], "/v1/completions")
+
+    def test_measure_adds_the_percentile_flags_only_when_asked(self):
+        measured = self.run_with(workload=pd.Workload(measure=True, num_prompts=2))
+        command = pd.bench_command(measured, "http://gw")
+        self.assertEqual(command[command.index("--metric-percentiles") + 1], "50,95,99")
+        self.assertNotIn("--metric-percentiles", pd.bench_command(RUN, "http://gw"))
+
+    def test_the_workload_window_is_the_servers_own(self):
+        busy = line(step={"requests": [{"req_id": "a"}]}, t_start=100.0, t_deadline=100.4)
+        later = line(step={"requests": [{"req_id": "b"}]}, t_start=140.0, t_deadline=141.5)
+        idle = line(step={"requests": []}, t_start=1.0, t_deadline=2.0)
+        layout = line(kv_layout={}, t=5.0)
+        self.assertEqual(pd.workload_window([busy + idle + layout, later]), (100.0, 141.5))
+        self.assertIsNone(pd.workload_window([idle + layout]))
+
+
+def sample(t, *processes):
+    return {"t": t, "processes": [{"pid": p[0], "start": p[1], "kind": p[2], "cpu_s": p[3], "rss_kb": 10,
+                                   "hwm_kb": 20} for p in processes]}
+
+
+class CpuAccounting(unittest.TestCase):
+    """The workload's CPU from samples: by identity, interpolated at the window's
+    edges, setup and shutdown apart."""
+
+    def series(self, setup=100.0, work=10.0, helper_per_s=0.1):
+        """A server (1 CPU-s per second while busy) and a writer, sampled every second
+        through ``setup`` idle seconds, a ``work`` window and 3 seconds after."""
+        samples = []
+        for second in range(int(setup + work + 4)):
+            busy = min(max(second - setup, 0), work)
+            samples.append(sample(float(second), (1, 1, "serving", busy * 1.0),
+                                  (2, 1, "writer", 0.05 * second * 0 + busy * helper_per_s + 0.5),
+                                  (3, 1, "clock", 0.0)))
+        return samples, (setup, setup + work)
+
+    def test_a_long_setup_does_not_change_the_workloads_helper_cores(self):
+        for setup in (0.0, 100.0):
+            samples, window = self.series(setup=setup)
+            report = pd.cpu_report({"d": samples}, window, {"d": [1000.0]}, 1.0)["d"]
+            self.assertAlmostEqual(report["serving_s"], 10.0)
+            self.assertAlmostEqual(report["helpers_s"], 1.0)
+            self.assertAlmostEqual(report["helpers_s"] / report["workload_s"], 0.1)
+            self.assertTrue(report["covered"] and not report["lost"])
+            self.assertAlmostEqual(report["max_gap_s"], 1.0)
+
+    def test_setup_is_its_own_number_and_the_edges_are_interpolated(self):
+        samples, _ = self.series(setup=20.0)
+        report = pd.cpu_report({"d": samples}, (20.5, 28.25), {"d": [1000.0]}, 1.0)["d"]
+        self.assertAlmostEqual(report["serving_s"], 7.75)
+        self.assertAlmostEqual(report["setup_serving_s"], 0.5)  # half of the second that straddles the edge
+        self.assertAlmostEqual(report["setup_helpers_s"], 0.05)
+        self.assertAlmostEqual(report["setup_serving_s"] + report["serving_s"], 8.25)
+
+    def test_the_writers_end_flush_is_its_lifetime_cpu_beyond_the_workload_and_never_double_counted(self):
+        samples, window = self.series()
+        report = pd.cpu_report({"d": samples}, window, {"d": [100_000.0 + 0.5 + 1.0]}, 1.0)["d"]
+        self.assertAlmostEqual(report["writers_at_end_s"], 0.5 + 1.0)
+        self.assertAlmostEqual(report["flush_s"], 100_000.0)
+        self.assertAlmostEqual(report["writer_lifetime_cpu_s"], 100_001.5)
+        self.assertEqual((report["writers_seen"], report["writer_manifests_with_cpu"]), (1, 1))
+
+    def test_a_profiler_off_node_has_an_explicit_zero_writer_cost(self):
+        no_writer = [sample(float(i), (1, 1, "serving", float(i))) for i in range(10)]
+        report = pd.cpu_report({"d": no_writer}, (2.0, 8.0), {"d": []}, 1.0)["d"]
+        self.assertEqual((report["writers_seen"], report["writer_lifetime_cpu_s"], report["flush_s"]), (0, 0, 0))
+        self.assertEqual(pd.cpu_report({"d": no_writer}, (2.0, 8.0), {}, 1.0)["d"]["flush_s"], 0)
+
+    def test_missing_or_inconsistent_writer_totals_are_unmeasured_never_zero(self):
+        samples, window = self.series()
+        for values in ([None], [], [float("nan")], [-1.0], [True], [0.5, 9.0]):
+            report = pd.cpu_report({"d": samples}, window, {"d": values}, 1.0)["d"]
+            self.assertIsNone(report["flush_s"], values)
+            self.assertIsNone(report["writer_lifetime_cpu_s"], values)
+        # A lifetime below what the samples saw the writers use is inconsistent beyond the tolerance.
+        report = pd.cpu_report({"d": samples}, window, {"d": [0.5]}, 1.0)["d"]
+        self.assertEqual((report["flush_s"], report["writer_lifetime_cpu_s"]), (None, None))
+        # ...and within a couple of ticks of it is the counters' resolution: no flush, still valid.
+        report = pd.cpu_report({"d": samples}, window, {"d": [1.49]}, 1.0)["d"]
+        self.assertEqual((report["flush_s"], report["writer_lifetime_cpu_s"]), (0.0, 1.49))
+
+    def test_a_process_that_vanished_or_appeared_is_listed_not_guessed(self):
+        samples = [sample(0.0, (1, 1, "serving", 1.0), (2, 1, "serving", 1.0)),
+                   sample(1.0, (1, 1, "serving", 2.0), (2, 1, "serving", 3.0)),
+                   sample(2.0, (1, 1, "serving", 3.0), (9, 5, "serving", 0.5)),
+                   sample(3.0, (1, 1, "serving", 4.0), (9, 5, "serving", 1.5))]
+        report = pd.cpu_over(samples, 0.5, 2.5)
+        self.assertEqual((report["lost"], report["new"]), (["2:1"], ["9:5"]))
+        self.assertAlmostEqual(report["serving_s"], (3.5 - 1.5) + (3.0 - 2.0) + 1.0)
+        self.assertTrue(report["covered"])
+        self.assertFalse(pd.cpu_over(samples, 0.5, 9.0)["covered"])
+
+
+class ProcessTree(unittest.TestCase):
+    """The probes and the orderly stop on real processes: a stub ``vllm serve``
+    owning a stub ``python -m vllm.kv_profiling.sink`` helper that ignores
+    SIGTERM and finishes its flush only once its owner has closed."""
+
+    OWNER = """
+import os, signal, subprocess, sys, time
+here = os.path.dirname(os.path.abspath(__file__))
+helper = subprocess.Popen([sys.executable, "-m", "vllm.kv_profiling.sink", here], cwd=here,
+                          env={**os.environ, "PYTHONPATH": os.path.join(here, "..", "lib")})
+stubborn = len(sys.argv) > 2 and sys.argv[2] == "stubborn"
+def term(*_):
+    if stubborn:
+        return
+    open(os.path.join(here, "closing"), "w").close()
+    helper.wait()
+    sys.exit(0)
+signal.signal(signal.SIGTERM, term)
+open(os.path.join(here, "up"), "w").close()
+while True:
+    time.sleep(0.05)
+"""
+    HELPER = """
+import os, signal, sys, time
+here = sys.argv[1]
+signal.signal(signal.SIGTERM, lambda *_: open(os.path.join(here, "sigterm"), "w").close())
+open(os.path.join(here, "helper.pid"), "w").write(str(os.getpid()))
+open(os.path.join(here, "helper-up"), "w").close()
+while not os.path.exists(os.path.join(here, "closing")):
+    time.sleep(0.05)
+time.sleep(0.3)
+open(os.path.join(here, "flushed"), "w").close()
+"""
+
+    def start(self, *extra):
+        import subprocess
+        import time
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(root)]))
+        (root / "bin").mkdir()
+        # The image's Python lives under /opt/venv/; the stubs run under a Python
+        # of their own, so the stop script's notion of a service is only them.
+        (root / "venv" / "bin").mkdir(parents=True)
+        python = root / "venv" / "bin" / "python"
+        python.symlink_to(sys.executable)
+        self.prefix = f"{root}/venv/bin/".encode()
+        package = root / "lib" / "vllm" / "kv_profiling"
+        package.mkdir(parents=True)
+        (package.parent / "__init__.py").write_text("")
+        (package / "__init__.py").write_text("")
+        (package / "sink.py").write_text(self.HELPER)
+        (root / "bin" / "vllm").write_text(self.OWNER.replace("sys.executable", repr(str(python))))
+        owner = subprocess.Popen([str(python), str(root / "bin" / "vllm"), "serve", *extra])
+        def reap():
+            owner.kill()
+            owner.wait()
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int((root / "bin" / "helper.pid").read_text()), 9)
+
+        self.addCleanup(reap)
+        for _ in range(100):
+            if (root / "bin" / "up").exists() and (root / "bin" / "helper-up").exists():
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the stub servers did not start")
+        return root / "bin", owner
+
+    def run_script(self, template, *args):
+        import subprocess
+
+        script = template.replace('b"/opt/venv/"', repr(self.prefix))
+        done = subprocess.run([sys.executable, "-c", script, *args], capture_output=True, text=True, check=True)
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_the_sampler_sees_serving_and_the_writer_with_a_monotonic_stamp_and_never_itself(self):
+        import subprocess
+        import time
+
+        bin_dir, owner = self.start()
+        out = bin_dir / "samples.jsonl"
+        stop = bin_dir / "samples.jsonl.stop"
+        sampler = subprocess.Popen([sys.executable, "-c", pd.CPU_SAMPLER, "0.1", str(out)])
+        self.addCleanup(lambda: (sampler.kill(), sampler.wait()))
+        time.sleep(0.5)
+        stop.touch()
+        sampler.wait(timeout=10)
+        samples = [json.loads(line) for line in out.read_text().splitlines()]
+        self.assertGreaterEqual(len(samples), 3)
+        self.assertTrue(all(b["t"] > a["t"] for a, b in zip(samples, samples[1:])))
+        self.assertLessEqual(samples[-1]["t"], time.monotonic())
+        kinds = sorted(p["kind"] for p in samples[-1]["processes"])
+        self.assertEqual(kinds, ["serving", "writer"])
+        self.assertEqual({p["pid"] for p in samples[-1]["processes"] if p["kind"] == "serving"}, {owner.pid})
+
+    def test_the_orderly_stop_signals_only_the_owner_and_waits_for_the_helpers_flush(self):
+        bin_dir, owner = self.start()
+        result = self.run_script(pd.STOP_OWNERS, "30")
+        self.assertTrue(result["graceful"], result)
+        self.assertEqual(result["signalled"], [owner.pid])
+        self.assertTrue((bin_dir / "flushed").exists())
+        self.assertFalse((bin_dir / "sigterm").exists(), "the helper was sent SIGTERM")
+
+    def test_a_node_that_does_not_stop_is_reported_not_forced_here(self):
+        bin_dir, owner = self.start("stubborn")
+        result = self.run_script(pd.STOP_OWNERS, "1")
+        self.assertFalse(result["graceful"])
+        self.assertIn(owner.pid, [pid for pid, kind in result["remaining"]])
+        self.assertFalse((bin_dir / "sigterm").exists())
+
+
+class OrderlyShutdown(unittest.TestCase):
+    def test_decode_stops_before_prefill_and_only_a_stuck_node_is_forced_and_recorded(self):
+        run = pd.Run(**{**{f: getattr(RUN, f) for f in RUN.__dataclass_fields__},
+                        "server": pd.Server(connector="nixl", timing="linear"), "profiler": pd.Profiler()})
+        calls = []
+
+        def exec_in(name, command, **kwargs):
+            calls.append(("exec", name))
+            ok = name != "c-p"
+            return json.dumps({"signalled": [1], "graceful": ok, "remaining": [] if ok else [[7, "owner"]],
+                               "seconds": 1.0})
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(pd.topology, "exec_in", exec_in), \
+                mock.patch.object(pd, "stop_services", lambda name: calls.append(("force", name))):
+            steps = pd.stop_orderly(run, {"p": "c-p", "d": "c-d"}, Path(directory),
+                on_endpoint_closed=lambda node, result:
+                    calls.append(("observer", node)))
+            saved = json.loads(Path(directory, "shutdown.json").read_text())
+        self.assertEqual(calls, [("exec", "c-d"), ("observer", "d"),
+                                 ("exec", "c-p"), ("force", "c-p"), ("observer", "p")])
+        self.assertEqual([(s["node"], s["graceful"], s.get("forced", False)) for s in steps],
+                         [("d", True, False), ("p", False, True)])
+        self.assertEqual(saved, steps)
+
+
+class ProfilerCollection(unittest.TestCase):
+    def test_profiles_are_copied_after_the_servers_stop(self):
+        run = pd.Run(**{**{f: getattr(RUN, f) for f in RUN.__dataclass_fields__},
+                        "server": pd.Server(connector="nixl", timing="linear"), "profiler": pd.Profiler()})
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(pd.shell, "run") as docker:
+            pd._collect_profiles(run, {"p": "c-p", "d": "c-d"}, Path(directory), "id-1")
+            saved = json.loads(Path(directory, "profiler.json").read_text())
+        self.assertEqual(saved["run_id"], "id-1")
+        sources = sorted(call.args[0][2] for call in docker.call_args_list)
+        self.assertEqual(sources, [f"c-d:{pd.PROFILES}/.", f"c-p:{pd.PROFILES}/."])
+
+
 def line(**record) -> str:
     return json.dumps(record) + "\n"
 
@@ -3137,6 +3575,96 @@ class HeterogeneousTpTests(unittest.TestCase):
                 self.assertEqual(verdict["problems"], [])
                 self.assertEqual(verdict["hetero_tp"]["max_descriptors"], 10)
 
+    def test_nixl_descriptors_follow_the_kernel_blocks_of_a_split_layout(self) -> None:
+        """A layout that splits each logical block into kernel blocks has NIXL post a
+        descriptor for each: the carried heads' bytes in a kernel block (here half a
+        logical block's, 5 per head), which the regions' registered block length must
+        confirm. The same READs against a layout without the split, or with another
+        registered length, are rejected."""
+        sizes = (2, 4)
+
+        def split_layouts(lengths=lambda page: page // 2, blocks=2):
+            def change(record):
+                layout = record.get("kv_layout")
+                if layout:
+                    page = layout["groups"][0]["real_page_bytes"]
+                    layout["kernel_geometry"] = {"kernel_blocks_per_logical": blocks,
+                                                 "registered_region_block_lengths": [lengths(page)] * 2}
+                return record
+
+            def apply(prefill, decode, ports):
+                for logs in (prefill, decode):
+                    for rank, text in enumerate(logs):
+                        logs[rank] = "".join(json.dumps(change(json.loads(line))) + "\n"
+                                             for line in text.splitlines())
+                return prefill, decode, ports
+            return apply
+
+        def halved(prefill, decode, ports):
+            for rank in range(len(decode)):
+                prefill, decode, ports = self.rewrite("decode", rank, self.each_transfer(
+                    "load", lambda entry: [entry[0] // 2] + entry[1:]))(prefill, decode, ports)
+            return prefill, decode, ports
+
+        def chained(*changes):
+            def apply(prefill, decode, ports):
+                for change in changes:
+                    prefill, decode, ports = change(prefill, decode, ports)
+                return prefill, decode, ports
+            return apply
+
+        def geometry_problems(change):
+            found = self.verdict(*sizes, 8, True, change)["problems"]
+            return [problem for problem in found if "head(s) of" in problem or "registered block lengths" in problem]
+
+        self.assertEqual(geometry_problems(chained(split_layouts(), halved)), [])
+        unsplit = geometry_problems(halved)
+        self.assertTrue(any("not 2 head(s) of 10 bytes each" in problem for problem in unsplit), unsplit)
+        whole = geometry_problems(split_layouts())
+        self.assertTrue(any("not 2 head(s) of 5 bytes each" in problem for problem in whole), whole)
+        wrong = geometry_problems(chained(split_layouts(lambda page: page), halved))
+        self.assertTrue(any("registered block lengths [20]" in problem or "registered block lengths [10]" in problem
+                            for problem in wrong), wrong)
+
+    def test_registered_lengths_cover_every_group_of_a_split_layout(self) -> None:
+        """A layout's registered block lengths describe all its groups' regions: with sliding and full
+        groups of different row lengths (10 and 20 bytes of head slab) split into two kernel rows each,
+        the lengths are the kernel blocks of both groups together. The descriptors' bytes (doubled
+        counts, same bytes) are accepted; a missing group's length, an extra one, and whole-page
+        descriptor bytes are rejected."""
+        groups = [("SlidingWindowSpec", 8, 10), ("FullAttentionSpec", 2, 20)]
+
+        def split(lengths=lambda layout: [g["real_page_bytes"] // 2 for g in layout["groups"]
+                                          for _ in range(g["layers"])], whole=False):
+            def apply(prefill, decode, ports):
+                for logs in (prefill, decode):
+                    for rank, text in enumerate(logs):
+                        records = [json.loads(line) for line in text.splitlines()]
+                        layout = records[0]["kv_layout"]
+                        layout["kernel_geometry"] = {"kernel_blocks_per_logical": 2,
+                                                     "registered_region_block_lengths": lengths(layout)}
+                        for record in records:
+                            for entry in (record.get("kv_transfers") or {}).get("load", {}).get("each", []):
+                                if not whole:
+                                    entry[3] *= 2
+                                    entry[6][1] *= 2
+                                    entry[6][2] *= 2
+                        logs[rank] = "".join(json.dumps(record) + "\n" for record in records)
+                return prefill, decode, ports
+            return apply
+
+        def problems(change):
+            return self.reconcile(2, 4, 8, True, change, groups=groups, global_heads=2)["problems"]
+
+        self.assertEqual(problems(None), [])
+        self.assertEqual(problems(split()), [])
+        only_full = problems(split(lambda layout: [layout["groups"][1]["real_page_bytes"] // 2] * 2))
+        self.assertTrue(any("registered block lengths [10] are not its groups' kernel blocks' [10, 20]" in p for p in only_full), only_full)
+        extra = problems(split(lambda layout: [g["real_page_bytes"] // 2 for g in layout["groups"]] + [7]))
+        self.assertTrue(any("registered block lengths [7, 10, 20] are not its groups' kernel blocks'" in p for p in extra), extra)
+        whole = problems(split(whole=True))
+        self.assertTrue(any("selected descriptors, not" in p for p in whole), whole)
+
     def test_unequal_sizes_need_one_switched_network(self) -> None:
         base = (E2E / "runs" / "example.yaml").read_text()
         for prefill, decode, error in (
@@ -3640,8 +4168,30 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
         (out/"run.json").write_text(json.dumps(raw))
         with self.assertRaises(FileNotFoundError):pd.recheck(out)
 
+    def test_a_nixl_only_collector_saved_run_rechecks_without_tent_evidence(self):
+        """UCX and LIBFABRIC runs save ``transport.json``, never ``tent.json``: the saved-run entry point must not read it for a
+        collector that reads NIXL's telemetry only (the collector's own evidence is judged, and found missing here)."""
+        run,p,d,ports,moved,_=self.fixture()
+        run.server.timing="linear"
+        run.collector=pd.Collector(tent=False,nixl_telemetry=True)
+        out=Path(self.directory.name)/"saved-nixl"
+        out.mkdir()
+        (out/"run.json").write_text(json.dumps({**asdict(run),"model":str(run.model)},default=str))
+        (out/"control-ports.json").write_text(json.dumps({"nodes":["gw"],"bytes":0,"ports":{"p0":{"node":"c","rx":50,"tx":0},"p1":{"node":"p","rx":0,"tx":25},"p2":{"node":"d","rx":0,"tx":25},"p3":{"node":"gw","rx":0,"tx":0}}}))
+        for role,texts in (("prefill",p),("decode",d)):
+            for rank,text in enumerate(texts):(out/getattr(run,role).step_log(role,0,rank)).write_text(text)
+        for file,data in (("bench.json",{"completed":2,"errors":[]}),("routers.json",{"control":50,"kv":moved+500}),("router-ports.json",ports)):
+            (out/file).write_text(json.dumps(data))
+        self.assertFalse((out/"tent.json").exists())
+        verdict=pd.recheck(out)
+        self.assertTrue(any("L2 collector p: no usable capture" in problem for problem in verdict["problems"]),
+                        verdict["problems"])
+        self.assertFalse(any("tent.json" in problem for problem in verdict["problems"]))
+
     def test_tcp_live_collection_marks_tent_not_applicable(self):
         from unittest.mock import patch
+        from harness.collector import SIGNAL_COLLECTOR as collector_script
+        cleared=[]
         run,p,d,ports,moved,_=self.fixture()
         output=Path(self.directory.name)/"live"
         state={"nodes":{name:{"container":name,"interfaces":{"control":{"address":"10.250.0.1"}}}
@@ -3652,7 +4202,8 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
                 for rank,text in enumerate(texts):(output/getattr(run,role).step_log(role,0,rank)).write_text(text)
         def addresses(*_):return ["10.1.0.1"]*4
         with patch.object(topology,"load_state",return_value=state), \
-             patch.object(topology,"exec_in",return_value=""), \
+             patch.object(topology,"exec_in",side_effect=lambda name,command,**kw:
+                 (cleared.append(name) or '{"signalled":[],"remaining":[]}') if command[:2]==[pd.PYTHON,"-c"] and command[2]==collector_script else ""), \
              patch.object(pd.shell,"run",return_value=""), \
              patch.object(pd,"stop_services"),patch.object(pd,"_background"),patch.object(pd,"_wait"), \
              patch.object(pd,"container_identities",return_value={}), \
@@ -3666,6 +4217,8 @@ class NixlTcpBackendTests(SyntheticRouting, unittest.TestCase):
             self.assertEqual(pd.execute(run,output)["problems"],[])
         self.assertFalse((output/"tent.json").exists())
         self.assertFalse((output/"tent-after.json").exists())
+        # A run without a collector still clears any one an earlier run left on every node.
+        self.assertEqual(sorted(cleared),["c","d","p"])
         started=json.loads((output/"servers.json").read_text())
         self.assertEqual({role:list(nodes) for role,nodes in started.items()},{"prefill":["p"],"decode":["d"]})
         self.assertIn("VLLM_HTTP_TIMEOUT_KEEP_ALIVE=120",started["decode"]["d"])
@@ -4513,3 +5066,393 @@ class MtpStatePullTests(unittest.TestCase):
                                                           "blocks": 1, "bytes": 1600}],
                                self.admission([0, 7, 9]))[0]
         self.assertTrue(any("logged 1 prefix hit check(s), not the 0" in p for p in got), got)
+
+
+class EndpointCaptureChecks(unittest.TestCase):
+    def test_missing_or_partial_observer_cannot_pass_l3(self):
+        from harness.endpoint_observer import check_captures
+
+        run = pd.Run(**{f: getattr(RUN, f) for f in RUN.__dataclass_fields__})
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            (output / "profiler.json").write_text(json.dumps({"run_id": "run"}))
+            verdict = {"problems": []}
+            check_captures(output, run, verdict)
+            self.assertEqual(len(verdict["problems"]),
+                             len(run.prefill.nodes + run.decode.nodes))
+            for node in run.prefill.nodes + run.decode.nodes:
+                directory = output / "endpoint-probes" / node / "captures/run/process"
+                directory.mkdir(parents=True)
+                (directory / "manifest.json").write_text(json.dumps({
+                    "run_id": "run", "complete": False}))
+            verdict = {"problems": []}
+            check_captures(output, run, verdict)
+            self.assertTrue(all("incomplete" in item for item in verdict["problems"]))
+
+
+class EndpointObserverDiagnostics(unittest.TestCase):
+    def test_stderr_only_failure_is_preserved_without_masking_exit_or_cleanup(self):
+        """A fake Docker CLI keeps real subprocess stream handling, without Docker."""
+        from harness.endpoint_observer import EndpointObserver
+
+        for logs_exit in (0, 23):
+            with (
+                self.subTest(logs_exit=logs_exit),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                output = root / "output"
+                output.mkdir()
+                docker = root / "docker"
+                docker.write_text(
+                    f"#!{sys.executable}\n"
+                    "import pathlib, sys\n"
+                    "assert sys.argv[-1] == 'owned-observer'\n"
+                    "action = sys.argv[1]\n"
+                    "if action == 'wait': print(1)\n"
+                    "elif action == 'logs':\n"
+                    "    sys.stderr.buffer.write(b'only-stderr: startup failed\\n')\n"
+                    f"    sys.exit({logs_exit})\n"
+                    "elif action == 'inspect': print('[]')\n"
+                    "elif action == 'rm':\n"
+                    f"    pathlib.Path({str(root / 'removed')!r}).touch()\n"
+                    "else: sys.exit(97)\n"
+                )
+                docker.chmod(0o755)
+                observer = EndpointObserver(
+                    "observer", output, "run", "decode", "owned-observer"
+                )
+                with mock.patch.dict(os.environ, {"PATH": str(root)}):
+                    observer.stop(False)
+                self.assertEqual((output / "observer.stdout.log").read_bytes(), b"")
+                stderr = b"only-stderr: startup failed\n"
+                self.assertEqual((output / "observer.stderr.log").read_bytes(), stderr)
+                self.assertIn(stderr, (output / "observer.log").read_bytes())
+                status = json.loads((output / "endpoint-status.json").read_text())
+                self.assertEqual(status["exit_code"], 1)
+                self.assertEqual(status["logs_exit_code"], logs_exit)
+                self.assertFalse(status["timed_out"])
+                self.assertTrue(status["removed"])
+                self.assertTrue((root / "removed").exists())
+
+
+class EndpointObserverAccounting(unittest.TestCase):
+    def test_observer_is_not_a_server_child_and_its_cpu_counts_as_a_helper(self):
+        command = (b"/opt/venv/bin/python\0/installed/vllm/kv_profiling/"
+                   b"probe.py\0--config\0x")
+        self.assertFalse(pd.is_service(command, b"python"))
+        # This is also the exact function embedded in the server stop scripts.
+        self.assertIn("endpoint controller", pd.STOP_OWNERS)
+        samples = [sample(float(t), (1, 1, "serving", float(t)),
+                          (2, 2, "probe", 0.1 * t)) for t in range(5)]
+        report = pd.cpu_over(samples, 1.0, 3.0)
+        self.assertAlmostEqual(report["serving_s"], 2.0)
+        self.assertAlmostEqual(report["helpers_s"], 0.2)
+        self.assertAlmostEqual(report["probes_s"], 0.2)
+        self.assertAlmostEqual(report["probes_at_end_s"], 0.3)
+
+
+class EndpointCaptureIntegrity(unittest.TestCase):
+    def create(self, output):
+        import hashlib
+        import uuid
+        from harness.endpoint_observer import bundle
+
+        run_id = str(uuid.uuid4())
+        probes = {
+            node: {"interfaces": ["lo"], "required": ["netdev"]} for node in ("p", "d")
+        }
+        profiler = pd.Profiler(
+            level="l3", probes=probes, observer_cpus={"p": [12], "d": [13]}
+        )
+        run = pd.Run(
+            **{
+                **{f: getattr(RUN, f) for f in RUN.__dataclass_fields__},
+                "profiler": profiler,
+            }
+        )
+        (output / "profiler.json").write_text(json.dumps({"run_id": run_id}))
+        for role, node in (("prefill", "p"), ("decode", "d")):
+            directory = output / "endpoint-probes" / node
+            directory.mkdir(parents=True)
+            source_root = Path(os.environ.get("KV_PROFILER_SOURCE_ROOT", pd.REPOSITORY))
+            digest = bundle(directory / "observer.pyz", source_root=source_root)
+            entries = []
+            for capture_role in ("frontend", "scheduler", "worker"):
+                process = str(uuid.uuid4())
+                meta = {
+                    "schema": 1,
+                    "type": "metadata",
+                    "run_id": run_id,
+                    "process_id": process,
+                    "pid": 1,
+                    "start_ticks": 100,
+                    "clock_id": str(uuid.uuid4()),
+                    "clock_source": "CLOCK_MONOTONIC",
+                    "boot_id": "boot",
+                    "net_namespace": "net",
+                    "pid_namespace": "pid",
+                    "time_namespace": "time",
+                    "context": {"role": capture_role, "engine_id": node, "rank": 0},
+                }
+                entry = {
+                    key: value
+                    for key, value in meta.items()
+                    if key not in ("schema", "type")
+                }
+                entries.append(entry)
+                folder = output / "profiles" / role / node / run_id / process
+                folder.mkdir(parents=True)
+                end = {
+                    "schema": 1,
+                    "type": "end",
+                    "complete": True,
+                    "stats": {
+                        "head": 0,
+                        "tail": 0,
+                        **dict.fromkeys(
+                            (
+                                "drop_full",
+                                "drop_contention",
+                                "drop_ids",
+                                "drop_handles",
+                                "drop_identity",
+                                "drop_conflict",
+                                "drop_closed",
+                                "unknown_handles",
+                            ),
+                            0,
+                        ),
+                    },
+                }
+                (folder / "events.jsonl").write_text(
+                    json.dumps(meta) + "\n" + json.dumps(end) + "\n"
+                )
+                (folder / "manifest.json").write_text(
+                    json.dumps(
+                        {**meta, "saved": True, "complete": True, "stats": end["stats"]}
+                    )
+                )
+            config = {
+                "run_id": run_id,
+                "endpoint": node,
+                "role": role,
+                "probes": probes[node],
+                "cpus": profiler.observer_cpus[node],
+                "inventory": entries,
+                "package_sha256": digest,
+                "owner_pid": 1,
+                "owner_start": 100,
+            }
+            (directory / "config.json").write_text(json.dumps(config))
+            # Get normalized defaults from the same immutable, stdlib-only package.
+            import subprocess
+
+            script = (
+                "import sys,json;sys.path.insert(0,sys.argv[1]);"
+                "from endpoint_probes.config import ProbeConfig,settings_dict;"
+                "print(json.dumps(settings_dict(ProbeConfig(**json.loads(sys.argv[2]))),"
+                "sort_keys=True))"
+            )
+            normalized = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(directory / "observer.pyz"),
+                    json.dumps(probes[node]),
+                ],
+                text=True,
+            )
+            process = str(uuid.uuid4())
+            meta = {
+                "schema": 1,
+                "probe_schema": 1,
+                "type": "metadata",
+                "run_id": run_id,
+                "process_id": process,
+                "context": {
+                    "endpoint": node,
+                    "endpoint_role": role,
+                    "role": "endpoint_observer",
+                },
+                "clock_id": str(uuid.uuid4()),
+                "clock_source": "CLOCK_MONOTONIC",
+                "boot_id": "boot",
+                "net_namespace": "net",
+                "pid_namespace": "pid",
+                "time_namespace": "time",
+                "config_sha256": hashlib.sha256(
+                    normalized.strip().encode()
+                ).hexdigest(),
+                "inventory": entries,
+                "affinity": profiler.observer_cpus[node],
+                "owner": {
+                    "pid": 1,
+                    "start_ticks": 100,
+                    "net_namespace": "net",
+                    "pid_namespace": "pid",
+                },
+                "package_sha256": digest,
+            }
+            events = []
+            for sequence, (scope, observation) in enumerate(
+                (
+                    ("cpu_isolation", {"verified": True}),
+                    ("observer", {"cpu_s": 0.1}),
+                    ("netdev", {"fields": {}}),
+                ),
+                1,
+            ):
+                events.append(
+                    {
+                        "schema": 1,
+                        "probe_schema": 1,
+                        "type": "event",
+                        "kind": "probe_resource"
+                        if scope == "observer"
+                        else "probe_status",
+                        "scope": scope,
+                        "entity": node,
+                        "time_ns": sequence,
+                        "sample_begin_ns": sequence,
+                        "sample_end_ns": sequence,
+                        "sequence": sequence,
+                        "request_ref": 0,
+                        "handoff_ref": 0,
+                        "transfer": 0,
+                        "peer_ref": 0,
+                        **dict.fromkeys(
+                            (
+                                "bytes",
+                                "selected_descriptors",
+                                "merged_descriptors",
+                                "duration0_ns",
+                                "duration1_ns",
+                                "aux0",
+                                "aux1",
+                            )
+                        ),
+                        "transport": {"kind": "unknown", "tcp": None, "rdma": None},
+                        "observation": observation,
+                    }
+                )
+            end = {
+                "schema": 1,
+                "probe_schema": 1,
+                "type": "end",
+                "complete": True,
+                "reason": "controller_stop",
+                "stats": {
+                    "head": 3,
+                    "tail": 3,
+                    "drop_probe_rows": 0,
+                    "isolation_failures": 0,
+                    "required_source_failures": 0,
+                    "observation_gaps": 0,
+                    "samples": 1,
+                    "controller_children_closed": True,
+                    "core": {"all_closed": True},
+                },
+            }
+            folder = directory / "captures" / run_id / process
+            folder.mkdir(parents=True)
+            (folder / "events.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in [meta, *events, end])
+            )
+            (folder / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "process_id": process,
+                        "saved": True,
+                        "complete": True,
+                        "end": end,
+                    }
+                )
+            )
+            (directory / "container.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "Id": node,
+                            "State": {
+                                "ExitCode": 0,
+                                "Running": False,
+                                "OOMKilled": False,
+                            },
+                        }
+                    ]
+                )
+            )
+            (directory / "endpoint-status.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "endpoint": node,
+                        "container_id": node,
+                        "exit_code": 0,
+                        "removed": True,
+                        "timed_out": False,
+                    }
+                )
+            )
+        return run
+
+    def test_complete_flags_do_not_replace_capture_contents_or_matching_identity(self):
+        import shutil
+        from harness.endpoint_observer import check_captures
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            clean = root / "clean"
+            clean.mkdir()
+            run = self.create(clean)
+            verdict = {"problems": []}
+            check_captures(clean, run, verdict)
+            self.assertEqual(verdict["problems"], [])
+            for fault in (
+                "missing_events",
+                "bad_json",
+                "swapped",
+                "stale",
+                "exit",
+                "timeout",
+            ):
+                out = root / fault
+                shutil.copytree(clean, out)
+                folder = out / "endpoint-probes/d"
+                if fault == "missing_events":
+                    next((folder / "captures").glob("*/*/events.jsonl")).unlink()
+                elif fault == "bad_json":
+                    next((folder / "captures").glob("*/*/manifest.json")).write_text(
+                        "["
+                    )
+                elif fault in ("swapped", "stale"):
+                    config = json.loads((folder / "config.json").read_text())
+                    config["endpoint" if fault == "swapped" else "run_id"] = "wrong"
+                    (folder / "config.json").write_text(json.dumps(config))
+                else:
+                    status = json.loads((folder / "endpoint-status.json").read_text())
+                    status["exit_code" if fault == "exit" else "timed_out"] = (
+                        1 if fault == "exit" else True
+                    )
+                    (folder / "endpoint-status.json").write_text(json.dumps(status))
+                verdict = {"problems": []}
+                check_captures(out, run, verdict)
+                self.assertTrue(verdict["problems"], fault)
+
+
+class EndpointProfileBacking(unittest.TestCase):
+    def test_readonly_input_uses_the_exposed_backing_not_a_proc_magic_link(self):
+        from harness.endpoint_observer import profile_backing
+
+        description = {"Mounts": [
+            {"Type": "bind", "Destination": "/e2e", "Source": "/shared"},
+            {"Type": "volume", "Destination": "/e2e/profiles", "Source": "/captures"}],
+            "GraphDriver": {"Data": {"MergedDir": "/overlay/merged"}}}
+        self.assertEqual(profile_backing(description), ("/captures", "existing_mount"))
+        self.assertEqual(profile_backing({"GraphDriver": description["GraphDriver"]}),
+                         ("/overlay/merged/e2e/profiles", "overlay_merged"))
+        with self.assertRaisesRegex(ValueError, "exposed profile"):
+            profile_backing({"GraphDriver": {"Data": {}}})

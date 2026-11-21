@@ -151,6 +151,11 @@ steps:
   no_plugin: true
   soft_fail: true
   source_file_dependencies:
+  - CMakeLists.txt
+  - setup.py
+  - csrc/kv_profiler/
+  - vllm/kv_profiling/
+  - tests/distributed/kv_transfer/
   - vllm/benchmarks/
   - vllm/config/
   - vllm/distributed/kv_transfer/
@@ -173,6 +178,11 @@ steps:
     - >-
       bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 45m
       "TRITON_CPU_BACKEND=1 pytest -x -v -s
+      tests/distributed/kv_transfer/test_profiler_core.py
+      tests/distributed/kv_transfer/test_nixl_profiler.py
+      tests/distributed/kv_transfer/test_nixl_profiler_transfer.py
+      tests/distributed/kv_transfer/test_mooncake_profiler.py
+      tests/distributed/kv_transfer/test_mooncake_collector.py
       tests/v1/worker/simulated
       tests/benchmarks/sweep/test_simulate.py
       tests/v1/e2e/test_simulated_forward.py

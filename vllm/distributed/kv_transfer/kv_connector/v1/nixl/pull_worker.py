@@ -50,6 +50,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         """Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        if (p := self._kvp) is not None:
+            p.load_pass()
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids, self._physical_blocks_per_logical_kv_block
@@ -474,6 +476,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 if rank_to_notify != (0, read_specs[0].remote_rank):
                     try:
                         self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+                        if (p := self._kvp) is not None:
+                            p.notify_sent(req_id, agent)
                     except Exception as e:
                         self._log_failure(
                             failure_type="notification_failed",
@@ -510,6 +514,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_rank = read_spec.remote_rank
         local_block_ids = read_spec.local_block_ids
         remote_block_ids = read_spec.remote_block_ids
+        if (p := self._kvp) is not None:
+            p.read_context(request_id, remote_request_id, dst_engine_id, remote_rank)
 
         remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
         block_size_ratio = self.transfer_topo.block_size_ratio(
@@ -535,6 +541,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             agent_name = self._remote_agents[dst_engine_id][(0, remote_rank)]
             try:
                 self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+                if (p := self._kvp) is not None:
+                    p.notify_sent(request_id, agent_name)
             except Exception as e:
                 self._log_failure(
                     failure_type="notification_failed",
@@ -625,9 +633,13 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_descs_ids,
                 notif_msg=notif_id,
             )
+            if (p := self._kvp) is not None:
+                p.transfer_prepared(handle, 0, 1, len(local_block_descs_ids))
 
             # Begin async xfer.
             self.nixl_wrapper.transfer(handle)
+            if (p := self._kvp) is not None:
+                p.transfer_posted(handle)
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
@@ -685,17 +697,28 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         try:
             for mask, local_handle in reads:
                 if mask.any():
+                    leg_ids = local_ids[mask]
                     handles.append(
                         self.nixl_wrapper.make_prepped_xfer(
                             "READ",
                             local_handle,
-                            desc_pos[local_ids[mask]],
+                            desc_pos[leg_ids],
                             remote_xfer_side_handle,
                             remote_ids[mask],
                         )
                     )
+                    if (p := self._kvp) is not None:
+                        p.transfer_prepared(
+                            handles[-1],
+                            2 if local_handle is local_dram_handle else 1,
+                            0,
+                            len(leg_ids),
+                        )
         except Exception:
             for handle in handles:
+                # Legs that will never be posted: say so before they are retired.
+                if (p := self._kvp) is not None:
+                    p.transfer_unposted(handle)
                 if not self._try_release_xfer_handle(request_id, handle):
                     self._recving_transfers[request_id].append(handle)
             raise
@@ -706,8 +729,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         for i, handle in enumerate(handles):
             try:
                 self.nixl_wrapper.transfer(handle)
+                if (p := self._kvp) is not None:
+                    p.transfer_posted(handle)
             except Exception:
-                for unstarted in handles[i:]:
+                for position, unstarted in enumerate(handles[i:]):
+                    if (p := self._kvp) is not None:
+                        # The leg whose post raised failed; later ones were never posted.
+                        if position == 0:
+                            p.transfer_failed(unstarted)
+                        else:
+                            p.transfer_unposted(unstarted)
                     if not self._try_release_xfer_handle(request_id, unstarted):
                         self._recving_transfers[request_id].append(unstarted)
                 raise
@@ -738,6 +769,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     and req_id not in self._reqs_to_process
                 ):
                     self.xfer_stats.record_notification_after_expiry()
+                    if (p := self._kvp) is not None:
+                        p.late_notification(req_id)
                     logger.error(
                         "Potentially invalid KV blocks for "
                         "unrecognized request %s were retrieved by "
@@ -754,12 +787,20 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 )
 
                 self.consumer_notification_counts_by_req[req_id] += 1
+                if (p := self._kvp) is not None:
+                    p.notify_observed(
+                        req_id,
+                        self.consumer_notification_counts_by_req[req_id],
+                        self.expected_consumer_notifications_by_req[req_id],
+                    )
                 # Wait all consumers (D) to be done reading before freeing.
                 if (
                     self.consumer_notification_counts_by_req[req_id]
                     == self.expected_consumer_notifications_by_req[req_id]
                 ):
                     notified_req_ids.add(req_id)
+                    if (p := self._kvp) is not None:
+                        p.senders_done(req_id)
                     del self.consumer_notification_counts_by_req[req_id]
                     del self.expected_consumer_notifications_by_req[req_id]
                     self._reqs_to_process.remove(req_id)

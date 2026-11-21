@@ -36,6 +36,7 @@ import json
 import math
 from pathlib import Path
 import time
+import uuid
 
 import yaml
 
@@ -64,6 +65,31 @@ DP_ROUTINGS = ("instance", "rank")
 DP_SUPERVISOR_PORT = 9256  # a per-rank instance's aggregated health (vLLM's default)
 WORK = "/e2e"
 STEP_LOG = f"{WORK}/steps.jsonl"
+PROFILES = f"{WORK}/profiles"
+# The L2 collector's snapshot of the source file, and what it writes (the CPU sampler and the
+# service filters recognise it by this exact path: ``is_service`` and ``CPU_SAMPLER`` hold it
+# as a literal because they run on their own inside the node).
+COLLECTOR_DIRECTORY = f"{WORK}/collector"
+COLLECTOR_PATH = f"{COLLECTOR_DIRECTORY}/collector.py"
+COLLECTOR_OUTPUT = f"{WORK}/collector-out"
+# NIXL's built-in telemetry through its multi-process Prometheus exporter: one endpoint a node, on the
+# node's loopback, the per-process stores in a private tmpfs directory.
+NIXL_TELEMETRY_PORT = 9300
+NIXL_TELEMETRY_DIRECTORY = "/dev/shm/nixl-telemetry"
+# Every NIXL telemetry setting the servers could inherit: an arm sets what it needs and clears the rest.
+NIXL_TELEMETRY_VARS = ("NIXL_TELEMETRY_ENABLE", "NIXL_TELEMETRY_EXPORTER", "NIXL_TELEMETRY_DIR",
+                       "NIXL_TELEMETRY_BUFFER_SIZE", "NIXL_TELEMETRY_RUN_INTERVAL",
+                       "NIXL_TELEMETRY_HISTOGRAM_BUCKETS_US", "NIXL_TELEMETRY_ENABLED_METRICS",
+                       "NIXL_TELEMETRY_MULTIPROC_DIR", "NIXL_TELEMETRY_PROMETHEUS_PORT",
+                       "NIXL_TELEMETRY_PROMETHEUS_LOCAL", "NIXL_TELEMETRY_RANK_ENV", "NIXL_TELEMETRY_MP_STALE_TTL")
+# Matches none of NIXL's event names, whatever the version (an empty allowlist would enable everything): with it no metric is
+# emitted, while the agent keeps its telemetry object and the per-transfer statistics the connector reads.
+NIXL_METRICS_DISABLED_TOKEN = "__vllm_nixl_metrics_disabled__"
+NIXL_TELEMETRY_ARMS = (None, "default", "emissions_disabled")
+# With vLLM's default shutdown timeout (0) the API server force-kills its engine process the moment it
+# signals it, before the connector's recorders close; an explicit worker-shutdown grace gives them the
+# time. It is above two recorders' close deadlines (``shutdown_timeout_s``) and under ``stop_orderly``'s wait.
+PROFILER_SHUTDOWN_GRACE_S = 30
 TENT_METRICS_PORT = 9100  # rank r of the host serves on TENT_METRICS_PORT + r
 DISABLED_TENT_TRANSPORTS = ("tcp", "rdma", "shm", "gds", "ascend_direct")
 
@@ -203,6 +229,12 @@ class Server:
     task size relative to the effective TCP MSS, and therefore MTU, can
     affect transfer time."""
     env: dict = field(default_factory=dict)
+    nixl_telemetry_arm: str | None = None
+    """Which NIXL telemetry configuration the servers run, for a latency A/B (NIXL connector only; the exporter arm is
+    ``collector.nixl_telemetry``). ``default``: vLLM's own, the collect-only sink, with every inherited telemetry
+    setting cleared; ``emissions_disabled``: the same with ``NIXL_TELEMETRY_ENABLED_METRICS`` set to a token that
+    matches no metric (no event is emitted or enqueued; the idle flush infrastructure, the timers and the per-transfer
+    statistics remain). ``None``: nothing is set or cleared."""
     timing: str | None = None
     """The simulator's timing provider (zero, linear, table, replay,
     aisimulate or a module.Class), required for a new run; None only in a
@@ -226,6 +258,20 @@ class Server:
 
 @dataclass
 class Workload:
+    endpoint: str = "completions"
+    """The OpenAI endpoint the benchmark uses: ``completions`` or ``chat``."""
+    measure: bool = False
+    """Report p50/p95/p99 of TTFT, TPOT, ITL and end-to-end latency, and each
+    server node's CPU (serving processes, the profiler's writers and clock
+    server apart) over the servers' own workload window, with setup and
+    shutdown costs apart (``cpu.json``)."""
+    percentiles: bool = False
+    """Only the latency percentiles of the benchmark (p50/p95/p99 of TTFT, TPOT, ITL and end-to-end), with none of
+    ``measure``'s per-node CPU samplers: what a latency comparison needs, and nothing extra running in any arm."""
+    monitor: bool = False
+    """Run the cheap contamination monitor (``harness.contamination``) around the client's benchmark and judge the window:
+    foreign CPU use on the measured CPUs, with its timing and accounting uncertainty; ``bench-window.json`` and
+    ``monitor/`` in the results."""
     input_len: int = 1024
     output_len: int = 16
     num_prompts: int = 40
@@ -281,6 +327,50 @@ class Router:
     that one, which the verdict then reports as uncalibrated."""
 
 
+@dataclass(frozen=True)
+class Profiler:
+    """The KV network profiler on both servers: the servers'
+    ``kv_connector_extra_config.network_profiler``, one run ID for both (L1
+    with NIXL or Mooncake, L3 with NIXL). Each server closes its recorders when
+    it is stopped; the harness stops them, then copies the profile directories
+    to ``profiles/<role>/<node>/``. Under Mooncake each instance gets a pinned
+    engine ID, prefill's scheduler serves the clock on its control address at
+    ``BOOTSTRAP_PORT + clock_port_offset`` and decode's maps each prefill
+    engine ID to that endpoint (``clock_peers``)."""
+
+    transport: str = "tcp"
+    clock_port_offset: int = 1000
+    flush: str = "end"
+    level: str = "l1"
+    probes: dict = field(default_factory=dict)
+    observer_cpus: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Collector:
+    """The out-of-process L2 collector (``vllm/kv_profiling/collector.py``) on
+    every server node: it scrapes the TENT metrics of the node's ranks from
+    outside the serving processes, from before the workload until after it, and
+    is stopped before the servers. Independent of ``profiler`` (L1): either, both
+    or neither can be on. Its limits are the collector's own, with the same
+    bounds."""
+
+    interval_s: float = 1.0
+    scrape_timeout_s: float = 2.0
+    startup_timeout_s: float = 10.0
+    shutdown_timeout_s: float = 10.0
+    tent: bool = True
+    """Scrape TENT's metrics (the Mooncake connector, or NIXL's Mooncake backend)."""
+    nixl_telemetry: bool = False
+    """Also, or instead, read NIXL's built-in telemetry (any NIXL backend, data-parallel size 1):
+    the servers get its exporter environment and each node's one endpoint is scraped, with the
+    expected agent inventory, a bounded baseline and a bounded, stable and checked final sample."""
+
+
+COLLECTOR_BOUNDS = {"interval_s": (0.05, 3600), "scrape_timeout_s": (0.05, 60),
+                    "startup_timeout_s": (0.05, 600), "shutdown_timeout_s": (0.05, 600)}
+
+
 @dataclass
 class Run:
     name: str
@@ -312,6 +402,8 @@ class Run:
     server: Server = field(default_factory=Server)
     workload: Workload = field(default_factory=Workload)
     startup_timeout: float = 600.0
+    profiler: Profiler | None = None
+    collector: Collector | None = None
 
 
 def load(path: str | Path, *, fetch: bool = False) -> Run:
@@ -327,7 +419,7 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
 
     known = {"name", "topology", "model", "prefill", "decode", "client", "control_network", "kv_check",
              "expect_fragmentation", "expect_prefill_hit_requests", "expect_decode_prefix_hits", "server", "workload", "router",
-             "startup_timeout", "kv_pattern_grain"}
+             "startup_timeout", "kv_pattern_grain", "profiler", "collector"}
     if unknown := set(raw) - known:
         raise ValueError(f"unknown run key(s): {', '.join(sorted(unknown))}")
     router_raw = raw.get("router")
@@ -352,6 +444,8 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
             kv_pattern_grain=raw.get("kv_pattern_grain"),
             server=Server(**(raw.get("server") or {})), workload=Workload(**(raw.get("workload") or {})),
             startup_timeout=float(raw.get("startup_timeout", 600)),
+            profiler=None if raw.get("profiler") is None else Profiler(**raw["profiler"]),
+            collector=None if raw.get("collector") is None else Collector(**raw["collector"]),
         )
     except KeyError as missing:
         raise ValueError(f"run config needs {missing}") from None
@@ -365,6 +459,62 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         raise ValueError(f"server.trust_remote_code is true or false, not {run.server.trust_remote_code!r}")
     if run.server.connector not in CONNECTORS:
         raise ValueError(f"server.connector is one of {', '.join(CONNECTORS)}, not {run.server.connector!r}")
+    for name in ("percentiles", "monitor"):
+        if not isinstance(getattr(run.workload, name), bool):
+            raise ValueError(f"workload.{name} is true or false")
+    if run.workload.endpoint not in ("completions", "chat"):
+        raise ValueError(f"workload.endpoint is completions or chat, not {run.workload.endpoint!r}")
+    if (profiler := run.profiler) is not None:
+        if profiler.level not in ("l1", "l3"):
+            raise ValueError("profiler.level must be l1 or l3")
+        if run.server.connector == "mooncake" and (
+                profiler.level != "l1" or run.prefill.data_parallel_size != 1 or run.decode.data_parallel_size != 1):
+            raise ValueError("under server.connector mooncake the profiler is L1 with data_parallel_size 1 on "
+                             "both sides (one engine ID an instance)")
+        if profiler.level == "l3":
+            nodes = set(run.prefill.nodes + run.decode.nodes)
+            if set(profiler.probes) != nodes or set(profiler.observer_cpus) != nodes:
+                raise ValueError(
+                    "L3 needs explicit probes and observer_cpus for every endpoint")
+            for cpus in profiler.observer_cpus.values():
+                if not isinstance(cpus, list) or not cpus or any(
+                    type(cpu) is not int or cpu < 0 for cpu in cpus
+                ):
+                    raise ValueError(
+                        "observer_cpus must contain non-negative CPU lists")
+        elif profiler.probes or profiler.observer_cpus:
+            raise ValueError("endpoint probe settings require L3")
+        if profiler.transport not in ("tcp", "unknown") or profiler.flush not in ("end", "background"):
+            raise ValueError("profiler.transport is tcp or unknown, profiler.flush end or background")
+        if (not isinstance(profiler.clock_port_offset, int) or isinstance(profiler.clock_port_offset, bool)
+                or not 1 <= profiler.clock_port_offset <= 65535):
+            raise ValueError("profiler.clock_port_offset is a port offset in 1..65535")
+    if (collector := run.collector) is not None:
+        if type(collector.tent) is not bool or type(collector.nixl_telemetry) is not bool:
+            raise ValueError("collector.tent and collector.nixl_telemetry are true or false")
+        if not (collector.tent or collector.nixl_telemetry):
+            raise ValueError("collector needs a source: tent or nixl_telemetry")
+        if collector.tent and not uses_tent(run.server):
+            raise ValueError("collector needs TENT's metrics: server.connector mooncake, or nixl with "
+                             "nixl_backend mooncake (or tent: false with nixl_telemetry: true)")
+        if collector.nixl_telemetry and (
+                run.server.connector != "nixl" or run.prefill.data_parallel_size != 1
+                or run.decode.data_parallel_size != 1):
+            raise ValueError("collector.nixl_telemetry needs server.connector nixl and data_parallel_size 1 on "
+                             "both sides (data parallelism is not qualified)")
+        for name, (low, high) in COLLECTOR_BOUNDS.items():
+            value = getattr(collector, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f"collector.{name} is a finite number in {low}..{high}")
+    if run.server.nixl_telemetry_arm not in NIXL_TELEMETRY_ARMS:
+        raise ValueError(f"server.nixl_telemetry_arm is one of {', '.join(map(str, NIXL_TELEMETRY_ARMS))}")
+    if run.server.nixl_telemetry_arm is not None or (run.collector is not None and run.collector.nixl_telemetry):
+        if run.server.connector != "nixl":
+            raise ValueError("a NIXL telemetry arm needs server.connector nixl")
+        if run.server.nixl_telemetry_arm is not None and run.collector is not None and run.collector.nixl_telemetry:
+            raise ValueError("server.nixl_telemetry_arm and collector.nixl_telemetry are different arms: one of them")
+        if inherited := sorted(k for k in run.server.env if k.startswith("NIXL_TELEMETRY_")):
+            raise ValueError(f"server.env sets NIXL telemetry variables the arm controls: {inherited}")
     _check_backend(run.server)
     for side in (run.prefill, run.decode):
         if side.kv_kernel_backend is not None and (
@@ -800,10 +950,14 @@ def bench_command(run: Run, base_url: str) -> list[str]:
         "--prefix-repetition-num-prefixes", str(repetition["num_prefixes"]),
         "--prefix-repetition-output-len", str(w.output_len)]
     return [
-        VLLM, "bench", "serve", "--backend", "openai", "--endpoint", "/v1/completions",
+        VLLM, "bench", "serve", *(("--backend", "openai-chat", "--endpoint", "/v1/chat/completions")
+                                  if w.endpoint == "chat" else
+                                  ("--backend", "openai", "--endpoint", "/v1/completions")),
         "--base-url", base_url, "--model", MODEL_NAME, "--tokenizer", MODEL_DIRECTORY,
         *(["--trust-remote-code"] if run.server.trust_remote_code else []),
-        *dataset, "--num-prompts", str(w.num_prompts),
+        *dataset, *(["--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", "50,95,99"]
+                    if w.measure or w.percentiles else []),
+        "--num-prompts", str(w.num_prompts),
         "--max-concurrency", str(w.concurrency), "--seed", str(w.seed), "--ignore-eos", "--disable-tqdm",
         "--save-result", "--save-detailed", "--result-dir", f"{WORK}/results", "--result-filename", "bench.json",
     ]
@@ -832,8 +986,37 @@ def kv_events_topic(control: str, endpoint_port: int) -> str:
     return f"kv@{control}:{endpoint_port}@{MODEL_NAME}"
 
 
+def profile_identities(run: Run, instances: dict) -> dict[str, dict[str, dict]]:
+    """Mooncake's profiled instances: each one's pinned engine ID and the clock
+    endpoint its scheduler would serve (its control address, ``BOOTSTRAP_PORT``
+    plus the profiler's offset), by role and node."""
+    port = BOOTSTRAP_PORT + run.profiler.clock_port_offset
+    return {role: {node: {"engine_id": f"{role}-{node}", "clock": f"{found['control']}:{port}"}
+                   for node, found in nodes.items()} for role, nodes in instances.items()}
+
+
+def nixl_telemetry_arm(run: Run) -> str | None:
+    """The run's NIXL telemetry arm: ``exporter`` with the collector's NIXL source, else the server's own."""
+    if run.collector is not None and run.collector.nixl_telemetry:
+        return "exporter"
+    return run.server.nixl_telemetry_arm
+
+
+def nixl_telemetry_env(arm: str) -> dict[str, str]:
+    """What an arm sets (everything else of ``NIXL_TELEMETRY_VARS`` is cleared)."""
+    return {"exporter": {"NIXL_TELEMETRY_EXPORTER": "prometheus_mp",
+                         "NIXL_TELEMETRY_MULTIPROC_DIR": NIXL_TELEMETRY_DIRECTORY,
+                         "NIXL_TELEMETRY_PROMETHEUS_PORT": str(NIXL_TELEMETRY_PORT),
+                         "NIXL_TELEMETRY_PROMETHEUS_LOCAL": "1"},
+            "emissions_disabled": {"NIXL_TELEMETRY_ENABLED_METRICS": NIXL_METRICS_DISABLED_TOKEN},
+            "default": {}}[arm]
+
+
 def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SERVER_PORT,
-                   endpoint: tuple[str, int] | None = None) -> list[str]:
+                   endpoint: tuple[str, int] | None = None,
+                   profile_id: str | None = None,
+                   node: str | None = None,
+                   identities: dict | None = None) -> list[str]:
     """``vllm serve`` for ``role`` (prefill or decode) on HTTP ``port``, TP
     rank r's KV on ``kv_addresses[r]`` in every DP rank (their own:
     ``rank_addresses``, DP rank by TP rank). ``endpoint``: the control
@@ -868,6 +1051,28 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
                    "kv_connector_extra_config": {"backends": [nixl_backend(run.server)]} if nixl else {"mooncake_protocol": "tcp"}}
     if non_tent or len(set(kv_addresses)) > 1:
         kv_transfer["kv_connector_extra_config"]["rank_addresses"] = kv_addresses * side.data_parallel_size
+    if run.profiler is not None:
+        if profile_id is None:
+            raise ValueError("a profiled run needs one profile ID for both servers")
+        kv_transfer["kv_connector_extra_config"]["network_profiler"] = {
+            "level": run.profiler.level, "run_id": profile_id, "output_dir": PROFILES,
+            "transport": run.profiler.transport, "clock_port_offset": run.profiler.clock_port_offset,
+            "flush": run.profiler.flush, "shutdown_timeout_s": 10}
+        if not nixl:
+            if identities is None or node is None:
+                raise ValueError("a profiled Mooncake server needs its node and the instances' identities")
+            kv_transfer["engine_id"] = identities[role][node]["engine_id"]
+            profile = kv_transfer["kv_connector_extra_config"]["network_profiler"]
+            del profile["clock_port_offset"]
+            if role == "prefill":
+                profile["clock_bind"] = identities[role][node]["clock"]
+            else:
+                profile["clock_peers"] = {one["engine_id"]: one["clock"] for one in identities["prefill"].values()}
+        if run.profiler.level == "l3":
+            if node is None:
+                raise ValueError("L3 server command needs its endpoint node")
+            profile = kv_transfer["kv_connector_extra_config"]["network_profiler"]
+            profile["probes"] = run.profiler.probes[node]
     connector_env = {
         # NIXL's handshake and its Mooncake backend's segment on the KV network.
         "VLLM_NIXL_SIDE_CHANNEL_HOST": kv_address, "NIXL_MOONCAKE_IP_ADDR": kv_address,
@@ -887,12 +1092,27 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         "MC_USE_TENT": "1",
         "MC_TENT_CONF": json.dumps(tent_config(kv_address, run.server.hp_tcp_args), separators=(",", ":")),
         **connector_env,
+        **({"VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS": str(PROFILER_SHUTDOWN_GRACE_S)}
+           if run.profiler is not None else {}),
+        # A profiled UCX server logs UCX's protocol selection tables (lanes and
+        # protocol per message size, per endpoint configuration) as it selects;
+        # parsed after the run into ucx-protocols/ (vllm/kv_profiling/ucx_protocols.py).
+        # UCX's log goes to stderr: unbuffered, so each table is one write that
+        # neither another process's output cuts nor a worker's exit loses
+        # (on stdout, a block-buffered stream, both happen).
+        **({"UCX_PROTO_INFO": "y", "UCX_LOG_FILE": "stderr"}
+           if run.profiler is not None and ucx else {}),
         # TENT's metrics, read from inside the node.
         "TENT_METRICS_HTTP_HOST": "127.0.0.1",
         "TENT_METRICS_HTTP_PORT": str(TENT_METRICS_PORT),
         "TENT_METRICS_REPORT_INTERVAL": "0",
         **{name: str(value) for name, value in run.server.env.items()},
     }
+    arm = nixl_telemetry_arm(run)
+    unset = []
+    if arm is not None:
+        env.update(nixl_telemetry_env(arm))
+        unset = [name for name in NIXL_TELEMETRY_VARS if name not in env]
     if non_tent:
         env = {k: v for k, v in env.items() if not k.startswith(("MC_", "TENT_", "NIXL_MOONCAKE_"))}
         if ucx:
@@ -902,7 +1122,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
     s = run.server
     block = side.block(s)
     return [
-        "env", *(f"{name}={value}" for name, value in env.items()),
+        "env", *(item for name in unset for item in ("-u", name)), *(f"{name}={value}" for name, value in env.items()),
         VLLM, "serve", MODEL_DIRECTORY, "--host", "0.0.0.0", "--port", str(port),
         "--served-model-name", MODEL_NAME, "--dtype", s.dtype, "--kv-cache-dtype", s.kv_cache_dtype,
         *(["--quantization", s.quantization] if s.quantization else []),
@@ -959,25 +1179,43 @@ def execute(run: Run, output: Path | None = None) -> dict:
     for name in container.values():
         # A previous run's servers would answer this run's requests.
         stop_services(name)
-        topology.exec_in(name, ["sh", "-c", f"rm -rf {WORK}/logs {WORK}/results {WORK}/steps*.jsonl "
+        topology.exec_in(name, ["sh", "-c", f"rm -rf {WORK}/logs {WORK}/results {WORK}/profiles {WORK}/steps*.jsonl "
                                             f"&& mkdir -p {WORK}/logs"])
+        # A collector a previous run left behind (the service filters leave it alone on purpose) would
+        # scrape into this run, collector or not: it is signalled and its files removed.
+        from . import collector
+
+        collector.clear(name)
+        if run.collector is not None and run.collector.nixl_telemetry:
+            # The exporter's per-process stores: private, local, empty before the servers start.
+            topology.exec_in(name, ["sh", "-c", f"rm -rf {NIXL_TELEMETRY_DIRECTORY} && "
+                                                f"mkdir -m 700 -p {NIXL_TELEMETRY_DIRECTORY}"])
         # Only this run's model: a file the previous run's had and this
         # one's lacks (a quantization sidecar) would be read as its own.
         topology.exec_in(name, ["sh", "-c", f"rm -rf {MODEL_DIRECTORY} && mkdir -p {MODEL_DIRECTORY}"])
         shell.run(["docker", "cp", f"{run.model}/.", f"{name}:{MODEL_DIRECTORY}"])
     front.prepare(container)
+    profile_id = str(uuid.uuid4()) if run.profiler is not None else None
+    collectors: list = []
 
     commands: dict[str, dict[str, list[str]]] = {}
+    identities = (profile_identities(run, instances)
+                  if run.profiler is not None and run.server.connector == "mooncake" else None)
+    if identities is not None:
+        # The engine IDs and clock endpoints the profiled Mooncake servers were given.
+        (output / "profile-identities.json").write_text(json.dumps(identities, indent=2) + "\n")
     for role, side in roles:
         for node in side.nodes:
             command = server_command(run, role, instances[role][node]["kv"], front.server_port(role),
-                                     (instances[role][node]["control"], front.endpoint_port(role)))
+                                     (instances[role][node]["control"], front.endpoint_port(role)),
+                                     profile_id, node=node, identities=identities)
             commands.setdefault(role, {})[node] = command
             _background(container[node], command, f"{WORK}/logs/{role}.log")
     # Each server as it was started: its environment and flags.
     (output / "servers.json").write_text(json.dumps(commands, indent=2) + "\n")
     # And what it runs in: each node container's image, by id, and its mounts.
     (output / "containers.json").write_text(json.dumps(container_identities(container), indent=2) + "\n")
+    observers = []
     try:
         # Every instance (the startup timeout counted from the first).
         deadline = time.monotonic() + run.startup_timeout
@@ -985,25 +1223,88 @@ def execute(run: Run, output: Path | None = None) -> dict:
             for node in side.nodes:
                 _wait(container[run.client], front.health_url(role, instances[role][node]["control"]),
                       max(1.0, deadline - time.monotonic()), container[node], f"{WORK}/logs/{role}.log")
+        if run.profiler is not None and run.profiler.level == "l3":
+            from .endpoint_observer import EndpointObserver
+
+            for role, side in roles:
+                for node in side.nodes:
+                    observers.append(EndpointObserver.start(
+                        container[node], output=output / "endpoint-probes" / node,
+                        run_id=profile_id, endpoint=node, role=role,
+                        cpus=run.profiler.observer_cpus[node],
+                        probes=run.profiler.probes[node],
+                        expected_workers=sum(side.node_of(dp) == node
+                            for dp, _ in side.ranks(side.tp(run.server))),
+                        expected_schedulers=sum(side.node_of(dp) == node
+                            for dp, tp in side.ranks(side.tp(run.server)) if tp == 0)))
         base_url = front.start(container, address)
+        if run.collector is not None:
+            from . import collector
+
+            # The profiled run's ID when there is one: both captures are one run's.
+            collectors = collector.start_all(run, container, output, profile_id or str(uuid.uuid4()))
 
         tent_before = _tent_metrics(run, container)
         control_before = network_ports(state, run.control_network)
         routers_before = router_bytes(state)
         ports_before = router_ports(state)
         bench = bench_command(run, base_url)
-        (output / "bench.log").write_text(topology.exec_in(container[run.client], bench, timeout=3600))
+        if run.workload.measure:
+            _start_samplers(run, container)
+        window = _monitored(run, output, lambda: (output / "bench.log").write_text(
+            topology.exec_in(container[run.client], bench, timeout=3600)))
+        if run.workload.measure:
+            _stop_samplers(run, container, output)
         # The servers' step logs settle shortly after the last response.
         time.sleep(2)
         routers_after = router_bytes(state)
         ports_after = router_ports(state)
         control_after = network_ports(state, run.control_network)
         tent_after = _tent_metrics(run, container)
+        if nixl_telemetry_arm(run) in ("default", "emissions_disabled"):
+            # An arm without an exporter: nothing may answer where the exporter's endpoint would be.
+            from . import nixl_telemetry
+
+            (output / "nixl-arm.json").write_text(json.dumps({
+                "arm": nixl_telemetry_arm(run),
+                "nodes": {node: nixl_telemetry.probe_endpoint(container[node], NIXL_TELEMETRY_PORT)
+                          for side in (run.prefill, run.decode) for node in side.nodes}}, indent=2) + "\n")
+        if collectors:
+            # The NIXL telemetry's final sample: the servers and the collectors are still alive.
+            from . import collector
+
+            collector.finish_all(collectors)
     finally:
         try:
+            if collectors:
+                from . import collector
+
+                # After the workload and the harness's own last scrape, before any server goes away.
+                (output / "collector" / "stops.json").write_text(
+                    json.dumps(collector.stop_all(collectors), indent=2) + "\n")
             _collect(run, container, output)
             front.collect(container, output)
+            if run.profiler is not None:
+                # The servers close their recorders on SIGTERM, which flushes and
+                # completes each process's trace; only then is it copied.
+                def endpoint_closed(node, result):
+                    for observer in list(observers):
+                        if observer.endpoint == node:
+                            observer.stop(bool(result.get("graceful")))
+                            observers.remove(observer)
+                stop_orderly(run, container, output, on_endpoint_closed=endpoint_closed)
+                _collect_profiles(run, container, output, profile_id)
+                if uses_ucx(run.server):
+                    ucx_protocols(run, container, output, profile_id)
+            if run.workload.measure:
+                # From the servers' own step logs, the samplers' files and (profiled)
+                # the writers' manifests: setup, workload and shutdown apart.
+                report = cpu_report_for(output, run)
+                (output / "cpu.json").write_text(json.dumps(
+                    report if report is not None else {"error": "no samples or no priced step"}, indent=2) + "\n")
         finally:
+            for observer in observers:
+                observer.stop(False)
             front.stop(container)
             for name in container.values():
                 stop_services(name)
@@ -1029,6 +1330,19 @@ def execute(run: Run, output: Path | None = None) -> dict:
            for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
           for role in ("prefill", "decode")],
         routers, run, tent, ports or None, exempt)
+    if run.profiler is not None and run.profiler.level == "l3":
+        from .endpoint_observer import check_captures
+
+        check_captures(output, run, verdict)
+    if run.collector is not None:
+        from . import collector
+
+        collector.check(output, run, tent, verdict)
+    if nixl_telemetry_arm(run) in ("default", "emissions_disabled"):
+        from . import nixl_telemetry
+
+        issues, verdict["nixl_arm"] = nixl_telemetry.arm_problems(output, run)
+        verdict["problems"].extend(issues)
     llmd.recheck(output, run, verdict)
     (output / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n")
     if verdict["problems"]:
@@ -1061,6 +1375,21 @@ def recheck(output: str | Path) -> dict:
         None if not uses_tent(run.server) else json.loads((output / "tent.json").read_text()),
         json.loads(ports.read_text()) if ports.exists() else None,
         control_saved)
+    if run.profiler is not None and run.profiler.level == "l3":
+        from .endpoint_observer import check_captures
+
+        check_captures(output, run, verdict)
+    if run.collector is not None:
+        from . import collector
+
+        # TENT's own scrape is saved only where TENT applies; NIXL-only collection has none to compare with.
+        collector.check(output, run, json.loads((output / "tent.json").read_text())
+                        if run.collector.tent and uses_tent(run.server) else {}, verdict)
+    if nixl_telemetry_arm(run) in ("default", "emissions_disabled"):
+        from . import nixl_telemetry
+
+        issues, verdict["nixl_arm"] = nixl_telemetry.arm_problems(output, run)
+        verdict["problems"].extend(issues)
     llmd.recheck(output, run, verdict)
     (output / "verdict-recheck.json").write_text(json.dumps(verdict, indent=2) + "\n")
     return verdict
@@ -1075,7 +1404,9 @@ def saved_run(output: str | Path) -> Run:
         router.epp_plugins = Path(router.epp_plugins)
     return Run(**{**raw, "model": Path(raw["model"]), "router": router,
                   "prefill": Side(**raw["prefill"]), "decode": Side(**raw["decode"]),
-                  "server": Server(**raw["server"]), "workload": Workload(**raw["workload"])})
+                  "server": Server(**raw["server"]), "workload": Workload(**raw["workload"]),
+                  "profiler": None if raw.get("profiler") is None else Profiler(**raw["profiler"]),
+                  "collector": None if raw.get("collector") is None else Collector(**raw["collector"])})
 
 
 def saved_peak_prefill_throughput(output: str | Path) -> dict:
@@ -2055,6 +2386,17 @@ def _group_pages(group: dict) -> list[int | None]:
                   key=str) or [group.get("real_page_bytes") or group.get("block_bytes")]
 
 
+def _kernel_rows(geometry: dict | None) -> tuple[set[int] | None, int]:
+    """A layout's registered block lengths (the bytes of each region's kernel block) and its kernel
+    blocks per logical block (1 when the layout records no split kernel geometry)."""
+    if not isinstance(geometry, dict):
+        return None, 1
+    split = geometry.get("kernel_blocks_per_logical")
+    lengths = geometry.get("registered_region_block_lengths")
+    return (set(lengths) if isinstance(lengths, list) and lengths else None,
+            split if isinstance(split, int) and not isinstance(split, bool) and split > 0 else 1)
+
+
 def group_kv_heads(model: Path, kinds: list) -> tuple[list[int] | None, str | None]:
     """Each KV cache group's total KV heads, from its layout `kind`: the
     model's own for all groups, except in the config family that gives its
@@ -2417,6 +2759,18 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
         for dp, rank in keys[role]:
             groups = (layout(role, dp, rank) or {}).get("groups") or []
             mine_slabs = []
+            # NIXL posts a descriptor per kernel block: a group's logical page over the kernel blocks it
+            # holds. The layout's registered block lengths describe all its groups' regions, so they
+            # must be exactly the kernel blocks of every group's pages together.
+            registered, split = _kernel_rows((layout(role, dp, rank) or {}).get("kernel_geometry"))
+            if nixl and split > 1 and registered is not None:
+                kernel_blocks = {page // split if isinstance(page, int) and page % split == 0 else None
+                                 for group in groups for page in _group_pages(group)}
+                if registered != kernel_blocks:
+                    problems.append(f"{name(role, dp, rank)}'s registered block lengths {sorted(registered)} are "
+                                    f"not its groups' kernel blocks' {sorted(kernel_blocks, key=str)} bytes")
+                    slabs[(role, dp, rank)] = (None,)
+                    continue
             for index, group in enumerate(groups):
                 want = gheads[role][rank][index] if index < len(totals) else None
                 if want is None or group.get("pattern") != "head-v1" or group.get("global_heads") != want:
@@ -2427,6 +2781,9 @@ def _hetero_tp(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, ports: 
                 # A group of several page sizes (sparse MLA: a latent's and an
                 # indexer's layers) has a slab for each.
                 pages = _group_pages(group)
+                if nixl and split > 1:
+                    pages = [page // split if isinstance(page, int) and page % split == 0 else None
+                             for page in pages]
                 good = all(isinstance(page, int) and page > 0 and page % len(want) == 0 for page in pages)
                 each = tuple(page // len(want) for page in pages) if good else None
                 mine_slabs.append(each[0] if each and len(each) == 1 else each)
@@ -3506,6 +3863,10 @@ def is_service(cmdline: bytes, comm: bytes) -> bool:
     """A process of the run: vLLM runs on the image's Python;
     vLLM renames its engine core and workers (VLLM::EngineCore,
     VLLM::Worker_TP0, ...)."""
+    argv = cmdline.split(b"\0")
+    if (len(argv) > 1 and
+            argv[1].endswith((b"/vllm/kv_profiling/probe.py", b"/observer.pyz", b"/e2e/collector/collector.py"))):
+        return False  # The endpoint controller's and the L2 collector's own lifecycles.
     return cmdline.startswith((b"/opt/venv/", b"VLLM::")) or comm.startswith(b"VLLM::")
 
 
@@ -3541,6 +3902,71 @@ for sig, wait in ((signal.SIGTERM, 30), (signal.SIGKILL, 10)):
         sys.exit(0)
 sys.exit(f"still running: {ours()}")
 """
+
+
+STOP_OWNERS = inspect.getsource(is_service) + """
+import json, os, signal, sys, time
+
+timeout = float(sys.argv[1])
+me = os.getpid()
+
+
+def processes():
+    found = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            raw = open(f"/proc/{pid}/cmdline", "rb").read()
+            comm = open(f"/proc/{pid}/comm", "rb").read()
+        except OSError:
+            continue
+        if int(pid) == me or not is_service(raw, comm):
+            continue
+        argv = raw.split(b"\\0")
+        helper = len(argv) > 2 and argv[1] == b"-m" and argv[2].startswith(b"vllm.kv_profiling.")
+        owner = not helper and b"serve" in argv[1:4] and any(a.endswith(b"vllm") for a in argv[:3])
+        found.append((int(pid), "helper" if helper else "owner" if owner else "child"))
+    return found
+
+
+started = time.monotonic()
+owners = [pid for pid, kind in processes() if kind == "owner"]
+for pid in owners:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+while processes() and time.monotonic() - started < timeout:
+    time.sleep(0.25)
+left = processes()
+print(json.dumps({"signalled": owners, "graceful": not left, "remaining": left,
+                  "seconds": round(time.monotonic() - started, 2)}))
+"""
+
+
+def stop_orderly(run: Run, container: dict[str, str], output: Path,
+                 timeout: float = 60.0, *, on_endpoint_closed=None) -> list[dict]:
+    """Shut the servers down so their recorders complete: SIGTERM only each
+    node's ``vllm serve`` (never the profiler's helpers, which finish their own
+    flush as their owner closes), decode first so prefill's clock server is
+    still there for decode's end calibration, each node waited for until every
+    process of it, helpers included, has exited. A node that does not finish
+    in time gets the broad forced stop, and the record says so
+    (``shutdown.json``)."""
+    steps = []
+    for node in (*run.decode.nodes, *run.prefill.nodes):
+        text = topology.exec_in(container[node], [PYTHON, "-c", STOP_OWNERS, str(timeout)], timeout=timeout + 30)
+        result = json.loads(text.strip().splitlines()[-1])
+        if not result["graceful"]:
+            result["forced"] = True
+            stop_services(container[node])
+        if on_endpoint_closed is not None:
+            try:
+                on_endpoint_closed(node, result)
+            except Exception as error:
+                result["observer_error"] = str(error)
+        steps.append({"node": node, **result})
+    (output / "shutdown.json").write_text(json.dumps(steps, indent=2) + "\n")
+    return steps
 
 
 def stop_services(container: str) -> None:
@@ -3686,6 +4112,316 @@ def _records(text: str) -> list[dict]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
+CPU_SAMPLER = r"""
+import json, os, sys, time
+interval, path = float(sys.argv[1]), sys.argv[2]
+tick = os.sysconf("SC_CLK_TCK")
+me = os.getpid()
+
+
+def sample():
+    found = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        if int(pid) == me:
+            continue
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+            comm = open(f"/proc/{pid}/comm", "rb").read().decode().strip()
+            stat = open(f"/proc/{pid}/stat").read().rpartition(")")[2].split()
+            status = open(f"/proc/{pid}/status").read()
+        except OSError:
+            continue
+        probe = (len(argv) > 1 and argv[1].endswith(
+            (b"/vllm/kv_profiling/probe.py", b"/observer.pyz")))
+        scraper = len(argv) > 1 and argv[1] == b"/e2e/collector/collector.py"
+        helper = probe or scraper or (len(argv) > 2 and argv[1] == b"-m" and
+                                      argv[2].startswith(b"vllm.kv_profiling."))
+        serving = not helper and (comm.startswith("VLLM") or
+                                  (b"serve" in argv[1:4] and any(a.endswith(b"vllm") for a in argv[:3])))
+        if not (helper or serving):
+            continue
+        kind = ("probe" if probe else "collector" if scraper else "serving" if serving else
+                "writer" if argv[2].endswith(b".sink") else "clock")
+        fields = {f.split(":")[0]: int(f.split()[1]) for f in status.splitlines()
+                  if f.startswith(("VmHWM:", "VmRSS:"))}
+        found.append({"pid": int(pid), "start": int(stat[19]), "kind": kind,
+                      "cpu_s": (int(stat[11]) + int(stat[12])) / tick,
+                      "rss_kb": fields.get("VmRSS", 0), "hwm_kb": fields.get("VmHWM", 0)})
+    return found
+
+
+with open(path, "a", buffering=1) as out:
+    while True:
+        out.write(json.dumps({"t": time.monotonic(), "processes": sample()}) + "\n")
+        if os.path.exists(path + ".stop"):
+            break
+        time.sleep(interval)
+"""
+SAMPLE_INTERVAL = 0.5
+
+
+def workload_window(step_logs: list[str]) -> tuple[float, float] | None:
+    """The servers' own workload window, in the monotonic seconds their step
+    logs and the samplers share: from the first priced step that ran a request
+    to the last such step's deadline, over every rank of both instances."""
+    starts, ends = [], []
+    for text in step_logs:
+        for line in text.splitlines():
+            record = json.loads(line)
+            if (record.get("step") or {}).get("requests") and "t_start" in record:
+                starts.append(record["t_start"])
+                ends.append(record.get("t_deadline", record["t_start"]))
+    return (min(starts), max(ends)) if starts else None
+
+
+def _series(samples: list[dict]) -> dict[tuple[int, int], dict]:
+    found: dict[tuple[int, int], dict] = {}
+    for sample in samples:
+        for p in sample["processes"]:
+            entry = found.setdefault((p["pid"], p["start"]), {"kind": p["kind"], "points": []})
+            entry["points"].append((sample["t"], p["cpu_s"]))
+    return found
+
+
+def _value(points: list[tuple[float, float]], t: float) -> float:
+    if t <= points[0][0]:
+        return points[0][1]
+    for (t1, v1), (t2, v2) in zip(points, points[1:]):
+        if t <= t2:
+            return v1 + (v2 - v1) * (t - t1) / (t2 - t1) if t2 > t1 else v2
+    return points[-1][1]
+
+
+def cpu_over(samples: list[dict], start: float, end: float) -> dict:
+    """CPU seconds by process kind between two monotonic instants, from a node's
+    samples, per process identity (pid and start time) and interpolated linearly
+    between samples: a process present at ``start`` counts what it used since, one
+    born inside the window all it used. A process that vanished before ``end`` is
+    listed in ``lost`` (its CPU is unaccounted); ``covered`` says the samples
+    reach both instants; ``max_gap_s`` the longest gap between samples."""
+    by_identity = _series(samples)
+    last_t = samples[-1]["t"]
+    totals = {"serving": 0.0, "writer": 0.0, "clock": 0.0, "probe": 0.0, "collector": 0.0}
+    at_start = {"writer": 0.0, "probe": 0.0}
+    at_end = {"writer": 0.0, "probe": 0.0}
+    lost, new = [], []
+    for key, entry in by_identity.items():
+        points = entry["points"]
+        if points[-1][0] < end and points[-1][0] < last_t:
+            lost.append(f"{key[0]}:{key[1]}")
+        if points[0][0] > start:
+            new.append(f"{key[0]}:{key[1]}")
+            before = 0.0
+        else:
+            before = _value(points, start)
+        totals[entry["kind"]] += _value(points, end) - before
+        if entry["kind"] in ("writer", "probe"):
+            at_start[entry["kind"]] += _value(points, start)
+            at_end[entry["kind"]] += _value(points, end)
+    times = [s["t"] for s in samples if start <= s["t"] <= end]
+    edges = [max((s["t"] for s in samples if s["t"] <= start), default=start), *times,
+             min((s["t"] for s in samples if s["t"] >= end), default=end)]
+    gaps = [b - a for a, b in zip(edges, edges[1:])]
+    return {"serving_s": totals["serving"], "writers_s": totals["writer"], "clock_s": totals["clock"],
+            "helpers_s": totals["writer"] + totals["clock"] + totals["probe"] + totals["collector"],
+            "collector_s": totals["collector"], "probes_s": totals["probe"], "probes_at_start_s": at_start["probe"],
+            "probes_at_end_s": at_end["probe"],
+            "writers_at_start_s": at_start["writer"],
+            "writers_at_end_s": at_end["writer"], "lost": sorted(lost), "new": sorted(new),
+            "covered": samples[0]["t"] <= start and last_t >= end, "samples": len(times),
+            "max_gap_s": max(gaps) if gaps else 0.0}
+
+
+WRITER_TICK_S = 0.01  # /proc's CPU counters tick at 100 Hz
+
+
+def cpu_report(samples: dict[str, list[dict]], window: tuple[float, float],
+               manifests: dict[str, list[float | None]], interval: float) -> dict[str, dict]:
+    """Each node's CPU, setup, workload and shutdown apart. ``setup``: from the first
+    sample to the workload's start; ``workload``: the servers' own window;
+    ``flush_s``: the writers' lifetime CPU from their manifests (``manifests[node]``:
+    one value per manifest, None when it has none) minus what they had used when the
+    workload ended (the end flush and every later shutdown cost; it is never inside
+    the workload numbers, so a total adds the two without double counting). A
+    manifest value that is missing, not finite or negative, or fewer manifests than
+    writers the samples saw, or a lifetime CPU less than the sampled writers' CPU
+    beyond the counters' resolution, leaves the lifetime and ``flush_s`` None: they
+    are unmeasured, never zero. A node with no writers and no manifests (profiler
+    off) has an explicit zero. RSS is the last sample's: ``rss_kb`` now and
+    ``lifetime_rss_hwm_kb``, the sum of lifetime high-water marks, neither a peak
+    over the workload."""
+    start, end = window
+    report = {}
+    for node, series in samples.items():
+        work = cpu_over(series, start, end)
+        setup = cpu_over(series, series[0]["t"], start) if series[0]["t"] < start else None
+        serving = [p for p in series[-1]["processes"] if p["kind"] == "serving"]
+        seen = sum(1 for entry in _series(series).values() if entry["kind"] == "writer")
+        values = manifests.get(node, [])
+        valid = len(values) == seen and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and 0 <= v < float("inf")
+            for v in values)
+        lifetime = sum(values) if valid else None
+        # CPU read from /proc ticks and from the process's own clock agree to a couple of
+        # ticks per writer; interpolation between samples adds at most a sampling interval of idle polling.
+        tolerance = seen * (2 * WRITER_TICK_S) + interval * 0.2
+        consistent = valid and lifetime + tolerance >= work["writers_at_end_s"]
+        report[node] = {
+            **work, "workload_s": end - start, "interval_s": interval, "window": [start, end],
+            "first_sample": series[0]["t"], "last_sample": series[-1]["t"],
+            "setup_serving_s": None if setup is None else setup["serving_s"],
+            "setup_helpers_s": None if setup is None else setup["helpers_s"],
+            "writers_seen": seen, "writer_manifests": len(values),
+            "writer_manifests_with_cpu": sum(1 for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)
+                                              and v == v and 0 <= v < float("inf")),
+            "writer_tolerance_s": tolerance,
+            "writer_lifetime_cpu_s": lifetime if consistent else None,
+            "flush_s": max(0.0, lifetime - work["writers_at_end_s"]) if consistent else None,
+            "rss_kb": sum(p["rss_kb"] for p in serving),
+            "lifetime_rss_hwm_kb": sum(p["hwm_kb"] for p in serving)}
+    return report
+
+
+def cpu_report_for(output: Path, run: Run) -> dict[str, dict] | None:
+    """``cpu_report`` from a result directory: the samplers' files, the step logs
+    of both instances and, for a profiled run, the writers' manifests."""
+    files = {node: output / "cpu-samples" / f"{node}.jsonl" for side in (run.prefill, run.decode)
+             for node in side.nodes}
+    if not all(path.is_file() for path in files.values()):
+        return None
+    steps = [(output / getattr(run, role).step_log(role, dp, tp)).read_text()
+             for role in ("prefill", "decode")
+             for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
+    window = workload_window(steps)
+    if window is None:
+        return None
+    samples = {node: [json.loads(line) for line in path.read_text().splitlines() if line] for node, path in files.items()}
+    manifests = {}
+    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+        for node in side.nodes:
+            found = sorted((output / "profiles" / role / node).glob("*/*/manifest.json"))
+            values = []
+            for path in found:
+                try:
+                    values.append(json.loads(path.read_text()).get("writer_cpu_s"))
+                except ValueError:
+                    values.append(None)
+            manifests[node] = values
+    report = cpu_report(samples, window, manifests, SAMPLE_INTERVAL)
+    if run.profiler is not None and run.profiler.level == "l3":
+        for node, item in report.items():
+            directory = output / "endpoint-probes" / node / "captures"
+            paths = list(directory.glob("*/*/manifest.json"))
+            manifest = json.loads(paths[0].read_text()) if len(paths) == 1 else {}
+            lifetime = manifest.get("observer_process_cpu_s")
+            consistent = (type(lifetime) in (int, float) and math.isfinite(lifetime) and
+                          lifetime + 2 * WRITER_TICK_S >= item["probes_at_end_s"])
+            item["probe_lifetime_cpu_s"] = lifetime if consistent else None
+            item["probe_flush_s"] = (max(0, lifetime - item["probes_at_end_s"])
+                                     if consistent else None)
+            item["probe_lifetime_rss_hwm_kib"] = manifest.get("observer_rss_hwm_kib")
+    return report
+
+
+SAMPLES = f"{WORK}/cpu-samples.jsonl"
+
+
+def _monitored(run: Run, output: Path, benchmark) -> dict:
+    """Run ``benchmark`` (the client's whole benchmark command), bracketed on the host's monotonic clock; with the monitor
+    on, the contamination sampler runs around it and its window is judged. Whatever happens (the benchmark raising, the
+    sampler failing, Docker not answering) the window, both ownership snapshots, the sampler's termination evidence and the
+    judgement are saved (``bench-window.json``, ``monitor/``), and a failure of the benchmark propagates unchanged."""
+    if not run.workload.monitor:
+        benchmark()
+        return {}
+    from . import contamination
+
+    folder = output / "monitor"
+    folder.mkdir(parents=True, exist_ok=True)
+    window: dict = {}
+    owned: dict | None = None
+    problems: list[str] = []
+    sampler = None
+    try:
+        owned = contamination.owned_containers(run.topology)
+        sampler = contamination.Sampler(folder, owned)
+        sampler.start()
+        sampler.wait_first()
+        window["begin_ns"] = time.monotonic_ns()
+        try:
+            benchmark()
+        except BaseException as exc:
+            window["benchmark_error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            window["end_ns"] = time.monotonic_ns()
+    except BaseException as exc:
+        if "benchmark_error" not in window:
+            problems.append(f"the monitor could not run: {type(exc).__name__}: {exc}")
+        raise
+    finally:
+        samples, read_errors, lifecycle, ended = [], [], None, None
+        try:
+            if sampler is not None:
+                lifecycle = sampler.stop()
+                samples, read_errors = contamination.read_samples(sampler.out)
+        except Exception as exc:  # noqa: BLE001 - evidence of the failure, not a reason to lose the rest
+            problems.append(f"the sampler could not be stopped or read: {type(exc).__name__}: {exc}")
+        try:
+            ended = contamination.owned_containers(run.topology)
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"the owned containers could not be listed at the end: {type(exc).__name__}: {exc}")
+        try:
+            if "begin_ns" in window and "end_ns" in window and owned is not None and ended is not None:
+                judgement = contamination.judge(samples, (window["begin_ns"], window["end_ns"]), owned, ended,
+                                                lifecycle=lifecycle, read_errors=read_errors)
+            else:
+                judgement = {"status": "unknown", "reasons": ["the window or an ownership snapshot is missing"],
+                             "intervals": 0}
+            if problems:
+                judgement = {**judgement, "status": "unknown", "reasons": [*problems, *judgement["reasons"]]}
+            (output / "bench-window.json").write_text(json.dumps(window) + "\n")
+            for name, value in (("owned-start.json", owned), ("owned-end.json", ended),
+                                ("judgement.json", {**judgement, "constants": contamination.CONSTANTS,
+                                                    "read_errors": read_errors})):
+                (folder / name).write_text(json.dumps(value, indent=2) + "\n")
+        except Exception:  # noqa: BLE001 - never mask the benchmark's own outcome; readers find the files missing
+            pass
+    return window
+
+
+def _start_samplers(run: Run, container: dict[str, str]) -> None:
+    """A CPU sampler on every server node, running before the benchmark starts
+    (each waited for until it has written two samples)."""
+    for side in (run.prefill, run.decode):
+        for node in side.nodes:
+            topology.exec_in(container[node], ["sh", "-c", f"rm -f {SAMPLES} {SAMPLES}.stop"])
+            _background(container[node], [PYTHON, "-c", CPU_SAMPLER, str(SAMPLE_INTERVAL), SAMPLES],
+                        f"{WORK}/logs/cpu-sampler.log")
+    for side in (run.prefill, run.decode):
+        for node in side.nodes:
+            for _ in range(40):
+                if topology.exec_in(container[node], ["sh", "-c", f"wc -l < {SAMPLES} 2>/dev/null || echo 0"]
+                                    ).strip() not in ("0", "1", ""):
+                    break
+                time.sleep(0.25)
+            else:
+                raise RuntimeError(f"the CPU sampler on {node} wrote no samples")
+
+
+def _stop_samplers(run: Run, container: dict[str, str], output: Path) -> None:
+    """Stop each sampler after the benchmark and copy its file."""
+    for side in (run.prefill, run.decode):
+        for node in side.nodes:
+            topology.exec_in(container[node], ["sh", "-c", f"touch {SAMPLES}.stop"])
+    time.sleep(2 * SAMPLE_INTERVAL + 0.5)
+    for side in (run.prefill, run.decode):
+        for node in side.nodes:
+            local = output / "cpu-samples" / f"{node}.jsonl"
+            local.parent.mkdir(parents=True, exist_ok=True)
+            shell.run(["docker", "cp", f"{container[node]}:{SAMPLES}", str(local)])
+
+
 def _background(container: str, command: list[str], log: str) -> None:
     script = " ".join(_quote(part) for part in command)
     shell.run(["docker", "exec", "-d", container, "sh", "-c", f"exec {script} > {log} 2>&1"])
@@ -3765,6 +4501,64 @@ def _tent_delta(before: str | None, after: str | None) -> dict | None:
     start, end = totals(before), totals(after)
     return {name: value if name == "tent_registered_buffer_bytes" else value - start.get(name, 0.0)
             for name, value in end.items()}
+
+
+def _collect_profiles(run: Run, container: dict[str, str], output: Path, profile_id: str | None) -> None:
+    """Each server node's profile directory under ``profiles/<role>/<node>/``,
+    and the run's profile ID."""
+
+    settings = asdict(run.profiler)
+    if run.profiler.level == "l1":
+        for key in ("level", "probes", "observer_cpus"):
+            settings.pop(key)
+    (output / "profiler.json").write_text(
+        json.dumps({"run_id": profile_id, **settings}, indent=2) + "\n")
+    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+        for node in side.nodes:
+            local = output / "profiles" / role / node
+            local.mkdir(parents=True, exist_ok=True)
+            shell.run(["docker", "cp", f"{container[node]}:{PROFILES}/.", str(local)], check=False)
+
+
+def ucx_protocols(run: Run, container: dict[str, str], output: Path, profile_id: str | None) -> None:
+    """Each profiled UCX server's protocol selection tables, parsed from its
+    log into ``ucx-protocols/<role>/<node>.json`` and joined by PID to the
+    node's recorders of this run. The log is copied again after the orderly
+    stop (``logs/<role>/<node>/<role>.final.log``): UCX prints
+    ``UCX_PROTO_INFO=used`` counts as workers are destroyed, after the run's
+    logs were collected. A log without tables (UCX_PROTO_INFO overridden, or a
+    UCX that prints none) is recorded as unavailable, and a node whose log
+    cannot be read or parsed never keeps the other nodes from being written."""
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "ucx_protocols", REPOSITORY / "vllm" / "kv_profiling" / "ucx_protocols.py")
+    parser = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parser)
+    for role, side in (("prefill", run.prefill), ("decode", run.decode)):
+        for node in side.nodes:
+            logs = output / "logs" / role / node
+            log = logs / f"{role}.final.log"
+            logs.mkdir(parents=True, exist_ok=True)
+            log.unlink(missing_ok=True)
+            try:
+                shell.run(["docker", "cp", f"{container[node]}:{WORK}/logs/{role}.log", str(log)])
+                copied = log.is_file()
+            except Exception:  # best effort (failed or timed out): the earlier copy is parsed
+                copied = False
+            if not copied:
+                log = logs / f"{role}.log"  # the copy taken before the stop
+            target = output / "ucx-protocols" / role / f"{node}.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                result = parser.summarize([log], output / "profiles" / role / node, profile_id)
+                if not result["tables"]:
+                    result["unavailable"] = "no UCX_PROTO_INFO table in the server log"
+            except Exception as error:  # this node only; never the run's other nodes
+                result = {"unavailable": f"{type(error).__name__}: {error}"}
+            result["log"] = {"path": str(log.relative_to(output)), "after_stop": copied}
+            target.write_text(json.dumps(result, indent=2) + "\n")
 
 
 def _collect(run: Run, container: dict[str, str], output: Path) -> None:

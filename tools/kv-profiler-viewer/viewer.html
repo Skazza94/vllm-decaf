@@ -1,0 +1,784 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KV Request Explorer</title>
+<style>
+/* Same layout and interactions as the accepted mock; every value shown is
+   served from the run's records, or an explicit unavailable/absent state. */
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --line: #e1e4ea; --fg: #1c2230; --muted: #687285;
+  --queue: #c9ced8; --prefill: #7b6ad8; --prep: #e0a030; --flight: #2f6fdb; --slow: #c8374a;
+  --notify: #8aa0c4; --wait: rgba(200, 55, 74, 0.22); --decode: #1f9d8f; --sel: rgba(47, 111, 219, 0.16);
+  --grid: rgba(28, 34, 48, 0.07); --accent: #2f6fdb; --absent: #9aa2b2;
+  --c0: #2f6fdb; --c1: #c8374a; --c2: #1f9d8f; --c3: #b86e00;
+  --font-ui: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-data: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f131a; --panel: #161c26; --line: #283142; --fg: #e4e9f2; --muted: #95a1b6;
+    --queue: #3a4356; --prefill: #9a8cf0; --prep: #f0b450; --flight: #6ea0ff; --slow: #ff6b7d;
+    --notify: #6f86ad; --wait: rgba(255, 107, 125, 0.25); --decode: #3cc7b8; --sel: rgba(110, 160, 255, 0.18);
+    --grid: rgba(228, 233, 242, 0.07); --accent: #6ea0ff; --absent: #6b7688;
+    --c0: #6ea0ff; --c1: #ff6b7d; --c2: #3cc7b8; --c3: #f0a640; color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 12px/1.4 var(--font-ui); }
+.wrap { max-width: 1600px; margin: 0 auto; padding: 10px max(16px, env(safe-area-inset-left, 0px)) 30px max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 10px; }
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; }
+.brand { font-weight: 700; }
+select, button { font: 500 12px var(--font-ui); color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 4px 8px; cursor: pointer; }
+button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+select:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.lbl { color: var(--muted); }
+.spacer { flex: 1; }
+.kv { display: flex; flex-wrap: wrap; gap: 2px 14px; font: 11.5px var(--font-data); color: var(--muted); }
+.kv b { color: var(--fg); font-weight: 600; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
+.ph { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.ph h2 { margin: 0; font-size: 12.5px; font-weight: 650; }
+.pairs { display: flex; flex-wrap: wrap; gap: 4px; }
+.pairs button i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+canvas { display: block; }
+.cwrap { position: relative; overflow-x: auto; }
+#tip { position: fixed; pointer-events: none; z-index: 20; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 5px 8px; font: 11.5px/1.4 var(--font-data); white-space: pre; box-shadow: 0 6px 18px rgba(0,0,0,.18); }
+.tablewrap { overflow: auto; max-height: 420px; }
+table { border-collapse: collapse; width: 100%; font: 11.5px var(--font-data); font-variant-numeric: tabular-nums; }
+th, td { padding: 3px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font: 600 10.5px var(--font-ui); text-transform: uppercase; letter-spacing: .04em; cursor: pointer; z-index: 1; }
+th[aria-sort] { color: var(--accent); }
+td.l, th.l { text-align: left; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--grid); }
+tbody tr[aria-selected="true"] { background: var(--sel); }
+td.hi { color: var(--slow); font-weight: 600; }
+td.na { color: var(--absent); }
+td .bar { display: inline-block; height: 7px; border-radius: 2px; background: var(--muted); opacity: .5; vertical-align: middle; margin-right: 4px; }
+td .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
+.detail { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 10px; }
+@media (max-width: 1100px) { .detail { grid-template-columns: minmax(0, 1fr); } }
+.recs { overflow: auto; max-height: 470px; }
+.recs td { text-align: left; }
+.recs td.t { text-align: right; }
+.layer { font: 600 10px var(--font-ui); text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.recs tbody tr.open { background: var(--sel); }
+.recs tr.raw td { background: var(--bg); padding: 8px 10px; cursor: default; }
+.raw-grid { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 14px; font: 11px/1.45 var(--font-data); white-space: normal; }
+.raw-grid .k { color: var(--muted); }
+.raw-grid .v { color: var(--fg); word-break: break-all; }
+.raw-grid .sec { grid-column: 1 / -1; font: 600 10px var(--font-ui); text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-top: 6px; }
+details.cfg { position: relative; }
+.cfg-body { max-height: 320px; overflow: auto; padding: 8px 12px; font: 11px/1.5 var(--font-data); white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <span class="brand">KV Request Explorer</span>
+    <label class="lbl" for="runsel">run</label><select id="runsel"></select>
+    <button type="button" id="all">whole run</button>
+    <button type="button" id="cfgbtn" aria-pressed="false">config</button>
+    <div class="spacer"></div>
+    <div class="kv" id="runkv"></div>
+  </div>
+  <section class="panel" id="cfgpanel" hidden>
+    <div class="ph"><h2>Configuration · UCX selection</h2>
+      <div class="spacer"></div><span class="lbl" id="cfgnote"></span></div>
+    <div class="cfg-body" id="cfgbody"></div>
+  </section>
+
+  <section class="panel">
+    <div class="ph"><h2>Time</h2>
+      <div class="pairs" id="pairs"></div>
+      <div class="spacer"></div><span class="lbl" id="lannote"></span></div>
+    <div class="cwrap"><canvas id="cv"></canvas></div>
+  </section>
+
+  <section class="panel">
+    <div class="ph"><h2>Requests</h2><span class="lbl" id="tcount"></span></div>
+    <div class="tablewrap"><table id="tbl"></table></div>
+  </section>
+
+  <div class="detail">
+    <section class="panel">
+      <div class="ph"><h2 id="dtitle">Request</h2>
+        <div class="legend lbl" id="dlegend">blue: transfer span · red: failed · gray: context of the same window</div>
+      </div>
+      <div class="cwrap"><canvas id="dv"></canvas></div>
+    </section>
+    <section class="panel">
+      <div class="ph"><h2>Records</h2><span class="lbl">every record joined to this request · click a record for its real source line</span></div>
+      <div class="recs"><table id="recs"></table></div>
+    </section>
+  </div>
+</div>
+<div id="tip" hidden></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const ms = v => v == null ? "—" : v >= 1000 ? (v / 1000).toFixed(3) + "s"
+  : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+const UNAVAIL = "n/r";               // not recorded (phase 4) / unavailable
+const ABSENT = "absent";             // source not in this run
+
+let RUN = 0, D = null, META = null, view = [0, 0], sel = null, pairSel = null,
+    sortKey = "first_record", sortDir = 1, dots = [];
+const qs = extra => `run=${RUN}` + (extra ? "&" + extra : "");
+const api = path => fetch(path).then(r => {
+  if (!r.ok) throw new Error(path + ": " + r.status);
+  return r.json();
+});
+const pairColor = k => {
+  const i = D.pairs.indexOf(k);
+  return css(`--c${i < 0 ? 0 : i % 4}`);
+};
+const shown = row => !pairSel || row.pair === pairSel;
+
+// ================================================================ top
+async function boot() {
+  const index = await api("/api/index");
+  const selEl = $("runsel");
+  selEl.innerHTML = index.runs.map(r =>
+    `<option value="${r.run}">${esc(r.dir.split("/").slice(-2).join("/"))}</option>`
+  ).join("");
+  selEl.addEventListener("change", e => { RUN = +e.target.value; load(); });
+  $("all").addEventListener("click", () => { view = [D.window.t0, D.window.t1]; draw(); });
+  $("cfgbtn").addEventListener("click", async e => {
+    const panel = $("cfgpanel");
+    panel.hidden = !panel.hidden;
+    e.currentTarget.setAttribute("aria-pressed", String(!panel.hidden));
+    if (!panel.hidden && !$("cfgbody").textContent) {
+      const cfg = await api("/api/config?" + qs());
+      const parts = [];
+      for (const c of cfg.configs) {
+        parts.push(`── capture ${c.layer} ${c.process_id || ""} (${esc(c.role || "")})`);
+        parts.push(JSON.stringify(c.metadata_config ?? c.metadata?.config ?? null, null, 1));
+      }
+      for (const doc of cfg.ucx_protocols) {
+        parts.push(`── ucx-protocols ${esc(doc.path)}`);
+        parts.push(JSON.stringify(doc.document, null, 1));
+      }
+      if (!cfg.ucx_protocols.length) parts.push("── UCX protocol selection: not captured");
+      $("cfgbody").textContent = parts.join("\n");
+      $("cfgnote").textContent = "saved snapshots, redacted by the recorder; rendered as text";
+    }
+  });
+  await load();
+}
+
+async function load() {
+  META = await api("/api/run?" + qs());
+  D = await api("/api/data?" + qs());
+  view = [D.window.t0, D.window.t1];
+  sel = null; pairSel = null;
+  runkv(); pairs(); draw(); table();
+  $("lannote").textContent =
+    "wheel: zoom · drag: pan · click a dot: select its request · " +
+    "dots: " + D.dot_label + " · GB/s: " + D.gbs_label;
+  $("dtitle").textContent = "Request";
+  $("recs").innerHTML = "";
+  dv.width = 1;
+}
+
+// Per timeline field, how many of the displayed rows carry a value (a measured
+// zero counts); a field no displayed row carries is listed as unavailable.
+const TIMELINE_FIELDS = [["prefill_ms", "prefill"], ["kv_wait_ms", "KV wait"],
+  ["admission_ms", "admit"], ["decode_window_ms", "decode"], ["ttft_ms", "TTFT"]];
+function timelineAvailability() {
+  const rows = D.requests.filter(shown);
+  const has = (r, f) => !!(r.timeline && r.timeline.available && r.timeline[f] != null);
+  const counts = TIMELINE_FIELDS.map(([f, label]) => [label, rows.filter(r => has(r, f)).length]);
+  return [
+    ["timeline fields", counts.map(([label, n]) => `${label} ${n}/${rows.length}`).join(" · ")],
+    ["unavailable", counts.filter(([, n]) => n === 0).map(([label]) => label).join(", ") || "none"],
+  ];
+}
+function runkv() {
+  const k = D.runkv;
+  const items = [
+    ["requests", k.requests],
+    ["transfers", k.transports],
+    ["READ p50/p99 ms", `${ms(k.read_p50_ms)}/${ms(k.read_p99_ms)}`],
+    ["READ GB/s p50/p99", k.gbs_p50 == null ? UNAVAIL
+      : `${k.gbs_p50.toFixed(2)}/${k.gbs_p99 == null ? UNAVAIL : k.gbs_p99.toFixed(2)}`],
+    ["slow READs", k.slow_reads],
+    ...timelineAvailability(),
+  ].concat(META.absent_sources.length
+    ? [["absent sources", META.absent_sources.join(", ")]] : [])
+    .concat(k.observations
+      ? [["other observations (listed separately)", k.observations]] : []);
+  $("runkv").innerHTML = items.map(([a, b]) =>
+    `<span>${esc(a)} <b>${esc(String(b))}</b></span>`).join("");
+}
+
+// ================================================================ pair filter
+function pairs() {
+  const counts = {};
+  for (const row of D.requests) if (shown(row)) counts[row.pair] = (counts[row.pair] || 0) + 1;
+  const btn = (k, label) =>
+    `<button type="button" data-k="${esc(k)}" aria-pressed="${(pairSel || "") === k}">` +
+    (k ? `<i style="background:${pairColor(k)}"></i>` : "") + esc(label) + "</button>";
+  $("pairs").innerHTML = btn("", "all pairs")
+    + D.pairs.map(k => { const [c, open] = pairCounts(k);
+        return btn(k, `${k} · ${c} · ${open} open`); }).join("");
+  $("pairs").querySelectorAll("button").forEach(b => b.addEventListener(
+    "click", () => { pairSel = b.dataset.k || null; pairs(); draw(); table(); runkv(); }));
+}
+function pairCounts(k) {
+  let total = 0, open = 0;
+  for (const row of D.requests) if (row.pair === k) { total++; if (row.state !== "completed") open++; }
+  return [total, open];
+}
+
+// ================================================================ lanes
+const cv = $("cv"), cx = cv.getContext("2d"), tip = $("tip");
+const LBL = 250;
+let cells = [];
+function stripsFor(pair) {
+  // strips of the L1 processes joined to this pair's sides (engine label)
+  const engines = new Set();
+  for (const row of D.requests) if (shown(row) && row.pair === pair)
+    D.pairs.forEach(p => { if (p === pair) engines.add(p); });
+  const sides = new Set(pair ? pair.split("→") : []);
+  return D.thread_strips.filter(s => s.engine && sides.has(s.engine));
+}
+function lanesFor() {
+  const L = [{ k: "dots", n: "transfer duration · ms (log) · dot = one transfer call", h: 120 }];
+  const ps = [...new Set(D.pairs.map(p => p.split("→")[0]))].sort();
+  for (const p of ps) L.push({ k: "inflight", p, n: `${p} · transfers in flight`, h: 30 });
+  L.push({ k: "bytes", n: "pair goodput · GB/s (100 ms, uniform-spread estimate)", h: 46 });
+  const byEngine = {};
+  for (const s of D.thread_strips) {
+    const key = s.engine_label || s.engine || "?";
+    byEngine[key] = (byEngine[key] || 0) + 1;
+  }
+  for (const engine of Object.keys(byEngine).sort())
+    L.push({ k: "strips", engine, n: `${engine} · shared thread activity per interval`, h: Math.min(byEngine[engine], 10) * 7 + 8 });
+  L.push({ k: "rtt", n: "TCP_INFO RTT µs per socket five-tuple and incarnation", h: 34 });
+  L.push({ k: "irq", n: "NIC IRQs + softirqs per s (host-wide context)", h: 30 });
+  L.push({ k: "ebpf", n: `eBPF events (${D.ebpf.coverage})`, h: 16 });
+  if (D.ebpf.coverage === "disabled") L[L.length - 1].n = "eBPF events (disabled — no records exist)";
+  return L;
+}
+function draw() {
+  const W = Math.max(900, cv.parentElement.clientWidth), dpr = window.devicePixelRatio || 1;
+  const lanes = lanesFor(), H = 20 + lanes.reduce((a, l) => a + l.h, 0) + 2;
+  cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + "px"; cv.style.height = H + "px";
+  cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const t0 = D.window.t0, t1 = D.window.t1;
+  const X = t => LBL + (t - view[0]) / (view[1] - view[0] || 1) * (W - LBL - 8);
+  const C = { muted: css("--muted"), grid: css("--grid"), line: css("--line"),
+              fg: css("--fg"), slow: css("--slow"), sel: css("--sel"), acc: css("--accent"),
+              absent: css("--absent") };
+  dots = []; cells = [];
+  cx.clearRect(0, 0, W, H); cx.font = "10.5px " + css("--font-data"); cx.textBaseline = "middle";
+  const span = view[1] - view[0];
+  const stepMs = [500, 1000, 2000, 5000, 10000, 30000, 60000, 120000, 300000]
+    .find(s => span / 1e6 / s <= 14) || 600000;
+  for (let t = Math.ceil(view[0] / (stepMs * 1e6)) * stepMs * 1e6; t <= view[1]; t += stepMs * 1e6) {
+    const x = X(t);
+    cx.fillStyle = C.grid; cx.fillRect(x, 16, 1, H - 16);
+    cx.fillStyle = C.muted; cx.textAlign = "center";
+    cx.fillText(ms((t - t0) / 1e6), x, 8);
+  }
+  cx.textAlign = "left";
+  if (sel) {
+    const a = sel.read_ms && sel.read_ms.length ? Math.max(...sel.read_ms) * 1e6 : 0;
+    cx.fillStyle = C.sel;
+    cx.fillRect(X(sel.first_record), 16, Math.max(2, X((sel.first_record || 0) + a) - X(sel.first_record)), H - 16);
+  }
+  let y = 18;
+  for (const l of lanes) {
+    cx.fillStyle = C.line; cx.fillRect(0, y - 0.5, W, 1);
+    cx.fillStyle = C.muted; cx.fillText(l.n, 6, y + Math.min(l.h / 2, 11));
+    cx.save(); cx.beginPath(); cx.rect(LBL, y, W - LBL, l.h); cx.clip();
+    const top = y + 3, bot = y + l.h - 2;
+    const area = (pts, maxV, color, stepNs = BIN_MS()) => {
+      if (!pts.length) return;
+      cx.beginPath(); cx.moveTo(X(pts[0][0]), bot);
+      for (const [t, v] of pts) {
+        const yy = bot - Math.min(1, (v ?? 0) / maxV) * (bot - top);
+        cx.lineTo(X(t), yy); cx.lineTo(X(t + stepNs), yy);
+      }
+      cx.lineTo(X(pts[pts.length - 1][0] + stepNs), bot); cx.closePath();
+      cx.fillStyle = color; cx.globalAlpha = 0.35; cx.fill(); cx.globalAlpha = 1;
+    };
+    const line = (pts, maxV, color) => {
+      if (!pts.some(p => p[1] != null)) {
+        cx.fillStyle = C.absent; cx.fillText("absent", LBL + 6, top + 6); return;
+      }
+      cx.beginPath();
+      pts.forEach(([t, v], i) => {
+        if (v == null) return;
+        const yy = bot - Math.min(1, v / maxV) * (bot - top);
+        i ? cx.lineTo(X(t), yy) : cx.moveTo(X(t), yy);
+      });
+      cx.strokeStyle = color; cx.lineWidth = 1.4; cx.stroke();
+    };
+    if (l.k === "dots") {
+      const lo = Math.log10(10), hi = Math.log10(3000);
+      const Y = v => bot - (Math.log10(Math.max(10, v)) - lo) / (hi - lo) * (bot - top - 4);
+      for (const v of [20, 50, 100, 500, 1000, 2000]) {
+        cx.fillStyle = C.grid; cx.fillRect(LBL, Y(v), W - LBL, 1);
+        cx.fillStyle = C.muted; cx.fillText(v, LBL + 3, Y(v) - 5);
+      }
+      for (const dpoint of D.dots) {
+        if (pairSel && dpoint.pair !== pairSel) continue;
+        const x = X(dpoint.t);
+        if (x < LBL - 4 || x > W + 4 || dpoint.ms == null) continue;
+        const slow = kSlow(dpoint.ms);
+        const isSel = sel && (sel.transport_keys || []).includes(dpoint.key);
+        cx.beginPath(); cx.arc(x, Y(dpoint.ms), isSel ? 4.5 : slow ? 3 : 2.2, 0, 7);
+        cx.fillStyle = dpoint.state === "completed" ? pairColor(dpoint.pair) : css("--slow");
+        cx.globalAlpha = slow ? 0.95 : 0.55; cx.fill(); cx.globalAlpha = 1;
+        dots.push({ x, y: Y(dpoint.ms), d: dpoint });
+      }
+    } else if (l.k === "inflight") {
+      const series = Object.entries(D.inflight).filter(([p]) => p.startsWith(l.p + "→") || !pairSel);
+      for (const [pair, pts] of series) area(pts, maxInflight(), pairColor(pair));
+    } else if (l.k === "bytes") {
+      for (const [pair, pts] of Object.entries(D.gbs))
+        if (!pairSel || pair === pairSel) line(pts, 12, pairColor(pair));
+      cx.fillStyle = C.muted; cx.fillText("12 GB/s", LBL + 3, y + 8);
+    } else if (l.k === "strips") {
+      const list = D.thread_strips.filter(s =>
+        (s.engine_label || s.engine || "?") === l.engine).slice(0, 10);
+      const rh = (l.h - 8) / list.length;
+      cx.font = "9.5px " + css("--font-data");
+      list.forEach((strip, i) => {
+        const yy = y + 4 + i * rh;
+        for (const p of strip.points) {
+          if (p.cpu == null || p.t1 == null) continue;
+          const xa = X(p.t0), xb = X(p.t1);
+          if (xb < LBL || xa > W) continue;
+          cx.fillStyle = p.cpu > 0.85 ? C.slow : C.fg;
+          cx.globalAlpha = Math.min(0.85, 0.15 + p.cpu * 0.85);
+          cx.fillRect(xa, yy + rh * 0.5, Math.max(1, xb - xa - 0.3), rh * 0.45 - 1);
+          cx.globalAlpha = 1;
+        }
+        cells.push({ y0: yy, y1: yy + rh, strip,
+          name: `${l.engine} · ${strip.label}${strip.start_ticks_unverified ? " · start-ticks unverified" : ""}` });
+      });
+      cx.fillStyle = C.muted; cx.font = "10.5px " + css("--font-data");
+      if (rh >= 7 && list.length <= 6) {
+        cx.textAlign = "right";
+        list.forEach((s, i) => cx.fillText(s.label, LBL - 6, y + 4 + i * rh + rh / 2));
+        cx.textAlign = "left";
+      }
+    } else if (l.k === "rtt") {
+      const allPts = [];
+      D.rtt.forEach((series, i) => {
+        const pts = series.points.filter(p => p.t != null).map(p => [p.t, p.rtt_us]);
+        line(pts, 2000, css(`--c${i % 4}`));
+        allPts.push(...pts);
+      });
+      if (!D.rtt.length) { cx.fillStyle = C.absent; cx.fillText("no TCP socket capture in this run", LBL + 6, top + 6); }
+    } else if (l.k === "irq") {
+      // separate time-ordered series per endpoint and counter; a missing
+      // reading stays absent (no line segments bridge between endpoints)
+      const byEndpoint = {};
+      for (const p of D.irq) {
+        const key = p.endpoint || "?";
+        (byEndpoint[key] ||= []).push(p);
+      }
+      const endpoints = Object.keys(byEndpoint).sort();
+      if (endpoints.length) {
+        let drewAny = false;
+        endpoints.forEach((endpoint, iColor) => {
+          // time-ordered within the endpoint: two recorder generations
+          // arrive as 6s, 7s, 1s, 2s and must draw 1s, 2s, 6s, 7s
+          const pts = (byEndpoint[endpoint] || [])
+            .slice()
+            .sort((a, b) => (a.t ?? 0) - (b.t ?? 0));
+          const color = css(`--c${iColor % 4}`);
+          const irqs = pts.filter(p => p.irq_total_per_s != null)
+            .map(p => [p.t, p.irq_total_per_s]);
+          if (irqs.length) {
+            area(irqs, Math.max(1000, ...irqs.map(p => p[1])), color);
+            drewAny = true;
+          }
+          const rx = pts.filter(p => p.net_rx_per_s != null)
+            .map(p => [p.t, p.net_rx_per_s]);
+          const tx = pts.filter(p => p.net_tx_per_s != null)
+            .map(p => [p.t, p.net_tx_per_s]);
+          if (rx.length) { line(rx, Math.max(1, ...rx.map(p => p[1] || 0)), color); drewAny = true; }
+          if (tx.length) { line(tx, Math.max(1, ...tx.map(p => p[1] || 0)), color); drewAny = true; }
+        });
+        if (!drewAny)
+          { cx.fillStyle = C.absent; cx.fillText("no interrupt rates readable in this run", LBL + 6, top + 6); }
+        else
+          { cx.fillStyle = C.muted; cx.fillText("one color per endpoint · IRQ area · NET_RX/NET_TX lines", LBL + 3, y + 8); }
+      } else { cx.fillStyle = C.absent; cx.fillText("no interrupts capture in this run", LBL + 6, top + 6); }
+    } else if (l.k === "ebpf") {
+      if (D.ebpf.coverage === "disabled")
+        { cx.fillStyle = C.absent; cx.fillText("disabled", LBL + 6, top + 6); }
+      else if (!D.ebpf.events.length)
+        { cx.fillStyle = C.muted; cx.fillText("no events (coverage " + D.ebpf.coverage + ")", LBL + 6, top + 6); }
+      for (const e of D.ebpf.events) {
+        if (e.t == null) continue;
+        const x = X(e.t);
+        if (x < LBL || x > W) continue;
+        cx.fillStyle = C.slow; cx.fillRect(x - 0.75, y + 2, 1.5, l.h - 4);
+      }
+    }
+    cx.restore();
+    y += l.h;
+  }
+  cv._g = { W, X };
+}
+function BIN_MS() { return (D.bin_ms || 100) * 1e6; }
+function maxInflight() { return Math.max(1, ...Object.values(D.inflight).flat().map(p => p[1] || 0)); }
+let slowThreshold = null;
+function kSlow(msValue) {
+  if (slowThreshold == null && D.runkv.read_p50_ms != null)
+    slowThreshold = 2 * D.runkv.read_p50_ms;
+  return slowThreshold != null && msValue > slowThreshold;
+}
+function maxConc() { return Math.max(1, ...Object.values(D.peak_per_pair)); }
+</script>
+<script>
+"use strict";
+// ================================================================ interaction
+let drag = null;
+cv.addEventListener("wheel", e => { e.preventDefault();
+  const g = cv._g; if (!g) return;
+  const rect = cv.getBoundingClientRect();
+  const f = Math.min(1, Math.max(0, (e.clientX - rect.left - LBL) / (g.W - LBL - 8)));
+  const tc = view[0] + f * (view[1] - view[0]);
+  const s = Math.min(D.window.t1 - D.window.t0, Math.max(1e6, (view[1] - view[0]) * Math.exp(e.deltaY * 0.0015)));
+  view = [tc - f * s, tc + (1 - f) * s]; clamp(); draw(); }, { passive: false });
+cv.addEventListener("mousedown", e => { drag = { x: e.clientX, v: [...view], moved: false }; });
+window.addEventListener("mouseup", e => {
+  if (drag && !drag.moved && e.target === cv) {
+    const h = nearest(e); if (h) selectByDot(h.d);
+  } drag = null; });
+function nearest(e) {
+  const rect = cv.getBoundingClientRect(), x = e.clientX - rect.left, y = e.clientY - rect.top;
+  let best = null, bd = 49;
+  for (const d of dots) { const dd = (d.x - x) ** 2 + (d.y - y) ** 2; if (dd < bd) { bd = dd; best = d; } }
+  return best;
+}
+window.addEventListener("mousemove", e => {
+  const g = cv._g; if (!g) return;
+  if (drag) {
+    const dx = e.clientX - drag.x;
+    if (Math.abs(dx) > 3) drag.moved = true;
+    const dt = dx / (g.W - LBL - 8) * (drag.v[1] - drag.v[0]);
+    view = [drag.v[0] - dt, drag.v[1] - dt]; clamp(); draw(); tip.hidden = true; return;
+  }
+  if (e.target !== cv) { tip.hidden = true; return; }
+  const rect = cv.getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const cell = mx > LBL && cells.find(c => my >= c.y0 && my < c.y1);
+  if (cell) {
+    const t = view[0] + (mx - LBL) / (g.W - LBL - 8) * (view[1] - view[0]);
+    const point = cell.strip.points.find(p => p.t0 != null && p.t0 <= t && (p.t1 ?? 0) >= t);
+    if (point) {
+      tip.textContent = `${cell.name}\ninterval ${ms((point.t1 - point.t0) / 1e6)}\nshared thread activity ${point.cpu == null ? "unavailable" : Math.round(point.cpu * 100) + "%"} · run-queue ${point.run_share == null ? "unavailable" : Math.round(point.run_share * 100) + "%"}`;
+      tip.hidden = false; tip.style.left = Math.min(innerWidth - 300, e.clientX + 14) + "px"; tip.style.top = e.clientY + 12 + "px"; return;
+    }
+  }
+  const h = nearest(e);
+  if (h) {
+    const d = h.d;
+    tip.textContent = `${d.pair || "?"} · ${d.state}\ntransfer   ${ms(d.ms)} ms  ${d.gbs == null ? UNAVAIL : d.gbs.toFixed(2) + " GB/s"}\nthread     ${d.thread ?? UNAVAIL}${d.thread_name ? " · " + d.thread_name : ""}`;
+    tip.hidden = false; tip.style.left = Math.min(innerWidth - 260, e.clientX + 14) + "px"; tip.style.top = e.clientY + 12 + "px";
+  } else tip.hidden = true;
+});
+function clamp() {
+  const s = view[1] - view[0];
+  if (view[0] < D.window.t0) view = [D.window.t0, D.window.t0 + s];
+  if (view[1] > D.window.t1) view = [D.window.t1 - s, D.window.t1];
+}
+addEventListener("resize", () => D && draw());
+addEventListener("resize", () => D && sel && zoomDetail());
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => D && draw());
+</script>
+<script>
+"use strict";
+// ================================================================ table
+const COLS = [
+  ["display", "request", r => `<span class="dot" style="background:${pairColor(r.pair)}"></span>${esc(r.display)}`, "l"],
+  ["pair", "pair", r => esc(D.pair_labels?.[r.pair] || r.pair || "?"), "l"],
+  ["read_threads", "READ thr", r => r.read_threads.length ? r.read_threads.join(",") : UNAVAIL],
+  ["first_record", "first rec s", r => r.first_record == null ? ABSENT : ((r.first_record - D.window.t0) / 1e9).toFixed(3)],
+  ["arrive", "arrive s", r => r.arrive == null ? UNAVAIL : ((r.arrive - D.window.t0) / 1e9).toFixed(3)],
+  ["prep", "prep→post ms", r => r.prep_ms.length ? ms(Math.max(...r.prep_ms)) : UNAVAIL],
+  ["read", "READ ms", r => r.read_ms.length ? ms(Math.max(...r.read_ms)) : UNAVAIL, r => isSlow(r)],
+  ["gbs", "GB/s", r => r.gbs.length ? Math.max(...r.gbs).toFixed(2) : UNAVAIL, r => isSlow(r)],
+  ["conc", "peak conc", r => r.peak_concurrency ?? UNAVAIL],
+  ["mib", "MiB", r => r.mib ?? UNAVAIL, null, r => r.bytes_basis],
+  ["descriptors", "desc", r => r.descriptors ?? UNAVAIL],
+  ["state", "state", r => esc(r.state), "l"],
+  ["cpu", "ReadThr CPU % · shared", r => r.posting_thread_cpu == null ? UNAVAIL : Math.round(r.posting_thread_cpu * 100)],
+  ["rtt", "RTT max µs · cand.", r => r.rtt_max_us_cand == null ? UNAVAIL : Math.round(r.rtt_max_us_cand), null, r => r.candidate_basis],
+  ["retx", "retx · cand.", r => r.retx_cand == null ? UNAVAIL : r.retx_cand, r => (r.retx_cand ?? 0) > 0, r => r.candidate_basis],
+  ["prefill", "prefill ms", r => tl(r, "prefill_ms")],
+  ["kvwait", "KV wait ms", r => tl(r, "kv_wait_ms")],
+  ["admit", "admit ms", r => tl(r, "admission_ms")],
+  ["decode", "decode ms", r => tl(r, "decode_window_ms")],
+  ["ttft", "TTFT ms · node", r => tl(r, "ttft_ms")],
+];
+const sortVal = {
+  display: r => r.display, pair: r => r.pair || "", read_threads: r => r.read_threads[0] ?? -1,
+  first_record: r => r.first_record ?? Infinity, arrive: r => r.arrive ?? Infinity,
+  prep: r => r.prep_ms.length ? Math.max(...r.prep_ms) : Infinity,
+  read: r => r.read_ms.length ? Math.max(...r.read_ms) : Infinity,
+  gbs: r => r.gbs.length ? Math.max(...r.gbs) : -1, conc: r => r.peak_concurrency ?? -1,
+  mib: r => r.mib ?? -1, descriptors: r => r.descriptors ?? -1, state: r => r.state,
+  cpu: r => r.posting_thread_cpu ?? -1, rtt: r => r.rtt_max_us_cand ?? -1,
+  retx: r => r.retx_cand ?? -1,
+  prefill: r => r.timeline?.prefill_ms ?? -1,
+  kvwait: r => r.timeline?.kv_wait_ms ?? -1,
+  admit: r => r.timeline?.admission_ms ?? -1,
+  decode: r => r.timeline?.decode_window_ms ?? -1,
+  ttft: r => r.timeline?.ttft_ms ?? -1,
+};
+// Numbers compare as numbers (2 < 10 < 100), anything else as text.
+function cmpSort(a, b) {
+  if (typeof a === "number" && typeof b === "number") return a < b ? -1 : a > b ? 1 : 0;
+  const x = String(a), y = String(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+// A request-timeline value (phase 4), or n/r with the reason it is unavailable.
+function tl(r, field) {
+  const t = r.timeline || {};
+  const v = t.available ? t[field] : null;
+  if (v == null) return `<span class="na" title="${esc((t.reasons || {})[field] || t.reason || "not recorded")}">${UNAVAIL}</span>`;
+  return ms(v);
+}
+function isSlow(row) {
+  return row.read_ms.some(v => kSlow(v));
+}
+function table() {
+  const rows = D.requests.filter(shown)
+    .sort((a, b) => sortDir * cmpSort(sortVal[sortKey](a), sortVal[sortKey](b)));
+  $("tcount").textContent =
+    `${rows.length} requests${pairSel ? " · " + (D.pair_labels?.[pairSel] || pairSel) : ""}`
+    + (D.runkv.observations ? ` · ${D.runkv.observations} other observations listed separately` : "")
+    + ` · ${META.summary_source.source} summary · click a header to sort`;
+  const maxR = Math.max(0, ...rows.map(r => r.read_ms.length ? Math.max(...r.read_ms) : 0));
+  $("tbl").innerHTML = `<thead><tr>${COLS.map(([k, n]) =>
+    `<th data-k="${k}" ${k === sortKey ? `aria-sort="${sortDir > 0 ? "ascending" : "descending"}"` : ""}>${esc(n)}</th>`).join("")}</tr></thead><tbody>` +
+    rows.map(r => `<tr data-k="${esc(r.key.scheduler_process_id)}|${esc(r.key.request)}|${r.key.occurrence}">` +
+      COLS.map(([k, , f, hi, title], i) => {
+        const flagged = typeof hi === "function" && hi(r);
+        const tip = typeof title === "function" ? title(r) : null;
+        return `<td ${tip ? `title="${esc(tip)}"` : ""} class="${k === "display" || k === "pair" || k === "state" ? "l" : ""} ${flagged ? "hi" : ""}">${k === "read" && r.read_ms.length
+          ? `<span class="bar" style="width:${Math.round(Math.max(...r.read_ms) / (maxR || 1) * 60)}px"></span>${f(r)}`
+          : f(r)}</td>`;
+      }).join("") + "</tr>").join("") + "</tbody>";
+  $("tbl").querySelectorAll("th").forEach(th => th.addEventListener("click", () => {
+    const k = th.dataset.k;
+    sortDir = k === sortKey ? -sortDir : 1; sortKey = k; table();
+  }));
+  $("tbl").querySelectorAll("tbody tr").forEach(tr => tr.addEventListener("click", () => {
+    const [pid, req, occ] = tr.dataset.k.split("|");
+    select(pid, req, +occ, true);
+  }));
+}
+</script>
+<script>
+"use strict";
+// ================================================================ detail
+const dv = $("dv"), dx = dv.getContext("2d");
+function selectByDot(d) {
+  // the dot is one physical transport: the click uses the same ownership
+  // rule as the table — the request whose transport_keys carry this dot's
+  // key. An unassigned transport selects nothing (the lanes show it).
+  const row = D.requests.find(r => (r.transport_keys || []).includes(d.key));
+  if (!row) {
+    $("dtitle").textContent =
+      `unassigned transfer ${d.key} — visible on the lanes, attributed to ` +
+      "no request";
+    return;
+  }
+  select(row.key.scheduler_process_id, row.key.request,
+    row.key.occurrence, true);
+}
+async function select(pid, req, occ, zoom) {
+  const payload = await api(`/api/records?${qs(`scheduler_process_id=${encodeURIComponent(pid)}&request=${encodeURIComponent(req)}&occurrence=${occ}`)}`);
+  sel = payload.logical;
+  L1 = payload.records;
+  if (zoom) {
+    const spanMs = Math.max(1, (sel.read_ms.length ? Math.max(...sel.read_ms) : 1) * 4);
+    const t0 = sel.first_record ?? D.window.t0;
+    view = [t0 - spanMs * 1e6, t0 + spanMs * 2 * 1e6];
+    clamp();
+  }
+  draw(); table(); zoomDetail();
+  $("dtitle").textContent = `${sel.display} · ${sel.pair_display || sel.pair || "?"} · ${sel.state}`;
+}
+let L1 = [];
+function zoomDetail() {
+  const q = sel;
+  if (!q) { $("dtitle").textContent = "Request"; dv.width = 1; $("recs").innerHTML = ""; return; }
+  const W = Math.max(600, dv.parentElement.clientWidth), dpr = window.devicePixelRatio || 1;
+  // the plotted window is sized from the measured endpoints of the request's
+  // own operations, so a READ 277 ms after the first record still draws
+  // ...and of its compute timeline's phases (phase 4), when they project
+  const phases = (q.timeline && q.timeline.available && q.timeline.spans) || [];
+  const allSpans = q.spans.concat(phases);
+  const spanT0 = Math.min(
+    q.first_record ?? Infinity,
+    ...allSpans.map(s => s.t0).filter(t => t != null));
+  const spanT1 = Math.max(
+    ...allSpans.map(s => s.t1).filter(t => t != null),
+    (q.spans.length ? q.spans[0].t0 : null) ?? (q.first_record ?? 0));
+  const view_span = Math.max(1, (spanT1 - spanT0) * 1.6);
+  const t0 = spanT0 - view_span * 0.2;
+  const t1 = spanT0 + view_span * 1.4;
+  window.__detail = { t0, t1, spanT0, spanT1 };
+  const LB = 220, RH = 24;
+  const rows = [["L1", "transfers (measured interval)", "spans"]];
+  const pairEngines = new Set((q.pair || "").split("→"));
+  for (const s of D.thread_strips.filter(
+    s => !s.engine_id || !q.pair || pairEngines.has(s.engine_id)))
+    rows.push(["L3", `threads · ${s.label}`, { strip: s }]);
+  for (const [i, r] of D.rtt.entries()) rows.push(["L3", `RTT · ${r.label}`, { rtt: r }]);
+  for (const c of D.collector) rows.push(["L2", `collector · ${c.label}`, { coll: c }]);
+  rows.push(["L3", "eBPF events", "ev"]);
+  rows.push(["L1", "decode node · KV wait / to first token / decode", "timeline"]);
+  const H = rows.length * RH + 22;
+  dv.width = W * dpr; dv.height = H * dpr; dv.style.width = W + "px"; dv.style.height = H + "px";
+  dx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const X = t => LB + (t - t0) / (t1 - t0) * (W - LB - 8);
+  const C = { muted: css("--muted"), grid: css("--grid"), line: css("--line"), fg: css("--fg"),
+              flight: css("--flight"), slow: css("--slow"), absent: css("--absent"), prep: css("--prep") };
+  dx.clearRect(0, 0, W, H); dx.font = "10.5px " + css("--font-data"); dx.textBaseline = "middle";
+  for (let k = 0; k <= 6; k++) {
+    const t = t0 + k / 6 * (t1 - t0), x = X(t);
+    dx.fillStyle = C.grid; dx.fillRect(x, 0, 1, H - 16);
+    dx.fillStyle = C.muted; dx.textAlign = "center";
+    dx.fillText("+" + ms(k / 6 * (t1 - t0) / 1e6), x, H - 7);
+  }
+  dx.textAlign = "left";
+  rows.forEach(([layer, name, what], i) => {
+    const y = i * RH;
+    dx.fillStyle = C.line; dx.fillRect(0, y + RH - 0.5, W, 1);
+    dx.fillStyle = C.muted; dx.fillText(layer, 6, y + RH / 2);
+    dx.fillStyle = C.fg; dx.fillText(String(name).slice(0, 44), 30, y + RH / 2);
+    dx.save(); dx.beginPath(); dx.rect(LB, y, W - LB, RH); dx.clip();
+    if (what === "spans") {
+      // each operation draws at its own measured start and end (ns)
+      for (const span of (q.spans || [])) {
+        const a = X(span.t0), b = Math.max(a + 1, X(span.t1));
+        dx.fillStyle = span.state === "completed" ? C.flight : C.slow;
+        dx.fillRect(a, y + 5, b - a, RH - 10);
+      }
+      if (!(q.spans || []).length) { dx.fillStyle = C.absent; dx.fillText("no completed transfer with a measured interval", LB + 6, y + RH / 2); }
+    } else if (what === "timeline") {
+      const t = q.timeline || {};
+      const spans = t.available ? (t.spans || []) : [];
+      const colour = { "waiting for KV": C.slow, "to first token": C.flight, "decode": C.muted };
+      for (const span of spans) {
+        const a = X(span.t0), b = Math.max(a + 1, X(span.t1));
+        dx.fillStyle = colour[span.kind] || C.fg;
+        dx.fillRect(a, y + 5, b - a, RH - 10);
+      }
+      if (!spans.length) {
+        dx.fillStyle = C.absent;
+        dx.fillText(t.available ? "phase times not on the reference clock" : (t.reason || "not recorded"), LB + 6, y + RH / 2);
+      }
+    } else if (what === "ev") {
+      if (D.ebpf.coverage === "disabled") { dx.fillStyle = C.absent; dx.fillText("disabled — no records exist", LB + 6, y + RH / 2); }
+      for (const e of D.ebpf.events) {
+        if (e.t == null || e.t < t0 || e.t > t1) continue;
+        dx.fillStyle = C.slow; dx.fillRect(X(e.t) - 0.75, y + 4, 1.5, RH - 8);
+      }
+    } else if (what.strip) {
+      for (const p of what.strip.points) {
+        if (p.t0 == null || p.cpu == null || p.t1 < t0 || p.t0 > t1) continue;
+        const xa = X(p.t0), xb = X(p.t1);
+        const h = Math.min(1, p.cpu) * (RH - 8);
+        dx.fillStyle = p.cpu > 0.85 ? C.slow : C.muted; dx.globalAlpha = 0.55;
+        dx.fillRect(xa, y + RH - 4 - h, Math.max(1, xb - xa - 0.5), h); dx.globalAlpha = 1;
+      }
+    } else if (what.rtt) {
+      let any = false;
+      for (const p of what.rtt.points) {
+        if (p.t == null || p.rtt_us == null || p.t < t0 || p.t > t1) continue;
+        any = true;
+        const h = Math.min(1, p.rtt_us / 2000) * (RH - 8);
+        dx.fillStyle = p.rtt_us > 300 ? C.slow : C.muted; dx.globalAlpha = 0.55;
+        dx.fillRect(X(p.t), y + RH - 4 - h, 2, h); dx.globalAlpha = 1;
+      }
+      if (!any) { dx.fillStyle = C.absent; dx.fillText("no samples in this window (per socket & incarnation)", LB + 6, y + RH / 2); }
+    } else if (what.coll) {
+      // per-field rates keep their own units; gauges (bytes) render as
+      // their own sampled values, never differenced into rates
+      for (const p of what.coll.points) {
+        if (!p.t || p.t < t0 || p.t > t1) continue;
+        for (const [name, entry] of Object.entries(p.rates)) {
+          if (!entry || entry.rate == null) continue;
+          const scale = entry.unit === "bytes" ? 1e9
+            : entry.unit === "requests" ? 1000 : 1;
+          const h = Math.max(1, Math.min(1, Math.abs(entry.rate) / scale) * (RH - 8));
+          const isGauge = name === "registered_buffer_bytes";
+          dx.fillStyle = isGauge ? css("--prep") : C.muted;
+          dx.globalAlpha = 0.55;
+          dx.fillRect(X(p.t), y + RH - 4 - h, 3, h);
+          dx.globalAlpha = 1;
+        }
+        for (const [name, gauge] of Object.entries(p.gauges || {})) {
+          if (gauge == null || gauge.value == null) continue;
+          // bytes on a 0..16 MiB visual scale, capped; units stay bytes
+          const h = Math.min(1, gauge.value / (16 * 2 ** 20)) * (RH - 8);
+          dx.fillStyle = css("--prep"); dx.globalAlpha = 0.75;
+          dx.fillRect(X(p.t), y + RH - 4 - h, 5, h);
+          dx.globalAlpha = 1;
+        }
+      }
+    }
+    dx.restore();
+  });
+  renderRecords(L1, q);
+}
+function oneLine(value) {
+  // captured values render as text: strings escaped, structures JSON
+  return value == null ? "null"
+    : typeof value === "object" ? JSON.stringify(value)
+    : String(value);
+}
+function renderRecords(records, q) {
+  const t0 = q.first_record ?? D.window.t0;
+  $("recs").innerHTML = `<thead><tr><th class="l">layer</th><th class="l">record</th><th class="t">t from first, ms</th><th class="l">source (file:line)</th></tr></thead><tbody>` +
+    records.map((r, i) => `<tr data-i="${i}"><td class="l"><span class="layer">${esc(r.layer)}</span></td>` +
+      `<td class="l">${esc(r.kind)}${r.scope ? " · " + esc(r.scope) : ""}</td>` +
+      `<td class="t">${r.t == null ? "unplaced" : ms((r.t - t0) / 1e6)}</td>` +
+      `<td class="l">${esc((r.path || "?").split("/").slice(-2).join("/"))}:${r.line ?? "?"}</td></tr>`).join("") + "</tbody>";
+  $("recs").querySelectorAll("tbody tr[data-i]").forEach(row => row.addEventListener("click", () => {
+    const nx = row.nextElementSibling;
+    if (nx && nx.classList.contains("raw")) { nx.remove(); row.classList.remove("open"); return; }
+    const r = records[+row.dataset.i];
+    const grid = parts => `<div class="raw-grid">${parts.join("")}</div>`;
+    const body = [];
+    body.push(`<span class="sec">record — ${esc(r.path || "?")} line ${r.line ?? "?"} (${esc(r.role || "")})</span>`);
+    for (const [k, v] of Object.entries(r.raw || {})) {
+      body.push(`<span class="k">${esc(k)}</span><span class="v">${esc(oneLine(v))}</span>`);
+    }
+    if (r.resolved) {
+      body.push(`<span class="sec">references resolved (dictionary)</span>`);
+      for (const [k, v] of Object.entries(r.resolved)) {
+        body.push(`<span class="k">${esc(k)}</span><span class="v">${v == null ? "unresolved" : esc(oneLine(v))}</span>`);
+      }
+    }
+    if (r.candidate_only) {
+      body.push(`<span class="sec new">time-window context (candidate association, never attribution)</span>`);
+    }
+    row.insertAdjacentHTML("afterend",
+      `<tr class="raw"><td colspan="4">${grid(body)}</td></tr>`);
+    row.classList.add("open");
+  }));
+}
+boot();
+</script>
+</body>
+</html>

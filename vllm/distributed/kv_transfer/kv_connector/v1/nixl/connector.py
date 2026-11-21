@@ -261,6 +261,15 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.set_host_xfer_buffer_ops(copy_operation)
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        if (w := self.connector_worker) is not None and (p := w._kvp) is not None:
+            p.step_begin(connector_metadata)
+
+    def finish_forward(self) -> None:
+        if (w := self.connector_worker) is not None and (p := w._kvp) is not None:
+            p.step_end()
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None

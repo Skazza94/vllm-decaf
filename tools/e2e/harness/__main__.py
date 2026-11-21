@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 
 from . import pd
@@ -27,6 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     prefill_decode = commands.add_parser(
         "run", help="a prefill/decode run of the vLLM simulator behind llm-d's router, in an up topology")
     prefill_decode.add_argument("run", help="the run config")
+    prefill_decode.add_argument("--output", help="the results directory (default: results/<name>-<time>)")
     recheck = commands.add_parser("recheck", help="a saved prefill/decode run's checks again (verdict-recheck.json)")
     recheck.add_argument("results", help="the run's results directory")
     peak = commands.add_parser(
@@ -38,7 +40,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(topology.up(specs.load(args.spec)), indent=2))
         return 0
     if args.command == "run":
-        print(json.dumps(pd.execute(pd.load(args.run, fetch=True)), indent=2))
+        print(json.dumps(pd.execute(pd.load(args.run, fetch=True),
+                                    Path(args.output) if args.output else None), indent=2))
         return 0
     if args.command == "peak-prefill":
         found = pd.saved_peak_prefill_throughput(args.results)

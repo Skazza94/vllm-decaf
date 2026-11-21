@@ -278,6 +278,10 @@ checked against a pattern the producer wrote.
 | Per-rank addresses, TCP and RDMA | [Transports](simulated_execution/real_kv_transfers.md#transports) |
 | Step-log records | [Logs](simulated_execution/real_kv_transfers.md#logs) |
 
+The [KV transfer profiler](../observability/kv_profiler_core.md) records each
+request's handoff, transfers and peer clocks at the connectors and the endpoints,
+for offline Perfetto export and summaries.
+
 ## Running without a GPU
 
 A CPU build of vLLM (`VLLM_TARGET_DEVICE=cpu`, which installs Triton's CPU

@@ -59,6 +59,60 @@ def zmq_ctx(socket_type: Any, addr: str) -> Iterator[zmq.Socket]:
             ctx.destroy(linger=0)
 
 
+def nixl_snapshot(agent, requested: dict) -> dict:
+    """What the NIXL agent set up (its initialized backends and their options)
+    beside what was requested. Imported and run only when a profiler attaches."""
+    from vllm.kv_profiling.snapshot import nixl_agent
+
+    return nixl_agent(agent, requested)
+
+
+def attach_profiler(
+    vllm_config,
+    role: str,
+    engine_id: str,
+    rank: int,
+    transfer_mode: str,
+    side_channel: tuple[str, int] | None = None,
+    context: dict | None = None,
+    transport_snapshot=None,
+):
+    """The KV network profiler of this scheduler or worker, None when off.
+
+    Nothing of ``vllm.kv_profiling`` is imported unless
+    ``kv_connector_extra_config["network_profiler"]`` enables a level.
+    ``transport_snapshot``, a callable, reports what the transport library set
+    up; it runs only when a worker's profiler attaches.
+    """
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+        "network_profiler"
+    )
+    if extra is None or (
+        isinstance(extra, dict) and extra.get("level", "off") == "off"
+    ):
+        return None
+    if not isinstance(extra, dict):
+        raise ValueError("network_profiler must be a dict")
+    from vllm.kv_profiling.nixl import attach_nixl
+
+    context = {
+        "backends": list(
+            vllm_config.kv_transfer_config.get_from_extra_config("backends", ["UCX"])
+        ),
+        **(context or {}),
+    }
+    return attach_nixl(
+        vllm_config,
+        role,
+        engine_id=engine_id,
+        rank=rank,
+        transfer_mode=transfer_mode,
+        side_channel=side_channel,
+        context=context,
+        transport_snapshot=transport_snapshot,
+    )
+
+
 def side_channel_port(parallel_config: "ParallelConfig") -> int:
     """The NIXL side-channel port of this data-parallel rank."""
     return envs.VLLM_NIXL_SIDE_CHANNEL_PORT + parallel_config.data_parallel_index

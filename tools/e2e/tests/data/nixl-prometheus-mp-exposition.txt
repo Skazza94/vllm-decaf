@@ -1,0 +1,187 @@
+# HELP exposer_transferred_bytes_total Transferred bytes to metrics services
+# TYPE exposer_transferred_bytes_total counter
+exposer_transferred_bytes_total 1076175
+# HELP exposer_scrapes_total Number of times metrics were scraped
+# TYPE exposer_scrapes_total counter
+exposer_scrapes_total 68
+# HELP exposer_request_latencies Latencies of serving scrape requests, in microseconds
+# TYPE exposer_request_latencies summary
+exposer_request_latencies_count 68
+exposer_request_latencies_sum 14454
+exposer_request_latencies{quantile="0.5"} 225
+exposer_request_latencies{quantile="0.9"} 242
+exposer_request_latencies{quantile="0.99"} 258
+# HELP agent_tx_bytes_total Number of bytes sent by the agent
+# TYPE agent_tx_bytes_total counter
+agent_tx_bytes_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_tx_bytes_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 256
+# HELP agent_rx_bytes_total Number of bytes received by the agent
+# TYPE agent_rx_bytes_total counter
+agent_rx_bytes_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_rx_bytes_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 3072
+# HELP agent_tx_requests_num_total Number of requests sent by the agent
+# TYPE agent_tx_requests_num_total counter
+agent_tx_requests_num_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_tx_requests_num_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 2
+# HELP agent_rx_requests_num_total Number of requests received by the agent
+# TYPE agent_rx_requests_num_total counter
+agent_rx_requests_num_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_rx_requests_num_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 8
+# HELP agent_memory_registered_total Cumulative memory registered
+# TYPE agent_memory_registered_total counter
+agent_memory_registered_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 2048
+agent_memory_registered_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 2048
+# HELP agent_memory_deregistered_total Cumulative memory deregistered
+# TYPE agent_memory_deregistered_total counter
+agent_memory_deregistered_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 2048
+agent_memory_deregistered_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 2048
+# HELP agent_xfer_time_total Cumulative sum of transfer time from start to completion
+# TYPE agent_xfer_time_total counter
+agent_xfer_time_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_xfer_time_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 1289
+# HELP agent_xfer_post_time_total Cumulative sum of time from start to posting to the back-end
+# TYPE agent_xfer_post_time_total counter
+agent_xfer_post_time_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_xfer_post_time_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 982
+# HELP agent_telemetry_events_dropped_total Cumulative telemetry events dropped at the producer-side staging queue
+# TYPE agent_telemetry_events_dropped_total counter
+agent_telemetry_events_dropped_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_telemetry_events_dropped_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 0
+# HELP agent_tx_last_bytes Bytes sent by the last request
+# TYPE agent_tx_last_bytes gauge
+agent_tx_last_bytes{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_tx_last_bytes{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 128
+# HELP agent_rx_last_bytes Bytes received by the last request
+# TYPE agent_rx_last_bytes gauge
+agent_rx_last_bytes{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_rx_last_bytes{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 384
+# HELP agent_memory_registered_last_bytes Memory registered by the last operation
+# TYPE agent_memory_registered_last_bytes gauge
+agent_memory_registered_last_bytes{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 2048
+agent_memory_registered_last_bytes{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 2048
+# HELP agent_memory_deregistered_last_bytes Memory deregistered by the last operation
+# TYPE agent_memory_deregistered_last_bytes gauge
+agent_memory_deregistered_last_bytes{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 2048
+agent_memory_deregistered_last_bytes{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 2048
+# HELP agent_xfer_time Transfer time of the last request
+# TYPE agent_xfer_time gauge
+agent_xfer_time{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_xfer_time{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 40
+# HELP agent_xfer_post_time Post time of the last request
+# TYPE agent_xfer_post_time gauge
+agent_xfer_post_time{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_xfer_post_time{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 22
+# HELP agent_xfer_time_us Distribution of transfer time from start to completion, in microseconds
+# TYPE agent_xfer_time_us histogram
+agent_xfer_time_us_count{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_xfer_time_us_sum{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="10"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="25"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="50"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="100"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="250"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="500"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="1000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="2500"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="5000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="10000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="25000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="50000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="100000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="250000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="500000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="1000000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="5000000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="10000000"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="+Inf"} 0
+agent_xfer_time_us_count{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 10
+agent_xfer_time_us_sum{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 1289
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="10"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="25"} 0
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="50"} 4
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="100"} 7
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="250"} 9
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="500"} 9
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="1000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="2500"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="5000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="10000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="25000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="50000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="100000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="250000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="500000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="1000000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="5000000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="10000000"} 10
+agent_xfer_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="+Inf"} 10
+# HELP agent_xfer_post_time_us Distribution of time from start to posting to the back-end, in microseconds
+# TYPE agent_xfer_post_time_us histogram
+agent_xfer_post_time_us_count{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_xfer_post_time_us_sum{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="10"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="25"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="50"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="100"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="250"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="500"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="1000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="2500"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="5000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="10000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="25000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="50000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="100000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="250000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="500000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="1000000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="5000000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="10000000"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",le="+Inf"} 0
+agent_xfer_post_time_us_count{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 10
+agent_xfer_post_time_us_sum{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0"} 982
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="10"} 0
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="25"} 6
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="50"} 8
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="100"} 8
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="250"} 9
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="500"} 9
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="1000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="2500"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="5000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="10000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="25000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="50000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="100000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="250000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="500000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="1000000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="5000000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="10000000"} 10
+agent_xfer_post_time_us_bucket{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",le="+Inf"} 10
+# HELP agent_errors_total Cumulative error count by status
+# TYPE agent_errors_total counter
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="not_posted"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="invalid_param"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="backend"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="not_found"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="mismatch"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="not_allowed"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="repost_active"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="unknown"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="not_supported"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="remote_disconnect"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="canceled"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="target",pid="10",agent_instance="0",status="no_telemetry"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="not_posted"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="invalid_param"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="backend"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="not_found"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="mismatch"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="not_allowed"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="repost_active"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="unknown"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="not_supported"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="remote_disconnect"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="canceled"} 0
+agent_errors_total{hostname="6338c262408c",agent_name="initiator",pid="23",agent_instance="0",status="no_telemetry"} 0

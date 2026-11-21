@@ -658,8 +658,24 @@ PREFILL, DECODE, GATEWAY = "10.0.0.1:8000", "10.0.0.3:8000", "10.0.0.5"
 
 def picker(request: str, target: str) -> dict:
     address, port = target.split(":")
-    return {"body": llmd.PICKED, "x-request-id": request,
+    return {"body": llmd.PICKED, "x-request-id": request, "incomingModelName": pd.MODEL_NAME,
             "result": {"TargetEndpoints": [{"Endpoint": {"Address": address, "Port": port}, "Score": 1}]}}
+
+
+class RoutedIdTests(unittest.TestCase):
+    def test_engine_request_names_give_the_routers_id_exactly(self) -> None:
+        """A completion is cmpl-<id>-<prompt index>-<suffix>, a chat chatcmpl-<id>-<suffix>: a chat id
+        keeps its last segment, even one of digits, which a prompt index would lose."""
+        uuid = "323b24ec-9ff2-4021-b53b-409912345678"
+        for name, routed in {
+                f"cmpl-{uuid}-0-87c1c6b7": uuid,
+                f"chatcmpl-{uuid}-a471d25e": uuid,
+                "chatcmpl-abc-7-a471d25e": "abc-7",
+                "cmpl-abc-7-a471d25e": "abc",
+                "chatcmpl-abc": None, "cmpl-abc-a471d25e": None, "other-abc-0-a471d25e": None,
+                f"chatcmpl-{uuid}-NOTHEX": None}.items():
+            with self.subTest(name=name):
+                self.assertEqual(llmd.routed_id(name), routed)
 
 
 class EvidenceTests(unittest.TestCase):
@@ -679,7 +695,7 @@ class EvidenceTests(unittest.TestCase):
               decode_events=("admitted", "reads_posted", "reads_done"),
               prefill_events=("admitted", "allocated", "sends_done"), extra_engine=(), scored=True,
               completed=2, extra_epp=(), extra_sidecar=(), extra_envoy=(), decode_suffixes=("abcd1234",),
-              ranks=1) -> None:
+              ranks=1, chat=False) -> None:
         directory = self.output / "llmd"
         directory.mkdir(exist_ok=True)
         (directory / "endpoints.yaml").write_text(yaml.safe_dump(llmd.endpoints(
@@ -714,7 +730,8 @@ class EvidenceTests(unittest.TestCase):
             (directory / name).write_text("startup text\n" + "\n".join(json.dumps(r) for r in records) + "\n")
 
         def steps(events, extra=(), suffixes=("abcd1234",)):
-            records = [{"kv_events": {kind: [f"cmpl-{r}-0-{suffix}" for r in (*self.REQUESTS, *extra)]
+            name = "chatcmpl-{}-{}" if chat else "cmpl-{}-0-{}"
+            records = [{"kv_events": {kind: [name.format(r, suffix) for r in (*self.REQUESTS, *extra)]
                                       for kind in events}} for suffix in suffixes]
             return "".join(json.dumps(r) + "\n" for r in records)
 
@@ -742,6 +759,23 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["gateway"]["others"], ["POST /tokenize 200"])
         self.assertEqual((evidence["producer_released"], evidence["consumer_received"]), (2, 2))
         self.assertIn("prefix-cache-affinity-filter.peakPrefillThroughput", evidence["uncalibrated"])
+
+    def test_a_chat_run_passes_and_an_unrouted_chat_request_fails(self) -> None:
+        self.write(chat=True)
+        self.assertEqual(self.problems(), [])
+        self.write(chat=True, extra_engine=("cccc-3333",))
+        self.assertProblem("ran cccc-3333, which the EPP never routed")
+
+    def test_picker_records_of_another_model_are_not_the_routing(self) -> None:
+        """Only the served model's picker records count: another model's, for a handled request's
+        exact id, neither fix nor break the picks."""
+        decoy = [{**picker(request, "10.0.0.99:8000"), "incomingModelName": "other-model"}
+                 for request in self.REQUESTS]
+        self.write(extra_epp=decoy)
+        self.assertEqual(self.problems(), [])
+        self.write(picked_prefill="10.0.0.99:8000", extra_epp=[
+            {**picker(request, PREFILL), "incomingModelName": "other-model"} for request in self.REQUESTS])
+        self.assertProblem("picked 0 prefill endpoint(s)")
 
     def test_missing_routing_evidence_fails(self) -> None:
         shell.run(["rm", "-rf", str(self.output / "llmd")])

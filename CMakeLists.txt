@@ -167,6 +167,12 @@ define_extension_target(
   WITH_SOABI)
 
 #
+# Profiler core is independent of torch and device backends.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(csrc/kv_profiler/CMakeLists.txt)
+endif()
+
+#
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
 if (NOT VLLM_TARGET_DEVICE STREQUAL "cuda" AND
