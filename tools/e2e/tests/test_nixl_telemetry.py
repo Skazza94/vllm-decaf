@@ -272,9 +272,19 @@ class CollectorKinds(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- the pure rules
-TABLE_TP1 = [{"pid": 51, "start": 100, "title": "VLLM::EngineCore"}]
-TABLE_TP2 = [{"pid": 50, "start": 99, "title": "VLLM::EngineCore"}, {"pid": 61, "start": 110, "title": "VLLM::Worker_TP0"},
-             {"pid": 62, "start": 111, "title": "VLLM::Worker_TP1"}]
+TABLE_TP1 = [{"pid": 51, "ppid": 1, "start": 100, "title": "VLLM::EngineCore"}]
+TABLE_TP2 = [{"pid": 50, "ppid": 1, "start": 99, "title": "VLLM::EngineCore"},
+             {"pid": 61, "ppid": 50, "start": 110, "title": "VLLM::Worker_TP0"},
+             {"pid": 62, "ppid": 50, "start": 111, "title": "VLLM::Worker_TP1"}]
+# DP2 (vLLM's multiprocess executor): each engine's workers are its children, also at TP1.
+TABLE_DP2_TP1 = [{"pid": 40, "ppid": 1, "start": 90, "title": "VLLM::EngineCore_DP0"},
+                 {"pid": 41, "ppid": 1, "start": 91, "title": "VLLM::EngineCore_DP1"},
+                 {"pid": 63, "ppid": 41, "start": 112, "title": "VLLM::Worker_DP1_EP1"},
+                 {"pid": 64, "ppid": 40, "start": 113, "title": "VLLM::Worker_DP0_EP0"}]
+TABLE_DP2_TP2 = [{"pid": 40, "ppid": 1, "start": 90, "title": "VLLM::EngineCore_DP0"},
+                 {"pid": 41, "ppid": 1, "start": 91, "title": "VLLM::EngineCore_DP1"},
+                 *({"pid": 70 + 2 * d + r, "ppid": 40 + d, "start": 120 + 2 * d + r, "title": f"VLLM::Worker_TP{r}"}
+                   for d in range(2) for r in range(2))]
 
 
 class Rules(unittest.TestCase):
@@ -283,18 +293,44 @@ class Rules(unittest.TestCase):
 
     def test_the_inventory_of_tp1_is_the_engine_process_and_of_tp2_the_workers(self):
         self.assertEqual(nixl.expected_agents(TABLE_TP1, 1),
-                         {51: {"rank": 0, "start": 100, "title": "VLLM::EngineCore", "host": None}})
+                         {51: {"rank": 0, "dp": 0, "tp": 0, "label": "DP0 TP0", "start": 100,
+                               "title": "VLLM::EngineCore", "host": None}})
         found = nixl.expected_agents(TABLE_TP2, 2)
         self.assertEqual({pid: e["rank"] for pid, e in found.items()}, {61: 0, 62: 1})
         for table, tp, message in (
                 (TABLE_TP2, 1, "TP1 expects one engine process and no worker"),
                 (TABLE_TP1, 2, "TP2 expects one worker for each rank"),
                 (TABLE_TP2[:2], 2, "TP2 expects one worker for each rank"),
-                ([*TABLE_TP2, {"pid": 70, "start": 1, "title": "VLLM::Worker_TP1"}], 2, "one worker for each rank"),
-                ([{"pid": 5, "start": 1, "title": "VLLM::Worker_DP1_TP0"}], 1, "data parallelism is not qualified"),
-                ([], 1, "TP1 expects")):
+                ([*TABLE_TP2, {"pid": 70, "ppid": 50, "start": 1, "title": "VLLM::Worker_TP1"}], 2,
+                 "one worker for each rank"),
+                ([*TABLE_TP2[:2], {"pid": 62, "ppid": 9, "start": 111, "title": "VLLM::Worker_TP1"}], 2,
+                 "whose parent is no engine process"),
+                (TABLE_DP2_TP1, 1, "whose parent is no engine process"),
+                ([*TABLE_TP1, dict(TABLE_TP1[0], pid=52)], 1, "DP1 expects one engine process for each DP rank"),
+                ([], 1, "DP1 expects")):
             with self.assertRaisesRegex(nixl.InventoryError, message):
                 nixl.expected_agents(table, tp)
+
+    def test_each_dp_rank_s_agents_are_its_engine_s_children(self):
+        """With data parallelism a worker belongs to the DP rank whose engine is its parent (its title's DP
+        suffix, when vLLM writes one, must agree), every rank has its own worker even at TP1, and the ranks
+        are numbered in the host order of the step logs (DP rank by TP rank)."""
+        found = nixl.expected_agents(TABLE_DP2_TP1, 1, 2)
+        self.assertEqual({pid: (e["dp"], e["tp"], e["rank"]) for pid, e in found.items()},
+                         {64: (0, 0, 0), 63: (1, 0, 1)})
+        found = nixl.expected_agents(TABLE_DP2_TP2, 2, 2)
+        self.assertEqual({pid: (e["dp"], e["tp"], e["rank"]) for pid, e in found.items()},
+                         {70: (0, 0, 0), 71: (0, 1, 1), 72: (1, 0, 2), 73: (1, 1, 3)})
+        swapped = [dict(r, ppid=41) if r["pid"] == 64 else dict(r, ppid=40) if r["pid"] == 63 else r
+                   for r in TABLE_DP2_TP1]
+        for table, tp, message in (
+                (swapped, 1, "is a child of DP rank"),
+                (TABLE_DP2_TP1[:3], 1, "TP1 expects one worker for each rank under DP rank 0"),
+                ([r for r in TABLE_DP2_TP2 if r["pid"] != 73], 2, "under DP rank 1's engine"),
+                (TABLE_DP2_TP1[1:], 1, "DP2 expects one engine process for each DP rank"),
+                (TABLE_TP1, 1, "DP2 expects")):
+            with self.subTest(message), self.assertRaisesRegex(nixl.InventoryError, message):
+                nixl.expected_agents(table, tp, 2)
 
     def test_every_rule_of_agent_problems(self):
         expected = nixl.expected_agents(TABLE_TP2, 2)
@@ -328,7 +364,7 @@ class Rules(unittest.TestCase):
         self.assertTrue(any("a partial sample" in p for p in nixl.agent_problems(expected, partial)))
 
     def test_the_agent_identity_is_the_whole_label_set_and_distinct_hosts_never_collapse(self):
-        expected = nixl.expected_agents([{"pid": 51, "start": 1, "title": "VLLM::EngineCore", "host": "node-a"}], 1)
+        expected = nixl.expected_agents([{"pid": 51, "ppid": 1, "start": 1, "title": "VLLM::EngineCore", "host": "node-a"}], 1)
         a = agent("u", 51)
         b = agent("u", 51, memory_registered_bytes=777)
         text = exposition([a], host="node-a") + exposition([b], host="node-b")
@@ -469,6 +505,7 @@ class Rig(unittest.TestCase):
     logs are the test's."""
 
     TP = 1
+    DP = 1
     ROLE = "decode"
     THIN = False  # an exporter that does not serve some names (another version)
     ZONE: tuple = ()  # families an exporter serves with a label this reader does not know
@@ -477,9 +514,12 @@ class Rig(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        self.table = TABLE_TP1 if self.TP == 1 else TABLE_TP2
-        self.steps = {rank: step_log(0) for rank in range(self.TP)}
-        agents = [agent("u0", 51)] if self.TP == 1 else [agent("u0", 61), agent("u1", 62)]
+        self.table = {(1, 1): TABLE_TP1, (1, 2): TABLE_TP2, (2, 1): TABLE_DP2_TP1, (2, 2): TABLE_DP2_TP2}[
+            (self.DP, self.TP)]
+        # the node-local rank (DP rank by TP rank) -> its agent's pid
+        self.owners = {e["rank"]: pid for pid, e in nixl.expected_agents(self.table, self.TP, self.DP).items()}
+        self.steps = {rank: step_log(0) for rank in self.owners}
+        agents = [agent(f"u{rank}", pid) for rank, pid in sorted(self.owners.items())]
         if self.THIN:
             for a in agents:
                 for name in ("xfer_post_time_us", "events_dropped", "memory_deregistered_bytes"):
@@ -488,7 +528,7 @@ class Rig(unittest.TestCase):
         self.endpoint = Endpoint(agents)
         self.endpoint.zone = tuple(self.ZONE)
         self.addCleanup(self.endpoint.close)
-        side = pd.Side("n", "data0")
+        side = pd.Side("n", "data0", data_parallel_size=self.DP)
         self.run = pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", "data0"),
                           decode=side, client="c", control_network="control", router=pd.Router("gw"),
                           server=pd.Server(connector="nixl", nixl_backend="ucx", timing="linear", tensor_parallel_size=self.TP),
@@ -518,8 +558,8 @@ class Rig(unittest.TestCase):
         self.node = self.make_node()
 
     def make_node(self):
-        state = {"target": "nixl-n", "role": self.ROLE, "tp": self.TP,
-                 "steps": {rank: f"/steps{rank}" for rank in range(self.TP)}}
+        state = {"target": "nixl-n", "role": self.ROLE, "tp": self.TP, "dp": self.DP,
+                 "steps": {rank: f"/steps{rank}" for rank in self.owners}}
         node = collector.NodeCollector("n", "local", self.run_id, self.run.collector, self.root / "node",
                                        ("nixl-n",), {"nixl-n": "nixl"}, state)
         node.directory.mkdir(parents=True, exist_ok=True)
@@ -550,13 +590,16 @@ class Rig(unittest.TestCase):
             process.stdout.close()
 
     def workload(self, requests=2, after=0.0):
-        """The decode agent's counters as the step log says a workload moved them (the flush may arrive late)."""
-        self.steps = {rank: step_log(requests) for rank in range(self.TP)}
+        """The decode agents' counters as the step logs say a workload moved them (the flush may arrive late);
+        ``requests`` per node-local rank, or one count for all."""
+        each = requests if isinstance(requests, dict) else dict.fromkeys(self.owners, requests)
+        self.steps = {rank: step_log(each[rank]) for rank in self.owners}
+        rank_of = {pid: rank for rank, pid in self.owners.items()}
 
         def move(agents):
             for a in agents:
-                a["fields"].update(rx_requests=requests, rx_bytes=100 * requests, xfer_time_us=10 * requests,
-                                   xfer_post_time_us=2 * requests)
+                n = each[rank_of[a["pid"]]]
+                a["fields"].update(rx_requests=n, rx_bytes=100 * n, xfer_time_us=10 * n, xfer_post_time_us=2 * n)
 
         self.endpoint.change(move, after)
 
@@ -572,7 +615,8 @@ class Rig(unittest.TestCase):
                                                            "exited": True, "errors": [],
                                                            "settings": self.run.collector.__dict__}))
         for rank, text in self.steps.items():
-            (self.root / "result" / self.run.decode.step_log("decode", 0, rank)).write_text(text)
+            dp, tp = divmod(rank, self.TP)
+            (self.root / "result" / self.run.decode.step_log("decode", dp, tp)).write_text(text)
         return self.root / "result"
 
     def verdict(self, output):
@@ -582,6 +626,102 @@ class Rig(unittest.TestCase):
         verdict = {"problems": []}
         collector.check(output, run, {}, verdict)
         return verdict
+
+
+class DataParallel(Rig):
+    """DP2 at TP1: each DP rank's worker is its engine's child, and every rank's counters are joined to its own
+    step log (the ranks move different numbers of requests, so a crossed join would be a problem)."""
+
+    DP = 2
+
+    def test_each_dp_rank_s_agent_agrees_with_its_own_step_log(self):
+        self.node.nixl_baseline()
+        self.assertEqual(self.node.boundaries["baseline"]["outcome"], "ok")
+        self.assertEqual({e["label"] for e in self.node.boundaries["expected"].values()}, {"DP0 TP0", "DP1 TP0"})
+        self.workload({0: 2, 1: 3})
+        self.node.nixl_final()
+        final = self.node.boundaries["final"]
+        self.assertEqual((final["outcome"], final["problems"]), ("ok", []), final.get("problems"))
+        output = self.saved()
+        verdict = self.verdict(output)
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["collector"]["n"]["nixl"]["workload"], {0: 2, 1: 3})
+        # DP rank 1's step log in DP rank 0's place: both ranks disagree with their counters
+        dp0, dp1 = (output / self.run.decode.step_log("decode", d, 0) for d in (0, 1))
+        dp0_text, dp1_text = dp0.read_text(), dp1.read_text()
+        dp0.write_text(dp1_text)
+        dp1.write_text(dp0_text)
+        problems = self.verdict(output)["problems"]
+        self.assertTrue(any("DP0 TP0: rx_requests changed by 2" in p for p in problems), problems)
+        self.assertTrue(any("DP1 TP0: rx_requests changed by 3" in p for p in problems), problems)
+
+
+class DataParallelTp2(DataParallel):
+    TP = 2
+
+    def test_each_dp_rank_s_agent_agrees_with_its_own_step_log(self):
+        self.node.nixl_baseline()
+        self.assertEqual(self.node.boundaries["baseline"]["outcome"], "ok")
+        self.workload({0: 1, 1: 2, 2: 3, 3: 4})
+        self.node.nixl_final()
+        final = self.node.boundaries["final"]
+        self.assertEqual((final["outcome"], final["problems"]), ("ok", []), final.get("problems"))
+        output = self.saved()
+        verdict = self.verdict(output)
+        self.assertEqual(verdict["problems"], [])
+        self.assertEqual(verdict["collector"]["n"]["nixl"]["workload"], {0: 1, 1: 2, 2: 3, 3: 4})
+        # The saved mapping is re-derived from both process tables before any counter is indexed: every
+        # worker given one saved rank, or a DP0 worker under DP1's engine at the end, fails.
+        path = output / "collector" / "n" / "boundaries.json"
+        good = path.read_text()
+        for label, edit in (
+                ("one saved rank", lambda b: b["expected"].update(
+                    {pid: dict(e, rank=0, dp=0, tp=0) for pid, e in b["expected"].items()})),
+                ("moved at the end", lambda b: b["final"].update(table_end=[
+                    dict(r, ppid=41) if r["pid"] == 70 else r for r in b["final"]["table_end"]])),
+                ("another layout", lambda b: b.update(dp=1)),
+                ("no final table", lambda b: b["final"].pop("table_end")),
+                ("no start table nor mapping", lambda b: (b.pop("table_start"), b.update(expected={}))),
+                ("a worker without its parent", lambda b: b["table_start"][-1].pop("ppid")),
+                ("one pid for two workers, a rank dropped", lambda b: (
+                    b.update(table_start=[dict(r, pid=70) if r["pid"] == 71 else r for r in b["table_start"]]),
+                    b["final"].update(table_end=[dict(r, pid=70) if r["pid"] == 71 else r
+                                                 for r in b["final"]["table_end"]]),
+                    b["expected"].pop("71"))),
+                ("a rank dropped from the mapping", lambda b: b["expected"].pop("71")),
+                ("a restarted worker", lambda b: b["final"].update(table_end=[
+                    dict(r, start=1) if r["pid"] == 73 else r for r in b["final"]["table_end"]]))):
+            with self.subTest(label):
+                saved = json.loads(good)
+                edit(saved)
+                path.write_text(json.dumps(saved))
+                problems = self.verdict(output)["problems"]
+                self.assertTrue(problems and all("NIXL telemetry n:" in p for p in problems), problems)
+                report = self.verdict(output)["collector"]["n"]["nixl"]
+                self.assertNotIn("workload", report)
+                self.assertNotIn("coverage", report)
+        path.write_text(good)
+
+    def test_an_empty_final_process_table_is_rejected_live(self):
+        """A final snapshot that reads but lists no vLLM process is judged like any other table: the boundary is
+        rejected."""
+        self.node.nixl_baseline()
+        self.workload({0: 1, 1: 2, 2: 3, 3: 4})
+        self.table = []
+        self.node.nixl_final()
+        final = self.node.boundaries["final"]
+        self.assertEqual(final["outcome"], "rejected")
+        self.assertTrue(any("end process table" in p and "missing or empty" in p for p in final["problems"]),
+                        final["problems"])
+
+    def test_a_worker_under_another_engine_at_the_final_boundary_is_rejected_live(self):
+        self.node.nixl_baseline()
+        self.workload({0: 1, 1: 2, 2: 3, 3: 4})
+        self.table = [dict(r, ppid=41) if r["pid"] == 70 else r for r in self.table]
+        self.node.nixl_final()
+        final = self.node.boundaries["final"]
+        self.assertEqual(final["outcome"], "rejected")
+        self.assertTrue(any("end process table" in p for p in final["problems"]), final["problems"])
 
 
 class HappyPath(Rig):
@@ -666,6 +806,15 @@ class UnknownLabelsEverywhere(UnknownLabels):
         final = self.node.boundaries["final"]
         self.assertEqual(final["outcome"], "unavailable_schema")
         self.assertTrue(final["table_end"] and final["attempts"] and final["after_ns"])
+        # unreadable values do not excuse the inventory: no process tables and no rank mapping fail
+        output = self.root / "result"
+        path = output / "collector" / "n" / "boundaries.json"
+        saved = json.loads(path.read_text())
+        saved.pop("table_start")
+        saved["final"].pop("table_end")
+        saved["expected"] = {}
+        path.write_text(json.dumps(saved))
+        self.assertTrue(self.verdict(output)["problems"])
 
 
 class UnknownLabelsKeepTheRestOfTheValidation(Rig):
@@ -683,9 +832,9 @@ class UnknownLabelsKeepTheRestOfTheValidation(Rig):
         self.node.nixl_final()
         final = self.node.boundaries["final"]
         self.assertEqual(final["outcome"], "rejected")
-        self.assertTrue(any("pid 62 is not the same process at both boundaries" in p for p in final["problems"]), final["problems"])
+        self.assertTrue(any("is not the end process table's {61: (0, 0, 0, 110), 62: (1, 0, 1, " in p for p in final["problems"]), final["problems"])
         verdict = self.verdict(self.saved())
-        self.assertTrue(any("pid 62" in p for p in verdict["problems"]), verdict["problems"])
+        self.assertTrue(any("62: (1, 0, 1, 112)" in p for p in verdict["problems"]), verdict["problems"])
 
     def test_a_missing_baseline_marker_in_the_saved_capture_is_caught(self):
         self.node.nixl_baseline()
@@ -752,7 +901,27 @@ class UnknownLabelsKeepTheRestOfTheValidation(Rig):
         self.node.nixl_final()
         self.assertEqual(self.node.boundaries["final"]["outcome"], "rejected")
         verdict = self.verdict(self.saved())
-        self.assertTrue(any("pid 62" in p for p in verdict["problems"]), verdict["problems"])
+        self.assertTrue(any("62: (1, 0, 1, 112)" in p for p in verdict["problems"]), verdict["problems"])
+
+    def test_an_empty_final_process_table_is_rejected_whatever_the_schema(self):
+        """A final snapshot that reads but lists no vLLM process is judged, with the values unreadable at both
+        boundaries or readable again by the end: both are rejected live and in the verdict."""
+        for recovered in (False, True):
+            with self.subTest(recovered=recovered):
+                self.setUp()
+                self.node.nixl_baseline()
+                self.assertEqual(self.node.boundaries["baseline"]["outcome"], "unavailable_schema")
+                if recovered:
+                    self.endpoint.zone = ()
+                self.workload(2)
+                self.table = []
+                self.node.nixl_final()
+                final = self.node.boundaries["final"]
+                self.assertEqual(final["outcome"], "rejected")
+                self.assertTrue(any("missing or empty" in p for p in final["problems"]), final["problems"])
+                verdict = self.verdict(self.saved())
+                self.assertTrue(any("end process table" in p for p in verdict["problems"]), verdict["problems"])
+                self.assertNotIn("workload", verdict["collector"]["n"]["nixl"])
 
     def test_a_pass_that_did_not_complete_keeps_its_error_whatever_the_schema(self):
         original = self.node._wait_marker
@@ -897,6 +1066,15 @@ class DelayedAndStalled(Rig):
         self.assertTrue(any("rx_requests changed by 0, the step log's transfers by 2" in p for p in final["problems"]), final["problems"])
         verdict = self.verdict(self.saved())
         self.assertTrue(any("the final sample was not accepted (final_timeout" in p for p in verdict["problems"]), verdict["problems"])
+        # collection stopped before the final table: the timeout is the failure, and the only one
+        timeout = [f"NIXL telemetry n: the final sample was not accepted (final_timeout: {final['problems'][:3]})"]
+        self.assertEqual(verdict["problems"], timeout)
+        output = self.root / "result"
+        path = output / "collector" / "n" / "boundaries.json"
+        saved = json.loads(path.read_text())
+        saved["final"]["table_end"] = None
+        path.write_text(json.dumps(saved))
+        self.assertEqual(self.verdict(output)["problems"], timeout)
 
     def test_a_workload_the_counters_disagree_with_stays_a_problem_even_when_stable(self):
         self.node.nixl_baseline()
@@ -948,7 +1126,7 @@ class Inventory(Rig):
         self.node.nixl_final()
         final = self.node.boundaries["final"]
         self.assertEqual(final["outcome"], "rejected")
-        self.assertTrue(any("pid 62 is not the same process at both boundaries" in p for p in final["problems"]), final["problems"])
+        self.assertTrue(any("is not the end process table's {61: (0, 0, 0, 110), 62: (1, 0, 1, " in p for p in final["problems"]), final["problems"])
         verdict = self.verdict(self.saved())
         self.assertTrue(any("the final sample was not accepted (rejected" in p for p in verdict["problems"]), verdict["problems"])
 
@@ -964,7 +1142,8 @@ class Tp1Engine(Rig):
         self.node.nixl_baseline()
         self.assertEqual(list(self.node.boundaries["expected"]), ["51"])
         self.setUp()
-        self.table = [{"pid": 51, "start": 100, "title": "VLLM::EngineCore"}, {"pid": 52, "start": 101, "title": "VLLM::Worker_TP0"}]
+        self.table = [{"pid": 51, "ppid": 1, "start": 100, "title": "VLLM::EngineCore"},
+                      {"pid": 52, "ppid": 51, "start": 101, "title": "VLLM::Worker_TP0"}]
         with self.assertRaisesRegex(RuntimeError, "TP1 expects one engine process and no worker"):
             self.node.nixl_baseline()
 
@@ -1033,7 +1212,7 @@ class SavedEvidence(Rig):
         def restart(saved):
             saved["table_start"][0]["start"] += 1
         self.edit_boundaries(output, restart)
-        self.assertTrue(any("is not the inventory's process at both boundaries" in p for p in self.verdict(output)["problems"]))
+        self.assertTrue(any("is not the start process table's" in p for p in self.verdict(output)["problems"]))
         output = self.good_again()
         (output / self.run.decode.step_log("decode", 0, 0)).write_text(step_log(3))
         self.assertTrue(any("rx_requests changed by 2, the step log's transfers by 3" in p for p in self.verdict(output)["problems"]))
@@ -1169,8 +1348,9 @@ class ArmCorrectness(unittest.TestCase):
         self.write_good()
 
     @staticmethod
-    def make(arm):
-        return pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", "data0"), decode=pd.Side("d", "data0"),
+    def make(arm, decode_dp=1):
+        return pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", "data0"),
+                      decode=pd.Side("d", "data0", data_parallel_size=decode_dp),
                       client="c", control_network="control", router=pd.Router("gw"),
                       server=pd.Server(connector="nixl", nixl_backend="ucx", timing="linear", nixl_telemetry_arm=arm))
 
@@ -1194,7 +1374,7 @@ class ArmCorrectness(unittest.TestCase):
         self.assertEqual(issues, [])
         self.assertEqual(report["arm"], "emissions_disabled")
         self.assertIn("not emitted", report["dropped_events"])
-        self.assertEqual(report["decode_transfers"], {0: 3})
+        self.assertEqual(report["decode_transfers"], {"d DP0 TP0": 3})
         self.run = self.make("default")
         self.write_good()
         issues, report = self.problems()
@@ -1252,12 +1432,32 @@ class ArmCorrectness(unittest.TestCase):
         (self.out / self.run.decode.step_log("decode", 0, 0)).write_text(step_log(2, xfer_us=0))
         self.assertTrue(any("without a positive integer-microsecond duration" in p for p in self.problems()[0]))
         (self.out / self.run.decode.step_log("decode", 0, 0)).write_text(step_log(0))
-        self.assertTrue(any("logged 0 transfers" in p for p in self.problems()[0]))
+        self.assertTrue(any("no decode rank logged a transfer" in p for p in self.problems()[0]))
         self.write_good()
         (self.out / "logs" / "decode" / "d" / "decode.log").write_text("ERROR transfer_exception NIXL_ERR_NO_TELEMETRY\n")
         found = " ".join(self.problems()[0])
         self.assertIn("transfer_exception", found)
         self.assertIn("NIXL_ERR_NO_TELEMETRY", found)
+
+
+    def test_an_idle_dp_replica_is_not_missing_statistics(self):
+        """With data parallelism a decode DP rank the router gave no request allocated nothing and read nothing:
+        that is an idle replica, not lost per-transfer statistics. A rank that allocated requests and logged no
+        transfer still fails, and so does a workload with no transfer on any rank."""
+        self.run = self.make("emissions_disabled", decode_dp=2)
+        self.write_good()
+        dp1 = self.out / self.run.decode.step_log("decode", 1, 0)
+        dp1.write_text(step_log(0))
+        issues, report = self.problems()
+        self.assertEqual(issues, [])
+        self.assertEqual(report["decode_transfers"], {"d DP0 TP0": 3, "d DP1 TP0": 0})
+        owning = json.dumps({"step": {"requests": 1}, "t_start": 1.0, "t_deadline": 2.0,
+                             "kv_events": {"allocated": {"cmpl-x-0": [1, 2]}}})
+        dp1.write_text(STEP_HEAD + "\n" + owning + "\n")
+        self.assertTrue(any("DP1 TP0 logged 0 transfers for 1 allocated" in p for p in self.problems()[0]))
+        dp1.write_text(step_log(0))
+        (self.out / self.run.decode.step_log("decode", 0, 0)).write_text(step_log(0))
+        self.assertTrue(any("no decode rank logged a transfer" in p for p in self.problems()[0]))
 
 
 class ProbeToValidator(unittest.TestCase):
@@ -1333,7 +1533,7 @@ class Wiring(unittest.TestCase):
         return pd.Run(**{**{f: getattr(self.RUN, f) for f in self.RUN.__dataclass_fields__},
                          "collector": pd.Collector(**options)})
 
-    def test_the_option_needs_nixl_data_parallel_size_one_and_a_source(self):
+    def test_the_option_needs_nixl_and_a_source_at_any_data_parallel_size(self):
         pd_parse = lambda raw: pd.parse(raw, Path("/r.yaml"))  # noqa: E731
         base = {"name": "t", "topology": "t", "model": "/m", "client": "c", "control_network": "control",
                 "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"},
@@ -1350,8 +1550,7 @@ class Wiring(unittest.TestCase):
                     pd_parse({**base, "collector": options, **({"server": server} if server else {})})
             dp = {**base, "decode": {"node": "d", "kv_network": "data0", "data_parallel_size": 2},
                   "collector": {"tent": False, "nixl_telemetry": True}}
-            with self.assertRaisesRegex(ValueError, "data parallelism is not qualified"):
-                pd_parse(dp)
+            self.assertEqual(pd_parse(dp).decode.data_parallel_size, 2)
             both = pd_parse({**base, "server": {"connector": "nixl", "nixl_backend": "mooncake", "timing": "linear"},
                              "collector": {"nixl_telemetry": True}})
             self.assertTrue(both.collector.tent and both.collector.nixl_telemetry)

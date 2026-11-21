@@ -158,8 +158,12 @@ class NodeCollector:
         if config.nixl_telemetry:
             side = run.prefill if node in run.prefill.nodes else run.decode
             role = "prefill" if side is run.prefill else "decode"
-            state = {"target": f"nixl-{node}", "role": role, "tp": side.tp(run.server),
-                     "steps": {tp: side.remote_step_log(0, tp) for tp in range(side.tp(run.server))}}
+            size = side.tp(run.server)
+            # every (DP rank, TP rank) of this node's instance, by its node-local index
+            state = {"target": f"nixl-{node}", "role": role, "tp": size,
+                     "dp": 1 if side.instances else side.data_parallel_size,
+                     "steps": {side.local_rank(dp, tp, size): side.remote_step_log(dp, tp)
+                               for dp, tp in side.ranks(size) if side.node_of(dp) == node}}
         started = cls(node, container, run_id, config, directory, tuple(t["id"] for t in wanted),
                       {t["id"]: t.get("source", "tent") for t in wanted}, state)
         try:
@@ -306,10 +310,11 @@ class NodeCollector:
         workload must not start without it."""
         state = self.nixl_state
         record = self.boundaries.setdefault("baseline", {"attempts": [], "outcome": None})
-        self.boundaries.update(node=self.node, target=state["target"], role=state["role"], tp=state["tp"])
+        self.boundaries.update(node=self.node, target=state["target"], role=state["role"], tp=state["tp"],
+                               dp=state["dp"])
         try:
             table = self._table()
-            expected = nixl.expected_agents(table, state["tp"])
+            expected = nixl.expected_agents(table, state["tp"], state["dp"])
         except (nixl.InventoryError, ValueError, KeyError) as error:
             record["outcome"] = "inventory_error"
             record["problems"] = [str(error)]
@@ -386,14 +391,11 @@ class NodeCollector:
         try:
             table_end = self._table()
         except (ValueError, KeyError) as error:
-            table_end, problems = [], [*problems, f"the process table could not be read again: {error}"]
+            table_end, problems = None, [*problems, f"the process table could not be read again: {error}"]
         record["table_end"] = table_end
-        start = {row["pid"]: row["start"] for row in self.boundaries["table_start"]}
-        end = {row["pid"]: row["start"] for row in table_end}
-        for pid in expected:
-            if end.get(pid) != start.get(pid):
-                problems.append(f"pid {pid} is not the same process at both boundaries (start ticks "
-                                f"{start.get(pid)} then {end.get(pid)})")
+        if table_end is not None:  # every table read, an empty one included, is judged
+            problems += nixl.inventory_problems(expected, {"start": self.boundaries["table_start"], "end": table_end},
+                                                self.nixl_state["tp"], self.nixl_state["dp"])
         record.update(outcome="ok" if not problems else "rejected", problems=problems, accepted=attempt)
         self._write_boundaries()
 
@@ -410,14 +412,11 @@ class NodeCollector:
         try:
             table_end = self._table()
         except (ValueError, KeyError) as error:
-            table_end, problems = [], [*problems, f"the process table could not be read again: {error}"]
+            table_end, problems = None, [*problems, f"the process table could not be read again: {error}"]
         record["table_end"] = table_end
-        start = {row["pid"]: row["start"] for row in self.boundaries["table_start"]}
-        end = {row["pid"]: row["start"] for row in table_end}
-        for pid in expected:
-            if end.get(pid) != start.get(pid):
-                problems.append(f"pid {pid} is not the same process at both boundaries (start ticks "
-                                f"{start.get(pid)} then {end.get(pid)})")
+        if table_end is not None:  # every table read, an empty one included, is judged
+            problems += nixl.inventory_problems(expected, {"start": self.boundaries["table_start"], "end": table_end},
+                                                self.nixl_state["tp"], self.nixl_state["dp"])
         # A reading that has recovered by the end is not itself an error: its values are kept and checked as any final sample is, and
         # only the change across the boundaries is unavailable (there is no baseline to subtract).
         outcome = ("rejected" if problems or attempt["outcome"] not in ("unavailable_schema", "ok")
@@ -671,12 +670,6 @@ def _check_unavailable(saved: dict, label: str, records: list[dict], target: str
             problems.append(f"{label}: the {name} sample in the capture has agents the harness recorded as none")
         if accepted.get("problems"):
             problems.append(f"{label}: the {name} attempt carries problems {accepted['problems'][:3]}")
-    start = {row["pid"]: row["start"] for row in saved.get("table_start", [])}
-    end = {row["pid"]: row["start"] for row in (saved.get("final") or {}).get("table_end", [])}
-    for pid, row in expected.items():
-        if not (start.get(pid) == row["start"] == end.get(pid)):
-            problems.append(f"{label}: pid {pid} is not the inventory's process at both boundaries "
-                            f"(start ticks {start.get(pid)}, {end.get(pid)}, inventory {row['start']})")
     report["unavailable_schema"] = {"unserved_label_series": ((saved.get("baseline") or {}).get("accepted") or {}).get(
         "unserved_label_series")}
 
@@ -697,8 +690,30 @@ def check_nixl(output: Path, run: pd.Run, node: str, role: str, side: pd.Side, r
         target = saved["target"]
         expected = {int(pid): row for pid, row in saved["expected"].items()}
         kv = {int(rank): size for rank, size in saved.get("kv_bytes", {}).items()}
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         problems.append(f"{label}: no boundary record: {error}")
+        return
+    # The full configured inventory at every completed boundary, before any counter or coverage is published:
+    # the baseline's table once it was accepted, the final's once the final ran (a final that timed out keeps
+    # its own failure, below). The rank mapping is re-derived from each with the run's local sizes.
+    local_dp = 1 if side.instances else side.data_parallel_size
+    baseline, final = saved.get("baseline") or {}, saved.get("final") or {}
+    completed = {"start": baseline.get("outcome") in ("ok", "unavailable_schema"),
+                 "end": final.get("outcome") not in (None, "final_timeout")}
+    # a completed boundary without its table is judged (and fails) as a malformed one
+    tables = {"start": saved.get("table_start"), "end": final.get("table_end")}
+    tables = {name: ([] if table is None else table) if completed[name] else None for name, table in tables.items()}
+    issues = nixl.inventory_problems(saved["expected"], tables, side.tp(run.server), local_dp)
+    if (saved.get("tp"), saved.get("dp")) != (side.tp(run.server), local_dp):
+        issues.append(f"the boundary record is of DP{saved.get('dp')} TP{saved.get('tp')}, the run's {node} is "
+                      f"DP{local_dp} TP{side.tp(run.server)}")
+    if issues:
+        problems.extend(f"{label}: {issue}" for issue in issues)
+        for name in ("baseline", "final"):
+            stage = saved.get(name) or {}
+            if stage.get("outcome") not in ("ok", "unavailable_schema", "readable_after_unavailable"):
+                problems.append(f"{label}: the {name} sample was not accepted ({stage.get('outcome')}: "
+                                f"{(stage.get('problems') or [])[:3]})")
         return
     agents = {}
     if (saved.get("baseline") or {}).get("outcome") == "unavailable_schema":
@@ -742,18 +757,15 @@ def check_nixl(output: Path, run: pd.Run, node: str, role: str, side: pd.Side, r
         window = pd.workload_window(steps) if steps else None
         interval = nixl.final_interval_problems(saved, records, target, None if window is None else window[1])
         problems.extend(f"{label}: {issue}" for issue in interval)
-    start = {row["pid"]: row["start"] for row in saved.get("table_start", [])}
-    end = {row["pid"]: row["start"] for row in (saved.get("final") or {}).get("table_end", [])}
-    for pid, row in expected.items():
-        if not (start.get(pid) == row["start"] == end.get(pid)):
-            problems.append(f"{label}: pid {pid} is not the inventory's process at both boundaries "
-                            f"(start ticks {start.get(pid)}, {end.get(pid)}, inventory {row['start']})")
     if len(agents) != 2:
         return
     loads = {}
-    for rank in range(side.tp(run.server)) if role == "decode" else ():
-        path = output / side.step_log(role, 0, rank)
-        loads[rank] = nixl.step_loads(path.read_text()) if path.is_file() else None
+    size = side.tp(run.server)
+    for dp, tp in side.ranks(size) if role == "decode" else ():
+        if side.node_of(dp) != node:
+            continue
+        path = output / side.step_log(role, dp, tp)
+        loads[side.local_rank(dp, tp, size)] = nixl.step_loads(path.read_text()) if path.is_file() else None
     loads = {rank: seen for rank, seen in loads.items() if seen is not None}
     issues = nixl.workload_problems(role, expected, agents["baseline"], agents["final"], loads)
     problems.extend(f"{label}: {issue}" for issue in issues)

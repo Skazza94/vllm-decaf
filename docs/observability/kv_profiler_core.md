@@ -1144,9 +1144,11 @@ NIXL exports asynchronously (a flush every 100 ms), so a successful scrape does 
 reached its counters. The collector therefore answers **boundary requests**: an orchestrator drops `<id>.json`
 (`{"name": "baseline"}` or `"final"`) in `--boundary-dir`; the collector scrapes a pass that began after it noticed the file and
 appends a `boundary` record (never changing an earlier one) naming the pass's sample IDs, its begin and end instants and each
-target's completeness. The harness (`collector: {nixl_telemetry: true}`, any NIXL backend, data-parallel size 1; `tent: false`
-for a backend without TENT) uses them as follows. *Inventory:* from the node's process titles and start ticks it expects one
-agent for each worker rank (the engine process for TP1). *Baseline:* the first boundary sample whose agents equal the inventory
+target's completeness. The harness (`collector: {nixl_telemetry: true}`, any NIXL backend and data-parallel size; `tent: false`
+for a backend without TENT) uses them as follows. *Inventory:* from the node's process titles, parents and start ticks it
+expects one agent for each (DP rank, TP rank): the engine process when TP x DP is 1 (vLLM's uniprocess executor), otherwise
+each `EngineCore_DP<d>` engine's worker children, one per TP rank, a worker joining its DP rank through its parent. Ranks are
+numbered on the node as DP rank by TP rank, the order of the step logs. *Baseline:* the first boundary sample whose agents equal the inventory
 exactly, with every field and every error series served and a positive registration (at least the rank's allocated KV bytes),
 equal to the harness's own scrape taken right after; bounded, and a failure aborts the run. *Final:* with the servers and the
 collector alive, after the counters have been unchanged for 0.5 s over samples that began after the workload, and still in

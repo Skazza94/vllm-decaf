@@ -3,7 +3,8 @@
 NIXL exports its counters asynchronously (a 100 ms flush), so an HTTP success proves neither that every agent
 has appeared nor that every completed transfer has reached its counters. The collector's boundaries are
 therefore defined samples: a *baseline* whose agent set equals the inventory the harness recorded (one agent
-for each worker rank of the node's instance, found through the processes' titles and start times) with every
+for each (DP rank, TP rank) of the node's instance, found through the processes' titles, parents and start
+times) with every
 required family served, and a *final* sample taken only once the counters have been unchanged for a stretch
 that began after the workload, still equal to the inventory, and in agreement with the transfer records.
 Everything here is pure (no container, no clock) so each rule can be tested on its own; the orchestration
@@ -31,7 +32,7 @@ STABLE_SAMPLES = 3
 STABLE_SPAN_NS = 500_000_000  # five flush intervals of NIXL's default 100 ms
 FINAL_TIMEOUT_S = 15.0
 
-# The vLLM processes of a node (their process titles), with their start times in clock ticks.
+# The vLLM processes of a node (their process titles), with their parents and start times in clock ticks.
 PROCESS_TABLE = r"""
 import json, os, socket
 
@@ -45,7 +46,8 @@ for pid in filter(str.isdigit, os.listdir("/proc")):
         continue
     title = argv[0].decode("utf-8", "replace") if argv else ""
     if title.startswith("VLLM::"):
-        rows.append({"pid": int(pid), "start": int(stat[19]), "title": title, "host": host})
+        rows.append({"pid": int(pid), "ppid": int(stat[1]), "start": int(stat[19]), "title": title,
+                     "host": host})
 print(json.dumps(sorted(rows, key=lambda r: r["pid"])))
 """
 
@@ -96,39 +98,109 @@ class InventoryError(ValueError):
     """The node's processes do not match the instance the run configured."""
 
 
-def parse_table(text: str) -> list[dict]:
-    rows = json.loads(text.strip().splitlines()[-1])
+def check_table(rows) -> list[dict]:
+    """A process table's rows, each with an integer pid, ppid and start and a string title."""
     if not isinstance(rows, list) or any(
-            not (isinstance(r, dict) and isinstance(r.get("pid"), int) and isinstance(r.get("start"), int)
-                 and isinstance(r.get("title"), str)) for r in rows):
-        raise InventoryError(f"the process table is malformed: {text[:200]!r}")
+            not (isinstance(r, dict) and type(r.get("pid")) is int and type(r.get("ppid")) is int
+                 and type(r.get("start")) is int and isinstance(r.get("title"), str)) for r in rows):
+        raise InventoryError(f"the process table is malformed: {json.dumps(rows)[:200]}")
+    pids = [row["pid"] for row in rows]
+    if len(set(pids)) != len(pids):
+        raise InventoryError(f"the process table repeats pid(s) {sorted({p for p in pids if pids.count(p) > 1})}")
     return rows
 
 
-def expected_agents(table: list[dict], tp: int) -> dict[int, dict]:
-    """The agents an instance of TP size ``tp`` must show, by pid: with TP1 the engine process owns its one
-    worker (the L1 traces show the scheduler and the worker sharing a pid there), with TP>1 each
-    ``Worker_TP<r>`` process owns one and the engine process owns none. Anything else is an error."""
-    engines = [r for r in table if r["title"].startswith("VLLM::EngineCore")]
-    workers: dict[int, list[dict]] = {}
+def parse_table(text: str) -> list[dict]:
+    try:
+        rows = json.loads(text.strip().splitlines()[-1])
+    except (ValueError, IndexError) as error:
+        raise InventoryError(f"the process table is not readable: {error}") from None
+    return check_table(rows)
+
+
+def expected_agents(table: list[dict], tp: int, dp: int = 1) -> dict[int, dict]:
+    """The agents an instance of ``dp`` local DP ranks of TP size ``tp`` must show, by pid, each with its rank:
+    the node-local index ``dp_rank * tp + tp_rank`` (the host order of the step logs and metrics ports).
+
+    The engine of DP rank d is ``EngineCore_DP<d>`` (``EngineCore`` at DP 1). vLLM runs the workers in the
+    engine process only when TP x DP is 1 (its uniprocess executor; the L1 traces show the scheduler and
+    the worker sharing a pid there): that engine owns the one agent and has no worker. Otherwise (the
+    multiprocess executor) every engine's workers are its children, titled ``Worker[_DP<d>][_TP<r>][...]``,
+    one per TP rank (no ``TP`` suffix at TP1), each owning one agent and the engine none. A worker joins its
+    DP rank through its parent only. Anything else is an error."""
+    pattern = r"^VLLM::EngineCore_DP(\d+)$" if dp > 1 else r"^VLLM::EngineCore(?:_DP0)?$"
+    engines: dict[int, list[dict]] = {}
     for row in table:
-        match = re.match(r"^VLLM::Worker_(?:DP(\d+)_)?TP(\d+)", row["title"])
-        if match:
-            if match.group(1) not in (None, "0"):
-                raise InventoryError(f"a data-parallel worker ({row['title']}): data parallelism is not qualified")
-            workers.setdefault(int(match.group(2)), []).append(row)
-    if tp == 1:
-        if len(engines) != 1 or workers:
-            raise InventoryError(f"TP1 expects one engine process and no worker, found "
-                                 f"{[r['title'] for r in engines]} and {sorted(workers)}")
-        owners = {0: engines[0]}
-    else:
-        if sorted(workers) != list(range(tp)) or any(len(v) != 1 for v in workers.values()):
-            raise InventoryError(f"TP{tp} expects one worker for each rank, found "
-                                 f"{ {r: len(v) for r, v in sorted(workers.items())} }")
-        owners = {rank: rows[0] for rank, rows in workers.items()}
-    return {row["pid"]: {"rank": rank, "start": row["start"], "title": row["title"], "host": row.get("host")}
-            for rank, row in owners.items()}
+        if (match := re.match(pattern, row["title"])):
+            engines.setdefault(int(match.group(1) or 0) if dp > 1 else 0, []).append(row)
+    if sorted(engines) != list(range(dp)) or any(len(v) != 1 for v in engines.values()):
+        raise InventoryError(f"DP{dp} expects one engine process for each DP rank, found "
+                             f"{[r['title'] for r in table if r['title'].startswith('VLLM::EngineCore')]}")
+    parent = {rows[0]["pid"]: d for d, rows in engines.items()}
+    children: dict[int, list[dict]] = {d: [] for d in engines}
+    for row in table:
+        if re.match(r"^VLLM::Worker(?:_|$)", row["title"]):
+            if row["ppid"] not in parent:
+                raise InventoryError(f"a worker ({row['title']}, pid {row['pid']}) whose parent is no engine process")
+            d = parent[row["ppid"]]
+            if (named := re.search(r"_DP(\d+)", row["title"])) and int(named.group(1)) != d:
+                raise InventoryError(f"{row['title']} is a child of DP rank {d}'s engine")
+            children[d].append(row)
+    owners: dict[tuple[int, int], dict] = {}
+    for d, workers in sorted(children.items()):
+        ranks: dict[int, list[dict]] = {}
+        for row in workers:
+            named = re.search(r"_TP(\d+)", row["title"])
+            ranks.setdefault(int(named.group(1)) if named else 0 if tp == 1 else -1, []).append(row)
+        if tp == dp == 1:
+            if workers:
+                raise InventoryError(f"TP1 expects one engine process and no worker, found "
+                                     f"{[engines[0][0]['title']]} and {sorted(w['title'] for w in workers)}")
+            owners[(d, 0)] = engines[d][0]
+        elif sorted(ranks) == list(range(tp)) and all(len(v) == 1 for v in ranks.values()):
+            owners.update({(d, r): rows[0] for r, rows in ranks.items()})
+        else:
+            raise InventoryError(f"TP{tp} expects one worker for each rank under DP rank {d}'s engine, found "
+                                 f"{sorted(w['title'] for w in workers)}")
+    return {row["pid"]: {"rank": d * tp + r, "dp": d, "tp": r, "label": f"DP{d} TP{r}", "start": row["start"],
+                         "title": row["title"], "host": row.get("host")}
+            for (d, r), row in owners.items()}
+
+
+def inventory_problems(saved, tables: dict, tp: int, dp: int) -> list[str]:
+    """The saved rank mapping against the one the configured local sizes give from each completed boundary's
+    process table (``None``: that boundary never read one, which is not judged here): the same pids, each with
+    the same node-local rank, DP rank, TP rank and start ticks. A malformed or missing table, an empty or
+    malformed mapping, or one that disagrees with a table (a rank given twice, a worker under another engine
+    at the end, a restarted process) is not used to index any counter."""
+    problems: list[str] = []
+    try:
+        if not isinstance(saved, dict) or not saved:
+            raise ValueError("there is no saved rank mapping")
+        owners = {int(pid): (row["rank"], row["dp"], row["tp"], row["start"]) for pid, row in saved.items()}
+        if len(owners) != len(saved) or any(type(v) is not int for owner in owners.values() for v in owner):
+            raise ValueError(f"the saved rank mapping is malformed: {owners}")
+        ranks = sorted(owner[0] for owner in owners.values())
+        if ranks != list(range(dp * tp)):
+            raise ValueError(f"the saved rank mapping holds ranks {ranks}, not each of the DP{dp} TP{tp} "
+                             f"instance's {dp * tp} once")
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        return [str(error)]
+    for name, table in tables.items():
+        if table is None:
+            continue
+        try:
+            if not isinstance(table, list) or not table:
+                raise InventoryError("it is missing or empty")
+            derived = expected_agents(check_table(table), tp, dp)
+        except InventoryError as error:
+            problems.append(f"the {name} process table is not a DP{dp} TP{tp} instance: {error}")
+            continue
+        wanted = {pid: (e["rank"], e["dp"], e["tp"], e["start"]) for pid, e in derived.items()}
+        if wanted != owners:
+            problems.append(f"the saved rank mapping (pid: rank, DP, TP, start) {owners} is not the {name} "
+                            f"process table's {wanted}")
+    return problems
 
 
 def identity(labels: dict) -> str:
@@ -449,12 +521,13 @@ def workload_problems(role: str, expected: dict[int, dict], baseline: dict[str, 
     first, last = by_rank(expected, baseline), by_rank(expected, final)
     for rank in sorted(expected.values(), key=lambda e: e["rank"]):
         r = rank["rank"]
+        who = rank.get("label", f"rank {r}")
         if r not in first or r not in last:
-            problems.append(f"rank {r}: no agent at both boundaries")
+            problems.append(f"{who}: no agent at both boundaries")
             continue
         a, b = first[r], last[r]
         if identity(a["labels"]) != identity(b["labels"]):
-            problems.append(f"rank {r}: the agent's identity changed between the boundaries "
+            problems.append(f"{who}: the agent's identity changed between the boundaries "
                             f"({identity(a['labels'])} then {identity(b['labels'])})")
             continue
         # Only what the exporter served at BOTH boundaries is compared; the rest is unavailable (see ``unavailable``).
@@ -463,27 +536,27 @@ def workload_problems(role: str, expected: dict[int, dict], baseline: dict[str, 
         errors = {s: b["errors"][s] - a["errors"][s] for s in sorted(set(a["errors"]) & set(b["errors"]))
                   if _finite(a["errors"][s]) and _finite(b["errors"][s])}
         if change.get("events_dropped"):
-            problems.append(f"rank {r}: {change['events_dropped']:.0f} telemetry event(s) dropped")
+            problems.append(f"{who}: {change['events_dropped']:.0f} telemetry event(s) dropped")
         if any(errors.values()):
-            problems.append(f"rank {r}: errors reported by NIXL {({s: v for s, v in errors.items() if v})}")
+            problems.append(f"{who}: errors reported by NIXL {({s: v for s, v in errors.items() if v})}")
         if change.get("memory_registered_bytes") or change.get("memory_deregistered_bytes"):
-            problems.append(f"rank {r}: registration changed over the workload "
+            problems.append(f"{who}: registration changed over the workload "
                             f"({change.get('memory_registered_bytes', 0):.0f} / "
                             f"{change.get('memory_deregistered_bytes', 0):.0f} B)")
         if role == "decode":
             seen = loads.get(r)
             if seen is None:
-                problems.append(f"rank {r}: no step log to compare with")
+                problems.append(f"{who}: no step log to compare with")
                 continue
             for name, key in (("rx_requests", "requests"), ("rx_bytes", "bytes"), ("xfer_time_us", "xfer_us"),
                               ("xfer_post_time_us", "post_us")):
                 if name in change and change[name] != seen[key]:
-                    problems.append(f"rank {r}: {name} changed by {change[name]:.0f}, the step log's transfers "
+                    problems.append(f"{who}: {name} changed by {change[name]:.0f}, the step log's transfers "
                                     f"by {seen[key]}")
             if change.get("tx_requests") or change.get("tx_bytes"):
-                problems.append(f"rank {r}: a decode rank transmitted ({change.get('tx_requests', 0):.0f} requests)")
+                problems.append(f"{who}: a decode rank transmitted ({change.get('tx_requests', 0):.0f} requests)")
         elif any(change.get(n) for n in ("rx_requests", "rx_bytes", "tx_requests", "tx_bytes")):
-            problems.append(f"rank {r}: a prefill rank moved bytes by NIXL's account "
+            problems.append(f"{who}: a prefill rank moved bytes by NIXL's account "
                             f"({ {n: change[n] for n in ('tx_bytes', 'rx_bytes', 'tx_requests', 'rx_requests') if n in change} })")
     return problems
 
@@ -547,20 +620,28 @@ def arm_problems(output, run) -> tuple[list[str], dict]:
     if set(probe.get("nodes", {})) != expected_nodes:
         problems.append(f"NIXL arm {arm}: the endpoint was probed on {sorted(probe.get('nodes', {}))}, not {sorted(expected_nodes)}")
     transfers = {}
-    for rank in range(run.decode.tp(run.server)):
-        path = output / run.decode.step_log("decode", 0, rank)
+    size = run.decode.tp(run.server)
+    for dp, tp in run.decode.ranks(size):
+        rank = f"{run.decode.node_of(dp)} DP{dp} TP{tp}"
+        path = output / run.decode.step_log("decode", dp, tp)
         if not path.is_file():
             problems.append(f"NIXL arm {arm}: no step log of decode rank {rank}")
             continue
-        count, slow = 0, 0
+        count, slow, owned = 0, 0, set()
         for line in path.read_text().splitlines():
-            for entry in json.loads(line).get("kv_transfers", {}).get("load", {}).get("each", ()):
+            record = json.loads(line)
+            owned.update(((record.get("kv_events") or {}).get("allocated") or {}))
+            for entry in record.get("kv_transfers", {}).get("load", {}).get("each", ()):
                 count += 1
                 slow += round(entry[1] * 1e6) <= 0
         transfers[rank] = count
-        if count == 0 or slow:
-            problems.append(f"NIXL arm {arm}: decode rank {rank} logged {count} transfers, {slow} without a positive "
-                            f"integer-microsecond duration (the per-transfer statistics must be intact)")
+        # A DP replica the router gave no request allocated nothing and read nothing: idle, not missing statistics.
+        if slow or (count == 0 and owned):
+            problems.append(f"NIXL arm {arm}: decode rank {rank} logged {count} transfers for {len(owned)} allocated "
+                            f"request(s), {slow} without a positive integer-microsecond duration (the per-transfer "
+                            f"statistics must be intact)")
+    if transfers and not sum(transfers.values()):
+        problems.append(f"NIXL arm {arm}: no decode rank logged a transfer (the per-transfer statistics must be intact)")
     report["decode_transfers"] = transfers
     for role, side in (("prefill", run.prefill), ("decode", run.decode)):
         for node in side.nodes:

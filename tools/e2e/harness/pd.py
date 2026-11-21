@@ -365,9 +365,10 @@ class Collector:
     tent: bool = True
     """Scrape TENT's metrics (the Mooncake connector, or NIXL's Mooncake backend)."""
     nixl_telemetry: bool = False
-    """Also, or instead, read NIXL's built-in telemetry (any NIXL backend, data-parallel size 1):
-    the servers get its exporter environment and each node's one endpoint is scraped, with the
-    expected agent inventory, a bounded baseline and a bounded, stable and checked final sample."""
+    """Also, or instead, read NIXL's built-in telemetry (any NIXL backend): the servers get its
+    exporter environment and each node's one endpoint is scraped, with the expected agent inventory
+    (one agent per DP rank and TP rank), a bounded baseline and a bounded, stable and checked final
+    sample."""
 
 
 COLLECTOR_BOUNDS = {"interval_s": (0.05, 3600), "scrape_timeout_s": (0.05, 60),
@@ -500,11 +501,8 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         if collector.tent and not uses_tent(run.server):
             raise ValueError("collector needs TENT's metrics: server.connector mooncake, or nixl with "
                              "nixl_backend mooncake (or tent: false with nixl_telemetry: true)")
-        if collector.nixl_telemetry and (
-                run.server.connector != "nixl" or run.prefill.data_parallel_size != 1
-                or run.decode.data_parallel_size != 1):
-            raise ValueError("collector.nixl_telemetry needs server.connector nixl and data_parallel_size 1 on "
-                             "both sides (data parallelism is not qualified)")
+        if collector.nixl_telemetry and run.server.connector != "nixl":
+            raise ValueError("collector.nixl_telemetry needs server.connector nixl")
         for name, (low, high) in COLLECTOR_BOUNDS.items():
             value = getattr(collector, name)
             if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
