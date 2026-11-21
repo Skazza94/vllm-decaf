@@ -382,7 +382,7 @@ the quality of the producer or frontend capture they use.
 ## The request explorer (viewer)
 
 ```console
-.venv/bin/python <vllm>/kv_profiling/viewer.py RUN_DIR [RUN_DIR ...]
+.venv/bin/python tools/kv-profiler-viewer/viewer.py RUN_DIR [RUN_DIR ...]
   [--port N] [--host H]
 ```
 
@@ -391,7 +391,9 @@ captures: per-request rows, the request × time lanes, the record detail and a
 run switch when several RUN_DIRs are given, each labelled by the transport its
 records carry. The server is standard library only and imports no vLLM or
 torch: the pairing is the summary's own, loaded by path (as with
-`ucx_protocols.py`), and `vllm/__init__.py` never executes.
+`ucx_protocols.py`), and `vllm/__init__.py` never executes. It is a repository
+tool, not part of the installed package: it reads the profiler's modules from
+the `vllm/kv_profiling` of the same checkout.
 
 Captures are found by their own metadata row, never by directory names: L1
 recorder captures feed `summarize` (naming the calibration mappings from the

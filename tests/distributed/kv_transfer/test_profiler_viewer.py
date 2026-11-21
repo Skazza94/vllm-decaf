@@ -23,7 +23,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
-VIEWER = Path(__file__).resolve().parents[3] / "vllm" / "kv_profiling" / (
+VIEWER = Path(__file__).resolve().parents[3] / "tools" / "kv-profiler-viewer" / (
     "viewer.py"
 )
 
@@ -1385,8 +1385,9 @@ def test_irq_reset_and_incomplete_poll_clears_baseline(viewer_module,
 def test_request_timeline_fields_come_from_the_summary_timelines(l1_run):
     """Phase 4's per-request fields are the summary's timelines, never estimated.
     A row's scheduler occurrence is the one whose record sequences contain its
-    own incoming handoff (no join needed); the prefill window is the producer occurrence owning the
-    outgoing handoff of the row's one confirmed, unreused join. The KV-wait bar
+    own incoming handoff (no join needed); the prefill window is the producer
+    occurrence owning the outgoing handoff of the row's one confirmed, unreused
+    join. The KV-wait bar
     runs from the load preparation to the KV receipt on the scheduler's clock;
     frontend times use the frontend's clock and are not drawn when it does not
     project. Every missing value has its own reason."""

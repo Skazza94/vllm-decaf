@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The KV request explorer server: the accepted viewer page over real data.
 
-``python vllm/kv_profiling/viewer.py RUN_DIR [RUN_DIR ...] [--port N]
+``python tools/kv-profiler-viewer/viewer.py RUN_DIR [RUN_DIR ...] [--port N]
 [--host H]``
 
 Standard library only (no vLLM or torch import: ``vllm/__init__.py`` is never
@@ -36,6 +36,9 @@ MAX_THREAD_STRIPS = 32
 GAUGE_FIELD = "registered_buffer_bytes"
 
 _PAGE = Path(__file__).resolve().parent / "viewer.html"
+# The profiler's own offline modules (summary, clocks, timelines, probe joins),
+# loaded by path from the repository this tool lives in.
+_CORE = Path(__file__).resolve().parents[2] / "vllm" / "kv_profiling"
 
 # ---------------------------------------------------------------------------
 # by-path loading of the profiler core (vllm/__init__.py never executes)
@@ -48,7 +51,7 @@ def load_core_modules(root=None):
     """Load summary/clock/perfetto/schema by file path under one package."""
     import importlib.util
 
-    root = Path(root or Path(__file__).resolve().parent)
+    root = Path(root or _CORE)
     if _PACKAGE not in sys.modules:
         spec = importlib.util.spec_from_file_location(
             _PACKAGE,
@@ -2537,7 +2540,7 @@ class Run:
         import importlib.util
 
         self.probe_candidates = {}
-        root = Path(__file__).resolve().parent
+        root = _CORE
         worker_files = [
             c.path for c in self.captures
             if c.layer == "l1" and not c.problems
