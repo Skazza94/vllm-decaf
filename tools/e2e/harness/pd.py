@@ -339,7 +339,7 @@ class Router:
 class Profiler:
     """The KV network profiler on both servers: the servers'
     ``kv_connector_extra_config.network_profiler``, one run ID for both (L1
-    with NIXL or Mooncake, L3 with NIXL). Each server closes its recorders when
+    or L3, with NIXL or Mooncake). Each server closes its recorders when
     it is stopped; the harness stops them, then copies the profile directories
     to ``profiles/<role>/<node>/``. Under Mooncake each instance gets a pinned
     engine ID, prefill's scheduler serves the clock on its control address at
@@ -476,8 +476,6 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
     if (profiler := run.profiler) is not None:
         if profiler.level not in ("l1", "l3"):
             raise ValueError("profiler.level must be l1 or l3")
-        if run.server.connector == "mooncake" and profiler.level != "l1":
-            raise ValueError("under server.connector mooncake the profiler is L1")
         if profiler.level == "l3":
             nodes = set(run.prefill.nodes + run.decode.nodes)
             if set(profiler.probes) != nodes or set(profiler.observer_cpus) != nodes:

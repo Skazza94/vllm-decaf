@@ -1117,7 +1117,8 @@ record kinds). Any miss is a problem of the run's verdict. The collector is not 
 service of the run: the harness's server filters leave it alone and its CPU is counted
 as a helper of its own kind (`collector_s`).
 
-The same harness turns the Mooncake adapter on with the run's `profiler` key (L1, any data-parallel size):
+The same harness turns the Mooncake adapter on with the run's `profiler` key (L1 or L3, any data-parallel size;
+at L3 each endpoint's observer as under NIXL):
 both servers get one run ID, every instance a pinned engine ID (`<role>-<node>`, which vLLM suffixes
 `_dp<rank>` for each DP rank; all written to `profile-identities.json`), each prefill instance's schedulers
 bind their clock servers on the node's control address (`BOOTSTRAP_PORT + clock_port_offset`, + the DP rank,

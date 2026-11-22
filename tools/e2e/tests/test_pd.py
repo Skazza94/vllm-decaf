@@ -333,14 +333,18 @@ class ProfilerConfig(unittest.TestCase):
             self.assertIsNone(pd.parse(raw, Path("/r.yaml")).profiler)
             for bad, message in (({"profiler": {"transport": "rdma"}}, "profiler.transport"),
                                  ({"profiler": {"clock_port_offset": 0}}, "clock_port_offset"),
-                                 ({"profiler": {"nope": 1}}, "unexpected keyword"),
-                                 ({"profiler": {"level": "l3"}, "server": {"connector": "mooncake", "timing": "linear"}},
-                                  "under server.connector mooncake the profiler is L1")):
+                                 ({"profiler": {"nope": 1}}, "unexpected keyword")):
                 with self.assertRaisesRegex(ValueError, message):
                     pd.parse({**raw, **bad}, Path("/r.yaml"))
             mooncake = pd.parse({**raw, "profiler": {}, "server": {"connector": "mooncake", "timing": "linear"}},
                                 Path("/r.yaml"))
             self.assertEqual(mooncake.profiler, pd.Profiler())
+            # The Mooncake connector profiles at L3 too, with each endpoint's probes and observer CPUs.
+            probes = {node: {"interfaces": ["data0"], "required": ["netdev"]} for node in ("p", "d")}
+            l3 = pd.parse({**raw, "server": {"connector": "mooncake", "timing": "linear"},
+                           "profiler": {"level": "l3", "probes": probes, "observer_cpus": {"p": [12], "d": [13]}}},
+                          Path("/r.yaml"))
+            self.assertEqual(l3.profiler.level, "l3")
             dp = pd.parse({**raw, "profiler": {}, "server": {"connector": "mooncake", "timing": "linear"},
                            "decode": {"node": "d", "kv_network": "data0", "data_parallel_size": 2}}, Path("/r.yaml"))
             self.assertEqual(dp.decode.data_parallel_size, 2)
