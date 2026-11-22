@@ -5556,6 +5556,25 @@ class EndpointCaptureChecks(unittest.TestCase):
             self.assertTrue(all("incomplete" in item for item in verdict["problems"]))
 
 
+def ebpf_package(root, omit=(), corrupt=(), manifest=None, collector_mode=0o755):
+    """A built eBPF package as tools/kv-profiler-ebpf/build.sh lays it out: its files and their manifest."""
+    import hashlib
+
+    root = Path(root)
+    files = {}
+    for name in ("collector", "observe.bpf.o", "limits.json"):
+        (root / name).write_bytes(name.encode())
+        files[name] = hashlib.sha256(name.encode()).hexdigest()
+    (root / "collector").chmod(collector_mode)
+    whole = {"schema": 2, "mode": "tcp_tracepoints", "files": files}
+    (root / "manifest.json").write_text(json.dumps(whole if manifest is None else manifest(whole)))
+    for name in omit:
+        (root / name).unlink()
+    for name in corrupt:
+        (root / name).write_bytes(b"changed")
+    return str(root)
+
+
 class EndpointObserverCapabilities(unittest.TestCase):
     def test_the_observer_keeps_its_endpoint_s_drops_and_inherits_only_ipc_lock(self):
         """Reading another process's /proc/<pid>/ns needs the target's capabilities to be a subset of the
@@ -5574,6 +5593,73 @@ class EndpointObserverCapabilities(unittest.TestCase):
         self.assertEqual(caps({"CapAdd": ["IPC_LOCK"], "CapDrop": ["IPC_LOCK"]}), ([], ["IPC_LOCK"]))
         self.assertEqual(caps({"CapAdd": None, "CapDrop": None}), ([], []))
         self.assertEqual(caps({}), ([], []))
+
+    def test_an_opted_in_ebpf_endpoint_gives_its_observer_only_bpf_perfmon_and_the_artifacts(self):
+        """The opt-in eBPF collector needs CAP_BPF and CAP_PERFMON (never CAP_SYS_ADMIN) and its built artifact
+        directory, read-only at its configured absolute path; without the explicit opt-in the observer gets
+        neither, and an opted-in endpoint without a usable artifact directory is refused before anything starts."""
+        import tempfile
+
+        from harness.endpoint_observer import observer_command
+
+        def parts(probes):
+            command = observer_command("o", "srv", {"Image": "img"}, [12], "/in", Path("/out"), probes)
+            caps = [command[i + 1] for i, arg in enumerate(command) if arg == "--cap-add"]
+            mounts = [command[i + 1] for i, arg in enumerate(command) if arg == "--mount"]
+            return caps, mounts
+
+        with tempfile.TemporaryDirectory() as artifacts:
+            ebpf_package(artifacts)
+            on = {"ebpf": {"enabled": True, "privileged_opt_in": True, "artifacts": artifacts}}
+            caps, mounts = parts(on)
+            self.assertEqual(caps, ["BPF", "PERFMON"])
+            self.assertIn(f"type=bind,src={artifacts},dst={artifacts},readonly", mounts)
+            for probes in ({"ebpf": {"enabled": True, "artifacts": artifacts}},
+                           {"ebpf": {"enabled": False, "privileged_opt_in": True, "artifacts": artifacts}},
+                           {"interfaces": ["data0"]}, None):
+                with self.subTest(probes=probes):
+                    caps, mounts = parts(probes)
+                    self.assertEqual(caps, [])
+                    self.assertFalse(any(artifacts in m for m in mounts))
+        with tempfile.TemporaryDirectory() as scratch:
+            def package(name, **kwargs):
+                return ebpf_package(Path(scratch, name).mkdir() or Path(scratch, name), **kwargs)
+
+            empty = str(Path(scratch, "empty").mkdir() or Path(scratch, "empty"))
+            broken = [
+                package("no-limits", omit=["limits.json"]),
+                package("changed", corrupt=["observe.bpf.o"]),
+                package("not-executable", collector_mode=0o644),
+                package("null-manifest", manifest=lambda whole: None),
+                package("list-manifest", manifest=lambda whole: [whole]),
+                package("integer-files", manifest=lambda whole: {**whole, "files": 3}),
+            ]
+            for artifacts in (None, "relative/dir", "/nonexistent/kvp-ebpf", empty, *broken):
+                with self.subTest(artifacts=artifacts), self.assertRaisesRegex(ValueError, "probes.ebpf.artifacts"):
+                    parts({"ebpf": {"enabled": True, "privileged_opt_in": True, "artifacts": artifacts}})
+        # a string is never consent: quoted booleans are refused, not read as true
+        for bad in ({"enabled": "false", "privileged_opt_in": True}, {"enabled": True, "privileged_opt_in": "true"}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "true or false"):
+                parts({"ebpf": {**bad, "artifacts": "/x"}})
+
+    def test_the_run_s_preflight_refuses_an_unusable_ebpf_opt_in_before_anything_starts(self):
+        """An opted-in endpoint's artifact directory and literal booleans are checked when the run is parsed,
+        before any endpoint is cleaned or server started."""
+        raw = {"name": "t", "topology": "t", "model": "/m", "client": "c", "control_network": "control",
+               "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"},
+               "router": {"gateway": "gw"}, "server": {"connector": "nixl", "timing": "linear"}}
+
+        def profiler(ebpf):
+            return {"level": "l3", "observer_cpus": {"p": [12], "d": [13]},
+                    "probes": {node: {"interfaces": ["data0"], "ebpf": ebpf} for node in ("p", "d")}}
+
+        with mock.patch.object(pd.models, "resolve", lambda model, fetch=False: Path(model)):
+            for ebpf, message in (({"enabled": True, "privileged_opt_in": True}, "probes.ebpf.artifacts"),
+                                  ({"enabled": "false", "privileged_opt_in": True}, "true or false")):
+                with self.subTest(ebpf=ebpf), self.assertRaisesRegex(ValueError, message):
+                    pd.parse({**raw, "profiler": profiler(ebpf)}, Path("/r.yaml"))
+            self.assertEqual(pd.parse({**raw, "profiler": profiler({"enabled": False})}, Path("/r.yaml")).profiler.level,
+                             "l3")
 
     def test_an_endpoint_with_another_added_privilege_is_refused_with_its_reason(self):
         """An endpoint holding an added capability the observer does not take would make its namespaces

@@ -101,7 +101,7 @@ class EndpointObserver:
         if uninherited := uninherited_capabilities(description):
             raise ValueError(f"{container} added capabilities {uninherited} the observer does not take: it could not "
                              f"read the endpoint's namespaces (only {list(INHERITED_CAPABILITIES)} are inherited)")
-        command = observer_command(name, container, description, cpus, input_path, output)
+        command = observer_command(name, container, description, cpus, input_path, output, probes)
         (output / "launch.json").write_text(json.dumps(command))
         observer = cls(name, output, run_id, endpoint)
         try:
@@ -109,7 +109,11 @@ class EndpointObserver:
             start_command = ["docker", "start", observer.container_id]
             (output / "start.json").write_text(json.dumps(start_command))
             shell.run(start_command)
-            deadline = time.monotonic() + 5
+            # an eBPF collector loads and attaches first (the observer's
+            # EBPF_ANSWER_TIMEOUT_S, 10 s) before the capture says ready
+            ebpf = (probes or {}).get("ebpf") or {}
+            deadline = time.monotonic() + READY_TIMEOUT_S + (
+                EBPF_ANSWER_TIMEOUT_S if ebpf.get("enabled") is True else 0)
             while time.monotonic() < deadline:
                 ready = list((output / "captures").glob(f"{run_id}/*/manifest.json"))
                 if len(ready) == 1 and json.loads(ready[0].read_text()).get("ready"):
@@ -243,6 +247,12 @@ def profile_backing(description):
     raise ValueError("L3 needs an exposed profile bind/volume or overlay merged root")
 
 
+# How long the controller waits for an observer's capture to be ready, plus, when
+# the endpoint opts into eBPF, the observer's own bound for the collector's first
+# answer (runner.EBPF_ANSWER_TIMEOUT_S).
+READY_TIMEOUT_S = 5.0
+EBPF_ANSWER_TIMEOUT_S = 10.0
+
 # The capabilities an observer takes from its endpoint when the endpoint's container added them: the kernel lets
 # a process read another's /proc/<pid>/ns only when the target's capabilities are a subset of its own (without
 # CAP_SYS_PTRACE), and an RDMA server adds IPC_LOCK. No other added privilege is copied.
@@ -260,10 +270,22 @@ def uninherited_capabilities(description) -> list[str]:
     return sorted(_capabilities(host.get("CapAdd")) - set(INHERITED_CAPABILITIES) - _capabilities(host.get("CapDrop")))
 
 
-def observer_command(name, container, description, cpus, input_path, output):
+# What the opt-in eBPF collector needs, and nothing broader (never CAP_SYS_ADMIN): loading BPF programs and
+# attaching them to tracepoints.
+EBPF_CAPABILITIES = ("BPF", "PERFMON")
+
+
+def observer_command(name, container, description, cpus, input_path, output, probes=None):
     """The observer's ``docker create``: in the endpoint container's network and PID namespaces, on its own CPUs,
     with the endpoint image. It drops what the endpoint's container dropped (``HostConfig.CapDrop``) and adds,
-    of what it added (``CapAdd``), only ``INHERITED_CAPABILITIES``."""
+    of what it added (``CapAdd``), only ``INHERITED_CAPABILITIES``. With the endpoint's ``probes.ebpf`` enabled
+    and explicitly opted into privilege, it also holds ``EBPF_CAPABILITIES`` and the built artifact directory,
+    read-only at the same absolute path."""
+    # literal booleans only (pd.ebpf_opt_in, the run's preflight): a string such as "false" is never consent
+    from .pd import ebpf_opt_in
+
+    privileged = ebpf_opt_in("endpoint", probes)
+    artifacts = probes["ebpf"]["artifacts"] if privileged else None
     host = description.get("HostConfig") or {}
     added = sorted(_capabilities(host.get("CapAdd")) & set(INHERITED_CAPABILITIES))
     dropped = sorted(_capabilities(host.get("CapDrop")))
@@ -280,6 +302,8 @@ def observer_command(name, container, description, cpus, input_path, output):
         f"container:{container}",
         *(arg for capability in dropped for arg in ("--cap-drop", capability)),
         *(arg for capability in added if capability not in dropped for arg in ("--cap-add", capability)),
+        *(arg for capability in (EBPF_CAPABILITIES if privileged else ()) for arg in ("--cap-add", capability)),
+        *(("--mount", f"type=bind,src={artifacts},dst={artifacts},readonly") if privileged else ()),
         "--cpuset-cpus",
         ",".join(map(str, cpus)),
         "--memory",

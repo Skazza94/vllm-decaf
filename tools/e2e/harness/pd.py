@@ -487,6 +487,8 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
                 ):
                     raise ValueError(
                         "observer_cpus must contain non-negative CPU lists")
+            for node, probes in profiler.probes.items():
+                ebpf_opt_in(node, probes)
         elif profiler.probes or profiler.observer_cpus:
             raise ValueError("endpoint probe settings require L3")
         if profiler.transport not in ("tcp", "unknown") or profiler.flush not in ("end", "background"):
@@ -1634,6 +1636,61 @@ def check_profiles(output: Path, run: Run, verdict: dict) -> None:
                                                f"{role} {node}", run_id, package, dp, tp,
                                                "kv_producer" if role == "prefill" else "kv_consumer",
                                                api_server_slots(run, side)))  # fmt: skip
+
+
+def ebpf_opt_in(node: str, probes) -> bool:
+    """Whether ``node``'s endpoint opts into the privileged eBPF collector, refused before anything starts unless
+    its settings are literal booleans and, opted in, its built artifact directory is usable: absolute, with its
+    manifest, collector and BPF object."""
+    ebpf = (probes or {}).get("ebpf") if isinstance(probes, dict) else None
+    if ebpf is None:
+        return False
+    if not isinstance(ebpf, dict) or any(type(ebpf.get(key, False)) is not bool
+                                         for key in ("enabled", "privileged_opt_in")):
+        raise ValueError(f"{node}: probes.ebpf.enabled and privileged_opt_in are true or false, not {ebpf!r}")
+    if not (ebpf.get("enabled") and ebpf.get("privileged_opt_in")):
+        return False
+    artifacts = ebpf.get("artifacts")
+    problem = _ebpf_artifacts_problem(artifacts)
+    if problem:
+        raise ValueError(f"{node}: probes.ebpf.artifacts is not the built artifact directory ({problem}): "
+                         f"{artifacts!r}")
+    return True
+
+
+# The built eBPF package, as the observer's runtime check (endpoint_probes.ebpf.validate_artifacts) reads it.
+EBPF_ARTIFACT_FILES = ("collector", "observe.bpf.o", "limits.json")
+
+
+def _ebpf_artifacts_problem(artifacts) -> str | None:
+    """Why ``artifacts`` is not a complete built package, checked as the runtime checks it: an absolute directory
+    whose manifest (schema 2, tcp_tracepoints) lists exactly the package's files, each present with its SHA-256."""
+    import hashlib
+
+    if not isinstance(artifacts, str) or not Path(artifacts).is_absolute():
+        return "an absolute path is required"
+    root = Path(artifacts)
+    try:
+        manifest = json.loads((root / "manifest.json").read_text())
+    except (OSError, ValueError) as error:
+        return f"manifest.json unreadable: {error}"
+    if not isinstance(manifest, dict):
+        return "manifest.json is not a mapping"
+    if (manifest.get("schema"), manifest.get("mode")) != (2, "tcp_tracepoints"):
+        return "manifest.json is not a schema 2 tcp_tracepoints package"
+    files = manifest.get("files")
+    if not isinstance(files, dict) or set(files) != set(EBPF_ARTIFACT_FILES):
+        listed = sorted(map(str, files)) if isinstance(files, dict) else type(files).__name__
+        return f"manifest lists {listed}, not {list(EBPF_ARTIFACT_FILES)}"
+    for name in EBPF_ARTIFACT_FILES:
+        try:
+            if hashlib.sha256((root / name).read_bytes()).hexdigest() != files[name]:
+                return f"{name} does not match its manifest"
+        except OSError as error:
+            return f"{name} missing: {error}"
+    if not (root / "collector").stat().st_mode & 0o111:
+        return "collector is not executable"
+    return None
 
 
 def check_mooncake_clocks(output: Path, run: Run, verdict: dict) -> None:

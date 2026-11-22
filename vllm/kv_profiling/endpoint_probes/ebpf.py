@@ -183,6 +183,28 @@ def validate_artifacts(directory):
     return manifest
 
 
+# The collector's loss scopes that lose endpoint events (or invalidate the
+# counters): unlike filter and global unknown exclusions, they make a capture
+# degraded.
+LOSS_SCOPES = ("endpoint_namespace", "counter_health")
+
+
+def event_loss(losses, terminal):
+    """Known event loss, by counter: the cumulative counters of ``LOSS_SCOPES``
+    (``losses``: (scope, counter) -> highest value) and the collector's terminal
+    output drops and malformed rows; zero counts and exclusions are not loss."""
+    loss = {
+        f"{scope}.{counter}": value
+        for (scope, counter), value in sorted(losses.items())
+        if value and scope in LOSS_SCOPES
+    }
+    for name in ("output_drops", "malformed"):
+        value = (terminal or {}).get(name)
+        if isinstance(value, int) and value:
+            loss[f"terminal.{name}"] = value
+    return loss
+
+
 class Channel:
     """Bounded pipes for an already-owned child; never enables kernel probes."""
 
@@ -198,6 +220,7 @@ class Channel:
         self.reaped = False
         self.accounting_error = None
         self.terminal = None
+        self.losses = {}  # (scope, counter) -> highest cumulative value
         self.monotonic_offset = None
         self.time_namespace = None
         self.namespaces = None
@@ -388,6 +411,10 @@ class Channel:
                     )
                 elif row.get("type") == "resource":
                     self.status["resource"] = row
+                elif row.get("type") == "loss" and isinstance(row.get("value"), int):
+                    # cumulative counters: the highest value of each is its total
+                    key = (row.get("scope"), row.get("counter"))
+                    self.losses[key] = max(self.losses.get(key, 0), row["value"])
                 elif row.get("type") == "end":
                     self.terminal = row
                     if row.get("failed") is True:
@@ -472,6 +499,7 @@ class Channel:
                 self.selector.close()
             for stream in (self.child.stdin, self.child.stdout, self.child.stderr):
                 stream.close()
+        loss = event_loss(self.losses, self.terminal)
         self.stopped_result = {
             **self.status,
             "complete": False,
@@ -483,6 +511,28 @@ class Channel:
             "final_usage": self.final_usage,
             "terminal": self.terminal,
             "coverage": "partial",
+            # Known event loss, apart from the lifecycle (``clean``): endpoint
+            # events the ring or the reads lost, counter wraps, and the
+            # collector's own output drops and malformed rows. Ordinary
+            # namespace, protocol, family and port exclusions, and global
+            # unknown exclusions, are not loss.
+            "event_loss": loss,
+            "degraded": bool(loss),
+            # Coverage is never provably complete (rare events, unverified kernel
+            # misses); a required source is judged on whether it ran cleanly: it
+            # became ready and stayed available, recorded no failure, and ended
+            # with its own unfailed terminal record, a normal exit and its final
+            # resource accounting.
+            "clean": bool(
+                self.status.get("available") is True
+                and self.status.get("state") == "partial"
+                and self.failed_reason is None
+                and isinstance(self.terminal, dict)
+                and self.terminal.get("failed") is False
+                and self.child.returncode in (0, 2)
+                and self.error is None
+                and self.final_usage is not None
+            ),
         }
         return self.stopped_result
 

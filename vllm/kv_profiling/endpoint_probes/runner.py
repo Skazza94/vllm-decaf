@@ -50,6 +50,10 @@ def _time_namespace():
         return None
 
 
+# How long an observer waits for its eBPF collector to load and attach (or to
+# report itself unavailable) before it starts sampling.
+EBPF_ANSWER_TIMEOUT_S = 10.0
+
 class Observer:
     """Observe an explicit owner; never signals it, rewrites sockets or retunes IRQs."""
 
@@ -114,6 +118,7 @@ class Observer:
         self.stop_event = threading.Event()
         self.failed_required = 0
         self.ebpf_failures = 0
+        self.ebpf_event_loss = {}
         self.isolation_failures = 0
         self.verified_processes = set()
         self.inventory = inventory
@@ -186,6 +191,10 @@ class Observer:
                 Settings(**config.ebpf), inventory, self.writer.directory / "ebpf"
             )
             self.ebpf.start()
+            self.wait_ebpf_answer()
+        # ready for the workload only now: every source started, an eBPF
+        # collector attached (or reported unavailable)
+        self.writer.publish_ready()
 
     def emit(
         self, scope, entity, begin, data, transport="unknown", kind="endpoint_metrics"
@@ -402,6 +411,28 @@ class Observer:
             )
         )
 
+    def wait_ebpf_answer(self, timeout_s=None):
+        """Wait, bounded, for the native collector's first answer: ``ready``, or
+        a status that it is unavailable. Loading and attaching take a moment, and
+        a sample taken meanwhile would count the source as missing; the observer
+        reports itself ready only after this, so no workload event precedes the
+        attachment. A collector still starting at the deadline stays
+        ``not_ready``: the missed deadline is recorded before the workload is
+        released, a failure of a required source even if a later poll sees the
+        collector ready."""
+        if timeout_s is None:
+            timeout_s = EBPF_ANSWER_TIMEOUT_S
+        deadline = time.monotonic() + timeout_s
+        while (
+            self.ebpf.status.get("state") == "starting"
+            and self.ebpf.running()
+            and time.monotonic() < deadline
+        ):
+            for row in self.ebpf.poll(self.writer, 0.05):
+                self.ebpf_row(row)
+        if self.ebpf.status.get("state") == "starting":
+            self.failure("ebpf", "not_ready_within_deadline", time.monotonic_ns())
+
     def sample_ebpf(self):
         if self.ebpf is None:
             return
@@ -541,8 +572,11 @@ class Observer:
             if self.ebpf:
                 native = self.ebpf.stop(self.writer, self.ebpf_row)
                 self.ebpf_row({"type": "lifecycle", **native})
-                if not native["complete"] and "ebpf" in self.config.required:
+                if not native.get("clean") and "ebpf" in self.config.required:
                     self.failed_required += 1
+                # a clean run with known event loss is degraded: it ran, but its
+                # events cannot certify counter agreement
+                self.ebpf_event_loss = native.get("event_loss") or {}
             complete = (
                 controller
                 and closure["all_closed"]
@@ -571,6 +605,8 @@ class Observer:
                     **self.resources(),
                     "required_source_failures": self.failed_required,
                     "ebpf_failures": self.ebpf_failures,
+                    "ebpf_degraded": bool(self.ebpf_event_loss),
+                    "ebpf_event_loss": self.ebpf_event_loss,
                     "isolation_failures": self.isolation_failures,
                     "controller_children_closed": controller,
                     "core": closure,

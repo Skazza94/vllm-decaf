@@ -7,18 +7,18 @@ start no profiler helpers and record no events.
 
 The native recorder requires Linux tmpfs and GIL-enabled CPython.
 
-Overhead was measured with a two-node serving A/B of one workload, profiler off
-against on, on latency and throughput: the NIXL pull connector over UCX/TCP at
-concurrency one.
+Overhead was measured with two-node serving A/Bs of one workload, profiler off
+against on, on latency and throughput: the NIXL pull connector at concurrency one.
 
-- L1 and L2 passed every check.
-- L3 passed throughput and every mean latency. Its 95% upper bounds for p99 time
-  to first token and p99 end-to-end latency exceeded the gate's limits, and L3 was
+- Over UCX/TCP, L2 passed every check. L1 (with the request timelines) and L3
+  passed throughput and every mean latency; their 95% upper bounds for p99 time to
+  first token and p99 end-to-end latency exceeded the gate's limits, and both were
   accepted after review of those results.
+- Over UCX/RDMA, L1, L2 and L3 together passed every check.
 
-Other workloads, connectors and transports are not covered by these measurements.
-Not yet qualified: GPU execution, RDMA transports, live eBPF attachment, and exact
-socket/QP attribution.
+Other workloads and connectors are not covered by these measurements. Not yet
+qualified: GPU execution, the overhead of the eBPF collector (its live attachment
+is validated; below), and exact socket/QP attribution.
 
 ## Explicit library lifecycle
 
@@ -673,7 +673,8 @@ all of the side's KV role, each whole and closed (the observer package's
 L3 includes the L1 connector instrumentation (NIXL pull and the Mooncake
 adapter below) and declares an external observer. It is off by default. Transport
 metrics come from the separate L2 collector (below); eBPF is an opt-in collector
-of this observer (below), unqualified until live validation. Sampling, JSON formatting
+of this observer (below): its live attachment is validated, its overhead not yet
+measured. Sampling, JSON formatting
 and kernel queries run in a separate endpoint process, never in a transfer
 callback. The native L1 ring ABI and transfer metrics are unchanged.
 
@@ -830,7 +831,8 @@ counters retain four-octet units and an explicit byte conversion. Hardware names
 are preserved; absent retry/RNR/CNP/WR/CQE fields are unavailable, not fabricated.
 Refresh `lifespan` is configuration, never written or counted as traffic.
 Optional QP identities are snapshots: QPN reuse between samples is not excluded.
-Physical NIC/RDMA counter correctness requires separate real-node qualification.
+On real nodes the RDMA port's data counters were checked against the KV bytes the
+connectors moved over RDMA, and stayed near zero for KV moved over TCP.
 
 `probe_join.candidates` makes offline local engine/rank ownership and interval
 matches. It validates run/endpoint/namespace/PID identities and projects different
@@ -845,7 +847,7 @@ than catching up, records gaps/loss and never fabricates completeness. Final
 manifests retain observer CPU/RSS accounting separately from serving and L1
 helpers. Off-vs-L3 serving overhead was measured only for the workload described
 at the top of this page, where its p99 latency bounds exceeded the gate and it
-was accepted after review. Real RDMA-node validation remains open.
+was accepted after review.
 
 ### Capture inventory and deployment snapshot
 
@@ -943,6 +945,33 @@ Missing privilege/BTF/hook, kernel verifier/load/attach refusal is unavailable w
 its diagnostic; there is no fallback, automatic capability grant or policy change.
 All four hooks must attach for this explicit mode. Required-source behavior remains
 `required: [ebpf]`; optional unavailability leaves other observations unchanged.
+
+The observer waits, bounded (10 s), for the collector's first answer (ready, or a
+status that it is unavailable) and only then marks its capture `ready` in its
+manifest, the signal a controller waits for: no workload event precedes the
+attachment, and loading is never sampled as a missing source. A collector still
+starting at the bound is `not_ready`. Coverage is never provably complete, so a
+required eBPF source is judged on a clean run (`clean` in the stop record): ready
+and still available, no failure, the collector's own unfailed terminal record, a
+normal exit and its final resource accounting. Known event loss (endpoint ring or
+read losses, counter wraps, the collector's output drops or malformed rows) marks
+the capture `ebpf_degraded`, with the counts in `ebpf_event_loss`: it stands, but
+its events cannot certify agreement with other sources. Namespace, protocol,
+family and port exclusions and global unknown exclusions are not loss.
+
+In the e2e harness an endpoint opts in with `probes.ebpf: {enabled: true,
+privileged_opt_in: true, mode: tcp_tracepoints, artifacts: <built directory>}`,
+both flags literal booleans. Its observer container then gets exactly
+`CAP_BPF` and `CAP_PERFMON` (never `CAP_SYS_ADMIN`) and the artifact directory
+read-only at the same absolute path. The run is refused before anything starts if
+that directory lacks the built manifest, collector or BPF object. Without the
+opt-in the observer gets neither. Live attachment has been validated on Linux 5.15
+with Docker's default seccomp profile. With those two capabilities, all four hooks
+attached; without them, the collector reported itself unavailable with the
+kernel's error. Its retransmissions agreed with TCP_INFO's retransmission counters:
+one retransmit event can carry several segments, and the event's own
+`total_retrans` snapshot matched TCP_INFO's. Resets were compared across the two
+endpoints' eBPF events, not against TCP_INFO.
 
 The ring has fixed 1 MiB data capacity, plus two one-entry 256-byte ARRAY values
 for control and loss counters. That is 1,049,088 bytes of ring/value capacity,

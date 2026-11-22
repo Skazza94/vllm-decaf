@@ -35,6 +35,7 @@ def inspect_trace(path, *, expected=None, probe=False):
     sequence = total = 0
     scopes = {}
     cpu_verified = 0
+    ebpf_losses, ebpf_terminal = {}, {}  # recorded eBPF loss counters and counts
     try:
         with Path(path).open() as stream:
             for index, line in enumerate(
@@ -78,6 +79,14 @@ def inspect_trace(path, *, expected=None, probe=False):
                     scopes[scope] = scopes.get(scope, 0) + 1
                     if scope == "cpu_isolation" and data.get("verified") is True:
                         cpu_verified += 1
+                    if scope == "ebpf" and data.get("type") == "loss":
+                        if isinstance(data.get("value"), int):
+                            key = (data.get("scope"), data.get("counter"))
+                            ebpf_losses[key] = max(
+                                ebpf_losses.get(key, 0), data["value"]
+                            )
+                    elif scope == "ebpf" and data.get("type") == "end":
+                        ebpf_terminal = data
                     if data.get("required") is True and data.get("available") is False:
                         problems.append("required source failure record")
                     if (
@@ -134,12 +143,16 @@ def inspect_trace(path, *, expected=None, probe=False):
                     problems.append(f"loss/failure: {name}={value}")
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
         problems.append(str(error))
+    from .ebpf import event_loss
+
     return {
         "metadata": meta,
         "end": terminal,
         "problems": problems,
         "complete": not problems,
         "sequence": sequence,
+        # derived from the recorded counters themselves, never the footer alone
+        "ebpf_event_loss": event_loss(ebpf_losses, ebpf_terminal),
         "scopes": scopes,
         "cpu_verified": cpu_verified,
     }
@@ -272,6 +285,7 @@ def endpoint_capture(directory, core_dir):
     """Validate saved observer data and exit status; never trust manifests alone."""
     directory = Path(directory)
     problems = []
+    ebpf = {"degraded": False, "event_loss": {}}
     try:
         config = read_json(directory / "config.json")
         run, endpoint = config["run_id"], config["endpoint"]
@@ -359,6 +373,15 @@ def endpoint_capture(directory, core_dir):
         ):
             problems.append("observer sampling/isolation/shutdown evidence missing")
         end_stats = (health["end"] or {}).get("stats", {})
+        # known eBPF event loss, from the recorded counters: the capture
+        # stands, marked degraded; a footer that says otherwise is a problem
+        loss = health.get("ebpf_event_loss") or {}
+        ebpf = {"degraded": bool(loss), "event_loss": loss}
+        if "ebpf_event_loss" in end_stats and (
+            end_stats.get("ebpf_event_loss") != loss
+            or end_stats.get("ebpf_degraded") is not bool(loss)
+        ):
+            problems.append("eBPF loss footer disagrees with the recorded counters")
         if (
             end_stats.get("controller_children_closed") is not True
             or end_stats.get("core", {}).get("all_closed") is not True
@@ -406,4 +429,4 @@ def endpoint_capture(directory, core_dir):
         AttributeError,
     ) as error:
         problems.append(str(error))
-    return {"complete": not problems, "problems": problems}
+    return {"complete": not problems, "problems": problems, "ebpf": ebpf}

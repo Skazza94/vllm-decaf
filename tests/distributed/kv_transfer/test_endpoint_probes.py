@@ -2320,3 +2320,277 @@ def test_the_kernels_compact_socket_records_are_not_required_failures(tmp_path):
                          tcp_info_length=0, tcp_info_expected=False)  # fmt: skip
     assert _tcp_required_failures(tmp_path, [request, fin_wait2, time_wait]) == 0
     assert _tcp_required_failures(tmp_path, [{**full, "tcp_info_length": 0}]) == 1
+
+
+@pytest.mark.parametrize(
+    "ready, failed, exit_code, clean",
+    [
+        (True, False, 2, True),
+        (True, True, 2, False),
+        (False, False, 2, False),
+        (True, False, 1, False),
+    ],
+)
+def test_ebpf_a_required_source_is_judged_on_a_clean_run_not_on_coverage(
+    tmp_path, ready, failed, exit_code, clean
+):
+    """A required eBPF source is judged on a clean run, never on coverage.
+
+    Its coverage is never provably complete, so it must be ready and available,
+    record no failure, and end with its own unfailed terminal record, a normal
+    exit and its final accounting."""
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel
+
+    ready_row = {"type": "ready", "available": True, "exact": False,
+                 "coverage": "partial"}  # fmt: skip
+    end_row = {"type": "end", "complete": False, "coverage": "partial",
+               "output_drops": 0, "malformed": 0, "failed": failed}  # fmt: skip
+    code = (
+        "import json,sys;"
+        + (f"print({json.dumps(json.dumps(ready_row))},flush=True);" if ready else "")
+        + "assert sys.stdin.readline()=='stop\\n';"
+        f"print({json.dumps(json.dumps(end_row))},flush=True);"
+        f"sys.exit({exit_code})"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    channel = Channel(child, tmp_path)
+    writer = Writer(tmp_path / "writer", metadata(), ProbeConfig())
+    try:
+        if ready:
+            deadline = time.monotonic() + 5
+            while not channel.status.get("available"):
+                assert time.monotonic() < deadline
+                channel.poll(writer, 0.05)
+        result = channel.stop(writer)
+        assert result["complete"] is False
+        assert result["clean"] is clean
+    finally:
+        if channel.running():
+            child.kill()
+            channel.stop(writer)
+
+
+def _fake_collector(monkeypatch, code):
+    """Replace the native collector's launch by a Python child running ``code``."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    def start(self):
+        self.status.update(state="unavailable", mode=self.settings.mode)
+        self.child = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.open_pipes()
+
+    monkeypatch.setattr(ebpf.Collector, "start", start)
+
+
+def _collector_code(ready_after_s, end_row, marker=None):
+    lines = ["import json,sys,time,pathlib"]
+    if ready_after_s is not None:
+        lines.append(f"time.sleep({ready_after_s})")
+        if marker is not None:
+            lines.append(f"pathlib.Path({str(marker)!r}).touch()")
+        lines.append("print(json.dumps({'type':'ready','available':True,"
+                     "'exact':False,'coverage':'partial'}),flush=True)")
+    lines += ["sys.stdin.readline()",
+              f"print({json.dumps(json.dumps(end_row))},flush=True)",
+              "sys.exit(2)"]
+    return ";".join(lines)
+
+
+@pytest.mark.parametrize("ready_after_s", [0.8, 2.6, None])
+def test_ebpf_the_capture_is_ready_only_after_the_collector_answers(
+    tmp_path, monkeypatch, ready_after_s
+):
+    """The manifest's ``ready``, the signal a controller waits for, appears only
+    once the collector has answered: attached when it is ready late, or, when it
+    does not answer within the observer's bound (2 s here), at that bound, with
+    the missed deadline a required-source failure even if it answers later."""
+    import contextlib
+    import threading
+
+    from vllm.kv_profiling.endpoint_probes import runner
+    from vllm.kv_profiling.endpoint_probes.runner import Observer
+
+    end_row = {"type": "end", "complete": False, "coverage": "partial",
+               "output_drops": 0, "malformed": 0, "failed": False}  # fmt: skip
+    answered = tmp_path / "answered"
+    _fake_collector(monkeypatch, _collector_code(ready_after_s, end_row, answered))
+    monkeypatch.setattr(runner, "EBPF_ANSWER_TIMEOUT_S", 2.0)
+    original = os.sched_getaffinity(0)
+    cpus = sorted(original)
+    owner, entries, directory = start_recorded_endpoint(tmp_path, cpus[0])
+    (directory / "close").touch()
+    wait_for(lambda: (directory / "closed").exists(), timeout=20)
+    run = entries[0]["run_id"]
+    built, seen = [], []  # (ready, collector answered, seconds since start)
+
+    def build():
+        built.append(Observer(
+            ProbeConfig(ebpf={"enabled": True, "privileged_opt_in": True,
+                              "mode": "tcp_tracepoints", "artifacts": str(tmp_path)},
+                        required=["ebpf"]),
+            run_id=run, endpoint="d", role="decode", owner_pid=owner.pid,
+            owner_start=process_identity(owner.pid)["start_ticks"],
+            inventory=entries, cpus=[cpus[-1]],
+            input_dir=str(directory / "profiles"),
+            output_dir=str(tmp_path / "out"),
+            irq_policy="virtual_not_applicable",
+        ))  # fmt: skip
+
+    try:
+        thread = threading.Thread(target=build)
+        started = time.monotonic()
+        thread.start()
+        while thread.is_alive():
+            for manifest in (tmp_path / "out").glob("*/*/manifest.json"):
+                with contextlib.suppress(ValueError):
+                    ready = json.loads(manifest.read_text()).get("ready")
+                    seen.append((ready, answered.exists(),
+                                 time.monotonic() - started))
+            time.sleep(0.02)
+        thread.join()
+        observer = built[0]
+        manifest = next((tmp_path / "out").glob("*/*/manifest.json"))
+        assert any(not ready for ready, _, _ in seen)
+        on_time = ready_after_s is not None and ready_after_s < 2.0
+        for ready, was_answered, elapsed in seen:
+            if ready and on_time:
+                assert was_answered  # never ready before the collector answered
+            if ready and not on_time:
+                assert elapsed >= 2.0  # only at the observer's bound
+        assert json.loads(manifest.read_text())["ready"] is True
+        if on_time:
+            assert observer.ebpf.status.get("available") is True
+        (tmp_path / "stop").touch()
+        (tmp_path / "children").write_text(
+            json.dumps({"run_id": run, "endpoint": "d", "children_closed": True}))
+        complete = observer.run(stop_file=tmp_path / "stop",
+                                endpoint_complete_file=tmp_path / "children")
+        stats = json.loads(manifest.read_text())["end"]["stats"]
+        assert complete is on_time
+        assert (stats["required_source_failures"] > 0) is (not on_time)
+    finally:
+        os.sched_setaffinity(0, original)
+        (directory / "exit").touch()
+        owner.wait(10)
+
+
+@pytest.mark.parametrize(
+    "losses, output_drops, degraded",
+    [
+        ([("endpoint_namespace", "scoped_ring_drop", 2)], 0, True),
+        ([], 3, True),
+        ([("filter_exclusion", "excluded_port", 5),
+          ("global_unknown", "global_nonfull", 4)], 0, False),
+    ],
+)
+def test_ebpf_known_event_loss_marks_a_clean_run_degraded(
+    tmp_path, losses, output_drops, degraded
+):
+    """A clean run that lost endpoint events (ring or reads) or output is
+    degraded; ordinary exclusions are not loss."""
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel
+
+    rows = [{"type": "ready", "available": True, "exact": False,
+             "coverage": "partial"}]  # fmt: skip
+    rows += [{"type": "loss", "scope": scope, "counter": counter, "value": value}
+             for scope, counter, value in losses]  # fmt: skip
+    end_row = {"type": "end", "complete": False, "coverage": "partial",
+               "output_drops": output_drops, "malformed": 0,
+               "failed": False}  # fmt: skip
+    printed = [f"print({json.dumps(json.dumps(row))},flush=True)" for row in rows]
+    code = ";".join(["import json,sys", *printed,
+                     "sys.stdin.readline()",
+                     f"print({json.dumps(json.dumps(end_row))},flush=True)",
+                     "sys.exit(2)"])  # fmt: skip
+    child = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    channel = Channel(child, tmp_path)
+    writer = Writer(tmp_path / "writer", metadata(), ProbeConfig())
+    try:
+        deadline = time.monotonic() + 5
+        while not channel.status.get("available"):
+            assert time.monotonic() < deadline
+            channel.poll(writer, 0.05)
+        time.sleep(0.2)
+        channel.poll(writer, 0.05)
+        result = channel.stop(writer)
+        assert result["clean"] is True
+        assert result["degraded"] is degraded
+        if output_drops:
+            assert result["event_loss"]["terminal.output_drops"] == output_drops
+        assert not any(k.startswith(("filter_exclusion", "global_unknown"))
+                       for k in result["event_loss"])
+    finally:
+        if channel.running():
+            child.kill()
+            channel.stop(writer)
+
+
+def test_ebpf_saved_capture_loss_comes_from_the_recorded_counters(
+    tmp_path, monkeypatch
+):
+    """A capture's eBPF loss is derived from the loss counters and terminal
+    counts it recorded, never taken from its footer alone; exclusions are not
+    loss."""
+    from vllm.kv_profiling.endpoint_probes.health import inspect_trace
+    from vllm.kv_profiling.endpoint_probes.runner import Observer
+
+    end_row = {"type": "end", "complete": False, "coverage": "partial",
+               "output_drops": 0, "malformed": 0, "failed": False}  # fmt: skip
+    losses = [
+        {"type": "loss", "scope": "endpoint_namespace",
+         "counter": "scoped_ring_drop", "value": 2},
+        {"type": "loss", "scope": "filter_exclusion",
+         "counter": "excluded_port", "value": 7},
+    ]  # fmt: skip
+    code = _collector_code(0.0, end_row).replace(
+        "sys.stdin.readline()",
+        ";".join(f"print({json.dumps(json.dumps(r))},flush=True)" for r in losses)
+        + ";sys.stdin.readline()",
+    )
+    _fake_collector(monkeypatch, code)
+    original = os.sched_getaffinity(0)
+    cpus = sorted(original)
+    owner, entries, directory = start_recorded_endpoint(tmp_path, cpus[0])
+    (directory / "close").touch()
+    wait_for(lambda: (directory / "closed").exists(), timeout=20)
+    run = entries[0]["run_id"]
+    try:
+        observer = Observer(
+            ProbeConfig(ebpf={"enabled": True, "privileged_opt_in": True,
+                              "mode": "tcp_tracepoints", "artifacts": str(tmp_path)},
+                        required=["ebpf"]),
+            run_id=run, endpoint="d", role="decode", owner_pid=owner.pid,
+            owner_start=process_identity(owner.pid)["start_ticks"],
+            inventory=entries, cpus=[cpus[-1]],
+            input_dir=str(directory / "profiles"),
+            output_dir=str(tmp_path / "out"),
+            irq_policy="virtual_not_applicable",
+        )  # fmt: skip
+        time.sleep(1.5)  # a sample or two: the loss rows are recorded
+        (tmp_path / "stop").touch()
+        (tmp_path / "children").write_text(
+            json.dumps({"run_id": run, "endpoint": "d", "children_closed": True}))
+        observer.run(stop_file=tmp_path / "stop",
+                     endpoint_complete_file=tmp_path / "children")
+        events = next((tmp_path / "out").glob("*/*/events.jsonl"))
+        derived = inspect_trace(events, probe=True)["ebpf_event_loss"]
+        assert derived == {"endpoint_namespace.scoped_ring_drop": 2}
+        manifest = json.loads(events.with_name("manifest.json").read_text())
+        stats = manifest["end"]["stats"]
+        assert stats["ebpf_degraded"] is True and stats["ebpf_event_loss"] == derived
+    finally:
+        os.sched_setaffinity(0, original)
+        (directory / "exit").touch()
+        owner.wait(10)

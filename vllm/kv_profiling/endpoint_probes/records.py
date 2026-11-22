@@ -124,6 +124,13 @@ class Writer:
         if not self.ready.wait(2) or self.error:
             raise RuntimeError(f"probe writer startup failed: {self.error}")
 
+    def publish_ready(self):
+        """Mark the capture ready in its manifest, the signal a controller waits
+        for: called by the observer once its whole setup (an eBPF collector's
+        first answer included) is done."""
+        self.manifest["ready"] = True
+        atomic_json(self.directory / "manifest.json", self.manifest)
+
     def put(self, row):
         validate(row)
         self.sequence += 1
@@ -170,8 +177,8 @@ class Writer:
                     raise ValueError("probe output byte limit at metadata")
                 stream.write(raw)
                 stream.flush()
-                self.manifest["ready"] = True
-                atomic_json(self.directory / "manifest.json", self.manifest)
+                # the stream is open; the capture's own readiness is the
+                # observer's to publish (``publish_ready``)
                 self.ready.set()
                 size = len(raw)
                 while True:
