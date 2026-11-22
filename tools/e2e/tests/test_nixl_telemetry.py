@@ -1293,6 +1293,21 @@ class SavedInterval(SavedEvidence):
         (output / self.run.decode.step_log("decode", 0, 0)).write_text(step_log(2, ends_at=10 ** 12))
         self.expect(output, "began before the workload's own last step ended")
 
+    def test_the_workload_window_is_the_node_s_own_ranks_on_its_host_s_clock(self):
+        """Two nodes keep two monotonic clocks: a node's final stretch is judged against its own ranks' step
+        logs only, never against the other node's (here a prefill log far later on its own clock)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            run = pd.Run(**{**{f: getattr(self.run, f) for f in self.run.__dataclass_fields__},
+                            "prefill": pd.Side("p", "data0")})
+            (output / run.decode.step_log("decode", 0, 0)).write_text(step_log(2, ends_at=2.0))
+            (output / run.prefill.step_log("prefill", 0, 0)).write_text(step_log(2, ends_at=10 ** 12))
+            decode = collector.node_step_logs(output, run, "decode", run.decode, "n")
+            self.assertEqual(decode, [step_log(2, ends_at=2.0)])
+            self.assertEqual(collector.node_step_logs(output, run, "prefill", run.prefill, "p"),
+                             [step_log(2, ends_at=10 ** 12)])
+            self.assertEqual(collector.node_step_logs(output, run, "decode", run.decode, "p"), [])
+
     def test_a_marker_noticed_after_its_pass_and_independent_scrapes_out_of_order_are_found(self):
         output = self.good()
 

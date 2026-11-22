@@ -5502,6 +5502,38 @@ class EndpointCaptureChecks(unittest.TestCase):
             self.assertTrue(all("incomplete" in item for item in verdict["problems"]))
 
 
+class EndpointObserverCapabilities(unittest.TestCase):
+    def test_the_observer_keeps_its_endpoint_s_drops_and_inherits_only_ipc_lock(self):
+        """Reading another process's /proc/<pid>/ns needs the target's capabilities to be a subset of the
+        reader's: an RDMA server's added IPC_LOCK becomes the observer's too. Any other privilege the endpoint
+        added is not copied, and every capability it dropped is dropped by the observer as well."""
+        from harness.endpoint_observer import observer_command
+
+        def caps(host):
+            command = observer_command("o", "srv", {"Image": "img", "HostConfig": host}, [12], "/in", Path("/out"))
+            return ([command[i + 1] for i, arg in enumerate(command) if arg == "--cap-add"],
+                    [command[i + 1] for i, arg in enumerate(command) if arg == "--cap-drop"])
+
+        self.assertEqual(caps({"CapAdd": ["IPC_LOCK"]}), (["IPC_LOCK"], []))
+        self.assertEqual(caps({"CapAdd": ["CAP_IPC_LOCK", "SYS_ADMIN", "NET_ADMIN"], "CapDrop": ["NET_RAW", "MKNOD"]}),
+                         (["IPC_LOCK"], ["MKNOD", "NET_RAW"]))
+        self.assertEqual(caps({"CapAdd": ["IPC_LOCK"], "CapDrop": ["IPC_LOCK"]}), ([], ["IPC_LOCK"]))
+        self.assertEqual(caps({"CapAdd": None, "CapDrop": None}), ([], []))
+        self.assertEqual(caps({}), ([], []))
+
+    def test_an_endpoint_with_another_added_privilege_is_refused_with_its_reason(self):
+        """An endpoint holding an added capability the observer does not take would make its namespaces
+        unreadable: the observer refuses it by name, before anything starts, instead of failing on /proc."""
+        from harness.endpoint_observer import uninherited_capabilities
+
+        self.assertEqual(uninherited_capabilities({"HostConfig": {"CapAdd": ["IPC_LOCK"], "CapDrop": ["NET_RAW"]}}),
+                         [])
+        self.assertEqual(uninherited_capabilities({"HostConfig": {"CapAdd": ["IPC_LOCK", "CAP_NET_ADMIN"]}}),
+                         ["NET_ADMIN"])
+        self.assertEqual(uninherited_capabilities({"HostConfig": {"CapAdd": ["NET_ADMIN"], "CapDrop": ["NET_ADMIN"]}}),
+                         [])
+
+
 class EndpointObserverDiagnostics(unittest.TestCase):
     def test_stderr_only_failure_is_preserved_without_masking_exit_or_cleanup(self):
         """A fake Docker CLI keeps real subprocess stream handling, without Docker."""

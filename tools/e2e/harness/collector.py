@@ -674,6 +674,17 @@ def _check_unavailable(saved: dict, label: str, records: list[dict], target: str
         "unserved_label_series")}
 
 
+def node_step_logs(output: Path, run: pd.Run, role: str, side: pd.Side, node: str) -> list[str]:
+    """The step logs of ``node``'s own ranks: their instants are on its host's monotonic clock, the one its
+    collector samples on (another node's ranks log on another host's)."""
+    steps = []
+    for dp, tp in side.ranks(side.tp(run.server)):
+        path = output / side.step_log(role, dp, tp)
+        if side.node_of(dp) == node and path.is_file():
+            steps.append(path.read_text())
+    return steps
+
+
 def check_nixl(output: Path, run: pd.Run, node: str, role: str, side: pd.Side, records: list[dict], found: dict,
                problems: list[str]) -> None:
     """The NIXL telemetry of one node, judged again from what was saved: the boundary record, the capture's markers
@@ -748,12 +759,7 @@ def check_nixl(output: Path, run: pd.Run, node: str, role: str, side: pd.Side, r
         order = nixl.boundary_problems(name, stage, records, target)
         problems.extend(f"{label}: {issue}" for issue in order)
     if (saved.get("final") or {}).get("outcome") == "ok":
-        steps = []
-        for step_role, step_side in (("prefill", run.prefill), ("decode", run.decode)):
-            for dp, tp in step_side.ranks(step_side.tp(run.server)):
-                path = output / step_side.step_log(step_role, dp, tp)
-                if path.is_file():
-                    steps.append(path.read_text())
+        steps = node_step_logs(output, run, role, side, node)
         window = pd.workload_window(steps) if steps else None
         interval = nixl.final_interval_problems(saved, records, target, None if window is None else window[1])
         problems.extend(f"{label}: {issue}" for issue in interval)

@@ -98,34 +98,10 @@ class EndpointObserver:
         (output / "config.json").write_text(json.dumps(config))
         # Share only the endpoint's live capture directory, read-only. Never mount
         # endpoint source trees or make the observer depend on harness algorithms.
-        command = [
-            "docker",
-            "create",
-            "--pull",
-            "never",
-            "--name",
-            name,
-            "--network",
-            f"container:{container}",
-            "--pid",
-            f"container:{container}",
-            "--cpuset-cpus",
-            ",".join(map(str, cpus)),
-            "--memory",
-            "128m",
-            "--mount",
-            f"type=bind,src={input_path},dst=/input,readonly",
-            "--mount",
-            f"type=bind,src={output},dst=/output",
-            "--mount",
-            f"type=bind,src={output / 'observer.pyz'},dst=/observer.pyz,readonly",
-            "--entrypoint",
-            "/opt/venv/bin/python",
-            description["Image"],
-            "/observer.pyz",
-            "--config",
-            "/output/config.json",
-        ]
+        if uninherited := uninherited_capabilities(description):
+            raise ValueError(f"{container} added capabilities {uninherited} the observer does not take: it could not "
+                             f"read the endpoint's namespaces (only {list(INHERITED_CAPABILITIES)} are inherited)")
+        command = observer_command(name, container, description, cpus, input_path, output)
         (output / "launch.json").write_text(json.dumps(command))
         observer = cls(name, output, run_id, endpoint)
         try:
@@ -265,6 +241,62 @@ def profile_backing(description):
     if merged and PurePosixPath(merged).is_absolute():
         return str(PurePosixPath(merged) / target.relative_to("/")), "overlay_merged"
     raise ValueError("L3 needs an exposed profile bind/volume or overlay merged root")
+
+
+# The capabilities an observer takes from its endpoint when the endpoint's container added them: the kernel lets
+# a process read another's /proc/<pid>/ns only when the target's capabilities are a subset of its own (without
+# CAP_SYS_PTRACE), and an RDMA server adds IPC_LOCK. No other added privilege is copied.
+INHERITED_CAPABILITIES = ("IPC_LOCK",)
+
+
+def _capabilities(values) -> set[str]:
+    return {str(v).upper().removeprefix("CAP_") for v in values or []}
+
+
+def uninherited_capabilities(description) -> list[str]:
+    """What the endpoint's container added beyond ``INHERITED_CAPABILITIES``: with any of them its processes hold
+    a capability the observer lacks, so their namespaces are unreadable to it."""
+    host = description.get("HostConfig") or {}
+    return sorted(_capabilities(host.get("CapAdd")) - set(INHERITED_CAPABILITIES) - _capabilities(host.get("CapDrop")))
+
+
+def observer_command(name, container, description, cpus, input_path, output):
+    """The observer's ``docker create``: in the endpoint container's network and PID namespaces, on its own CPUs,
+    with the endpoint image. It drops what the endpoint's container dropped (``HostConfig.CapDrop``) and adds,
+    of what it added (``CapAdd``), only ``INHERITED_CAPABILITIES``."""
+    host = description.get("HostConfig") or {}
+    added = sorted(_capabilities(host.get("CapAdd")) & set(INHERITED_CAPABILITIES))
+    dropped = sorted(_capabilities(host.get("CapDrop")))
+    return [
+        "docker",
+        "create",
+        "--pull",
+        "never",
+        "--name",
+        name,
+        "--network",
+        f"container:{container}",
+        "--pid",
+        f"container:{container}",
+        *(arg for capability in dropped for arg in ("--cap-drop", capability)),
+        *(arg for capability in added if capability not in dropped for arg in ("--cap-add", capability)),
+        "--cpuset-cpus",
+        ",".join(map(str, cpus)),
+        "--memory",
+        "128m",
+        "--mount",
+        f"type=bind,src={input_path},dst=/input,readonly",
+        "--mount",
+        f"type=bind,src={output},dst=/output",
+        "--mount",
+        f"type=bind,src={output / 'observer.pyz'},dst=/observer.pyz,readonly",
+        "--entrypoint",
+        "/opt/venv/bin/python",
+        description["Image"],
+        "/observer.pyz",
+        "--config",
+        "/output/config.json",
+    ]
 
 
 def bundle(path, *, source_root=None):
