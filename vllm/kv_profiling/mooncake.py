@@ -673,6 +673,22 @@ def capabilities(role: str, kv_role: str | None, config=None) -> dict:
     }
 
 
+def clock_bind_port(port: int, dp_rank) -> int:
+    """The port DP rank ``dp_rank``'s scheduler clock server binds: ``clock_bind``
+    names DP rank 0's, and each DP rank (one engine, its own ``<id>_dp<rank>``
+    engine ID) binds the next port, so the engines of one instance never share
+    one.
+
+    Raises:
+        ValueError: the rank's port is past 65535.
+
+    """
+    bound = port + (dp_rank or 0)
+    if not 1 <= bound <= 65535:
+        raise ValueError(f"clock_bind port {port} + DP rank {dp_rank} is not a port")
+    return bound
+
+
 def attach_mooncake(
     vllm_config,
     role: str,
@@ -738,7 +754,7 @@ def _build(
                     config.run_id,
                     generation=generation,
                     host=host.strip("[]"),
-                    port=int(port),
+                    port=clock_bind_port(int(port), config.context.get("dp_rank")),
                 )
             if kv_role in ("kv_consumer", "kv_both") and config.clock_peers:
                 profiler.peers = PeerClocks(config, config.run_id, generation, offset=0)
@@ -751,6 +767,7 @@ def _build(
 __all__ = [
     "MooncakeProfiler",
     "attach_mooncake",
+    "clock_bind_port",
     "capabilities",
     "close_with_owner",
 ]

@@ -1180,6 +1180,42 @@ def test_clock_endpoints_are_explicit_and_calibrate_a_real_pair(tmp_path):
     )
 
 
+def test_each_dp_rank_s_clock_server_binds_its_own_port(tmp_path):
+    """With data parallelism every DP rank is one engine with its own scheduler:
+    ``clock_bind`` names DP rank 0's port and DP rank d's server binds the port + d,
+    so an instance's engines never share one; a port past 65535 is refused."""
+    from mooncake_profiled import _make_test_kv_cache_config, vllm_config
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (  # noqa: E501
+        MooncakeConnectorScheduler,
+    )
+    from vllm.kv_profiling.mooncake import clock_bind_port
+
+    assert clock_bind_port(9000, None) == clock_bind_port(9000, 0) == 9000
+    assert clock_bind_port(9000, 3) == 9003
+    with pytest.raises(ValueError, match="is not a port"):
+        clock_bind_port(65535, 1)
+    port = _free_port()
+    run = profiler_extra(tmp_path)
+    config = vllm_config(
+        "kv_producer",
+        {
+            "network_profiler": {
+                **run["network_profiler"],
+                "clock_bind": f"127.0.0.1:{port - 1}",
+            }
+        },
+    )
+    config.parallel_config.data_parallel_index = 1
+    producer = MooncakeConnectorScheduler(
+        config, "engine-p_dp1", _make_test_kv_cache_config()
+    )
+    try:
+        assert producer._kvp.server.address[1] == port
+    finally:
+        producer._kvp.close()
+
+
 def test_a_peer_without_a_clock_mapping_stays_unaligned_with_a_reason(tmp_path):
     from tests.v1.kv_connector.unit.utils import create_request
 

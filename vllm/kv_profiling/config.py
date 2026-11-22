@@ -50,9 +50,11 @@ class NetworkProfilerConfig:
     step_window_s: float = 1.0
     """Length of the step rollup windows (0 disables the rollups)."""
     clock_bind: str | None = None
-    """Mooncake producer: ``host:port`` its scheduler's clock server binds."""
+    """Mooncake producer: ``host:port`` its scheduler's clock server binds; with
+    data parallelism DP rank d's binds ``port + d``."""
     clock_peers: dict[str, str] = field(default_factory=dict)
-    """Mooncake consumer: remote engine ID -> the producer's clock ``host:port``."""
+    """Mooncake consumer: remote engine ID (``<id>_dp<rank>`` for a data-parallel
+    producer) -> that engine's clock ``host:port``."""
     inflight_cap: int | None = None
     """Mooncake: bound on generations open at once (a write batch is one); None is
     1024 or the handle slots, whichever is smaller."""

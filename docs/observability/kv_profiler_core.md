@@ -1047,7 +1047,10 @@ not wait for a transfer and serving shutdown is unchanged.
 
 Clocks: the producer's scheduler binds an explicit `clock_bind` (`host:port`) and the
 consumer's maps each remote engine ID to the producer's advertised clock endpoint in
-`clock_peers`; no wire message changes and no side-channel offset is added. A peer
+`clock_peers`; no wire message changes and no side-channel offset is added. With data
+parallelism each DP rank is an engine of its own (vLLM's `<engine ID>_dp<rank>`) with its
+own scheduler: `clock_bind` names DP rank 0's endpoint and DP rank d's binds its port + d,
+and `clock_peers` maps every producer DP engine to its own endpoint. A peer
 without a mapping stays unaligned and is listed in `profiler.json`
 (`clock.unmapped_engines`). Capabilities are by process role and KV role
 (`capabilities` in the metadata): a worker or scheduler without the producer role does
@@ -1114,12 +1117,17 @@ record kinds). Any miss is a problem of the run's verdict. The collector is not 
 service of the run: the harness's server filters leave it alone and its CPU is counted
 as a helper of its own kind (`collector_s`).
 
-The same harness turns the Mooncake adapter on with the run's `profiler` key (L1; data-parallel size 1 on both
-sides, one engine ID an instance): both servers get one run ID, every instance a pinned engine ID
-(`<role>-<node>`, written to `profile-identities.json`), each prefill instance's scheduler binds its clock
-server on the node's control address (`BOOTSTRAP_PORT + clock_port_offset`, so the clock traffic never rides
-the KV network the checks count) and the decode instance maps each prefill engine ID to that endpoint
-(`clock_peers`). The servers are stopped as under NIXL (decode first, so the clock servers are alive for the
+The same harness turns the Mooncake adapter on with the run's `profiler` key (L1, any data-parallel size):
+both servers get one run ID, every instance a pinned engine ID (`<role>-<node>`, which vLLM suffixes
+`_dp<rank>` for each DP rank; all written to `profile-identities.json`), each prefill instance's schedulers
+bind their clock servers on the node's control address (`BOOTSTRAP_PORT + clock_port_offset`, + the DP rank,
+so the clock traffic never rides the KV network the checks count) and the decode instance maps each prefill
+DP engine ID to its endpoint (`clock_peers`). The run is refused before any server starts when the last prefill
+DP rank's clock port would pass 65535 or the prefill engines would be more clock peers than the profiler's
+default `clock_max_peers` (64). The verdict requires every successful calibration to be answered by the
+engine it names: an engine of `profile-identities.json` (once), at that engine's endpoint, with its recorded
+prefill scheduler's clock and a mapping file of the same run and clock pair; idle and unaligned peers keep
+their status. The servers are stopped as under NIXL (decode first, so the clock servers are alive for the
 end calibration) before the profile directories are copied. With `collector` as well, each producer rank's
 batches can be checked against its TENT counters: the batches' bytes equal the collector's write bytes, and
 TENT's requests (it merges adjacent descriptors of a batch) are at most the batches' descriptors.
