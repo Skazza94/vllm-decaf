@@ -1364,7 +1364,11 @@ class ArmCorrectness(unittest.TestCase):
 
     @staticmethod
     def make(arm, decode_dp=1):
-        return pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", "data0"),
+        # a DP side needs the model's config to tell an MoE model's ranks from a dense model's (#39)
+        from tests.test_pd import MOE_MODEL
+
+        return pd.Run(name="t", topology="t", model=MOE_MODEL if decode_dp > 1 else Path("/m"),
+                      prefill=pd.Side("p", "data0"),
                       decode=pd.Side("d", "data0", data_parallel_size=decode_dp),
                       client="c", control_network="control", router=pd.Router("gw"),
                       server=pd.Server(connector="nixl", nixl_backend="ucx", timing="linear", nixl_telemetry_arm=arm))

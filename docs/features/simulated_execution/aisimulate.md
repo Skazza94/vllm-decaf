@@ -116,6 +116,7 @@ can still lack data and fail then.
 | --- | --- |
 | Tensor parallelism | Within one node: TP 1, 2, 4 or 8. |
 | MoE data-parallel attention with expert parallelism | Each rank of TP 1, 2 or 4, timed as vLLM lays it out (attention on a rank's GPUs, the experts over all of them); up to 8 GPUs, all on one host, launched by one server or a server each by a multi-port supervisor (`--data-parallel-multi-port-external-lb`). Ranks on other hosts are rejected. |
+| Data parallelism of a dense model | Each rank is an independent engine, timed as the tensor-parallel deployment it is (TP 1, 2, 4 or 8, its own GPUs); the ranks are not synchronized, so a step takes its own rank's time. |
 | Decode context parallelism | Within a tensor-parallel group, for the models below. |
 
 ## Decode context parallelism

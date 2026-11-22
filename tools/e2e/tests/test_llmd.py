@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import json
 import os
@@ -20,6 +21,17 @@ from harness import llmd, pd, shell, spec, topology
 E2E = Path(__file__).resolve().parent.parent
 
 
+def _moe_model_dir() -> Path:
+    directory = tempfile.TemporaryDirectory()
+    atexit.register(directory.cleanup)
+    (Path(directory.name) / "config.json").write_text(json.dumps({"model_type": "qwen3_moe", "num_experts": 8}))
+    return Path(directory.name)
+
+
+# The runs' DP ranks are an MoE model's (the model is the harness's choice, not these tests').
+MOE_MODEL = _moe_model_dir()
+
+
 def run_config(**router) -> dict:
     return {"name": "llmd-test", "topology": "llmd-1p1d", "model": "org/name",
             "prefill": {"node": "prefill0", "kv_network": "data0"},
@@ -34,7 +46,8 @@ def load(raw: dict) -> types.SimpleNamespace:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "run.yaml"
         path.write_text(yaml.safe_dump(raw))
-        run = pd.load(path)
+        with mock.patch.object(pd.models, "resolve", return_value=MOE_MODEL):
+            run = pd.load(path)
         return types.SimpleNamespace(run=run, router=run.router)
 
 

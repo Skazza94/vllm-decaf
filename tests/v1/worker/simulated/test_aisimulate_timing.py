@@ -323,6 +323,56 @@ def test_a_native_moe_target_is_timed_with_its_own_modes(fake_aisimulate):
     assert record["compared_geometry"]["num_key_value_heads"] == 4
 
 
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_a_dense_dp_ranks_engine_is_timed_as_its_tensor_parallel_deployment(
+    fake_aisimulate, tmp_path, tp
+):
+    """A non-MoE model's DP ranks run as engines of data parallelism 1
+    (their index kept): the provider holds that view, so each rank is the
+    tensor-parallel deployment it is, no attention data parallelism and no
+    expert groups; the front end's DP n config is refused as before."""
+    dense = {**QWEN3_MOE, "architectures": ["Qwen3ForCausalLM"]}
+    configs = tmp_path / "aisim_core" / "model_configs"
+    (configs / "Qwen--Qwen3-8B-Test_config.json").write_text(json.dumps(dense))
+    engine = engine_config(
+        "Qwen/Qwen3-8B-Test",
+        dense,
+        tensor_parallel_size=tp,
+        data_parallel_size=1,
+        data_parallel_index=1,
+    )
+    p = provider(engine)
+    config = fake_aisimulate.instances[0].config.kwargs
+    assert (config["tp"], config["attention_dp"]) == (tp, 1)
+    assert (config["moe_tp_size"], config["moe_ep_size"]) == (None, None)
+    assert p.num_ranks == 1
+    record = p.assumptions()["aisimulate"]
+    assert record["topology"]["modeled_gpus"] == tp
+    assert not any("slowest rank" in note for note in record["approximations"])
+    with pytest.raises(ValueError, match="without an MoE model's expert parallelism"):
+        provider(
+            engine_config(
+                "Qwen/Qwen3-8B-Test",
+                dense,
+                tensor_parallel_size=tp,
+                data_parallel_size=2,
+            )
+        )
+
+
+def test_only_moe_dp_attention_carries_the_slowest_rank_approximation(
+    fake_aisimulate,
+):
+    for parallel, expected in (
+        ({}, False),
+        ({"tensor_parallel_size": 2}, False),
+        ({"data_parallel_size": 2, "enable_expert_parallel": True}, True),
+    ):
+        record = provider(engine_config(**parallel)).assumptions()["aisimulate"]
+        notes = record["approximations"]
+        assert any("slowest rank" in note for note in notes) is expected
+
+
 @pytest.mark.parametrize(
     "role, worker_type",
     [("kv_producer", "prefill"), ("kv_consumer", "decode"), (None, "aggregated")],

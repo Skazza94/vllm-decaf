@@ -45,8 +45,10 @@ model: Qwen/Qwen2.5-7B-Instruct@a09a35458c702b33eeacc393d103063234e8bc28
 # TP sizes, data_parallel_size 1, no speculative decoding). Under tensor parallelism kv_network may be
 # a list, one network per rank (rank r of both sides on the same network).
 # data_parallel_size > 1 (per side, may differ): an MoE model's data-parallel
-# attention with expert parallelism; every DP rank's TP rank r uses the same
-# KV network, as any prefill DP rank may pair with any decode DP rank. The
+# attention with expert parallelism, or a dense model's independent engines
+# (one server, no expert parallelism, no per-rank routing); every DP rank's TP
+# rank r uses the same KV network, as any prefill DP rank may pair with any
+# decode DP rank. The
 # instance is one endpoint of the router: under Mooncake llm-d's sidecar
 # selects the prefill DP rank (decode's is vLLM's choice), under NIXL vLLM
 # balances both sides' ranks.

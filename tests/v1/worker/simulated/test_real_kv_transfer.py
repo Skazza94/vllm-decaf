@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration of real NIXL KV transfers under simulated compute."""
 
+import copy
 import itertools
 import json
 import math
@@ -44,6 +45,44 @@ def model_dir(tmp_path_factory):
                 "num_hidden_layers": 2,
                 "num_attention_heads": 2,
                 "num_key_value_heads": 2,
+                "max_position_embeddings": 256,
+                "torch_dtype": "float32",
+            }
+        )
+    )
+    return str(directory)
+
+
+@pytest.fixture(scope="module")
+def dense_mla_model_dir(tmp_path_factory):
+    """The tiny DeepSeek-V3 with every layer dense: MLA without experts."""
+    config = {
+        **DEEPSEEK_V3,
+        "n_routed_experts": 0,
+        "n_shared_experts": 0,
+        "first_k_dense_replace": 2,
+    }
+    directory = tmp_path_factory.mktemp("tiny-dense-mla")
+    (directory / "config.json").write_text(json.dumps(config))
+    return str(directory)
+
+
+@pytest.fixture(scope="module")
+def sliding_model_dir(tmp_path_factory):
+    """A tiny dense Mistral configuration: every layer a 32-token window."""
+    directory = tmp_path_factory.mktemp("tiny-mistral")
+    (directory / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["MistralForCausalLM"],
+                "model_type": "mistral",
+                "vocab_size": 128,
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "sliding_window": 32,
                 "max_position_embeddings": 256,
                 "torch_dtype": "float32",
             }
@@ -1466,12 +1505,9 @@ def test_real_mode_allows_tensor_parallelism_and_dp_attention(model_dir, moe_mod
         enable_expert_parallel=True,
     )
     assert config.parallel_config.data_parallel_size == 2
-    for model, kwargs in (
-        (model_dir, {"enable_expert_parallel": True}),  # independent engines
-        (moe_model_dir, {}),  # experts not split
-    ):
-        with pytest.raises(ValueError, match="only as an MoE model's data-parallel"):
-            engine_config(model, kv_transfer=mooncake, data_parallel_size=2, **kwargs)
+    # Experts not split: the MoE model's DP ranks are not independent.
+    with pytest.raises(ValueError, match="only as an MoE model's data-parallel"):
+        engine_config(moe_model_dir, kv_transfer=mooncake, data_parallel_size=2)
     # Over NIXL too: each DP engine has its own side channel and engine id.
     for connector in ("NixlConnector", "NixlPullConnector"):
         nixl = {"kv_connector": connector}
@@ -1482,14 +1518,8 @@ def test_real_mode_allows_tensor_parallelism_and_dp_attention(model_dir, moe_mod
             enable_expert_parallel=True,
         )
         assert config.parallel_config.data_parallel_size == 2
-        for model, kwargs in (
-            (model_dir, {"enable_expert_parallel": True}),
-            (moe_model_dir, {}),
-        ):
-            with pytest.raises(
-                ValueError, match="only as an MoE model's data-parallel"
-            ):
-                engine_config(model, kv_transfer=nixl, data_parallel_size=2, **kwargs)
+        with pytest.raises(ValueError, match="only as an MoE model's data-parallel"):
+            engine_config(moe_model_dir, kv_transfer=nixl, data_parallel_size=2)
         with pytest.raises(ValueError, match="data-parallel attention at most"):
             engine_config(model_dir, kv_transfer=nixl, pipeline_parallel_size=2)
     with pytest.raises(ValueError, match="one of NixlConnector"):
@@ -1498,6 +1528,156 @@ def test_real_mode_allows_tensor_parallelism_and_dp_attention(model_dir, moe_mod
             kv_transfer={"kv_connector": "NixlPushConnector"},
             data_parallel_size=2,
             enable_expert_parallel=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "connector", ["NixlConnector", "NixlPullConnector", "MooncakeConnector"]
+)
+@pytest.mark.parametrize("tp", [1, 2])
+@pytest.mark.parametrize("dp", [2, 4])
+def test_a_dense_models_dp_ranks_are_admitted_as_their_tensor_parallel_engines(
+    model_dir, connector, tp, dp
+):
+    """A non-MoE model's ranks are independent engines (DP 1 once launched):
+    DP n is admitted where the same layout at DP 1 is, and the front end
+    keeps its configuration, which launches the n engines."""
+    transfer = {"kv_connector": connector}
+    config = engine_config(
+        model_dir, kv_transfer=transfer, tensor_parallel_size=tp, data_parallel_size=dp
+    )
+    parallel = config.parallel_config
+    assert (parallel.tensor_parallel_size, parallel.data_parallel_size) == (tp, dp)
+    assert parallel.data_parallel_size_local == dp
+
+
+@pytest.mark.parametrize("connector", ["NixlConnector", "MooncakeConnector"])
+@pytest.mark.parametrize("dp", [1, 2, 4])
+def test_dense_dp_ranks_of_sliding_window_and_mla_models_are_admitted_as_at_dp_1(
+    sliding_model_dir, dense_mla_model_dir, connector, dp
+):
+    """The rule reads the engine, not a model: the dense sliding-window and
+    plain MLA models are admitted at DP n where they are at DP 1, and DCP on
+    the MLA one follows NIXL's pull connector alone, as at DP 1."""
+    transfer = {"kv_connector": connector}
+    sliding = engine_config(
+        sliding_model_dir, kv_transfer=transfer, data_parallel_size=dp
+    )
+    assert sliding.model_config.get_sliding_window() == 32
+    assert sliding.parallel_config.data_parallel_size == dp
+    mla = engine_config(
+        dense_mla_model_dir, kv_transfer=transfer, data_parallel_size=dp
+    )
+    assert not mla.model_config.is_moe
+    assert mla.parallel_config.data_parallel_size == dp
+    dcp = {"tensor_parallel_size": 2, "decode_context_parallel_size": 2}
+    if connector == "NixlConnector":
+        config = engine_config(
+            dense_mla_model_dir, kv_transfer=transfer, data_parallel_size=dp, **dcp
+        )
+        assert config.parallel_config.decode_context_parallel_size == 2
+    else:
+        with pytest.raises(ValueError, match="decode context parallelism"):
+            engine_config(
+                dense_mla_model_dir,
+                kv_transfer=transfer,
+                data_parallel_size=dp,
+                **dcp,
+            )
+
+
+@pytest.mark.parametrize("connector", ["NixlConnector", "MooncakeConnector"])
+def test_dense_dp_ranks_spanning_nodes_are_refused(model_dir, connector):
+    """Ranks of one host and one node only: a replica whose TP workers span
+    nodes (two nodes of two local ranks) is no replica this check validated."""
+    transfer = {"kv_connector": connector}
+    engine_config(
+        model_dir,
+        kv_transfer=transfer,
+        tensor_parallel_size=2,
+        data_parallel_size=2,
+        data_parallel_size_local=2,
+    )
+    for local in (None, 1, 2):
+        extra = {} if local is None else {"data_parallel_size_local": local}
+        with pytest.raises(ValueError, match="launched together on this host"):
+            engine_config(
+                model_dir,
+                kv_transfer=transfer,
+                tensor_parallel_size=2,
+                data_parallel_size=2,
+                nnodes=2,
+                **extra,
+            )
+
+
+def test_a_dense_dp_instance_is_checked_as_the_engine_it_runs_as(model_dir):
+    from vllm.config.simulation import engine_view
+
+    config = engine_config(model_dir, tensor_parallel_size=2, data_parallel_size=2)
+    parallel = config.parallel_config
+    view = engine_view(config)
+    assert view is not config and view.parallel_config is not parallel
+    assert view.model_config is config.model_config
+    expected = copy.copy(parallel)
+    expected.reconfigure_for_independent_dp_rank()
+    for name in (
+        "data_parallel_size",
+        "data_parallel_size_local",
+        "data_parallel_rank",
+    ):
+        assert getattr(view.parallel_config, name) == getattr(expected, name)
+    assert view.parallel_config.data_parallel_size == 1
+    assert view.parallel_config.tensor_parallel_size == 2
+    assert view.parallel_config.data_parallel_index == parallel.data_parallel_index
+    # The front end's configuration still describes both engines.
+    assert (parallel.data_parallel_size, parallel.data_parallel_size_local) == (2, 2)
+    single = engine_config(model_dir)
+    assert engine_view(single) is single
+
+
+def test_an_moe_models_configuration_is_its_own_engine_view(moe_model_dir):
+    from vllm.config.simulation import engine_view
+
+    config = engine_config(
+        moe_model_dir, data_parallel_size=2, enable_expert_parallel=True
+    )
+    assert engine_view(config) is config
+
+
+def test_dense_dp_ranks_launched_apart_are_refused(model_dir):
+    """Only ranks all on this host under one server are checked (the rest of
+    a dense DP deployment is not validated). vLLM refuses a dense model's
+    external load balancing itself; the check covers the other layouts."""
+    with pytest.raises(ValueError, match="do not support external data parallel"):
+        engine_config(
+            model_dir,
+            data_parallel_size=2,
+            data_parallel_external_lb=True,
+            data_parallel_rank=0,
+        )
+    config = engine_config(model_dir, data_parallel_size=2)
+    for change in (
+        {"data_parallel_size_local": 1},
+        {"data_parallel_hybrid_lb": True},
+    ):
+        parallel = copy.copy(config.parallel_config)
+        for name, value in change.items():
+            setattr(parallel, name, value)
+        apart = copy.copy(config)
+        apart.parallel_config = parallel
+        with pytest.raises(ValueError, match="launched together on this host"):
+            apart.simulation_config._verify_real_kv_transfer(apart)
+    config.simulation_config._verify_real_kv_transfer(config)
+
+
+def test_dense_dp_ranks_keep_the_other_real_transfer_checks(model_dir):
+    # The engine's view is checked in full: DP does not hide a bad layout.
+    with pytest.raises(ValueError, match="data-parallel attention at most"):
+        engine_config(model_dir, data_parallel_size=2, pipeline_parallel_size=2)
+    with pytest.raises(ValueError, match="the real clock"):
+        engine_config(
+            model_dir, simulation={"clock": "virtual"}, data_parallel_size=2
         )
 
 

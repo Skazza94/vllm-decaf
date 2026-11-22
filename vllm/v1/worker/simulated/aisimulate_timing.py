@@ -334,11 +334,11 @@ GEOMETRY_FIELDS: dict[str, tuple[str, ...]] = {
         ATTENTION_FIELDS + GDN_FIELDS,
     ),
 }
+DP_ATTENTION_APPROXIMATION = (
+    "an MoE data-parallel attention step takes its slowest rank's estimate, not "
+    "per-layer synchronization or exact expert routing under uneven load"
+)
 APPROXIMATIONS = [
-    (
-        "a data-parallel step takes its slowest rank's estimate, not per-layer "
-        "synchronization or exact expert routing under uneven load"
-    ),
     "the op-level estimator reduces a rank's requests to aggregate and average lengths",
 ]
 
@@ -520,7 +520,9 @@ class AisimulateTimingProvider:
     measured kernels; no analytical fallback) for the published deployment
     `target_model` on `gpu`. Host time is `host_us` per step.
 
-    Supported: tensor parallelism within one node (TP 1, 2, 4 or 8), or
+    Supported: tensor parallelism within one node (TP 1, 2, 4 or 8), which
+    is also what a dense model's data-parallel rank is (an engine of data
+    parallelism 1, independent of the others), or
     an MoE model's local data-parallel attention with expert parallelism
     (each rank tensor-parallel or not, up to 8 modeled GPUs or exactly 16, in
     AISimulate's 8-GPU nodes); decode context
@@ -832,7 +834,10 @@ class AisimulateTimingProvider:
                 f"vLLM {resolved.get('backend_version') or backend_version} "
                 f"data; the simulator runs vLLM {vllm_version}"
             ),
-            "approximations": APPROXIMATIONS
+            "approximations": (
+                [DP_ATTENTION_APPROXIMATION] if topology["attention_dp"] > 1 else []
+            )
+            + APPROXIMATIONS
             + ([V4_APPROXIMATION] if v4 else [])
             + ([MLA_PREFIX_APPROXIMATION] if plain_mla else [])
             + ([GQA_DCP_PREFIX_APPROXIMATION] if gqa_dcp else [])

@@ -3,6 +3,7 @@ E2E_VLLM=1 (several minutes, most of the machine's cores)."""
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 from dataclasses import asdict
 import io
@@ -33,6 +34,17 @@ class SyntheticRouting:
 
 
 E2E = Path(__file__).resolve().parent.parent
+
+
+def _model_dir(config: dict) -> Path:
+    directory = tempfile.TemporaryDirectory()
+    atexit.register(directory.cleanup)
+    (Path(directory.name) / "config.json").write_text(json.dumps(config))
+    return Path(directory.name)
+
+
+MOE_MODEL = _model_dir({"model_type": "qwen3_moe", "num_experts": 8})
+DENSE_MODEL = _model_dir({"model_type": "qwen3", "num_hidden_layers": 2})
 RUN = pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", "data0"),
              decode=pd.Side("d", "data0"), client="c", control_network="control", router=pd.Router("gw"),
              workload=pd.Workload(num_prompts=2))
@@ -168,11 +180,11 @@ class ProfilerConfig(unittest.TestCase):
 
         dp = {"prefill": pd.Side("p", "data0", data_parallel_size=2),
               "decode": pd.Side("d", "data0", data_parallel_size=2)}  # fmt: skip
-        profiled = self.run_with(profiler=pd.Profiler(), **dp)
+        profiled = self.run_with(profiler=pd.Profiler(), model=MOE_MODEL, **dp)
         for role in ("prefill", "decode"):
             self.assertEqual(flag(profiled, role), str(pd.PROFILER_SHUTDOWN_GRACE_S))
             self.assertIsNone(flag(self.run_with(profiler=pd.Profiler()), role))
-            command = pd.server_command(self.run_with(**dp), role, ["10.100.0.1"])
+            command = pd.server_command(self.run_with(model=MOE_MODEL, **dp), role, ["10.100.0.1"])
             self.assertNotIn("--shutdown-timeout", command)
 
     def test_every_recorder_of_each_dp_rank_must_be_present_and_closed(self):
@@ -375,7 +387,8 @@ class ProfilerConfig(unittest.TestCase):
         each server still pins the instance's ID once."""
         side = {"prefill": pd.Side("p0", "data0", data_parallel_size=2),
                 "decode": pd.Side("d0", "data0", data_parallel_size=2)}  # fmt: skip
-        run = self.run_with(server=self.MOONCAKE, profiler=pd.Profiler(clock_port_offset=1500), **side)
+        run = self.run_with(server=self.MOONCAKE, profiler=pd.Profiler(clock_port_offset=1500), model=MOE_MODEL,
+                            **side)
         instances = {"prefill": {"p0": {"control": "10.250.0.2"}}, "decode": {"d0": {"control": "10.250.0.4"}}}
         identities = pd.profile_identities(run, instances)
         port = pd.BOOTSTRAP_PORT + 1500
@@ -1554,6 +1567,12 @@ class RecheckTests(SyntheticRouting, unittest.TestCase):
         (directory / "bench.json").write_text(json.dumps({"completed": 2, "errors": []}))
         (directory / "routers.json").write_text(json.dumps({"control": 50, "data0": moved + 100}))
         (directory / "tent.json").write_text("{}")
+        # The one prefill engine's bootstrap evidence (DP 1, TP 1: the engine hosts its worker).
+        (directory / "bootstrap-p.json").write_text(json.dumps({
+            "senders": {"7": "10.100.0.1:40000"}, "kv_addresses": ["10.100.0.1"], "query": {"0": {"engine_id": "u", "worker_addr": {"0": {"0": "tcp://10.100.0.1:40000"}}}},
+            "processes": {"7": {"ppid": 1, "comm": "VLLM::EngineCor", "cmdline": "VLLM::EngineCore",
+                                "listening": ["10.100.0.1:40000"]}},
+            "engines": {"7": {"title": "EngineCore", "engine_id": "u"}}}))
         (directory / "control-ports.json").write_text(json.dumps({"nodes": ["gw"], "bytes": 40, "ports": {
             "p0": {"node": "c", "rx": 50, "tx": 0}, "p1": {"node": "p", "rx": 0, "tx": 25},
             "p2": {"node": "d", "rx": 0, "tx": 25}, "p3": {"node": "gw", "rx": 0, "tx": 40}}}))
@@ -1705,9 +1724,9 @@ def sent(nbytes: int) -> str:
     return line(kv_transfers={"send": {"count": nbytes // 1000, "bytes": nbytes, "failed": 0}})
 
 
-def dp_run(prefill_dp: int, decode_dp: int, tp: int = 1) -> pd.Run:
+def dp_run(prefill_dp: int, decode_dp: int, tp: int = 1, model: Path = MOE_MODEL) -> pd.Run:
     networks = "data0" if tp == 1 else ["data0", "data1"]
-    return pd.Run(name="t", topology="t", model=Path("/m"),
+    return pd.Run(name="t", topology="t", model=model,
                   prefill=pd.Side("p", networks, data_parallel_size=prefill_dp),
                   decode=pd.Side("d", networks, data_parallel_size=decode_dp), client="c",
                   control_network="control", router=pd.Router("gw"), server=pd.Server(tensor_parallel_size=tp),
@@ -1798,6 +1817,161 @@ class DataParallelCheckTests(unittest.TestCase):
         self.assertIn('"rank_addresses": ["10.100.0.1", "10.101.0.1", "10.100.0.1", "10.101.0.1"]', command)
         self.assertIn("--data-parallel-size 2 --enable-expert-parallel", command)
         self.assertNotIn("--data-parallel-size", " ".join(pd.server_command(TP2, "prefill", ["a", "b"])))
+
+    def test_a_dense_models_dp_ranks_are_independent_engines_each_with_its_tp_addresses(self) -> None:
+        run = dp_run(2, 2, tp=2, model=DENSE_MODEL)
+        for role in ("prefill", "decode"):
+            command = " ".join(pd.server_command(run, role, ["10.100.0.1", "10.101.0.1"]))
+            # Each engine lists its TP ranks (an MoE instance's list is DP by TP).
+            self.assertIn('"rank_addresses": ["10.100.0.1", "10.101.0.1"]}', command)
+            self.assertIn("--data-parallel-size 2 ", command)
+            self.assertNotIn("--enable-expert-parallel", command)
+            self.assertNotIn("--data-parallel-multi-port-external-lb", command)
+        self.assertEqual(run.prefill.ranks(2), [(0, 0), (0, 1), (1, 0), (1, 1)])
+
+    def test_moe_is_read_from_the_config_as_vllm_counts_experts(self) -> None:
+        cases = {
+            "dense": ({"model_type": "qwen3"}, False),
+            "scalar experts": ({"num_experts": 8}, True),
+            "an alias": ({"num_local_experts": 8}, True),
+            "experts of the text config": ({"text_config": {"n_routed_experts": 64}}, True),
+            "the text config decides": ({"num_experts": 8, "text_config": {"model_type": "qwen3"}}, False),
+            "a zero per layer list": ({"num_experts": [0, 0]}, False),
+            "a per layer list": ({"num_experts": [8, 8]}, True),
+            "the first alias present wins": ({"num_experts": 0, "n_routed_experts": 8}, False),
+            "only in the MoE blocks": ({"block_configs": [{"block_type": "attention"},
+                                                          {"block_type": "moe", "n_routed_experts": 8}]}, True),
+            "no MoE block": ({"block_configs": [{"block_type": "attention"}]}, False),
+            "an llm_config": ({"llm_config": {"num_experts": 8}}, True),
+            "a list decides before the blocks": ({"num_experts": [0, 0], "block_configs": [
+                {"block_type": "moe", "n_routed_experts": 8}]}, False),
+        }
+        for name, (config, expected) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                (Path(directory) / "config.json").write_text(json.dumps(config))
+                self.assertIs(pd.moe_of(Path(directory)), expected)
+
+    def test_the_bootstrap_servers_published_workers_are_checked_against_the_listeners(self) -> None:
+        def found(dp=2, tp=2):
+            kv = [f"10.{100 + t}.0.1" for t in range(tp)]
+            ports = {(d, t): 40000 + 10 * d + t for d in range(dp) for t in range(tp)}
+            title = lambda t: f"Worker_TP{t}" if tp > 1 else "Worker"
+            processes, engines, query = {}, {}, {}
+            for d in range(dp):
+                engine_pid = str(100 + d)
+                engine_id = f"u_dp{d}" if dp > 1 else "u"
+                processes[engine_pid] = {"ppid": 1, "comm": "VLLM::EngineCor", "listening": [],
+                                         "cmdline": f"VLLM::EngineCore_DP{d}" if dp > 1 else "VLLM::EngineCore"}
+                query[str(d)] = {"engine_id": engine_id, "worker_addr": {}}
+                for t in range(tp):
+                    pid = str(200 + 10 * d + t)
+                    processes[pid] = {"ppid": int(engine_pid), "comm": "VLLM::Worker", "cmdline": f"VLLM::{title(t)}",
+                                      "listening": [f"{kv[t]}:{ports[d, t]}", "0.0.0.0:8998", f"127.0.0.1:{9100 + t}"]}
+                    engines[pid] = {"title": title(t), "engine_id": engine_id}
+                    query[str(d)]["worker_addr"][str(t)] = {"0": f"tcp://{kv[t]}:{ports[d, t]}"}
+            senders = {pid: process["listening"][0] for pid, process in processes.items() if pid in engines}
+            return {"kv_addresses": kv, "query": query, "processes": processes, "engines": engines,
+                    "senders": senders}
+
+        def problems(change=None, dp=2, tp=2, **sizes):
+            data = found(**sizes) if sizes else found(dp, tp)
+            if change:
+                change(data)
+            return pd.bootstrap_problems(data, dp, tp, "prefill0")
+
+        def has(text, found_problems):
+            return any(text in p for p in found_problems)
+
+        found_wide = lambda: found(1, 16)
+        self.assertEqual(problems(), [])
+        # TP 1 (a worker's title has no rank) and DP 1 (its engine id has no suffix, the engine hosts it).
+        self.assertEqual(pd.bootstrap_problems(found(2, 1), 2, 1, "p"), [])
+        solo = found(1, 1)
+        solo["processes"]["200"]["cmdline"], solo["processes"]["200"]["ppid"] = "VLLM::EngineCore", 1
+        self.assertEqual(pd.bootstrap_problems(solo, 1, 1, "p"), [])
+        self.assertTrue(has("not 0..2", pd.bootstrap_problems(found(2, 2), 3, 2, "p")))
+        self.assertTrue(has("TP ranks", pd.bootstrap_problems(found(2, 2), 2, 3, "p")))
+        # Another engine's id with the right suffix, or the other engine's workers.
+        def foreign(data):
+            data["query"]["0"]["engine_id"] = "other_dp0"
+        self.assertTrue(has("but its listener logged u_dp0", problems(foreign)))
+        self.assertTrue(has("of different servers", problems(foreign)))
+        def swapped(data):
+            query = data["query"]
+            query["0"], query["1"] = query["1"], query["0"]
+        self.assertTrue(has("not VLLM::EngineCore_DP1", problems(swapped)) or has("EngineCore_DP", problems(swapped)))
+        self.assertTrue(has("`<id>_dp<rank>`", problems(swapped)))
+        # Another TP rank's address under this rank.
+        def crossed(data):
+            entry = data["query"]["0"]["worker_addr"]
+            entry["0"], entry["1"] = entry["1"], entry["0"]
+        self.assertTrue(has("not on TP rank 0's KV address", problems(crossed)))
+        # The worker's HTTP bootstrap port, or its metrics', on the right host; a port nobody listens on.
+        def http(data):
+            data["query"]["0"]["worker_addr"]["0"]["0"] = "tcp://10.100.0.1:8998"
+        self.assertTrue(has("0 process(es) logged binding that sender endpoint", problems(http)))
+        def lost(data):
+            data["query"]["1"]["worker_addr"]["1"]["0"] = "tcp://10.101.0.1:1"
+        self.assertTrue(has("0 process(es) logged binding", problems(lost)))
+        # An empty stage map, a missing rank, no registration at all.
+        def empty(data):
+            data["query"]["0"]["worker_addr"]["1"] = {}
+        self.assertTrue(has("not stage 0", problems(empty)))
+        def gone(data):
+            data["query"].clear()
+        self.assertTrue(has("publishes DP ranks []", problems(gone)))
+        # Another socket of the same worker on the same host: not the endpoint it logged binding as its sender.
+        def sibling(data):
+            data["processes"]["200"]["listening"].append("10.100.0.1:46000")
+            data["query"]["0"]["worker_addr"]["0"]["0"] = "tcp://10.100.0.1:46000"
+        self.assertTrue(has("0 process(es) logged binding that sender endpoint", problems(sibling)))
+        # Malformed entries are problems, never skipped or raised.
+        for name, change in {
+            "a null entry": lambda data: data["query"].__setitem__("1", None),
+            "a null stage map": lambda data: data["query"]["0"]["worker_addr"].__setitem__("1", None),
+            "a non-numeric rank": lambda data: data["query"]["0"]["worker_addr"].__setitem__("x", {}),
+            "no engine id": lambda data: data["query"]["0"].pop("engine_id"),
+        }.items():
+            with self.subTest(name):
+                self.assertTrue(problems(change), name)
+        self.assertTrue(pd.bootstrap_problems({}, 2, 2, "p"))
+        # Ranks are compared as numbers: a TP16 capture is valid.
+        self.assertEqual(pd.bootstrap_problems(found_wide(), 1, 16, "p"), [])
+        # A noncanonical rank key beside a null canonical one; a null title; the evidence file cut short.
+        def padded(data):
+            data["query"]["00"], data["query"]["1"] = data["query"].pop("0"), data["query"]["1"]
+            data["query"]["0"] = None
+        self.assertTrue(has("rank key '00'", problems(padded)))
+        self.assertTrue(has("DP rank 0's entry is malformed", problems(padded)))
+        def untitled(data):
+            data["engines"]["200"]["title"] = None
+        self.assertTrue(has("logged no title", problems(untitled)))
+        # A worker that is not the rank's: TP rank by title.
+        def retitled(data):
+            data["engines"]["200"]["title"] = "Worker_TP1"
+        self.assertTrue(has("its listener is Worker_TP1", problems(retitled)))
+
+    def test_a_mooncake_runs_bootstrap_evidence_is_required_by_its_verdicts(self) -> None:
+        run = dp_run(2, 2, model=DENSE_MODEL)
+        run.server.connector = "mooncake"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            self.assertEqual(pd._bootstrap_verdict(run, output),
+                             ["p's bootstrap evidence (bootstrap-p.json) is missing"])
+            (output / "bootstrap-p.json").write_text("[]")
+            self.assertEqual(pd._bootstrap_verdict(run, output), ["p's bootstrap evidence is malformed"])
+            (output / "bootstrap-p.json").write_text("{}")
+            self.assertEqual(pd._bootstrap_verdict(run, output), ["p's bootstrap evidence is malformed"])
+            (output / "bootstrap-p.json").write_text('{"query": {"0": ')
+            self.assertEqual(len(pd._bootstrap_verdict(run, output)), 1)
+            self.assertIn("is malformed (JSONDecodeError", pd._bootstrap_verdict(run, output)[0])
+        run.server.connector = "nixl"
+        self.assertEqual(pd._bootstrap_verdict(run, Path("/nowhere")), [])
+
+    def test_a_dp_launch_needs_the_models_config_to_tell_moe_from_dense(self) -> None:
+        run = dp_run(2, 2, model=Path("/not-fetched"))
+        with self.assertRaisesRegex(ValueError, "needs the model's config"):
+            pd.server_command(run, "prefill", ["10.100.0.1"])
 
 
 def instances_run(prefill: list[str], decode: list[str], tp: int = 1, connector: str = "mooncake") -> pd.Run:
@@ -2971,9 +3145,14 @@ class PrefixCachingCheckTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 pd.parse(change, path)
         # With a server a rank, the index is of ranks: allowed, and the replay port leaves room for them.
-        ranked = pd.parse({**router(dp_routing="rank"), "server": {**base["server"], "connector": "nixl"},
-                           "prefill": {"node": "p", "kv_network": "data0", "data_parallel_size": 8},
-                           "decode": {"node": "d", "kv_network": "data0", "data_parallel_size": 8}}, path)
+        per_rank = {**router(dp_routing="rank"), "server": {**base["server"], "connector": "nixl"},
+                    "prefill": {"node": "p", "kv_network": "data0", "data_parallel_size": 8},
+                    "decode": {"node": "d", "kv_network": "data0", "data_parallel_size": 8}}
+        # A dense model's ranks have no servers of their own (vLLM refuses external load balancing for it).
+        with mock.patch.object(pd.models, "resolve", return_value=DENSE_MODEL), self.assertRaisesRegex(
+                ValueError, "dp_routing: rank needs an MoE model"):
+            pd.parse(per_rank, path)
+        ranked = pd.parse(per_rank, path)
         self.assertTrue(pd.rank_routed(ranked, ranked.prefill) and ranked.router.prefix_index == "precise")
         self.assertGreaterEqual(pd.KV_EVENTS_REPLAY_PORT - pd.KV_EVENTS_PORT, 64)
         # Over Mooncake llm-d's sidecar cannot pick a rank server's bootstrap server.
@@ -3973,7 +4152,8 @@ class HeterogeneousTpTests(unittest.TestCase):
                           "data_parallel_size: 2}", base, count=1, flags=re.M)
             spec.write_text(re.sub(r"^decode:.*$", "decode: {node: decode0, kv_network: kv, "
                                    "tensor_parallel_size: 4, data_parallel_size: 2}", text, count=1, flags=re.M))
-            run = pd.load(spec)
+            with mock.patch.object(pd.models, "resolve", return_value=MOE_MODEL):
+                run = pd.load(spec)
         self.assertEqual((run.prefill.tp(run.server), run.decode.tp(run.server)), (2, 4))
         addresses = ["10.102.0.1", "10.102.0.3", "10.102.0.5", "10.102.0.7"]
         command = pd.server_command(run, "decode", addresses)

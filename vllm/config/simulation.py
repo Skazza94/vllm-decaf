@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration for simulated execution."""
 
+import copy
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator
@@ -49,6 +50,21 @@ def moves_real_kv(vllm_config: "VllmConfig") -> bool:
         vllm_config.simulation_config.simulate_forward is True
         and vllm_config.kv_transfer_config is not None
     )
+
+
+def engine_view(vllm_config: "VllmConfig") -> "VllmConfig":
+    """The configuration an engine of `vllm_config` holds. A non-MoE model's
+    data-parallel ranks are independent engines, each reconfigured to data
+    parallelism 1 (`reconfigure_for_independent_dp_rank`, which the engine
+    calls); the checks of what an engine runs read this view. The given
+    configuration is left as it is."""
+    parallel = vllm_config.parallel_config
+    if parallel.data_parallel_size == 1 or vllm_config.model_config.is_moe:
+        return vllm_config
+    view = copy.copy(vllm_config)
+    view.parallel_config = copy.copy(parallel)
+    view.parallel_config.reconfigure_for_independent_dp_rank()
+    return view
 
 
 @config
@@ -174,7 +190,7 @@ class SimulationConfig:
         if not (current_platform.is_cpu() or current_platform.is_cuda_alike()):
             raise ValueError("Simulated forward needs a CUDA-alike or CPU platform.")
         if current_platform.is_cpu() and parallel.decode_context_parallel_size > 1:
-            self._verify_cpu_decode_context_parallel(vllm_config)
+            self._verify_cpu_decode_context_parallel(engine_view(vllm_config))
         if vllm_config.lora_config is not None:
             raise ValueError("Simulated forward does not support LoRA.")
         if vllm_config.weight_transfer_config is not None:
@@ -360,7 +376,9 @@ class SimulationConfig:
         instances of a full-attention model, dense or MoE (its experts hold
         no KV), or of a dense MLA one (one latent per token and layer, which
         every tensor-parallel rank holds whole), on one rank, tensor-parallel
-        ones, or an MoE model's data-parallel ranks with expert parallelism.
+        ones, an MoE model's data-parallel ranks with expert parallelism, or a
+        dense model's data-parallel ranks (independent engines, each checked
+        as the tensor-parallel deployment it runs as).
         Sliding-window layers, alone or beside full-attention ones, of which
         either connector moves each window's blocks only; Qwen gated
         delta-net or Mamba2 layers (a hybrid model's), each request's state
@@ -405,6 +423,25 @@ class SimulationConfig:
         if cache.kv_cache_memory_bytes is None:
             problems.append("an explicit kv_cache_memory_bytes")
         parallel = vllm_config.parallel_config
+        dense_dp = (
+            parallel.data_parallel_size > 1 and not vllm_config.model_config.is_moe
+        )
+        if dense_dp and (
+            parallel.local_engines_only
+            or parallel.data_parallel_size_local != parallel.data_parallel_size
+            or parallel.nnodes != 1
+        ):
+            problems.append(
+                "all of a dense model's data-parallel ranks launched together "
+                "on this host by one server (internal load balancing, one "
+                f"node), not {parallel.data_parallel_size_local} of "
+                f"{parallel.data_parallel_size} local, {parallel.nnodes} nodes "
+                "or an external or hybrid load balancer"
+            )
+        # What the engines hold: a dense model's ranks run as tensor-parallel
+        # deployments of their own, which the rest of the checks read.
+        vllm_config = engine_view(vllm_config)
+        parallel = vllm_config.parallel_config
         sizes = {
             "TP": parallel.tensor_parallel_size,
             "PP": parallel.pipeline_parallel_size,
@@ -417,10 +454,10 @@ class SimulationConfig:
         # ranks of the other instance that hold them; an instance of another
         # TP size pairs for plain attention only, the connector re-sharding
         # heads (`simulated_tp_mismatch`; each head's pattern is its own).
-        # Data-parallel attention (an MoE model's DP
-        # ranks, with expert parallelism): each DP rank holds its own
-        # requests' KV, paired with whichever DP rank serves the request on
-        # the other instance.
+        # Data parallelism: an MoE model's data-parallel attention with
+        # expert parallelism, or a dense model's independent ranks (the view's
+        # DP is 1). Each DP rank holds its own requests' KV, paired with
+        # whichever DP rank serves the request on the other instance.
         # Decode context parallelism: a dense MLA model over NIXL's pull
         # connector, the scope `_verify_cpu_decode_context_parallel` checks
         # (each rank's blocks are global pages, `kv_pattern.dcp_page`).
