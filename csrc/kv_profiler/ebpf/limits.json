@@ -18,7 +18,7 @@
       "type": "ARRAY",
       "max_entries": 1,
       "key_bytes": 4,
-      "value_bytes": 256
+      "value_bytes": 512
     },
     "loss_counts": {
       "type": "ARRAY",
@@ -27,11 +27,13 @@
       "value_bytes": 256
     }
   },
-  "ring_and_array_value_capacity_bytes": 1049088,
+  "ring_and_array_value_capacity_bytes": 1049344,
   "capacity_is_physical_charge": false,
   "memory_audit_gate": false,
   "local_ports_max": 32,
   "peer_ports_max": 32,
+  "local_addresses_max": 8,
+  "peer_addresses_max": 8,
   "event_binary_bytes_max": 256,
   "output_json_bytes_max": 2048,
   "output_queue_max_records": 4096,

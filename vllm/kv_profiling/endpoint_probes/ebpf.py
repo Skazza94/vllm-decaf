@@ -46,6 +46,10 @@ class Settings:
     artifacts: str | None = None
     local_ports: tuple = ()
     peer_ports: tuple = ()
+    # Address allow-lists, as probes.tcp's: an IPv4 address also matches its
+    # IPv4-mapped IPv6 form. Empty: any address.
+    local_ips: tuple = ()
+    peer_ips: tuple = ()
 
     def __post_init__(self):
         for name in ("enabled", "privileged_opt_in"):
@@ -67,6 +71,29 @@ class Settings:
                 or len(set(ports)) != len(ports)
             ):
                 raise ValueError(f"ebpf.{name} requires up to 32 distinct ports")
+        for name in ("local_ips", "peer_ips"):
+            values = getattr(self, name)
+            if (
+                not isinstance(values, (tuple, list))
+                or len(values) > 8
+                or not all(isinstance(value, str) for value in values)
+            ):
+                raise ValueError(f"ebpf.{name} requires up to 8 IP addresses")
+            normalized = [normalized_ip(value) for value in values]
+            if len(set(normalized)) != len(normalized):
+                raise ValueError(f"ebpf.{name} requires distinct addresses")
+
+
+def normalized_ip(value):
+    """The address as the collector matches it: IPv4-mapped IPv6 as IPv4. A
+    zone (``%eth0``) is refused: the kernel match has no interface scope."""
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise ValueError(f"ebpf: {value!r} is not an IP address") from None
+    if getattr(address, "scope_id", None) is not None:
+        raise ValueError(f"ebpf: {value!r} has a zone; give the address alone")
+    return str(getattr(address, "ipv4_mapped", None) or address)
 
 
 def effective_privilege():
@@ -166,13 +193,23 @@ def decode_row(line):
     return row
 
 
+# The built package's schema: the observer and the collector it launches are one
+# generation (3: the plan's address allow-lists); any other package is rebuilt.
+PACKAGE_SCHEMA = 3
+
+
 def validate_artifacts(directory):
     """Check a package against its own manifest, never against its build host."""
     root = Path(directory)
     manifest = json.loads((root / "manifest.json").read_text())
     expected = {"collector", "observe.bpf.o", "limits.json"}
+    if isinstance(manifest, dict) and manifest.get("schema") != PACKAGE_SCHEMA:
+        raise ValueError(
+            f"eBPF package schema {manifest.get('schema')!r}, not {PACKAGE_SCHEMA}: "
+            "rebuild it with tools/kv-profiler-ebpf/build.sh"
+        )
     if (
-        manifest.get("schema") != 2
+        not isinstance(manifest, dict)
         or manifest.get("mode") != "tcp_tracepoints"
         or set(manifest.get("files", {})) != expected
     ):
@@ -562,9 +599,11 @@ class Collector(Channel):
             spec = self.directory / "tcp.plan"
             local_ports = " ".join(map(str, self.settings.local_ports))
             peer_ports = " ".join(map(str, self.settings.peer_ports))
+            local_ips = " ".join(map(normalized_ip, self.settings.local_ips))
+            peer_ips = " ".join(map(normalized_ip, self.settings.peer_ips))
             spec.write_text(
                 f"P {own['pid']} {own['start_ticks']}\nN {netns}\n"
-                f"L {local_ports}\nR {peer_ports}\n"
+                f"L {local_ports}\nR {peer_ports}\nLA {local_ips}\nRA {peer_ips}\n"
             )
             spec.chmod(0o600)
             root = Path(self.settings.artifacts)

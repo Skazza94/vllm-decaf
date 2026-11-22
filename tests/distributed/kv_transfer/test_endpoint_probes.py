@@ -829,6 +829,15 @@ def test_candidate_uniqueness_is_qualified_when_either_stream_is_partial(
         {"enabled": True, "sets": ["provider_wr", "provider_wr"]},
         {"enabled": True, "sets": ["unknown"]},
         {"enabled": False, "artifacts": "/unused"},
+        {"enabled": True, "mode": "tcp_tracepoints", "local_ips": ["10.0.0.300"]},
+        {"enabled": True, "mode": "tcp_tracepoints", "peer_ips": "10.0.0.1"},
+        {"enabled": True, "mode": "tcp_tracepoints",
+         "peer_ips": [f"10.0.0.{i}" for i in range(9)]},
+        {"enabled": True, "mode": "tcp_tracepoints",
+         "local_ips": ["10.0.0.1", "::ffff:10.0.0.1"]},
+        {"enabled": True, "mode": "tcp_tracepoints", "peer_ips": ["fe80::1%eth0"]},
+        {"enabled": True, "mode": "tcp_tracepoints",
+         "peer_ips": ["::ffff:10.0.0.1%eth0"]},
     ],
 )
 def test_ebpf_invalid_options_are_refused_before_start(value):
@@ -1009,7 +1018,7 @@ def test_ebpf_artifacts_match_their_own_manifest_not_build_environment(tmp_path)
     for name in names:
         (tmp_path / name).write_text(name)
     manifest = {
-        "schema": 2,
+        "schema": 3,
         "mode": "tcp_tracepoints",
         "files": {name: digest(tmp_path / name) for name in names},
         "image": "different-build",
@@ -1020,6 +1029,10 @@ def test_ebpf_artifacts_match_their_own_manifest_not_build_environment(tmp_path)
     assert validate_artifacts(tmp_path) == manifest
     (tmp_path / "collector").write_text("changed")
     with pytest.raises(ValueError, match="hash mismatch"):
+        validate_artifacts(tmp_path)
+    # a previous generation's package (no address allow-lists) is rebuilt
+    (tmp_path / "manifest.json").write_text(json.dumps({**manifest, "schema": 2}))
+    with pytest.raises(ValueError, match="rebuild it"):
         validate_artifacts(tmp_path)
 
 
@@ -2594,3 +2607,39 @@ def test_ebpf_saved_capture_loss_comes_from_the_recorded_counters(
         os.sched_setaffinity(0, original)
         (directory / "exit").touch()
         owner.wait(10)
+
+
+def test_ebpf_the_collector_s_plan_carries_the_address_allow_lists(
+    tmp_path, monkeypatch
+):
+    """The observer hands the collector its address allow-lists as the kernel
+    matches them (IPv4-mapped IPv6 as IPv4), next to the port lists; no lists
+    means any address."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "effective_privilege", lambda: True)
+    monkeypatch.setattr(ebpf, "validate_artifacts", lambda root: {})
+    launched, real_popen = [], subprocess.Popen
+
+    def popen(argv, **kwargs):
+        launched.append(Path(argv[2]).read_text())
+        return real_popen([sys.executable, "-c", "pass"], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    monkeypatch.setattr(ebpf.subprocess, "Popen", popen)
+    for name, options in [
+        ("scoped", {"local_ips": ["::ffff:10.0.0.1"],
+                    "peer_ips": ["10.0.0.2", "fd00::5"], "peer_ports": [7]}),
+        ("any", {}),
+    ]:
+        collector = ebpf.Collector(
+            ebpf.Settings(enabled=True, privileged_opt_in=True,
+                          mode="tcp_tracepoints", artifacts=str(tmp_path), **options),
+            [], tmp_path / name)  # fmt: skip
+        collector.start()
+        assert collector.child is not None, collector.status.get("reason")
+        collector.child.wait(10)
+        collector.child.stdin.close()
+    lines = [plan.splitlines()[2:] for plan in launched]
+    assert lines[0] == ["L ", "R 7", "LA 10.0.0.1", "RA 10.0.0.2 fd00::5"]
+    assert lines[1] == ["L ", "R ", "LA ", "RA "]

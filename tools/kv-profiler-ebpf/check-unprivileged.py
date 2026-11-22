@@ -36,7 +36,7 @@ assert all("tcp_probe" not in r["section"] for r in programs)
 pid = os.getpid()
 start = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
 plan = root / "unprivileged.plan"
-plan.write_text(f"P {pid} {start}\nN {os.stat('/proc/self/ns/net').st_ino}\nL \nR \n")
+plan.write_text(f"P {pid} {start}\nN {os.stat('/proc/self/ns/net').st_ino}\nL \nR \nLA \nRA \n")
 plan.chmod(0o600)
 run = subprocess.run(
     [str(root / "collector"), "--arm", str(plan), str(root / "observe.bpf.o")],

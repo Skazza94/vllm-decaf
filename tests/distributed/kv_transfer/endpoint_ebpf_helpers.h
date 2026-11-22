@@ -19,10 +19,11 @@
 #define __noinline __attribute__((noinline))
 #define BPF_PROG(name, ...) name(__VA_ARGS__)
 #define bpf_ntohs(x) ntohs(x)
+#define bpf_htonl(x) htonl(x)
 static struct kvp_control test_control;
 static struct kvp_loss_counts test_loss;
 static struct kvp_event test_records[4096];
-static unsigned int test_count, test_reserved, test_discards;
+static unsigned int test_count, test_reserved;
 static pthread_mutex_t test_mutex = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local unsigned int missing_fields, full_reads;
 static _Thread_local const char *read_fault;
@@ -68,14 +69,6 @@ static void bpf_ringbuf_submit(void *event, unsigned long flags) {
   pthread_mutex_lock(&test_mutex);
   assert(test_count < 4096);
   test_records[test_count++] = *(struct kvp_event *)event;
-  pthread_mutex_unlock(&test_mutex);
-  free(event);
-}
-static void bpf_ringbuf_discard(void *event, unsigned long flags) {
-  (void)flags;
-  pthread_mutex_lock(&test_mutex);
-  test_reserved -= 264;
-  test_discards++;
   pthread_mutex_unlock(&test_mutex);
   free(event);
 }

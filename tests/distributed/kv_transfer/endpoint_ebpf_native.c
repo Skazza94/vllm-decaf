@@ -35,7 +35,7 @@ static struct sock make_socket(void) {
 static void init(void) {
   test_control = (struct kvp_control){.enabled = 1, .netns = 99};
   memset(&test_loss, 0, sizeof(test_loss));
-  test_count = test_reserved = test_discards = full_reads = missing_fields = 0;
+  test_count = test_reserved = full_reads = missing_fields = 0;
   read_fault = NULL;
 }
 static void test_scope_and_full_socket(void) {
@@ -92,8 +92,9 @@ static void test_optional_fields_and_reads(void) {
   init();
   read_fault = "__sk_common.skc_rcv_saddr";
   tcp_reset_tx(&sk);
-  assert(!test_count && test_discards == 1 &&
-         test_loss.count[SCOPED_RECORD_DISCARD] == 1);
+  /* the tuple is read before the ring: nothing reserved */
+  assert(!test_count && !test_reserved &&
+         test_loss.count[SCOPED_TUPLE_READ] == 1);
   init();
   sk.__sk_common.skc_cookie.counter = 0;
   sk.__sk_common.skc_family = 10;
@@ -102,6 +103,43 @@ static void test_optional_fields_and_reads(void) {
   tcp_reset_rx(&sk);
   assert(test_count == 1 && !test_records[0].cookie_available);
   assert(test_records[0].family == 10 && test_records[0].peer_address[15] == 2);
+}
+static void test_address_filter(void) {
+  /* Empty lists admit any address; otherwise both ends must be listed. IPv4
+     lists also match IPv4-mapped IPv6 sockets; IPv6 lists match exactly. */
+  struct sock sk = make_socket();
+  init();
+  test_control.local_v4_count = test_control.peer_v4_count = 1;
+  test_control.local_v4[0] = htonl(0x7f000001);
+  test_control.peer_v4[0] = htonl(0x7f000003);
+  tcp_retrans(&sk);
+  assert(!test_count && !test_reserved && test_loss.count[EXCLUDED_ADDRESS] == 1);
+  test_control.peer_v4[0] = htonl(0x7f000002);
+  tcp_retrans(&sk);
+  assert(test_count == 1 && test_records[0].peer_address[3] == 2);
+  sk.__sk_common.skc_family = 10;
+  memset(&sk.__sk_common.skc_v6_rcv_saddr, 0, 16);
+  memset(&sk.__sk_common.skc_v6_daddr, 0, 16);
+  sk.__sk_common.skc_v6_rcv_saddr.s6_addr[10] = 0xff;
+  sk.__sk_common.skc_v6_rcv_saddr.s6_addr[11] = 0xff;
+  memcpy(&sk.__sk_common.skc_v6_rcv_saddr.s6_addr[12], &test_control.local_v4[0], 4);
+  sk.__sk_common.skc_v6_daddr.s6_addr[10] = 0xff;
+  sk.__sk_common.skc_v6_daddr.s6_addr[11] = 0xff;
+  memcpy(&sk.__sk_common.skc_v6_daddr.s6_addr[12], &test_control.peer_v4[0], 4);
+  tcp_retrans(&sk);
+  assert(test_count == 2 && test_records[1].family == 10);
+  sk.__sk_common.skc_v6_daddr.s6_addr[10] = 0;
+  sk.__sk_common.skc_v6_daddr.s6_addr[11] = 0;
+  tcp_retrans(&sk);
+  assert(test_count == 2 && test_loss.count[EXCLUDED_ADDRESS] == 2);
+  test_control.peer_v4_count = 0;
+  test_control.peer_v6_count = 1;
+  memcpy(test_control.peer_v6[0], &sk.__sk_common.skc_v6_daddr, 16);
+  tcp_retrans(&sk);
+  assert(test_count == 3);
+  test_control.peer_v6[0][3] ^= 1;
+  tcp_retrans(&sk);
+  assert(test_count == 3 && test_loss.count[EXCLUDED_ADDRESS] == 3);
 }
 static void *flood(void *unused) {
   (void)unused;
@@ -175,10 +213,11 @@ static void test_parent_death(void) {
 int main(void) {
   test_scope_and_full_socket();
   test_optional_fields_and_reads();
+  test_address_filter();
   test_concurrent_ring_loss();
   test_real_parent_guard();
   test_parent_death();
   puts(
-      "PASS: TCP events/full-socket/filter/field/loss contracts; external BPF helpers "
+      "PASS: TCP events/full-socket/filter/address/field/loss contracts; external BPF helpers "
       "emulated; parent death uses real OS; no BPF load/attach");
 }

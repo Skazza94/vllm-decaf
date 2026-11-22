@@ -197,6 +197,45 @@ static int parse_plan(const char *path, struct plan *p) {
     else
       p->control.local_count = n;
   }
+  /* LA/RA: the local and peer address allow-lists; IPv4-mapped IPv6 is IPv4. */
+  for (u32 side = 0; ok && side < 2; side++) {
+    ok = fgets(line, sizeof(line), f) && line[0] == (side ? 'R' : 'L') &&
+         line[1] == 'A' && line[2] == ' ';
+    if (!ok) break;
+    u32 *v4 = side ? p->control.peer_v4 : p->control.local_v4;
+    u32(*v6)[4] = side ? p->control.peer_v6 : p->control.local_v6;
+    u32 n4 = 0, n6 = 0;
+    char *save, *token = strtok_r(line + 3, " \n", &save);
+    while (token) {
+      struct in_addr a4;
+      struct in6_addr a6;
+      if (n4 + n6 >= KVP_ADDRESSES) {
+        ok = 0;
+        break;
+      }
+      if (inet_pton(AF_INET, token, &a4) == 1) {
+        v4[n4++] = a4.s_addr;
+      } else if (inet_pton(AF_INET6, token, &a6) == 1) {
+        u32 words[4];
+        memcpy(words, &a6, sizeof(words));
+        if (!words[0] && !words[1] && words[2] == htonl(0x0000ffff))
+          v4[n4++] = words[3];
+        else
+          memcpy(v6[n6++], words, sizeof(words));
+      } else {
+        ok = 0;
+        break;
+      }
+      token = strtok_r(NULL, " \n", &save);
+    }
+    if (side) {
+      p->control.peer_v4_count = n4;
+      p->control.peer_v6_count = n6;
+    } else {
+      p->control.local_v4_count = n4;
+      p->control.local_v6_count = n6;
+    }
+  }
   if (fgets(line, sizeof(line), f)) ok = 0;
   fclose(f);
   return ok ? 0 : -EINVAL;
@@ -216,7 +255,8 @@ static int contract(struct bpf_object *obj, int inspect) {
     if (bit == 1 ? (bpf_map__type(map) != BPF_MAP_TYPE_RINGBUF || n != KVP_RING_BYTES ||
                     k || v)
                  : (bpf_map__type(map) != BPF_MAP_TYPE_ARRAY || n != 1 || k != 4 ||
-                    v != 256))
+                    v != (bit == 2 ? sizeof(struct kvp_control)
+                                   : sizeof(struct kvp_loss_counts))))
       return -EINVAL;
     mask |= bit;
     maps++;
@@ -279,8 +319,9 @@ static int losses(struct bpf_object *obj) {
   const char *names[] = {
       "global_null",           "global_scope_read", "global_nonfull",
       "excluded_namespace",    "excluded_protocol", "excluded_port",
-      "excluded_family",       "scoped_ring_drop",  "scoped_tuple_read",
-      "scoped_record_discard", "counter_wrap"};
+      "excluded_family",       "excluded_address",  "scoped_ring_drop",
+      "scoped_tuple_read",     "counter_wrap"};
+  _Static_assert(sizeof(names) / sizeof(*names) == STAT_COUNT, "loss names");
   struct kvp_loss_counts value;
   u32 zero = 0;
   if (bpf_map_lookup_elem(map_fd(obj, "loss_counts"), &zero, &value)) return -errno;
@@ -288,7 +329,7 @@ static int losses(struct bpf_object *obj) {
     if (output(0,
                "{\"type\":\"loss\",\"scope\":\"%s\",\"counter\":\"%s\",\"value\":%llu}",
                i <= GLOBAL_NONFULL    ? "global_unknown"
-               : i <= EXCLUDED_FAMILY ? "filter_exclusion"
+               : i <= EXCLUDED_ADDRESS ? "filter_exclusion"
                : i == STAT_WRAP       ? "counter_health"
                                       : "endpoint_namespace",
                names[i], (unsigned long long)value.count[i]))

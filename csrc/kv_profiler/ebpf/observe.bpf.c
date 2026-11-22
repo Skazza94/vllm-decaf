@@ -42,6 +42,24 @@ static __always_inline int port_allowed(u16 port, u16 *ports, u32 count) {
     if (i < count && ports[i] == port) return 1;
   return 0;
 }
+static __always_inline int address_allowed(u32 family, const u32 *address,
+                                           const u32 *v4, u32 v4_count,
+                                           const u32 (*v6)[4], u32 v6_count) {
+  if (!v4_count && !v6_count) return 1;
+  int mapped = family == 10 && !address[0] && !address[1] &&
+               address[2] == bpf_htonl(0x0000ffff);
+  if (family == 2 || mapped) {
+    u32 ipv4 = family == 2 ? address[0] : address[3];
+    for (u32 i = 0; i < KVP_ADDRESSES; i++)
+      if (i < v4_count && v4[i] == ipv4) return 1;
+    return 0;
+  }
+  for (u32 i = 0; i < KVP_ADDRESSES; i++)
+    if (i < v6_count && v6[i][0] == address[0] && v6[i][1] == address[1] &&
+        v6[i][2] == address[2] && v6[i][3] == address[3])
+      return 1;
+  return 0;
+}
 static __noinline int socket_event(struct sock *sk, u32 kind, u32 old, u32 next) {
   u64 timestamp = bpf_ktime_get_ns();
   u32 zero = 0;
@@ -97,6 +115,28 @@ static __noinline int socket_event(struct sock *sk, u32 kind, u32 old, u32 next)
     count_stat(EXCLUDED_PORT);
     return 0;
   }
+  u32 local_address[4] = {0, 0, 0, 0}, peer_address[4] = {0, 0, 0, 0};
+  int error;
+  if (family == 2) {
+    error = BPF_CORE_READ_INTO(&local_address[0], sk, __sk_common.skc_rcv_saddr);
+    error |= BPF_CORE_READ_INTO(&peer_address[0], sk, __sk_common.skc_daddr);
+  } else {
+    error = BPF_CORE_READ_INTO((struct in6_addr *)local_address, sk,
+                               __sk_common.skc_v6_rcv_saddr);
+    error |= BPF_CORE_READ_INTO((struct in6_addr *)peer_address, sk,
+                                __sk_common.skc_v6_daddr);
+  }
+  if (error) {
+    count_stat(SCOPED_TUPLE_READ);
+    return 0;
+  }
+  if (!address_allowed(family, local_address, cfg->local_v4, cfg->local_v4_count,
+                       cfg->local_v6, cfg->local_v6_count) ||
+      !address_allowed(family, peer_address, cfg->peer_v4, cfg->peer_v4_count,
+                       cfg->peer_v6, cfg->peer_v6_count)) {
+    count_stat(EXCLUDED_ADDRESS);
+    return 0;
+  }
   struct kvp_event *row = bpf_ringbuf_reserve(&events, sizeof(*row), 0);
   if (!row) {
     count_stat(SCOPED_RING_DROP);
@@ -113,21 +153,8 @@ static __noinline int socket_event(struct sock *sk, u32 kind, u32 old, u32 next)
   row->peer_port = peer;
   row->old_state = old;
   row->new_state = next;
-  int error;
-  if (family == 2) {
-    error =
-        BPF_CORE_READ_INTO((u32 *)row->local_address, sk, __sk_common.skc_rcv_saddr);
-    error |= BPF_CORE_READ_INTO((u32 *)row->peer_address, sk, __sk_common.skc_daddr);
-  } else {
-    error = BPF_CORE_READ_INTO(&row->local_address, sk, __sk_common.skc_v6_rcv_saddr);
-    error |= BPF_CORE_READ_INTO(&row->peer_address, sk, __sk_common.skc_v6_daddr);
-  }
-  if (error) {
-    count_stat(SCOPED_TUPLE_READ);
-    count_stat(SCOPED_RECORD_DISCARD);
-    bpf_ringbuf_discard(row, 0);
-    return 0;
-  }
+  __builtin_memcpy(row->local_address, local_address, 16);
+  __builtin_memcpy(row->peer_address, peer_address, 16);
   if (bpf_core_field_exists(sk->__sk_common.skc_cookie.counter) &&
       !BPF_CORE_READ_INTO(&row->cookie, sk, __sk_common.skc_cookie.counter))
     row->cookie_available = row->cookie != 0;

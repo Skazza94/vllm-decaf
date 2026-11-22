@@ -16,6 +16,7 @@ typedef __u8 u8;
 #define KVP_SCHEMA 2
 #define KVP_RING_BYTES 1048576
 #define KVP_PORTS 32
+#define KVP_ADDRESSES 8
 #define KVP_RECORD_BYTES 2048
 #define KVP_QUEUE 4096
 #define KVP_EVENTS 4
@@ -31,9 +32,9 @@ enum kvp_stat {
   EXCLUDED_PROTOCOL,
   EXCLUDED_PORT,
   EXCLUDED_FAMILY,
+  EXCLUDED_ADDRESS,
   SCOPED_RING_DROP,
   SCOPED_TUPLE_READ,
-  SCOPED_RECORD_DISCARD,
   STAT_WRAP,
   STAT_COUNT
 };
@@ -41,7 +42,12 @@ struct kvp_control {
   u64 enabled, netns;
   u32 local_count, peer_count;
   u16 local_ports[KVP_PORTS], peer_ports[KVP_PORTS];
-  u8 reserved[104];
+  /* Address allow-lists, network order; IPv4-mapped IPv6 is matched as IPv4.
+     Both of a side's counts zero: any address. */
+  u32 local_v4_count, peer_v4_count, local_v6_count, peer_v6_count;
+  u32 local_v4[KVP_ADDRESSES], peer_v4[KVP_ADDRESSES];
+  u32 local_v6[KVP_ADDRESSES][4], peer_v6[KVP_ADDRESSES][4];
+  u8 reserved[24];
 };
 struct kvp_loss_counts {
   u64 count[32];
@@ -56,7 +62,7 @@ struct kvp_event {
   u32 available, read_errors, cookie_available;
   u8 reserved[128];
 };
-_Static_assert(sizeof(struct kvp_control) == 256, "control capacity");
+_Static_assert(sizeof(struct kvp_control) == 512, "control capacity");
 _Static_assert(sizeof(struct kvp_loss_counts) == 256, "statistics capacity");
 _Static_assert(sizeof(struct kvp_event) == 256, "binary event capacity");
 #endif

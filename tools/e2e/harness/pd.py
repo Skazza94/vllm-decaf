@@ -1660,11 +1660,13 @@ def ebpf_opt_in(node: str, probes) -> bool:
 
 # The built eBPF package, as the observer's runtime check (endpoint_probes.ebpf.validate_artifacts) reads it.
 EBPF_ARTIFACT_FILES = ("collector", "observe.bpf.o", "limits.json")
+EBPF_PACKAGE_SCHEMA = 3  # endpoint_probes.ebpf.PACKAGE_SCHEMA
 
 
 def _ebpf_artifacts_problem(artifacts) -> str | None:
     """Why ``artifacts`` is not a complete built package, checked as the runtime checks it: an absolute directory
-    whose manifest (schema 2, tcp_tracepoints) lists exactly the package's files, each present with its SHA-256."""
+    whose manifest (EBPF_PACKAGE_SCHEMA, tcp_tracepoints) lists exactly the package's files, each present with its
+    SHA-256. A package of another schema is a previous generation: rebuilt, never run."""
     import hashlib
 
     if not isinstance(artifacts, str) or not Path(artifacts).is_absolute():
@@ -1676,8 +1678,11 @@ def _ebpf_artifacts_problem(artifacts) -> str | None:
         return f"manifest.json unreadable: {error}"
     if not isinstance(manifest, dict):
         return "manifest.json is not a mapping"
-    if (manifest.get("schema"), manifest.get("mode")) != (2, "tcp_tracepoints"):
-        return "manifest.json is not a schema 2 tcp_tracepoints package"
+    if manifest.get("schema") != EBPF_PACKAGE_SCHEMA:
+        return (f"package schema {manifest.get('schema')!r}, not {EBPF_PACKAGE_SCHEMA}: rebuild it with "
+                "tools/kv-profiler-ebpf/build.sh")
+    if manifest.get("mode") != "tcp_tracepoints":
+        return "manifest.json is not a tcp_tracepoints package"
     files = manifest.get("files")
     if not isinstance(files, dict) or set(files) != set(EBPF_ARTIFACT_FILES):
         listed = sorted(map(str, files)) if isinstance(files, dict) else type(files).__name__

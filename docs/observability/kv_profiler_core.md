@@ -899,8 +899,13 @@ cleans up that ID even if startup fails; it never removes a name collision.
 The stdlib observer accepts `probes.ebpf` with `enabled: true`,
 `privileged_opt_in: true`, `mode: tcp_tracepoints`, and an absolute `artifacts`
 directory. Optional `local_ports` and `peer_ports` lists contain at most 32
-unique ports each. Matching is OR within each list and AND between configured
-lists; absent lists are unrestricted. Off is the default: there is no native
+unique ports each; optional `local_ips` and `peer_ips` lists, as `probes.tcp`'s,
+at most eight unique addresses each, without a zone (`%eth0`), an IPv4 address
+also matching its IPv4-mapped IPv6 form. Matching is OR within each list and AND between configured
+lists; absent lists are unrestricted. The program applies them in the kernel,
+after the network namespace, before an event reaches the ring: with host
+networking the namespace is the host's, and the address lists keep the capture to
+the KV link's connections. Off is the default: there is no native
 child, capability check, BPF syscall or automatic privileged launch. Off identities
 and old stdlib captures remain unchanged. Uprobe `sets` and `kernel_audit` options
 are removed; old enabled configurations need an explicit migration.
@@ -957,14 +962,13 @@ normal exit and its final resource accounting. Known event loss (endpoint ring o
 read losses, counter wraps, the collector's output drops or malformed rows) marks
 the capture `ebpf_degraded`, with the counts in `ebpf_event_loss`: it stands, but
 its events cannot certify agreement with other sources. Namespace, protocol,
-family and port exclusions and global unknown exclusions are not loss.
+family, port and address exclusions and global unknown exclusions are not loss.
 
 In the e2e harness an endpoint opts in with `probes.ebpf: {enabled: true,
 privileged_opt_in: true, mode: tcp_tracepoints, artifacts: <built directory>}`,
 both flags literal booleans. Its observer container then gets exactly
 `CAP_BPF` and `CAP_PERFMON` (never `CAP_SYS_ADMIN`) and the artifact directory
-read-only at the same absolute path. The run is refused before anything starts if
-that directory lacks the built manifest, collector or BPF object. Without the
+read-only at the same absolute path. The run is refused before anything starts if that directory is not a complete built package: its manifest, collector, BPF object and limits, each matching its manifest hash, and an executable collector. A package of another schema (an earlier build, whose collector reads another plan) is refused with a request to rebuild it with `tools/kv-profiler-ebpf/build.sh`; the observer checks the same before launching it. Without the
 opt-in the observer gets neither. Live attachment has been validated on Linux 5.15
 with Docker's default seccomp profile. With those two capabilities, all four hooks
 attached; without them, the collector reported itself unavailable with the

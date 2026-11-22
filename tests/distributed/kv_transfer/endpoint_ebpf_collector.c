@@ -198,15 +198,39 @@ int main(int argc, char **argv) {
   p.control.netns = ns.st_ino;
   FILE *plan_file = tmpfile();
   assert(plan_file);
-  fprintf(plan_file, "P %d %llu\nN %llu\nL \nR 1234\n", p.parent,
-          (unsigned long long)p.start, (unsigned long long)p.control.netns);
+  fprintf(plan_file,
+          "P %d %llu\nN %llu\nL \nR 1234\nLA 10.0.0.1 ::ffff:10.0.0.2\nRA fd00::5\n",
+          p.parent, (unsigned long long)p.start, (unsigned long long)p.control.netns);
   fflush(plan_file);
   char plan_path[64];
   snprintf(plan_path, sizeof(plan_path), "/proc/self/fd/%d", fileno(plan_file));
   struct plan parsed = {0};
   assert(!parse_plan(plan_path, &parsed));
   assert(parsed.control.local_count == 0 && parsed.control.peer_ports[0] == 1234);
+  /* IPv4-mapped IPv6 is kept as IPv4; IPv6 in network order */
+  assert(parsed.control.local_v4_count == 2 && !parsed.control.local_v6_count);
+  assert(parsed.control.local_v4[0] == htonl(0x0a000001) &&
+         parsed.control.local_v4[1] == htonl(0x0a000002));
+  assert(!parsed.control.peer_v4_count && parsed.control.peer_v6_count == 1 &&
+         parsed.control.peer_v6[0][0] == htonl(0xfd000000) &&
+         parsed.control.peer_v6[0][3] == htonl(5));
   fclose(plan_file);
+  /* a malformed address, nine addresses, or a plan without its address lines */
+  const char *bad[] = {"LA 10.0.0.300\nRA \n",
+                       "LA 1.1.1.1 1.1.1.2 1.1.1.3 1.1.1.4 1.1.1.5 1.1.1.6 1.1.1.7 1.1.1.8 "
+                       "1.1.1.9\nRA \n",
+                       ""};
+  for (unsigned int i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+    plan_file = tmpfile();
+    assert(plan_file);
+    fprintf(plan_file, "P %d %llu\nN %llu\nL \nR \n%s", p.parent,
+            (unsigned long long)p.start, (unsigned long long)p.control.netns, bad[i]);
+    fflush(plan_file);
+    snprintf(plan_path, sizeof(plan_path), "/proc/self/fd/%d", fileno(plan_file));
+    struct plan refused = {0};
+    assert(parse_plan(plan_path, &refused) == -EINVAL);
+    fclose(plan_file);
+  }
   reset();
   load_error = -EPERM;
   assert(run(obj, &p) == 2 && !attached && !rings);
