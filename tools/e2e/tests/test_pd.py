@@ -38,6 +38,136 @@ RUN = pd.Run(name="t", topology="t", model=Path("/m"), prefill=pd.Side("p", "dat
              workload=pd.Workload(num_prompts=2))
 
 
+class RdmaTransport(unittest.TestCase):
+    """``server.kv_transport: rdma``: the server command carries the simulator's RDMA settings (each rank's
+    device, its control address, ``kv_transport``) and none of the harness's TCP-only ones; the run is refused
+    before anything starts when it cannot work, and the local topologies (no RDMA devices) refuse it."""
+
+    def rdma_run(self, connector="nixl", backend="ucx", dp=1, tp=1, env=None, profiler=None, **server):
+        return pd.Run(**{**{f: getattr(RUN, f) for f in RUN.__dataclass_fields__},
+                         "prefill": pd.Side("p", "data0", data_parallel_size=dp, tensor_parallel_size=tp),
+                         "decode": pd.Side("d", "data0", data_parallel_size=dp, tensor_parallel_size=tp),
+                         "server": pd.Server(connector=connector, nixl_backend=backend, timing="linear",
+                                             kv_transport="rdma", env=env or {}, **server),
+                         "profiler": profiler})  # fmt: skip
+
+    @staticmethod
+    def parts(command):
+        at = command.index(pd.VLLM)
+        env = dict(item.split("=", 1) for item in command[1:at] if "=" in item)
+        return env, json.loads(command[command.index("--kv-transfer-config") + 1])
+
+    def test_each_connector_s_rdma_command_has_each_rank_s_device_and_no_tcp_setting(self):
+        for connector, backend in (("nixl", "ucx"), ("nixl", "mooncake"), ("mooncake", "mooncake")):
+            with self.subTest(connector=connector, backend=backend):
+                run = self.rdma_run(connector, backend, dp=2, tp=2)
+                env, kv = self.parts(pd.server_command(run, "decode", ["10.1.0.1", "10.1.0.2"],
+                                                       rdma_devices=["mlx5_0", "mlx5_1:2"]))
+                extra = kv["kv_connector_extra_config"]
+                self.assertEqual(extra["kv_transport"], "rdma")
+                self.assertEqual(extra["rank_addresses"], ["10.1.0.1", "10.1.0.2"] * 2)
+                self.assertEqual(extra["rank_rdma_devices"], ["mlx5_0", "mlx5_1:2"] * 2)
+                self.assertNotIn("mooncake_protocol", extra)
+                self.assertFalse({"UCX_TLS", "MC_TENT_CONF"} & set(env) or any(k.startswith("FI_") for k in env), env)
+
+    def test_a_user_s_tent_configuration_reaches_the_rdma_binding(self):
+        """The harness's own MC_TENT_CONF (TCP) is dropped under RDMA; one the run sets is passed for the
+        binding to keep or refuse."""
+        conf = json.dumps({"log_level": "info"})
+        env, _ = self.parts(pd.server_command(self.rdma_run("mooncake", "mooncake", env={"MC_TENT_CONF": conf}),
+                                              "prefill", ["10.1.0.1"], rdma_devices=["mlx5_0"]))
+        self.assertEqual(env["MC_TENT_CONF"], conf)
+
+    def test_the_devices_are_required_with_rdma_only_and_one_per_tp_rank(self):
+        run = self.rdma_run(tp=2)
+        for devices in (None, ["mlx5_0"], ["mlx5_0", ""]):
+            with self.subTest(devices=devices), self.assertRaisesRegex(ValueError, "rdma_devices"):
+                pd.server_command(run, "prefill", ["10.1.0.1", "10.1.0.2"], rdma_devices=devices)
+        with self.assertRaisesRegex(ValueError, "given exactly with kv_transport rdma"):
+            pd.server_command(pd.Run(**{**{f: getattr(RUN, f) for f in RUN.__dataclass_fields__},
+                                        "server": pd.Server(connector="nixl", nixl_backend="ucx", timing="linear")}),
+                              "prefill", ["10.1.0.1"], rdma_devices=["mlx5_0"])
+
+    def test_an_rdma_run_that_cannot_work_is_refused_before_it_starts(self):
+        for run, message in ((self.rdma_run(backend="libfabric"), "LIBFABRIC has no verbs path"),
+                             (self.rdma_run(env={"UCX_TLS": "rc"}), "does not take TCP transport settings"),
+                             (self.rdma_run(connector="mooncake", hp_tcp_args={"max_outstanding_tasks": 8}),
+                              "does not take hp_tcp_args")):
+            with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                pd.server_command(run, "prefill", ["10.1.0.1"], rdma_devices=["mlx5_0"])
+        with self.assertRaisesRegex(ValueError, "kv_transport is tcp or rdma"):
+            pd.server_command(pd.Run(**{
+                **{f: getattr(RUN, f) for f in RUN.__dataclass_fields__},
+                "server": pd.Server(connector="nixl", nixl_backend="ucx", timing="linear", kv_transport="ib")}),
+                "prefill", ["10.1.0.1"])
+        with self.assertRaisesRegex(ValueError, "the local topologies do not have"):
+            pd.execute(self.rdma_run(), Path("/nonexistent"))
+
+    def test_each_rank_s_recorded_binding_must_be_the_requested_transport_s(self):
+        """Over RDMA a rank records UCX's rc,self on its device:port or TENT's RDMA transport alone; over TCP a
+        TENT path records none. A binding of the other transport, or an incomplete RDMA one, is a problem."""
+        ucx = {"transport": "rdma", "address": "10.1.0.1", "device": "mlx5_0", "port": 1,
+               "UCX_TLS": "rc,self", "UCX_NET_DEVICES": "mlx5_0:1"}
+        tent = {"transport": "rdma", "engine": "tent", "address": "10.1.0.1", "device": "mlx5_0", "port": 1,
+                "tent_transports": ["rdma"]}
+        check = pd._transport_binding_problem
+        self.assertIsNone(check(ucx, "ucx", True))
+        self.assertIsNone(check(tent, "tent", True))
+        self.assertIsNone(check(None, "tent", False))
+        for binding, kind, rdma, message in (
+                ({**ucx, "UCX_NET_DEVICES": "mlx5_1:1"}, "ucx", True, "not UCX's rc,self on mlx5_0:1"),
+                ({**ucx, "UCX_TLS": "rc,tcp,self"}, "ucx", True, "not UCX's rc,self"),
+                ({**tent, "tent_transports": ["rdma", "tcp"]}, "tent", True, "TENT's RDMA transport alone"),
+                ({**tent, "port": 0}, "tent", True, "names no address, device or port 1-255"),
+                ({**tent, "port": 256}, "tent", True, "names no address, device or port 1-255"),
+                (None, "tent", True, "not an RDMA binding"),
+                (tent, "tent", False, "but the run asked for TCP")):
+            with self.subTest(message):
+                self.assertIn(message, check(binding, kind, rdma) or "")
+
+    def test_a_rank_s_kv_address_follows_the_node_s_links_on_its_network(self):
+        """As ``_kv_addresses`` places them: the node's only link on the rank's network serves every rank,
+        several links one per rank; links of other networks or nodes are not the rank's."""
+        side = pd.Side("p", "data0")
+        one = {"data0": {"p1": {"node": "p", "slot": 0, "address": "10.0.0.1"},
+                         "p2": {"node": "d", "slot": 0, "address": "10.0.0.2"}},
+               "other": {"p3": {"node": "p", "slot": 1, "address": "192.0.2.1"}}}  # fmt: skip
+        self.assertEqual([pd._rank_address(one, side, "p", tp, 2) for tp in (0, 1)], ["10.0.0.1", "10.0.0.1"])
+        two = {"data0": {"p1": {"node": "p", "slot": 1, "address": "10.0.0.11"},
+                         "p0": {"node": "p", "slot": 0, "address": "10.0.0.10"}}}  # fmt: skip
+        self.assertEqual([pd._rank_address(two, side, "p", tp, 2) for tp in (0, 1)], ["10.0.0.10", "10.0.0.11"])
+        self.assertIsNone(pd._rank_address(None, side, "p", 0, 1))
+
+    def test_hp_tcp_s_task_limit_applies_to_tcp_only(self):
+        """hp_tcp is TENT's TCP transport: an RDMA run has no hp_tcp limit to preflight or report."""
+        self.assertIsNone(pd.hp_tcp_task_limit(self.rdma_run("mooncake", "mooncake").server))
+        self.assertEqual(pd.hp_tcp_task_limit(pd.Server(connector="mooncake", timing="linear")),
+                         pd.TENT_DEFAULT_MAX_OUTSTANDING_TASKS)
+
+    def test_the_saved_profiler_settings_carry_the_label_the_servers_used(self):
+        for run, label in ((self.rdma_run(profiler=pd.Profiler()), "rdma"),
+                           (self.rdma_run(profiler=pd.Profiler(transport="unknown")), "unknown")):
+            with self.subTest(label):
+                self.assertEqual(pd.profiler_transport(run), label)
+        tcp = pd.Run(**{**{f: getattr(RUN, f) for f in RUN.__dataclass_fields__}, "profiler": pd.Profiler()})
+        self.assertEqual(pd.profiler_transport(tcp), "tcp")
+
+    def test_the_profiler_labels_its_transfers_with_the_run_s_transport(self):
+        run = self.rdma_run(profiler=pd.Profiler())
+        _, kv = self.parts(pd.server_command(run, "decode", ["10.1.0.1"], profile_id="id-1",
+                                             rdma_devices=["mlx5_0"]))
+        self.assertEqual(kv["kv_connector_extra_config"]["network_profiler"]["transport"], "rdma")
+        raw = {"name": "t", "topology": "t", "model": "/m", "client": "c", "control_network": "control",
+               "prefill": {"node": "p", "kv_network": "data0"}, "decode": {"node": "d", "kv_network": "data0"},
+               "router": {"gateway": "gw"},
+               "server": {"connector": "nixl", "nixl_backend": "ucx", "timing": "linear", "kv_transport": "rdma"}}
+        with mock.patch.object(pd.models, "resolve", lambda model, fetch=False: Path(model)):
+            self.assertEqual(pd.parse({**raw, "profiler": {"transport": "unknown"}}, Path("/r.yaml")).profiler.transport,
+                             "unknown")
+            with self.assertRaisesRegex(ValueError, "profiler.transport tcp labels a kv_transport rdma run"):
+                pd.parse({**raw, "profiler": {"transport": "tcp"}}, Path("/r.yaml"))
+
+
 class ProfilerConfig(unittest.TestCase):
     """The KV network profiler's run options: both servers get one run ID and
     the connector's ``network_profiler`` namespace; off, nothing changes."""

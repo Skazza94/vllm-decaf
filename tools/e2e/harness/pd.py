@@ -252,6 +252,10 @@ class Server:
     (NixlConnector, decode reads). nixl_backend selects Mooncake/TENT, UCX/TCP or LIBFABRIC/TCP."""
     nixl_backend: str = "mooncake"
     """NIXL backend: mooncake (default), ucx or libfabric over CPU TCP."""
+    kv_transport: str = "tcp"
+    """How the real KV transfers move (the simulator's ``kv_transport``): tcp, or rdma on each rank's RDMA
+    device (NIXL's UCX or Mooncake backend, or the Mooncake connector). RDMA needs real RDMA nodes: a launcher
+    passes each rank's device to ``server_command``; the local topologies have none, so ``execute`` refuses it."""
     speculative: dict | None = None
     """Native MTP: {method: mtp, num_speculative_tokens: k (1 to 5),
     acceptance_rates: [...], seed: 0}. Both instances take the same
@@ -344,7 +348,9 @@ class Profiler:
     ``BOOTSTRAP_PORT + clock_port_offset`` and decode's maps each prefill
     engine ID to that endpoint (``clock_peers``)."""
 
-    transport: str = "tcp"
+    transport: str | None = None
+    """The transport the recorders label their transfers with: tcp, rdma or unknown; None: the run's
+    ``server.kv_transport``."""
     clock_port_offset: int = 1000
     flush: str = "end"
     level: str = "l1"
@@ -489,8 +495,11 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
                         "observer_cpus must contain non-negative CPU lists")
         elif profiler.probes or profiler.observer_cpus:
             raise ValueError("endpoint probe settings require L3")
-        if profiler.transport not in ("tcp", "unknown") or profiler.flush not in ("end", "background"):
-            raise ValueError("profiler.transport is tcp or unknown, profiler.flush end or background")
+        if profiler.transport not in (None, "tcp", "rdma", "unknown") or profiler.flush not in ("end", "background"):
+            raise ValueError("profiler.transport is tcp, rdma or unknown, profiler.flush end or background")
+        if profiler.transport not in (None, "unknown", run.server.kv_transport):
+            raise ValueError(f"profiler.transport {profiler.transport} labels a kv_transport "
+                             f"{run.server.kv_transport} run")
         if (not isinstance(profiler.clock_port_offset, int) or isinstance(profiler.clock_port_offset, bool)
                 or not 1 <= profiler.clock_port_offset <= 65535):
             raise ValueError("profiler.clock_port_offset is a port offset in 1..65535")
@@ -889,6 +898,18 @@ def nixl_backend(server: Server) -> str:
 def _check_backend(server: Server) -> None:
     if server.nixl_backend not in ("mooncake", "ucx", "libfabric"):
         raise ValueError("server.nixl_backend is one of mooncake, ucx, libfabric")
+    if server.kv_transport not in ("tcp", "rdma"):
+        raise ValueError(f"server.kv_transport is tcp or rdma, not {server.kv_transport!r}")
+    if server.kv_transport == "rdma":
+        if server.connector == "nixl" and server.nixl_backend == "libfabric":
+            raise ValueError("kv_transport rdma needs NIXL's UCX or Mooncake backend (LIBFABRIC has no verbs path)")
+        # The simulator's RDMA bindings set the native transports: UCX's and libfabric's TCP selection would
+        # contradict them, and hp_tcp is TENT's TCP transport. A user's MC_TENT_CONF reaches the binding, which
+        # keeps its other settings and refuses a contradicting one.
+        if set_tcp := sorted(k for k in server.env if k == "UCX_TLS" or k.startswith("FI_")):
+            raise ValueError(f"kv_transport rdma does not take TCP transport settings {set_tcp}")
+        if server.hp_tcp_args:
+            raise ValueError("kv_transport rdma does not take hp_tcp_args (TENT's TCP transport)")
     if server.nixl_backend != "mooncake" and server.connector != "nixl":
         raise ValueError("UCX/LIBFABRIC needs server.connector: nixl")
     if not uses_tent(server):
@@ -925,8 +946,8 @@ def hp_tcp_task_limit(server: Server) -> int | None:
             hp_tcp, dict) else None
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
-    if not uses_tent(server):
-        return None
+    if not uses_tent(server) or server.kv_transport != "tcp":
+        return None  # hp_tcp is TENT's TCP transport: an RDMA run has none
     env = {name: str(value) for name, value in server.env.items()}
     if env.get("MC_USE_TENT", "1") != "1":
         return None
@@ -1020,6 +1041,12 @@ def profile_identities(run: Run, instances: dict) -> dict[str, dict[str, dict]]:
     return found
 
 
+def profiler_transport(run: Run) -> str:
+    """The label the recorders give their transfers: the profiler's own (``unknown`` kept), else the run's
+    ``kv_transport``. Both the server command and the run's ``profiler.json`` use it."""
+    return run.profiler.transport or run.server.kv_transport
+
+
 def nixl_telemetry_arm(run: Run) -> str | None:
     """The run's NIXL telemetry arm: ``exporter`` with the collector's NIXL source, else the server's own."""
     if run.collector is not None and run.collector.nixl_telemetry:
@@ -1041,18 +1068,28 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
                    endpoint: tuple[str, int] | None = None,
                    profile_id: str | None = None,
                    node: str | None = None,
-                   identities: dict | None = None) -> list[str]:
+                   identities: dict | None = None,
+                   rdma_devices: list[str] | None = None) -> list[str]:
     """``vllm serve`` for ``role`` (prefill or decode) on HTTP ``port``, TP
     rank r's KV on ``kv_addresses[r]`` in every DP rank (their own:
     ``rank_addresses``, DP rank by TP rank). ``endpoint``: the control
     address and port the router knows the instance by (a precise prefix
-    index names its events after it)."""
+    index names its events after it). ``rdma_devices``: with
+    ``server.kv_transport`` rdma, TP rank r's RDMA device (``device[:port]``)
+    in every DP rank, required then and refused otherwise."""
 
     _check_backend(run.server)
     ucx = uses_ucx(run.server)
     non_tent = not uses_tent(run.server)
     kv_address = kv_addresses[0]
     side = getattr(run, role)
+    rdma = run.server.kv_transport == "rdma"
+    if rdma != (rdma_devices is not None):
+        raise ValueError("rdma_devices are each rank's RDMA device, given exactly with kv_transport rdma")
+    if rdma and (not isinstance(rdma_devices, list) or len(rdma_devices) != side.tp(run.server)
+                 or not all(isinstance(d, str) and d for d in rdma_devices)):
+        raise ValueError(f"rdma_devices names one RDMA device per TP rank ({side.tp(run.server)}), "
+                         f"not {rdma_devices!r}")
 
     timing_args = run.server.timing_args
     if timing_args is None:
@@ -1074,14 +1111,19 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
                    "kv_buffer_device": "cpu",
                    # Explicit selection prevents another installed backend from taking over.
                    "kv_connector_extra_config": {"backends": [nixl_backend(run.server)]} if nixl else {"mooncake_protocol": "tcp"}}
-    if non_tent or len(set(kv_addresses)) > 1:
+    if non_tent or len(set(kv_addresses)) > 1 or rdma:
         kv_transfer["kv_connector_extra_config"]["rank_addresses"] = kv_addresses * side.data_parallel_size
+    if rdma:
+        extra = kv_transfer["kv_connector_extra_config"]
+        extra.update(kv_transport="rdma", rank_rdma_devices=list(rdma_devices) * side.data_parallel_size)
+        extra.pop("mooncake_protocol", None)
     if run.profiler is not None:
         if profile_id is None:
             raise ValueError("a profiled run needs one profile ID for both servers")
         kv_transfer["kv_connector_extra_config"]["network_profiler"] = {
             "level": run.profiler.level, "run_id": profile_id, "output_dir": PROFILES,
-            "transport": run.profiler.transport, "clock_port_offset": run.profiler.clock_port_offset,
+            "transport": profiler_transport(run),
+            "clock_port_offset": run.profiler.clock_port_offset,
             "flush": run.profiler.flush, "shutdown_timeout_s": 10}
         if not nixl:
             if identities is None or node is None:
@@ -1141,10 +1183,13 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         unset = [name for name in NIXL_TELEMETRY_VARS if name not in env]
     if non_tent:
         env = {k: v for k, v in env.items() if not k.startswith(("MC_", "TENT_", "NIXL_MOONCAKE_"))}
-        if ucx:
+        if ucx and not rdma:
             env["UCX_TLS"] = "tcp,self"
-        else:
+        elif not ucx:
             env.update(FI_PROVIDER="tcp", FI_ADDR_FORMAT="FI_SOCKADDR_IN", FI_PREFER_SYSCONFIG="0")
+    if rdma and "MC_TENT_CONF" not in run.server.env:
+        # the harness's MC_TENT_CONF is its TCP one; the RDMA binding configures TENT (RDMA on, TCP off) itself
+        env.pop("MC_TENT_CONF", None)
     s = run.server
     block = side.block(s)
     return [
@@ -1193,6 +1238,9 @@ def execute(run: Run, output: Path | None = None) -> dict:
 
     from . import llmd  # it imports this module
 
+    if run.server.kv_transport != "tcp":
+        raise ValueError("kv_transport rdma needs real RDMA devices, which the local topologies do not have: "
+                         "run it through a launcher on RDMA nodes (server_command's rdma_devices)")
     front = llmd.Front(run)
     state = topology.load_state(run.topology)
     nodes = state["nodes"]
@@ -1732,10 +1780,34 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
             if sent["failed"]:
                 problems.append(f"{at}{role}'s connector failed {sent['failed']} transfer(s)")
             identity = (layout or {}).get("nixl_transport")
-            if run.server.connector == "nixl" and (not uses_tent(run.server) or identity is not None):
+            rdma = run.server.kv_transport == "rdma"
+            rank_address = _rank_address(ports, side, side.node_of(dp), tp, sizes[role]) if rdma else None
+            if run.server.connector == "mooncake":
+                # the Mooncake connector's TENT binding: RDMA's when RDMA was asked, none over TCP
+                binding = (layout or {}).get("mooncake_transport")
+                problem = _transport_binding_problem(binding, "tent", rdma)
+                if problem:
+                    problems.append(f"{at}{role}'s Mooncake {problem}")
+                elif rank_address and binding.get("address") != rank_address:
+                    problems.append(f"{at}{role}'s Mooncake address {binding.get('address')} is not its rank's "
+                                    f"KV address {rank_address}")
+            if run.server.connector == "nixl" and (not uses_tent(run.server) or identity is not None or rdma):
                 expected = [nixl_backend(run.server)]
                 if not isinstance(identity, dict) or identity.get("backends") != expected:
                     problems.append(f"{at}{role}'s initialized NIXL backend is {identity}, expected {expected}")
+                elif rdma or uses_tent(run.server):
+                    problem = _transport_binding_problem(identity.get("binding"), "ucx" if uses_ucx(run.server)
+                                                         else "tent", rdma)
+                    if problem:
+                        problems.append(f"{at}{role}'s {nixl_backend(run.server)} {problem}")
+                    if uses_ucx(run.server) and (
+                            identity.get("progress_thread") is not True
+                            or type(identity.get("num_threads")) is not int or identity["num_threads"] < 0):
+                        problems.append(f"{at}{role} has no valid {nixl_backend(run.server)} thread/progress evidence")
+                    binding = identity.get("binding") or {}
+                    if rank_address and binding.get("address") != rank_address:
+                        problems.append(f"{at}{role}'s {nixl_backend(run.server)} address {binding.get('address')} "
+                                        f"is not its rank's KV address {rank_address}")
                 elif not uses_tent(run.server):
                     binding = identity.get("binding") or {}
                     ucx = uses_ucx(run.server)
@@ -1887,9 +1959,11 @@ def check(bench: dict, prefill_steps: list[str], decode_steps: list[str], router
                             f"transfer, whether or not a retry recovered it ({sent['failed']} connector transfer(s) "
                             "failed)")
             hp_tcp = None
-            if tents and run.server.connector != "nixl" and role == "prefill":
+            if tents and run.server.connector != "nixl" and role == "prefill" and run.server.kv_transport == "tcp":
+                # hp_tcp's task accounting; TENT's transport counters below are any transport's
                 hp_tcp = _hp_tcp_writes(records, hp_tcp_task_limit(run.server))
-            if tents and counters is not None:
+            if tents and counters is not None and run.server.kv_transport == "tcp":
+                # over RDMA hp_tcp stays None: the rank's ``tent`` keeps TENT's counters
                 hp_tcp = {**(hp_tcp or {}), **{
                     key: int(counters.get(f"tent_{key}_total") or 0) if "failures" in key else (
                         None if counters.get(f"tent_{key}_total") is None else int(counters[f"tent_{key}_total"]))
@@ -3681,6 +3755,40 @@ def _hetero_hybrid(run: Run, sizes: dict[str, int], logs: dict, ranks: dict, por
 
 
 
+def _rank_address(ports: dict | None, side: Side, node: str, tp: int, tp_size: int) -> str | None:
+    """TP rank ``tp``'s KV address on ``node`` by the rule ``_kv_addresses`` places it: the node's only link on
+    the rank's network serves every rank, otherwise link ``tp``'s; None when the caller supplied no such link."""
+    network = side.rank_networks(tp_size)[tp]
+    links = sorted((p for p in ((ports or {}).get(network) or {}).values() if p.get("node") == node),
+                   key=lambda p: p.get("slot", 0))
+    if len(links) == 1:
+        return links[0].get("address")
+    return links[tp].get("address") if tp < len(links) else None
+
+
+def _transport_binding_problem(binding, kind: str, rdma: bool) -> str | None:
+    """Why a rank's recorded transport binding is not the requested one, or None. ``kind``: ``ucx`` (NIXL's UCX
+    backend: ``rc,self`` on the rank's ``device:port``) or ``tent`` (NIXL's Mooncake backend or the Mooncake
+    connector: TENT's RDMA transport alone on the rank's device). Over TCP a TENT path records no binding and a
+    UCX one its TCP binding (checked on its own); an RDMA binding there is a problem."""
+    if not rdma:
+        if isinstance(binding, dict) and binding.get("transport") == "rdma":
+            return f"binding is RDMA's ({binding}), but the run asked for TCP"
+        return None
+    if not isinstance(binding, dict) or binding.get("transport") != "rdma":
+        return f"binding is {binding}, not an RDMA binding"
+    device, port = binding.get("device"), binding.get("port")
+    if (not binding.get("address") or not isinstance(device, str) or not device or type(port) is not int
+            or not 1 <= port <= 255):  # the simulator's RDMA port range
+        return f"RDMA binding names no address, device or port 1-255: {binding}"
+    if kind == "ucx":
+        if binding.get("UCX_TLS") != "rc,self" or binding.get("UCX_NET_DEVICES") != f"{device}:{port}":
+            return f"RDMA binding is not UCX's rc,self on {device}:{port}: {binding}"
+    elif binding.get("engine") != "tent" or binding.get("tent_transports") != ["rdma"]:
+        return f"RDMA binding is not TENT's RDMA transport alone: {binding}"
+    return None
+
+
 def _hp_tcp_writes(records: list[dict], limit: int | None) -> dict:
     """A Mooncake prefill rank's connector writes (``send``) against hp_tcp's
     task limit, reported, never judged: TENT may merge a write's descriptors
@@ -4741,7 +4849,7 @@ def _collect_profiles(run: Run, container: dict[str, str], output: Path, profile
     """Each server node's profile directory under ``profiles/<role>/<node>/``,
     and the run's profile ID."""
 
-    settings = asdict(run.profiler)
+    settings = {**asdict(run.profiler), "transport": profiler_transport(run)}
     if run.profiler.level == "l1":
         for key in ("level", "probes", "observer_cpus"):
             settings.pop(key)

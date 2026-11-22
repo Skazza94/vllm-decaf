@@ -468,6 +468,16 @@ would move it are refused rather than overridden:
     containers are given the RDMA devices, `IPC_LOCK` and an unlimited memlock
     limit.
 
+The harness in `tools/e2e` selects RDMA with `server.kv_transport: rdma`. Its
+`server_command` then takes each TP rank's device (`rdma_devices`) and writes
+`kv_transport`, `rank_rdma_devices` and `rank_addresses` for every DP rank,
+without its TCP-only settings (`UCX_TLS`, libfabric's TCP provider, its own
+`MC_TENT_CONF`, `mooncake_protocol`). A run with a LIBFABRIC backend, a TCP
+transport setting in `server.env` or `hp_tcp_args` is refused before anything
+starts. The local topologies have no RDMA devices, so `harness run` refuses
+RDMA. A launcher on RDMA nodes uses `server_command` directly, and the
+profiler labels the transfers with the run's transport.
+
 ### Troubleshooting: a blocked handshake
 
 A managed UCX or LIBFABRIC `add_remote_agent` can block indefinitely when the
