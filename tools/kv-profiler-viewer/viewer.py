@@ -911,6 +911,12 @@ class Run:
                 # / incomplete — planned shares are never confirmed bytes
                 "write": batch.get("write"),
                 "status": batch.get("state"),
+                # whether the members' shares partition the batch's measured
+                # totals exactly (the summary's check): only then is a share
+                # a confirmed part of what was written
+                "partition": (batch.get("partition") or {}).get("status"),
+                "partition_reasons": (batch.get("partition") or {}).get(
+                    "reasons") or [],
             }
         out = []
         for entry in self.summary.get("transfers", []):
@@ -966,7 +972,8 @@ class Run:
                 # their consumer-scheduler spines.
                 batch_info = shares.get(
                     (source_index, entry.get("transfer")),
-                    {"members": {}, "write": None, "status": None},
+                    {"members": {}, "write": None, "status": None,
+                     "partition": None, "partition_reasons": []},
                 )
                 member_shares = batch_info["members"]
                 # the batch's member rows on the worker carry each member's
@@ -1013,6 +1020,10 @@ class Run:
                 "consumer": consumer,
                 "member_pairs": member_pairs,
                 "member_shares": member_shares,
+                "batch_write": batch_info.get("write") if mooncake else None,
+                "partition": batch_info.get("partition") if mooncake else None,
+                "partition_reasons": (batch_info.get("partition_reasons")
+                                      if mooncake else []),
                 "pair": pair,
                 "t0": p0,
                 "t1": p1,
@@ -1302,8 +1313,10 @@ class Run:
                 # incoming handoff row (a (P, X) row never matches a member
                 # that names (P, A), and a genuine (P, A) survives a second
                 # (P, X) row beside it). Duplicate identical rows dedupe.
+                # A Mooncake consumer's handoff names the shared transfer id
+                # (``transfer_id``), never the producer's request.
                 incoming = {
-                    (h.get("producer_engine"), h.get("producer_request"))
+                    (h.get("producer_engine"), h.get("transfer_id"))
                     for h in row["spine"].get("handoffs", [])
                     if h.get("direction") == "incoming"
                     and self._engine_matches(
@@ -2319,10 +2332,15 @@ class Run:
         pair = None
         read_ms, gpss = [], []
         prep_ms = []
-        bytes_total, desc_total = None, 0
+        # Each value is a sum only when every contribution is known: a
+        # missing share or transfer leaves it unavailable, a recorded zero
+        # stays zero. A Mooncake share is confirmed only when its batch
+        # wrote AND the members partition the batch's measured totals.
+        byte_parts, desc_parts = [], []
         tids = set()
         mooncake_member = False
         planned = False
+        unconfirmed = []  # why the row's bytes are not confirmed
         for transport in transports:
             pair = pair or transport.get("pair")
             if transport.get("duration_ns"):
@@ -2334,32 +2352,42 @@ class Run:
             if transport.get("mooncake") and request in transport.get(
                 "member_shares", {}
             ):
+                mooncake_member = True
+                share_bytes, share_desc, _ = transport["member_shares"][
+                    request
+                ]
+                byte_parts.append(share_bytes)
+                desc_parts.append(share_desc)
                 if not transport.get("confirmed"):
                     # planned, never confirmed: the batch's write did not
-                    # complete, so the rows carry no confirmed bytes
+                    # complete
                     planned = True
-                else:
-                    mooncake_member = True
-                    share_bytes, share_desc, _ = transport["member_shares"][
-                        request
-                    ]
-                    bytes_total = (bytes_total or 0) + (
-                        share_bytes if share_bytes is not None else 0
-                    )
-                    if share_bytes is None and share_desc is None:
-                        planned = True
-                    if share_desc is not None:
-                        desc_total += share_desc
+                    write = transport.get("batch_write") or "did not complete"
+                    unconfirmed.append(f"batch write {write}")
+                elif transport.get("partition") != "exact":
+                    reasons = "; ".join(transport.get("partition_reasons") or [])
+                    status = transport.get("partition") or "unknown"
+                    unconfirmed.append(f"batch partition {status}"
+                                       + (f": {reasons}" if reasons else ""))
             else:
-                value = transport.get("bytes")
-                if value is not None:
-                    bytes_total = (bytes_total or 0) + value
-                if transport.get("descriptors") is not None:
-                    desc_total += transport["descriptors"]
+                byte_parts.append(transport.get("bytes"))
+                desc_parts.append(transport.get("descriptors"))
+                if transport.get("state") != "completed":
+                    unconfirmed.append(f"transfer {transport.get('state')}")
             if transport.get("thread") is not None:
                 tids.add(transport["thread"])
             if transport.get("planned_basis"):
                 planned = True
+        bytes_total = (sum(byte_parts) if byte_parts
+                       and all(v is not None for v in byte_parts) else None)
+        if transports and bytes_total is None:
+            # a completed transfer whose byte count was not recorded cannot
+            # confirm an amount (a recorded zero can)
+            missing = sum(1 for v in byte_parts if v is None)
+            unconfirmed.append(f"byte count not recorded ({missing} of "
+                               f"{len(byte_parts)} transfer(s))")
+        desc_total = (sum(desc_parts) if desc_parts
+                      and all(v is not None for v in desc_parts) else None)
         bases = sorted({
             transport.get("throughput_basis") for transport in transports
             if transport.get("throughput_basis")
@@ -2464,13 +2492,15 @@ class Run:
             "peak_concurrency": peak,
             "mib": (round(bytes_total / 2 ** 20, 3)
                     if bytes_total is not None else None),
-            "descriptors": desc_total if desc_total else None,
+            "descriptors": desc_total,
             "posting_thread_cpu": post_cpu,
-            "bytes_basis": ("batch member share (confirmed)"
-                            if mooncake_member and not planned
-                            else "batch member share (planned, not "
-                            "confirmed)" if planned and mooncake_member
-                            else "completed payload"),
+            "bytes_basis": (
+                ("batch member share" if mooncake_member else "transfer payload")
+                + (f" (not confirmed: {', '.join(sorted(set(unconfirmed)))})"
+                   if unconfirmed else " (confirmed)" if mooncake_member
+                   else " (completed)")
+                if transports else "no transfer attached"),
+            "bytes_confirmed": bool(transports) and not unconfirmed,
             "planned_symbol": planned,
             "failures": entry.get("failures"),
             "not_recorded": ["prefill_window", "kv_wait", "decode_window",

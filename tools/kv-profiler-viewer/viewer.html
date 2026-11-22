@@ -57,6 +57,7 @@ tbody tr:hover { background: var(--grid); }
 tbody tr[aria-selected="true"] { background: var(--sel); }
 td.hi { color: var(--slow); font-weight: 600; }
 td.na { color: var(--absent); }
+td .uc { color: var(--absent); font-size: 0.85em; font-style: italic; }
 td .bar { display: inline-block; height: 7px; border-radius: 2px; background: var(--muted); opacity: .5; vertical-align: middle; margin-right: 4px; }
 td .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
 .detail { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 10px; }
@@ -516,8 +517,8 @@ const COLS = [
   ["read", "READ ms", r => r.read_ms.length ? ms(Math.max(...r.read_ms)) : UNAVAIL, r => isSlow(r)],
   ["gbs", "GB/s", r => r.gbs.length ? Math.max(...r.gbs).toFixed(2) : UNAVAIL, r => isSlow(r)],
   ["conc", "peak conc", r => r.peak_concurrency ?? UNAVAIL],
-  ["mib", "MiB", r => r.mib ?? UNAVAIL, null, r => r.bytes_basis],
-  ["descriptors", "desc", r => r.descriptors ?? UNAVAIL],
+  ["mib", "MiB", r => amount(r, r.mib), null, r => r.bytes_basis],
+  ["descriptors", "desc", r => amount(r, r.descriptors), null, r => r.bytes_basis],
   ["state", "state", r => esc(r.state), "l"],
   ["cpu", "ReadThr CPU % · shared", r => r.posting_thread_cpu == null ? UNAVAIL : Math.round(r.posting_thread_cpu * 100)],
   ["rtt", "RTT max µs · cand.", r => r.rtt_max_us_cand == null ? UNAVAIL : Math.round(r.rtt_max_us_cand), null, r => r.candidate_basis],
@@ -548,6 +549,13 @@ function cmpSort(a, b) {
   if (typeof a === "number" && typeof b === "number") return a < b ? -1 : a > b ? 1 : 0;
   const x = String(a), y = String(b);
   return x < y ? -1 : x > y ? 1 : 0;
+}
+// A byte or descriptor amount: n/r when unknown; an amount the records do not
+// confirm (a failed write's planned share, a share that does not partition its
+// batch, a missing byte count) carries a visible qualifier, its reason in the tooltip.
+function amount(r, v) {
+  if (v == null) return UNAVAIL;
+  return r.bytes_confirmed ? String(v) : `${v} <span class="uc">unconfirmed</span>`;
 }
 // A request-timeline value (phase 4), or n/r with the reason it is unavailable.
 function tl(r, field) {

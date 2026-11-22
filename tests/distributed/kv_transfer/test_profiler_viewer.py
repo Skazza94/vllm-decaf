@@ -775,7 +775,7 @@ def write_mooncake_fixture(tmp_path, clock_d=None, clock_p=None,
     # consumer side
     sched = l1_metadata("mc-d-sched", clock_d, role="scheduler",
                         kv_role="kv_consumer", engine_id="engine-d",
-                        run_id=run_id, boot=boot)
+                        run_id=run_id, boot=boot, connector="mooncake")
     d_events = [
         l1_event("request_bind", start_d + 1_000, request_ref=1, subject=1),
         l1_event("request_bind", start_d + 1_100, request_ref=2, subject=1),
@@ -796,7 +796,9 @@ def write_mooncake_fixture(tmp_path, clock_d=None, clock_p=None,
         l1_event("transfer_bind", start_p + 10_000, transfer=1,
                  subject=0, aux0=2),
         l1_event("prepared", start_p + 11_000, transfer=1),
-        l1_event("post_begin", start_p + 12_000, transfer=1),
+        # the write's own totals ride its post_begin, as the adapter records them
+        l1_event("post_begin", start_p + 12_000, transfer=1, bytes=1_000,
+                 selected_descriptors=10),
         l1_event("post_return", start_p + 300_000, transfer=1,
                  duration0_ns=288_000),
         # member rows: shares partition the batch exactly; each member
@@ -828,21 +830,24 @@ def write_mooncake_fixture(tmp_path, clock_d=None, clock_p=None,
     frag5 = dict_fragment(5, "engine-p")
 
     def make(events, meta):
-        rows = [meta, frag1, frag2, frag3, frag4, frag5]
-        seq = 3
-        for row in events:
-            row = dict(row)
-            row["sequence"] = seq
-            seq += 1
-            rows.append(row)
+        # every row after the metadata numbered 1..N, as a closed recorder
+        # writes them (no gap, nothing dropped: no capture loss)
+        rows = [meta, *(dict(row) for row in
+                        (frag1, frag2, frag3, frag4, frag5, *events))]
+        for sequence, row in enumerate(rows[1:], 1):
+            row["sequence"] = sequence
         rows.append({"schema": 1, "type": "end", "complete": True,
-                     "stats": {}})
+                     "stats": {"head": len(rows) - 1, "tail": len(rows) - 1}})
         return rows
 
     write_capture(base / "d" / "events.jsonl",
                   make(d_events, sched))
     write_capture(base / "p" / "events.jsonl",
                   make(p_events, worker))
+    # the producer worker's own report, as a closed recorder writes it
+    (base / "p" / "profiler.json").write_text(json.dumps(
+        {"saved": True, "complete": True, "hook_errors": 0,
+         "observation_complete": True}))
     write_capture(base / "ps" / "events.jsonl",
                   make(psched_events, prod))
     # no cross-clock evidence in this fixture: same boot, one domain
@@ -1689,3 +1694,134 @@ def test_a_mapping_of_another_clock_is_refused_before_selection(
             if e.get("aligned") and e.get("used", True)]
     assert [e["local_generation"] for e in used] == [first["clock_id"]]
     assert used[0]["drift_known"] is False
+
+
+def _mooncake_edit(viewer_module, tmp_path, edit):
+    """The Mooncake fixture with its producer worker's records edited, then the run's request rows."""
+    base, _ = write_mooncake_fixture(tmp_path)
+    p_file = base / "p" / "events.jsonl"
+    rows = [json.loads(line) for line in p_file.read_text().splitlines()]
+    rows = edit(rows) or rows
+    for i, e in enumerate(rows[1:-1], 1):
+        e["sequence"] = i
+    write_capture(p_file, rows)
+    run = viewer_module.ViewerApp([str(base)]).run(0)
+    return {r["key"]["request"]: r for r in run.request_rows}
+
+
+def _member(rows, request_ref):
+    return next(e for e in rows if e.get("kind") == "request_bind"
+                and e.get("subject") == 6 and e.get("request_ref") == request_ref)
+
+
+def test_a_share_that_does_not_partition_its_batch_is_not_confirmed(
+    viewer_module, tmp_path
+):
+    """A member recording more bytes than its batch wrote breaks the summary's
+    partition: the viewer reports that share as not confirmed, with the reason."""
+    def doubled(rows):
+        _member(rows, 1)["bytes"] = 1200
+
+    row = _mooncake_edit(viewer_module, tmp_path, doubled)["mc-req-1"]
+    assert row["bytes_confirmed"] is False
+    assert "not confirmed: batch partition mismatch" in row["bytes_basis"]
+
+
+def test_an_unknown_share_is_unavailable_never_zero(viewer_module, tmp_path):
+    """A member whose share was not recorded has no bytes to show: unavailable,
+    not 0, and the batch's partition cannot confirm the other share either."""
+    def removed(rows):
+        _member(rows, 1)["bytes"] = None
+
+    rows = _mooncake_edit(viewer_module, tmp_path, removed)
+    assert rows["mc-req-1"]["mib"] is None
+    assert rows["mc-req-2"]["bytes_confirmed"] is False
+
+
+def test_a_recorded_zero_descriptor_count_stays_zero(viewer_module, tmp_path):
+    """A share of zero descriptors, recorded, is a measured zero."""
+    def zero(rows):
+        _member(rows, 1)["selected_descriptors"] = 0
+        _member(rows, 2)["selected_descriptors"] = 10
+
+    rows = _mooncake_edit(viewer_module, tmp_path, zero)
+    assert rows["mc-req-1"]["descriptors"] == 0
+    assert rows["mc-req-1"]["bytes_confirmed"] is True
+
+
+def test_a_failed_write_s_shares_are_labelled_not_confirmed(
+    viewer_module, tmp_path
+):
+    """A batch whose write failed confirmed nothing: its members' rows say so."""
+    def failed(rows):
+        complete = next(e for e in rows if e.get("kind") == "complete_observed")
+        rows[rows.index(complete)] = l1_event(
+            "failed", complete["time_ns"], transfer=1, subject=1, status=5)
+
+    row = _mooncake_edit(viewer_module, tmp_path, failed)["mc-req-1"]
+    assert row["bytes_confirmed"] is False
+    assert "not confirmed: batch write failed" in row["bytes_basis"]
+
+
+def test_a_completed_read_without_a_byte_count_confirms_no_amount(
+    viewer_module, tmp_path
+):
+    """A NIXL read that completed but whose byte count was not recorded keeps
+    its completed state and confirms no amount (the basis says why); a recorded
+    zero byte count is a measured amount and confirms."""
+    def run_with(value):
+        base = write_l1_transfer_fixture(tmp_path / str(value))
+        path = base / "b" / "events.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        for row in rows:
+            if row.get("kind") == "complete_observed":
+                row["bytes"] = value
+        write_capture(path, rows)
+        return viewer_module.ViewerApp([str(base)]).run(0).request_rows
+
+    for row in run_with(None):
+        if row["transports"]:
+            assert row["state"] == "completed"
+            assert row["mib"] is None and row["bytes_confirmed"] is False
+            assert "byte count not recorded" in row["bytes_basis"]
+    zero = [row for row in run_with(0) if row["transports"]]
+    assert zero and all(r["mib"] == 0.0 and r["bytes_confirmed"] for r in zero)
+
+
+def test_the_table_marks_an_unconfirmed_amount_beside_the_number(
+    viewer_module, l1_run
+):
+    """An amount the records do not confirm carries a visible qualifier in its
+    cell (its reason in the tooltip); a confirmed amount is a bare number; the
+    transfer state column is unchanged."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is not installed: the page's JavaScript cannot run here")
+    run, _ = l1_run
+    data = run.api_data()
+    records = run.api_records(run.request_rows[0]["key"]["scheduler_process_id"],
+                              run.request_rows[0]["key"]["request"], 0)
+    confirmed = json.loads(json.dumps(data["requests"][0]))
+    unconfirmed = json.loads(json.dumps(confirmed))
+    confirmed.update(mib=141.75, bytes_confirmed=True, state="completed",
+                     bytes_basis="batch member share (confirmed)")
+    unconfirmed.update(mib=283.5, bytes_confirmed=False, state="completed",
+                       bytes_basis="batch member share (not confirmed: "
+                       "batch partition mismatch)")
+    unconfirmed["key"] = {**unconfirmed["key"],
+                          "request": unconfirmed["key"]["request"] + "-u"}
+    unconfirmed["display"] = unconfirmed["display"] + "-u"
+    data["requests"] = [confirmed, unconfirmed]
+    payload = {"run": run.api_run(), "data": data, "config": run.api_config(),
+               "records": records}
+    out = subprocess.run(
+        [node, str(Path(__file__).with_name("_viewer_page_test.mjs")),
+         str((VIEWER.parent / "viewer.html").resolve())],
+        input=json.dumps(payload), capture_output=True, text=True, timeout=120,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    table = json.loads(out.stdout)["tableHtml"]
+    assert '283.5 <span class="uc">unconfirmed</span>' in table
+    assert "batch partition mismatch" in table
+    assert ">141.75<" in table and '141.75 <span class="uc">' not in table
+    assert table.count(">completed<") == 2
