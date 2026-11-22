@@ -1732,7 +1732,7 @@ class MooncakeConnectorWorker:
         """
         sock = self.async_zmq_ctx.socket(zmq.ROUTER)
         self.side_channel_port = sock.bind_to_random_port(f"tcp://{self.hostname}")
-        logger.debug(
+        logger.info(
             "Mooncake sender starting listening on path: tcp://%s:%d",
             self.hostname,
             self.side_channel_port,

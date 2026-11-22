@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import inspect
 import json
+import re
 import math
 from pathlib import Path
 import time
@@ -79,7 +80,8 @@ class Side:
     # A list: one per tensor-parallel rank, which every DP rank's TP rank of
     # that index uses (any prefill DP rank may pair with any decode DP rank).
     kv_network: str | list[str]
-    # > 1: an MoE model's data-parallel attention with expert parallelism.
+    # > 1: an MoE model's data-parallel attention with expert parallelism, or
+    # a dense model's independent engines (internal load balancing).
     data_parallel_size: int = 1
     tensor_parallel_size: int | None = None
     """This instance's TP size; None: the server's. Unequal sizes (one
@@ -431,6 +433,9 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
         raise ValueError(f"router.dp_routing is one of {', '.join(DP_ROUTINGS)}, not {run.router.dp_routing!r}")
     if run.router.dp_routing == "rank" and run.prefill.data_parallel_size == run.decode.data_parallel_size == 1:
         raise ValueError("router.dp_routing: rank needs a side with data_parallel_size > 1")
+    if run.router.dp_routing == "rank" and moe_of(run.model) is False:
+        raise ValueError("router.dp_routing: rank needs an MoE model: a dense model's DP ranks are served by one "
+                         "server (vLLM refuses external load balancing for it)")
     if run.router.dp_routing == "rank" and run.server.connector != "nixl":
         # vLLM launches a Mooncake bootstrap server for each external-LB
         # prefill server (mooncake_connector.py's should_launch_bootstrap_
@@ -522,6 +527,40 @@ def plain_mla_of(model: Path) -> bool:
             and not any("index_topk" in source for source in sources)
             and not any(source.get("model_type") in ("deepseek_v4", "kimi_k3", "kimi_linear")
                         for source in sources))
+
+
+MOE_EXPERT_KEYS = ("num_experts", "moe_num_experts", "n_routed_experts", "num_local_experts")
+
+
+def moe_of(model: Path) -> bool | None:
+    """Whether the model is an MoE one, from its config as vLLM's ``is_moe``
+    reads it (``get_num_experts`` of the text config: the first expert-count
+    field present, the first of a list, else the largest ``n_routed_experts``
+    of a heterogeneous model's MoE ``block_configs``): its DP ranks are
+    data-parallel attention with expert parallelism; a dense model's are
+    independent engines. None: the config is not fetched yet."""
+    try:
+        config = json.loads((Path(model) / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    text = next((config[key] for key in ("text_config", "llm_config") if isinstance(config.get(key), dict)
+                 and config[key]), config)
+    experts = next((text[key] for key in MOE_EXPERT_KEYS if key in text), 0)
+    if isinstance(experts, list):
+        # vLLM takes a list's first element and goes no further.
+        return bool(experts[0]) if experts else False
+    if not experts:
+        experts = max((block.get("n_routed_experts") or 0 for block in text.get("block_configs") or []
+                       if isinstance(block, dict) and block.get("block_type") == "moe"), default=0)
+    return bool(experts)
+
+
+def _moe_for_launch(run: Run) -> bool:
+    moe = moe_of(run.model)
+    if moe is None:
+        raise ValueError(f"data parallelism needs the model's config ({run.model}) to tell an MoE model's "
+                         "ranks from a dense model's: fetch it first")
+    return moe
 
 
 def _check_dcp(run: Run) -> None:
@@ -867,7 +906,11 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
                    # Explicit selection prevents another installed backend from taking over.
                    "kv_connector_extra_config": {"backends": [nixl_backend(run.server)]} if nixl else {"mooncake_protocol": "tcp"}}
     if non_tent or len(set(kv_addresses)) > 1:
-        kv_transfer["kv_connector_extra_config"]["rank_addresses"] = kv_addresses * side.data_parallel_size
+        # An MoE instance's engines list their ranks in turn (DP by TP); a
+        # dense model's engines are independent, each listing its TP ranks.
+        kv_transfer["kv_connector_extra_config"]["rank_addresses"] = (
+            kv_addresses * side.data_parallel_size if side.data_parallel_size > 1 and _moe_for_launch(run)
+            else kv_addresses)
     connector_env = {
         # NIXL's handshake and its Mooncake backend's segment on the KV network.
         "VLLM_NIXL_SIDE_CHANNEL_HOST": kv_address, "NIXL_MOONCAKE_IP_ADDR": kv_address,
@@ -913,7 +956,8 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         "--max-num-batched-tokens", str(s.max_num_batched_tokens), "--max-num-seqs", str(s.max_num_seqs),
         "--tensor-parallel-size", str(side.tp(s)),
         *_decode_context_parallel_flags(side),
-        *(["--data-parallel-size", str(side.data_parallel_size), "--enable-expert-parallel"]
+        *(["--data-parallel-size", str(side.data_parallel_size),
+           *(["--enable-expert-parallel"] if _moe_for_launch(run) else [])]
           if side.data_parallel_size > 1 else []),
         # Per-rank routing: an API server a rank, on ``port`` + rank.
         *(["--data-parallel-multi-port-external-lb", "--data-parallel-size-local", str(side.data_parallel_size),
@@ -932,6 +976,176 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
         *_precise_index_flags(run, endpoint),
         "--simulate-forward",
     ]
+
+
+# Run in a prefill node after the workload: Mooncake's bootstrap server's reply (what each engine published) and
+# each process's listening sockets with its place in the process tree, to compare them.
+_BOOTSTRAP_PROBE = r"""
+import json, os, re, socket, sys, urllib.request
+query = json.load(urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/query", timeout=30))
+sockets = {}
+for family in ("tcp", "tcp6"):
+    for line in open(f"/proc/net/{family}").read().splitlines()[1:]:
+        fields = line.split()
+        if fields[3] == "0A":
+            host, port = fields[1].rsplit(":", 1)
+            address = socket.inet_ntoa(bytes.fromhex(host)[::-1]) if family == "tcp" else (
+                "::" if not int(host, 16) else host)
+            sockets[fields[9]] = f"{address}:{int(port, 16)}"
+processes = {}
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        ppid = int(re.search(r"PPid:\s+(\d+)", open(f"/proc/{pid}/status").read()).group(1))
+        listening = []
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            match = re.match(r"socket:\[(\d+)\]", os.readlink(f"/proc/{pid}/fd/{fd}"))
+            if match and match.group(1) in sockets:
+                listening.append(sockets[match.group(1)])
+        processes[pid] = {"ppid": ppid, "comm": open(f"/proc/{pid}/comm").read().strip(),
+                          "cmdline": open(f"/proc/{pid}/cmdline").read().replace("\0", " ").strip()[:160],
+                          "listening": sorted(set(listening))}
+    except (OSError, AttributeError):
+        pass
+engines, senders = {}, {}
+for line in open(sys.argv[2], errors="replace"):
+    match = re.match(r"\((\S+) pid=(\d+)\).*Creating v1 connector with name: \S+ and engine_id: (\S+)", line)
+    if match:
+        engines[match.group(2)] = {"title": match.group(1), "engine_id": match.group(3)}
+    match = re.match(r"\((\S+) pid=(\d+)\).*Mooncake sender starting listening on path: tcp://(\S+)", line)
+    if match:
+        senders[match.group(2)] = match.group(3)
+print(json.dumps({"query": query, "processes": processes, "engines": engines, "senders": senders}))
+"""
+
+
+def _bootstrap_evidence(run: Run, container: dict[str, str], output: Path,
+                        kv_addresses: dict[str, list[str]]) -> None:
+    """Mooncake's bootstrap server's published workers, with the prefill
+    nodes' listeners (``bootstrap-<node>.json``): decode indexes the reply by
+    engine id and ignores its DP key, so the key, rank and address of each
+    entry are compared here with the worker that listens."""
+    if run.server.connector != "mooncake":
+        return
+    for node in run.prefill.nodes:
+        probe = topology.exec_in(container[node], ["/opt/venv/bin/python", "-c", _BOOTSTRAP_PROBE,
+                                                    str(BOOTSTRAP_PORT), f"{WORK}/logs/prefill.log"])
+        found = json.loads(probe)
+        found["kv_addresses"] = kv_addresses[node]
+        (output / f"bootstrap-{node}.json").write_text(json.dumps(found, indent=2) + "\n")
+
+
+def bootstrap_problems(found: dict, data_parallel_size: int, tp_size: int, node: str) -> list[str]:
+    """Each worker a prefill node's bootstrap server publishes against the
+    one that serves it. The reply (``query``) must hold exactly the node's
+    DP ranks (compared as sets of integers), each entry an object with its
+    engine's id and exactly its TP ranks, one pipeline stage each; every
+    published address must be on the rank's own KV address and be the
+    sender endpoint one process logged binding (``senders``: pid -> the
+    ``host:port`` its connector logged binding at startup) that is also listening, and
+    that process must have logged the engine id this rank publishes (the
+    full id, the engine's own: with several DP ranks ``<server id>_dp<rank>``),
+    its title saying the TP rank, and be, or be a child of, the engine process
+    of that DP rank. ``processes``: pid -> parent pid, title, listening
+    ``host:port`` sockets; ``engines``: pid -> the title and engine id its
+    connector logged."""
+    parts = [found.get(name) for name in ("query", "processes", "engines", "kv_addresses")]
+    senders = found.get("senders")
+    if not all(isinstance(part, dict) for part in (*parts[:3], senders)) or not isinstance(parts[3], list):
+        return [f"{node}'s bootstrap evidence is malformed"]
+    query, processes, engines, kv = parts
+    problems = []
+
+    def ranks(mapping: dict, what: str) -> dict[int, object]:
+        found_ranks = {}
+        for key, value in mapping.items():
+            if isinstance(key, str) and re.fullmatch(r"0|[1-9][0-9]*", key):
+                found_ranks[int(key)] = value
+            else:
+                problems.append(f"{node}: {what} has the rank key {key!r}")
+        return found_ranks
+
+    published = ranks(query, "the bootstrap reply")
+    if set(published) != set(range(data_parallel_size)):
+        problems.append(f"{node}'s bootstrap server publishes DP ranks {sorted(published)}, "
+                        f"not 0..{data_parallel_size - 1}")
+    ids = {}
+    for dp in sorted(set(published) & set(range(data_parallel_size))):
+        entry = published[dp]
+        if not (isinstance(entry, dict) and isinstance(entry.get("engine_id"), str)
+                and isinstance(entry.get("worker_addr"), dict)):
+            problems.append(f"{node}: DP rank {dp}'s entry is malformed: {entry!r}")
+            continue
+        engine_id = entry["engine_id"]
+        ids[dp] = engine_id
+        workers = ranks(entry["worker_addr"], f"DP rank {dp}")
+        if set(workers) != set(range(tp_size)):
+            problems.append(f"{node}: DP rank {dp} publishes TP ranks {sorted(workers)}, not 0..{tp_size - 1}")
+        for tp in sorted(set(workers) & set(range(tp_size))):
+            stages = workers[tp]
+            where = f"{node}: published (DP {dp}, TP {tp})"
+            if not (isinstance(stages, dict) and set(stages) == {"0"} and isinstance(stages["0"], str)):
+                problems.append(f"{where} has pipeline stages {stages!r}, not stage 0")
+                continue
+            address = stages["0"]
+            match = re.fullmatch(r"tcp://([0-9.]+):(\d+)", address)
+            if not match or tp >= len(kv) or match[1] != kv[tp]:
+                problems.append(f"{where} at {address}: not on TP rank {tp}'s KV address "
+                                f"{kv[tp] if tp < len(kv) else None}")
+                continue
+            endpoint = address.removeprefix("tcp://")
+            owners = [pid for pid, sender in senders.items() if sender == endpoint]
+            if len(owners) != 1:
+                problems.append(f"{where} at {address}: {len(owners)} process(es) logged binding that sender endpoint")
+                continue
+            pid = owners[0]
+            process = processes.get(pid)
+            if not isinstance(process, dict) or endpoint not in process.get("listening", []):
+                problems.append(f"{where} at {address}: the process {pid} that bound it does not listen there")
+                continue
+            logged = engines.get(pid)
+            if not isinstance(logged, dict) or logged.get("engine_id") != engine_id:
+                problems.append(f"{where} at {address}: engine id {engine_id}, but its listener "
+                                f"logged {logged and logged.get('engine_id')}")
+            title = logged.get("title") if isinstance(logged, dict) else None
+            if not isinstance(title, str):
+                problems.append(f"{where} at {address}: its listener logged no title")
+                continue
+            rank = re.search(r"_TP(\d+)", title)
+            if (int(rank[1]) if rank else 0) != tp or (rank is None and tp_size != 1):
+                problems.append(f"{where} at {address}: its listener is {title or None}")
+            parent = (processes.get(str(process.get("ppid"))) or {}).get("cmdline")
+            engine = f"VLLM::EngineCore_DP{dp}" if data_parallel_size > 1 else "VLLM::EngineCore"
+            if engine not in (process.get("cmdline"), parent):
+                problems.append(f"{where} at {address}: its listener belongs to {parent}, not {engine}")
+    if len(set(ids.values())) != len(ids):
+        problems.append(f"{node}: the DP ranks share an engine id: {sorted(ids.values())}")
+    if data_parallel_size > 1:
+        if any(not i.endswith(f"_dp{dp}") for dp, i in ids.items()):
+            problems.append(f"{node}: an engine id is not its DP rank's (`<id>_dp<rank>`): {ids}")
+        if len({i.rsplit("_dp", 1)[0] for i in ids.values()}) > 1:
+            problems.append(f"{node}: the DP ranks' engine ids are of different servers: {ids}")
+    return problems
+
+
+def _bootstrap_verdict(run: Run, output: Path) -> list[str]:
+    """`bootstrap_problems` of every prefill node of a Mooncake run, from the
+    evidence the run saved; missing evidence is a problem."""
+    if run.server.connector != "mooncake":
+        return []
+    problems = []
+    for node in run.prefill.nodes:
+        saved = output / f"bootstrap-{node}.json"
+        if not saved.exists():
+            problems.append(f"{node}'s bootstrap evidence ({saved.name}) is missing")
+            continue
+        try:
+            found = json.loads(saved.read_text())
+            problems.extend(bootstrap_problems(found, run.prefill.data_parallel_size, run.prefill.tp(run.server),
+                                               node) if isinstance(found, dict) else
+                            [f"{node}'s bootstrap evidence is malformed"])
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            problems.append(f"{node}'s bootstrap evidence is malformed ({type(error).__name__}: {error})")
+    return problems
 
 
 def execute(run: Run, output: Path | None = None) -> dict:
@@ -999,6 +1213,7 @@ def execute(run: Run, output: Path | None = None) -> dict:
         ports_after = router_ports(state)
         control_after = network_ports(state, run.control_network)
         tent_after = _tent_metrics(run, container)
+        _bootstrap_evidence(run, container, output, {n: instances['prefill'][n]['kv'] for n in run.prefill.nodes})
     finally:
         try:
             _collect(run, container, output)
@@ -1029,6 +1244,7 @@ def execute(run: Run, output: Path | None = None) -> dict:
            for dp, tp in getattr(run, role).ranks(getattr(run, role).tp(run.server))]
           for role in ("prefill", "decode")],
         routers, run, tent, ports or None, exempt)
+    verdict["problems"].extend(_bootstrap_verdict(run, output))
     llmd.recheck(output, run, verdict)
     (output / "verdict.json").write_text(json.dumps(verdict, indent=2) + "\n")
     if verdict["problems"]:
@@ -1061,6 +1277,7 @@ def recheck(output: str | Path) -> dict:
         None if not uses_tent(run.server) else json.loads((output / "tent.json").read_text()),
         json.loads(ports.read_text()) if ports.exists() else None,
         control_saved)
+    verdict["problems"].extend(_bootstrap_verdict(run, output))
     llmd.recheck(output, run, verdict)
     (output / "verdict-recheck.json").write_text(json.dumps(verdict, indent=2) + "\n")
     return verdict

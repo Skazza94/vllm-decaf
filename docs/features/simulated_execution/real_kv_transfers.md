@@ -283,8 +283,21 @@ An MoE model's data-parallel attention with expert parallelism
   both instances. This needs NIXL, as `MooncakeConnector`'s bootstrap server is
   one an instance.
 
-Not supported: pipeline or prefill context parallelism, nor data parallelism of
-dense models (independent engines).
+A dense model's DP ranks (`--data-parallel-size N`, no expert parallelism) are
+independent engines, each a tensor-parallel instance of its own, and take every
+layout a single instance takes:
+
+- vLLM launches all N engines from one server (its internal load balancer): the
+  ranks must be on one host, and an external or hybrid load balancer is
+  refused. Each engine holds its own requests' KV, names itself in its transfer
+  parameters like an MoE DP rank, and pairs with whichever DP rank serves the
+  request on the other instance; the instances' DP sizes may differ.
+- `rank_addresses` lists one address per TP rank, which every engine of the
+  instance uses (an MoE instance lists its DP ranks' too, DP by TP).
+- Every other check reads what each engine holds, a data-parallel size of 1:
+  a dense layout is admitted at DP N where it is at DP 1.
+
+Not supported: pipeline or prefill context parallelism.
 
 ### Decode context parallelism
 
@@ -320,10 +333,15 @@ TP size, the TP sizes one dividing the other.
   simulator checks both instances' scope, including the side of DCP 1: this
   instance's from its config, the producer's from its NIXL metadata
   (`simulated_scope`).
+- **Data parallelism**: a dense model's DP ranks are independent engines, so
+  the simulator admits each as the DCP engine it is, as at DP 1 (a dense MLA
+  model over NIXL's pull connector; Mooncake's connector stays refused). That
+  is a configuration check: the e2e launcher refuses DCP with data parallelism
+  or several instances, and no byte-checked run covers the combination.
 - **Refused with DCP**: Mooncake's connector (which slices no page by DCP
-  rank), NIXL's push connector, speculative decoding, pipeline, prefill
-  context or data parallelism, expert parallelism and TP sizes neither of which
-  divides the other, on either side.
+  rank), NIXL's push connector, speculative decoding, pipeline or prefill
+  context parallelism, an MoE model's data parallelism, expert parallelism and
+  TP sizes neither of which divides the other, on either side.
 
 ## Block sizes and kernel geometry
 
