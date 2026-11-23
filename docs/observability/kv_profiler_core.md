@@ -7,8 +7,9 @@ start no profiler helpers and record no events.
 
 The native recorder requires Linux tmpfs and GIL-enabled CPython.
 
-Overhead was measured with two-node serving A/Bs of one workload, profiler off
-against on, on latency and throughput: the NIXL pull connector at concurrency one.
+The profiler levels' overhead was measured with two-node serving A/Bs of one
+workload, profiler off against on, on latency and throughput: the NIXL pull
+connector at concurrency one.
 
 - Over UCX/TCP, L2 passed every check. L1 (with the request timelines) and L3
   passed throughput and every mean latency; their 95% upper bounds for p99 time to
@@ -16,9 +17,16 @@ against on, on latency and throughput: the NIXL pull connector at concurrency on
   accepted after review of those results.
 - Over UCX/RDMA, L1, L2 and L3 together passed every check.
 
+We measured how enabling eBPF changed serving performance with L3 enabled in both
+arms of a two-node NIXL pull benchmark over UCX/TCP at concurrency one. With the
+KV-link address filters, throughput, all mean latencies and p99 inter-token
+latency passed. The upper 95% bounds for p99 time to first token and p99
+end-to-end latency exceeded their limits. The gate recorded FAIL, and we accepted
+an exception for this filtered workload. Host-wide tracing also exceeded its p99
+end-to-end limit.
+
 Other workloads and connectors are not covered by these measurements. Not yet
-qualified: GPU execution, the overhead of the eBPF collector (its live attachment
-is validated; below), and exact socket/QP attribution.
+qualified: GPU execution and exact socket/QP attribution.
 
 ## Explicit library lifecycle
 
@@ -673,8 +681,7 @@ all of the side's KV role, each whole and closed (the observer package's
 L3 includes the L1 connector instrumentation (NIXL pull and the Mooncake
 adapter below) and declares an external observer. It is off by default. Transport
 metrics come from the separate L2 collector (below); eBPF is an opt-in collector
-of this observer (below): its live attachment is validated, its overhead not yet
-measured. Sampling, JSON formatting
+of this observer (below), validated live; its overhead is described above. Sampling, JSON formatting
 and kernel queries run in a separate endpoint process, never in a transfer
 callback. The native L1 ring ABI and transfer metrics are unchanged.
 
@@ -952,10 +959,13 @@ All four hooks must attach for this explicit mode. Required-source behavior rema
 `required: [ebpf]`; optional unavailability leaves other observations unchanged.
 
 The observer waits, bounded (10 s), for the collector's first answer (ready, or a
-status that it is unavailable) and only then marks its capture `ready` in its
-manifest, the signal a controller waits for: no workload event precedes the
-attachment, and loading is never sampled as a missing source. A collector still
-starting at the bound is `not_ready`. Coverage is never provably complete, so a
+status that it is unavailable) and marks its capture `ready` in its manifest, the
+signal a controller waits for, after that answer or when the bound expires. A
+collector still starting at the bound is `not_ready`: a failure when eBPF is
+required, even if it answers later. The endpoint capture can close cleanly with
+partial eBPF coverage. Without address lists, qualifying events across the whole
+network namespace (with host networking, the host's) are eligible for capture.
+Coverage is never provably complete, so a
 required eBPF source is judged on a clean run (`clean` in the stop record): ready
 and still available, no failure, the collector's own unfailed terminal record, a
 normal exit and its final resource accounting. Known event loss (endpoint ring or
@@ -966,19 +976,21 @@ family, port and address exclusions and global unknown exclusions are not loss.
 
 In the e2e harness an endpoint opts in with `probes.ebpf: {enabled: true,
 privileged_opt_in: true, mode: tcp_tracepoints, artifacts: <built directory>}`,
-both flags literal booleans. Its observer container then gets exactly
-`CAP_BPF` and `CAP_PERFMON` (never `CAP_SYS_ADMIN`) and the artifact directory
+both flags literal booleans. Its observer container then adds `CAP_BPF` and
+`CAP_PERFMON` (never `CAP_SYS_ADMIN`) and mounts the artifact directory
 read-only at the same absolute path. The run is refused before anything starts if that directory is not a complete built package: its manifest, collector, BPF object and limits, each matching its manifest hash, and an executable collector. A package of another schema (an earlier build, whose collector reads another plan) is refused with a request to rebuild it with `tools/kv-profiler-ebpf/build.sh`; the observer checks the same before launching it. Without the
-opt-in the observer gets neither. Live attachment has been validated on Linux 5.15
+opt-in the observer adds neither. Live attachment has been validated on Linux 5.15
 with Docker's default seccomp profile. With those two capabilities, all four hooks
-attached; without them, the collector reported itself unavailable with the
-kernel's error. Its retransmissions agreed with TCP_INFO's retransmission counters:
-one retransmit event can carry several segments, and the event's own
-`total_retrans` snapshot matched TCP_INFO's. Resets were compared across the two
-endpoints' eBPF events, not against TCP_INFO.
+attached. Without them, the missing effective privileges were reported before
+loading BPF; kernel load or attach failures carry their diagnostic. The final eBPF
+retransmitted-segment counter matched the final TCP_INFO sample on each
+retransmitting socket. TCP_INFO was polled intermittently. Reset totals agreed
+between the sending and receiving endpoints. L3 polled the current socket state,
+while eBPF recorded individual transitions.
 
-The ring has fixed 1 MiB data capacity, plus two one-entry 256-byte ARRAY values
-for control and loss counters. That is 1,049,088 bytes of ring/value capacity,
+The ring has fixed 1 MiB data capacity, plus two one-entry ARRAY values: 512 bytes
+of control (the port and address lists) and 256 bytes of loss counters. That is
+1,049,344 bytes of ring/value capacity,
 not physical kernel memory charge. Kernel bookkeeping and JIT memory are additional.
 Map fdinfo is diagnostic only; missing or large reported values are not a gate.
 No per-host qualification or per-kernel audit is required. Four programs/links,
