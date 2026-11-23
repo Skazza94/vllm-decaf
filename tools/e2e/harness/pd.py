@@ -348,7 +348,7 @@ class Profiler:
 
     transport: str = "tcp"
     clock_port_offset: int = 1000
-    flush: str = "end"
+    flush: str = "background"
     level: str = "l1"
     probes: dict = field(default_factory=dict)
     observer_cpus: dict = field(default_factory=dict)

@@ -69,6 +69,10 @@ class JsonlSink:
 
     def drain_to(self, stream, batch_records: int = 256, after_sequence: int = 0):
         begin, end, raw = self.ring.peek(batch_records)
+        if begin == end:
+            # nothing to write or acknowledge: an idle background drain does
+            # no I/O (the final rows are synced on their own)
+            return end
         for offset in range(0, len(raw), RECORD.size):
             row = decode_record(raw[offset : offset + RECORD.size])
             if row["sequence"] <= after_sequence:

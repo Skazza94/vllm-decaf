@@ -245,6 +245,36 @@ def test_only_one_reader_lease_and_output_failure_does_not_ack(rings, tmp_path):
     assert ring.stats()["tail"] == ring.stats()["head"]
 
 
+def test_an_empty_drain_does_no_io_and_a_nonempty_one_syncs_before_ack(
+    rings, tmp_path, monkeypatch
+):
+    """An idle background helper drains an empty ring every few milliseconds:
+    that must neither flush, sync nor acknowledge. A batch with records is still
+    written and synced before its acknowledgement."""
+    from vllm.kv_profiling import sink as sink_module
+
+    ring, path = rings()
+    syncs = []
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        syncs.append(ring.stats()["tail"])
+        real_fsync(fd)
+
+    monkeypatch.setattr(sink_module.os, "fsync", fsync)
+    output = tmp_path / "trace.jsonl"
+    with JsonlSink(str(path)) as sink, output.open("w+b", buffering=0) as stream:
+        for _ in range(50):
+            assert sink.drain_to(stream) == 0
+        assert syncs == [] and output.stat().st_size == 0
+        ring.record(*fields(request="request"))
+        end = sink.drain_to(stream)
+        assert end == ring.stats()["head"] > 0
+        # synced once, while the batch was still unacknowledged
+        assert syncs == [0] and ring.stats()["tail"] == end
+        assert sink.drain_to(stream) == end and syncs == [0]
+
+
 @pytest.fixture
 def recorders(tmp_path):
     resources = []
@@ -259,6 +289,8 @@ def recorders(tmp_path):
             id_bytes=4096,
             handle_slots=8,
             shutdown_timeout_s=2,
+            # ring semantics are tested deterministically: drained at close only
+            flush="end",
         )
         options.update(kwargs)
         config = NetworkProfilerConfig(**options)

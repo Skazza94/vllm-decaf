@@ -9,7 +9,8 @@ The native recorder requires Linux tmpfs and GIL-enabled CPython.
 
 The profiler levels' overhead was measured with two-node serving A/Bs of one
 workload, profiler off against on, on latency and throughput: the NIXL pull
-connector at concurrency one.
+connector at concurrency one. Every result below, the eBPF one included, was
+measured with `flush="end"`, not the default `background`.
 
 - Over UCX/TCP, L2 passed every check. L1 (with the request timelines) and L3
   passed throughput and every mean latency; their 95% upper bounds for p99 time to
@@ -126,8 +127,11 @@ Memory does not grow with the number of recorded transfers.
 
 ## Sink and shutdown
 
-`flush="end"` starts an idle helper and drains only at close.
-`flush="background"` drains in a separate process. The consumer owns a kernel
+`flush="background"` (the default) drains the ring while the run serves, in a
+separate process, so a capture is not bounded by the ring's size.
+`flush="end"` starts an idle helper and drains only at close: a capture then
+holds at most `ring_records` records per process, and later ones are counted as
+`drop_full`. The consumer owns a kernel
 reader lease, never the producer guard. Its death releases that lease.
 Readers copy a bounded batch, write and flush it, and only then acknowledge it.
 Every row, including metadata and the footer, uses complete-write handling.
@@ -664,8 +668,10 @@ itself guarantee that the recorders close.
 With data parallelism vLLM runs an API server process for each DP rank (its
 `--api-server-count` default), each with its own frontend recorder. At
 `--shutdown-timeout 0` the serving process force-kills them right after SIGTERM,
-before they close: their recorders keep only their metadata row, which records
-the timeout in effect (`shutdown_timeout_s`, `close_at_shutdown`). Every
+before they close. With `flush="end"` their recorders keep only their metadata
+row, which records the timeout in effect (`shutdown_timeout_s`,
+`close_at_shutdown`); with `flush="background"` the rows already written survive,
+and the capture is still incomplete. Every
 frontend records its process name as `api_server`: `MainProcess` with one API
 server, `ApiServer_<i>` with several, `APIServer_DPRank_<r>` for a DP rank's own
 server. Give such deployments a positive `--shutdown-timeout`, above
@@ -853,8 +859,8 @@ and polling rates. Large counter sets are chunked. It skips missed ticks rather
 than catching up, records gaps/loss and never fabricates completeness. Final
 manifests retain observer CPU/RSS accounting separately from serving and L1
 helpers. Off-vs-L3 serving overhead was measured only for the workload described
-at the top of this page, where its p99 latency bounds exceeded the gate and it
-was accepted after review.
+at the top of this page, with `flush="end"`, where its p99 latency bounds exceeded
+the gate and it was accepted after review.
 
 ### Capture inventory and deployment snapshot
 

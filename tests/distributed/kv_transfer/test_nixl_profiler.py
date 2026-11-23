@@ -1529,7 +1529,7 @@ def test_an_attached_profiler_records_what_was_requested_and_what_nixl_set_up(
         snapshot = p.recorder.metadata["config"]
         assert "config" not in p.recorder.metadata["context"]
         assert snapshot["profiler"]["level"] == "l1"
-        assert snapshot["profiler"]["flush"] == "end"
+        assert snapshot["profiler"]["flush"] == "background"
         assert snapshot["environment"]["UCX_TLS"] == "tcp,self"
         assert "UNRELATED_TOKEN" not in snapshot["environment"]
         kv = snapshot["vllm"]["kv_transfer"]
@@ -1794,7 +1794,7 @@ def test_settings_that_distinguish_runs_are_recorded(tmp_path, monkeypatch):
     monkeypatch.setenv("FI_TCP_IFACE", "eth1")
     cfg = _kv_config({"backends": ["LIBFABRIC"]})
     end = NetworkProfilerConfig(
-        level="l1", run_id=str(uuid4()), output_dir=str(tmp_path)
+        level="l1", run_id=str(uuid4()), output_dir=str(tmp_path), flush="end"
     )
     background = dataclasses.replace(end, flush="background")
     taken = []

@@ -38,7 +38,7 @@ class NetworkProfilerConfig:
     id_slots: int = 16384
     id_bytes: int = 8 << 20
     handle_slots: int = 4096
-    flush: str = "end"
+    flush: str = "background"
     transport: str = "unknown"
     clock: bool = True
     clock_port_offset: int = 1000
