@@ -5,7 +5,12 @@ the Mooncake connector and the frontend attach to it (see the adapters below).
 Without `kv_connector_extra_config["network_profiler"]` the serving processes
 start no profiler helpers and record no events.
 
-The native recorder requires Linux tmpfs and GIL-enabled CPython. Each recording
+The native recorder requires Linux tmpfs and GIL-enabled CPython, and its
+extension, `vllm._kv_profiler`, built into the installed `vllm` package. The
+normal build compiles it. A `VLLM_USE_PRECOMPILED=1` install does not, because
+the upstream wheel has none: build it as below. An enabled profiler without it
+fails at startup with an error that gives the build commands for that
+installation. Each recording
 process (every scheduler, worker and API server) allocates its ring in
 `shared_dir` (`/dev/shm` by default) when the profiler starts: 17.25 MiB at the
 default sizes. Docker's default `/dev/shm` (64 MB) holds three, fewer than a
@@ -48,12 +53,20 @@ qualified: GPU execution and exact socket/QP attribution.
 ## Explicit library lifecycle
 
 Build the `_kv_profiler` extension through the normal vLLM build, or build just
-this standalone target during development:
+this standalone target, for example after a `VLLM_USE_PRECOMPILED=1` install.
+It installs into `<prefix>/vllm`, so the prefix is the directory that holds the
+`vllm` package the service imports: the source tree for an editable install,
+`site-packages` otherwise. The startup error of an enabled profiler without the
+extension prints these commands for its own interpreter and prefix. To work them
+out yourself, run the service's interpreter in the service's environment from
+the source tree; `-P` keeps the current directory off the import path, so the
+source tree's `vllm` is not picked up by mistake.
 
 ```console
+python="$PWD/.venv/bin/python"  # the service's interpreter, absolute (not resolved)
+prefix=$("$python" -P -c 'import pathlib, vllm; print(pathlib.Path(vllm.__file__).resolve().parent.parent)')
 cmake -S csrc/kv_profiler -B build/kv-profiler \
-  -DPython_EXECUTABLE=.venv/bin/python \
-  -DCMAKE_INSTALL_PREFIX=.venv/lib/python3.12/site-packages
+  -DPython_EXECUTABLE="$python" -DCMAKE_INSTALL_PREFIX="$prefix"
 cmake --build build/kv-profiler
 cmake --install build/kv-profiler
 ```

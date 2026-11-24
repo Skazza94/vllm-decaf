@@ -29,6 +29,42 @@ def ring_bytes(config: NetworkProfilerConfig) -> int:
     return ((identities_end + 63) & ~63) + 2 * config.handle_slots * 32
 
 
+def _native_recorder():
+    """The native recorder, or, when it is not installed, an error that says so
+    and how to build it into the ``vllm`` package this process imports (an
+    editable checkout or site-packages). A present but unloadable extension
+    keeps its loader error."""
+    import importlib
+
+    try:
+        return importlib.import_module("vllm._kv_profiler")
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm._kv_profiler":
+            raise
+        import shlex
+
+        import vllm
+
+        package = Path(vllm.__file__).resolve().parent
+        interpreter = Path(sys.executable).absolute()
+        build = " ".join(
+            shlex.quote(part)
+            for part in (
+                "cmake", "-S", "csrc/kv_profiler", "-B", "build/kv-profiler",
+                f"-DPython_EXECUTABLE={interpreter}",
+                f"-DCMAKE_INSTALL_PREFIX={package.parent}",
+            )
+        )  # fmt: skip
+        raise ImportError(
+            "KV profiler: the native recorder (vllm._kv_profiler) is not "
+            f"installed in {package}. A VLLM_USE_PRECOMPILED=1 install skips it "
+            "(the upstream wheel has none); it needs Linux and GIL-enabled "
+            f"CPython. Build it from the source tree with: {build} && "
+            "cmake --build build/kv-profiler && cmake --install build/kv-profiler",
+            name="vllm._kv_profiler",
+        ) from exc
+
+
 def _no_room(config: NetworkProfilerConfig, error: OSError) -> OSError:
     """The ring did not fit in ``shared_dir``: say where, how much and what to do."""
     try:
@@ -81,7 +117,7 @@ class ProcessRecorder:
     ):
         if not config.enabled:
             raise ValueError("use open_recorder for a disabled configuration")
-        from vllm import _kv_profiler
+        _kv_profiler = _native_recorder()
 
         self.config = config
         self.process_id = str(uuid4())

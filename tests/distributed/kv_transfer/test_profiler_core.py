@@ -1767,3 +1767,62 @@ def test_a_relative_output_dir_is_anchored_when_the_recorder_opens(
     events = [json.loads(line) for line in lines]
     assert sum(row.get("type") == "event" for row in events) == 2
     assert not (elsewhere / "profiles").exists()
+
+
+def test_a_missing_native_recorder_says_why_and_how_to_build_it(
+    tmp_path, monkeypatch
+):
+    """An enabled profiler without the native extension (a precompiled install)
+    fails with an error naming the cause and the build into the imported
+    package, before anything is created in shared memory."""
+    import sys
+
+    import vllm
+
+    monkeypatch.setitem(sys.modules, "vllm._kv_profiler", None)
+    monkeypatch.delattr(vllm, "_kv_profiler", raising=False)  # set by earlier imports
+    monkeypatch.setattr(sys, "executable", "/opt/my env/bin/python")
+    shared = tmp_path / "shm"
+    shared.mkdir()
+    with pytest.raises(ImportError) as raised:
+        ProcessRecorder(_small(tmp_path, shared_dir=str(shared)))
+    message = str(raised.value)
+    package = Path(vllm.__file__).resolve().parent
+    for part in (
+        "native recorder (vllm._kv_profiler) is not installed",
+        "VLLM_USE_PRECOMPILED=1",
+        "cmake --install",
+    ):
+        assert part in message, (part, message)
+    # each argument shell-quoted: a path with a space stays one argument
+    import shlex
+
+    command = message.split("Build it from the source tree with: ", 1)[1]
+    first = shlex.split(command.split(" && ", 1)[0])
+    assert first == [
+        "cmake", "-S", "csrc/kv_profiler", "-B", "build/kv-profiler",
+        "-DPython_EXECUTABLE=/opt/my env/bin/python",
+        f"-DCMAKE_INSTALL_PREFIX={package.parent}",
+    ]  # fmt: skip
+    assert raised.value.name == "vllm._kv_profiler"
+    assert list(shared.iterdir()) == []
+
+
+def test_an_unloadable_native_recorder_keeps_its_loader_error(tmp_path, monkeypatch):
+    """A present extension the loader rejects is not reported as missing: its
+    own error comes through, without the installation hint."""
+    import sys
+
+    import vllm
+
+    broken = tmp_path / "vllm"
+    broken.mkdir()
+    (broken / "_kv_profiler.abi3.so").write_bytes(b"not an ELF")
+    monkeypatch.delitem(sys.modules, "vllm._kv_profiler", raising=False)
+    monkeypatch.delattr(vllm, "_kv_profiler", raising=False)
+    monkeypatch.setattr(vllm, "__path__", [str(broken), *vllm.__path__])
+    with pytest.raises(ImportError) as raised:
+        ProcessRecorder(_small(tmp_path))
+    assert not isinstance(raised.value, ModuleNotFoundError)
+    assert "not installed" not in str(raised.value)
+    assert "_kv_profiler.abi3.so" in str(raised.value)
