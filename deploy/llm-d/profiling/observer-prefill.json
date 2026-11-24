@@ -1,0 +1,26 @@
+{
+  "probes": {
+    "interval_s": 1,
+    "interfaces": [
+      "eth0"
+    ],
+    "threads": true,
+    "interrupts": true,
+    "required": [
+      "netdev",
+      "threads",
+      "interrupts"
+    ]
+  },
+  "role": "prefill",
+  "expected": {
+    "frontend": 1,
+    "scheduler": 1,
+    "worker": 1
+  },
+  "profiles_dir": "/kvp/profiles",
+  "observer_root": "/kvp/observer",
+  "irq_policy": "virtual_not_applicable",
+  "startup_timeout_s": 900,
+  "stop_grace_s": 60
+}

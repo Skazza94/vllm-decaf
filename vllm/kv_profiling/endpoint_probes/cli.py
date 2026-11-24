@@ -46,11 +46,28 @@ def main():
         "JSON on stdin (for a launcher that reaped the observer)",
     )
     parser.add_argument(
+        "--sidecar",
+        metavar="SETTINGS",
+        help="run as the observer's launcher beside the server (a pod sidecar): "
+        "SETTINGS is JSON with probes, role, expected, profiles_dir, "
+        "observer_root and irq_policy; needs --run-id and --endpoint",
+    )
+    parser.add_argument("--endpoint", help="this endpoint's ID, with --sidecar")
+    parser.add_argument(
         "--code-digest",
         action="store_true",
         help="print the digest of this observer code, as captures record it",
     )
     args = parser.parse_args()
+    if args.sidecar:
+        if not args.run_id or not args.endpoint:
+            parser.error("--sidecar needs --run-id and --endpoint")
+        from .sidecar import main as sidecar_main
+
+        # the observer runs from the same standalone entry point as this
+        return sidecar_main(
+            args.sidecar, args.run_id, args.endpoint, str(Path(sys.argv[0]).absolute())
+        )
     if args.code_digest:
         print(code_digest())
         return 0

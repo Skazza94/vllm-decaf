@@ -1,0 +1,134 @@
+# An in-cluster llm-d router for clusters without a Gateway implementation that
+# serves InferencePools: llm-d's endpoint picker (EPP) and Envoy in one pod,
+# Envoy asking the picker over ext_proc where each request goes. A cluster with
+# llm-d's own gateway installed points it at the InferencePool instead and
+# skips this.
+#
+# Needs the InferencePool CRD of the release the picker is built against:
+#   kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/v1.6.2/manifests.yaml
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: vllm-decaf
+spec:
+  # The prefill and decode pods; the picker tells them apart by llm-d.ai/role.
+  selector:
+    matchLabels:
+      app: llm-d-pd
+  # Prefill's vLLM and decode's disaggregation sidecar both serve on 8000.
+  targetPorts:
+  - number: 8000
+  endpointPickerRef:
+    name: llm-d-router
+    port:
+      number: 9002
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llm-d-router
+---
+# What the picker reads: the pool, its pods, and its own lease.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llm-d-router
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch]
+- apiGroups: [inference.networking.k8s.io]
+  resources: [inferencepools]
+  verbs: [get, list, watch]
+- apiGroups: [inference.networking.x-k8s.io]
+  resources: [inferencepoolimports, inferenceobjectives, inferencemodelrewrites]
+  verbs: [get, list, watch]
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llm-d-router
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llm-d-router
+subjects:
+- kind: ServiceAccount
+  name: llm-d-router
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-d-router
+  labels:
+    app: llm-d-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-d-router
+  template:
+    metadata:
+      labels:
+        app: llm-d-router
+    spec:
+      serviceAccountName: llm-d-router
+      containers:
+      - name: epp
+        image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v1.0.0@sha256:024188e998f516879f68532016ca24fabca00afbdcc2af9a61b17634e197df2c
+        imagePullPolicy: IfNotPresent
+        args:
+        - --config-file=/etc/epp/epp-config.yaml
+        - --pool-name=vllm-decaf
+        - --pool-namespace=$(POD_NAMESPACE)
+        - --grpc-port=9002
+        - --grpc-health-port=9003
+        - --metrics-port=9090
+        - --secure-serving=false
+        - --health-checking=true
+        - --v=2
+        env:
+        - name: POD_NAMESPACE
+          valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+        ports:
+        - {name: grpc, containerPort: 9002}
+        - {name: grpc-health, containerPort: 9003}
+        - {name: metrics, containerPort: 9090}
+        readinessProbe:
+          grpc: {port: 9003, service: readiness}
+          periodSeconds: 5
+        resources:
+          requests: {cpu: "1", memory: 512Mi}
+          limits: {cpu: "1", memory: 512Mi}
+        volumeMounts:
+        - {name: config, mountPath: /etc/epp, readOnly: true}
+      - name: envoy
+        image: envoyproxy/envoy:distroless-v1.33.2@sha256:85500e28ed088ec39ff0adc1be3d358a8ad062926aaa62c36b28bde00919e4e8
+        imagePullPolicy: IfNotPresent
+        args: [-c, /etc/envoy/envoy.yaml]
+        ports:
+        - {name: http, containerPort: 8081}
+        resources:
+          requests: {cpu: "1", memory: 256Mi}
+          limits: {cpu: "1", memory: 256Mi}
+        volumeMounts:
+        - {name: config, mountPath: /etc/envoy, readOnly: true}
+      volumes:
+      - name: config
+        configMap:
+          name: llm-d-router
+---
+# The gateway: send OpenAI requests here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-d-router
+spec:
+  selector:
+    app: llm-d-router
+  ports:
+  - {name: http, port: 80, targetPort: 8081}
+  - {name: grpc, port: 9002, targetPort: 9002}

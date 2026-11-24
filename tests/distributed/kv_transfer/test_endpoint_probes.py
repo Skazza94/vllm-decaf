@@ -11,6 +11,7 @@ import errno
 import json
 import os
 import shlex
+import signal
 import socket
 import struct
 import subprocess
@@ -230,9 +231,11 @@ def start_owner(cpu):
     return child
 
 
-def start_recorded_endpoint(tmp_path, cpu, *, overlap_cpu=None, close_delay=0):
+def start_recorded_endpoint(
+    tmp_path, cpu, *, overlap_cpu=None, close_delay=0, run_id=None
+):
     directory = tmp_path / "endpoint"
-    run_id = str(uuid4())
+    run_id = run_id or str(uuid4())
     command = [
         sys.executable,
         str(Path(__file__).with_name("profiled_endpoint.py")),
@@ -3092,3 +3095,483 @@ def test_one_launch_config_rule_for_launch_and_check(change):
     assert launch_config_problems({**good, **change})
     if "expected" in change:
         assert expected_problems(change["expected"])
+
+
+def _sidecar(tmp_path, run_id, observer_cpu, **settings):
+    """A sidecar process beside an endpoint, as a pod would run it."""
+    probes = ProbeConfig(interval_s=0.1, slow_interval_s=0.1, interfaces=["lo"],
+                         required=["netdev"])  # fmt: skip
+    values = {
+        "probes": asdict(probes),
+        "role": "decode",
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
+        "profiles_dir": str(tmp_path / "endpoint" / "profiles"),
+        "observer_root": str(tmp_path / "kvp"),
+        "irq_policy": "virtual_not_applicable",
+        "cpus": [observer_cpu],
+        "startup_timeout_s": 30,
+        **settings,
+    }
+    path = tmp_path / "sidecar.json"
+    path.write_text(json.dumps(values))
+    return subprocess.Popen(
+        [sys.executable, str(Path(probe.__file__)), "--sidecar", str(path),
+         "--run-id", run_id, "--endpoint", "d"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+
+
+def _check(attempt, core_dir):
+    done = subprocess.run(
+        [sys.executable, str(Path(probe.__file__)), "--check-capture", str(attempt),
+         "--core-dir", str(core_dir)],
+        capture_output=True, text=True, timeout=30,
+    )  # fmt: skip
+    return json.loads(done.stdout)
+
+
+@pytest.mark.parametrize("ending", ["server_exits_then_sigterm", "sigterm_first"])
+def test_the_sidecar_follows_the_pod_lifecycle_to_a_complete_capture(
+    tmp_path, ending
+):
+    """Started before the server (which can then start), the sidecar waits for
+    the expected recorders, marks readiness once its observer is ready, and on
+    termination waits for the L1 captures to close, publishes completion, stops
+    and reaps the observer and records its exit: the capture checks complete."""
+    allowed = sorted(os.sched_getaffinity(0))
+    run_id = str(uuid4())
+    sidecar = _sidecar(tmp_path, run_id, allowed[-1])
+    try:
+        time.sleep(0.5)
+        assert sidecar.poll() is None and not (tmp_path / "kvp" / "ready").exists()
+        owner, _, endpoint_dir = start_recorded_endpoint(
+            tmp_path, allowed[0], run_id=run_id
+        )
+        wait_for(lambda: (tmp_path / "kvp" / "ready").exists(), timeout=30)
+        attempt = Path((tmp_path / "kvp" / "ready").read_text())
+        (endpoint_dir / "close").touch()
+        wait_for(lambda: (endpoint_dir / "closed").exists(), timeout=20)
+        if ending == "server_exits_then_sigterm":
+            # Kubernetes stops the main container first, then the sidecar
+            (endpoint_dir / "exit").touch()
+            owner.wait(10)
+            time.sleep(0.3)
+            sidecar.send_signal(signal.SIGTERM)
+        else:
+            # SIGTERM while the server still runs: readiness is withdrawn at
+            # once, and completion waits for the processes to exit
+            sidecar.send_signal(signal.SIGTERM)
+            wait_for(lambda: not (tmp_path / "kvp" / "ready").exists(), timeout=5)
+            assert sidecar.poll() is None
+            time.sleep(1.5)
+            (endpoint_dir / "exit").touch()
+            owner.wait(10)
+        stdout, stderr = sidecar.communicate(timeout=40)
+        assert sidecar.returncode == 0, stderr
+        assert not (tmp_path / "kvp" / "ready").exists()
+        record = json.loads((attempt / "exit.json").read_text())
+        assert (record["exit_code"], record["launcher"], record["timed_out"]) == (
+            0, "sidecar", False)  # fmt: skip
+        summary = _check(attempt, endpoint_dir / "profiles")
+        assert summary["complete"], summary
+    finally:
+        if sidecar.poll() is None:
+            sidecar.kill()
+            sidecar.wait()
+        if (tmp_path / "endpoint").exists():
+            (tmp_path / "endpoint" / "exit").touch()
+
+
+def test_a_forced_stop_records_an_incomplete_capture_never_a_hang(tmp_path):
+    """SIGTERM while the server keeps recording: within its grace the sidecar
+    publishes that the children did not close, stops the observer and records
+    its exit; the capture is incomplete."""
+    allowed = sorted(os.sched_getaffinity(0))
+    run_id = str(uuid4())
+    owner, _, endpoint_dir = start_recorded_endpoint(
+        tmp_path, allowed[0], run_id=run_id
+    )
+    sidecar = _sidecar(tmp_path, run_id, allowed[-1], stop_grace_s=1)
+    try:
+        wait_for(lambda: (tmp_path / "kvp" / "ready").exists(), timeout=30)
+        attempt = Path((tmp_path / "kvp" / "ready").read_text())
+        started = time.monotonic()
+        sidecar.send_signal(signal.SIGTERM)
+        sidecar.communicate(timeout=30)
+        assert time.monotonic() - started < 15
+        children = json.loads((attempt / "children.json").read_text())
+        assert children["children_closed"] is False
+        assert (attempt / "exit.json").exists()
+        assert not _check(attempt, endpoint_dir / "profiles")["complete"]
+    finally:
+        if sidecar.poll() is None:
+            sidecar.kill()
+            sidecar.wait()
+        (endpoint_dir / "exit").touch()
+        owner.wait(10)
+
+
+def test_a_restarted_sidecar_never_uses_an_earlier_attempt_s_markers(tmp_path):
+    """Each start is a fresh attempt: an earlier attempt's readiness, stop and
+    completion markers neither mark it ready nor stop or certify it."""
+    allowed = sorted(os.sched_getaffinity(0))
+    run_id = str(uuid4())
+    root = tmp_path / "kvp"
+    stale = root / "attempt-0-1"
+    stale.mkdir(parents=True)
+    (stale / "stop").touch()
+    (stale / "children.json").write_text(
+        json.dumps({"run_id": run_id, "endpoint": "d", "children_closed": True}))
+    (root / "ready").write_text(str(stale))
+    owner, _, endpoint_dir = start_recorded_endpoint(
+        tmp_path, allowed[0], run_id=run_id
+    )
+    sidecar = _sidecar(tmp_path, run_id, allowed[-1])
+    try:
+        def fresh_ready():
+            marker = root / "ready"
+            return marker.exists() and marker.read_text() != str(stale)
+
+        wait_for(fresh_ready, timeout=30)
+        attempt = Path((root / "ready").read_text())
+        assert attempt != stale and not (attempt / "stop").exists()
+        time.sleep(0.5)
+        assert sidecar.poll() is None  # the stale stop file stopped nothing
+        (endpoint_dir / "close").touch()
+        wait_for(lambda: (endpoint_dir / "closed").exists(), timeout=20)
+        (endpoint_dir / "exit").touch()
+        owner.wait(10)
+        sidecar.send_signal(signal.SIGTERM)
+        sidecar.communicate(timeout=40)
+        assert _check(attempt, endpoint_dir / "profiles")["complete"]
+    finally:
+        if sidecar.poll() is None:
+            sidecar.kill()
+            sidecar.wait()
+        (endpoint_dir / "exit").touch()
+        owner.wait(10)
+
+
+def test_a_sidecar_without_its_recorders_times_out_without_an_observer(tmp_path):
+    allowed = sorted(os.sched_getaffinity(0))
+    (tmp_path / "endpoint" / "profiles").mkdir(parents=True)
+    sidecar = _sidecar(tmp_path, str(uuid4()), allowed[-1], startup_timeout_s=1)
+    sidecar.communicate(timeout=20)
+    assert sidecar.returncode == 1
+    (attempt,) = (tmp_path / "kvp").glob("attempt-*")
+    assert "timed out waiting for the expected recorders" in (
+        attempt / "sidecar.log").read_text()  # fmt: skip
+    assert not (attempt / "config.json").exists()
+
+
+def test_a_sidecar_s_failed_observer_fails_the_sidecar(tmp_path):
+    """An observer that refuses to start (here, the wrong endpoint side) makes
+    the sidecar exit nonzero, with the exit recorded."""
+    allowed = sorted(os.sched_getaffinity(0))
+    run_id = str(uuid4())
+    owner, _, endpoint_dir = start_recorded_endpoint(
+        tmp_path, allowed[0], run_id=run_id
+    )
+    try:
+        sidecar = _sidecar(tmp_path, run_id, allowed[-1], role="prefill")
+        sidecar.communicate(timeout=30)
+        assert sidecar.returncode == 1
+        (attempt,) = (tmp_path / "kvp").glob("attempt-*")
+        record = json.loads((attempt / "exit.json").read_text())
+        assert record["exit_code"] not in (0, None)
+        assert "exited before it was ready" in (attempt / "sidecar.log").read_text()
+    finally:
+        (endpoint_dir / "exit").touch()
+        owner.wait(10)
+
+
+def test_a_stalled_observer_is_bounded_by_the_startup_deadline(tmp_path):
+    """One startup deadline covers the recorders and the observer's
+    readiness: an observer that never becomes ready is killed at it."""
+    from vllm.kv_profiling.endpoint_probes.sidecar import Sidecar
+
+    allowed = sorted(os.sched_getaffinity(0))
+    run_id = str(uuid4())
+    owner, _, endpoint_dir = start_recorded_endpoint(
+        tmp_path, allowed[0], run_id=run_id
+    )
+    stalled = tmp_path / "stalled.py"
+    stalled.write_text("import time\ntime.sleep(600)\n")
+    probes = ProbeConfig(interfaces=["lo"], required=["netdev"])
+    settings = {
+        "probes": asdict(probes), "role": "decode",
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
+        "profiles_dir": str(endpoint_dir / "profiles"),
+        "observer_root": str(tmp_path / "kvp"),
+        "irq_policy": "virtual_not_applicable", "cpus": [allowed[-1]],
+        "startup_timeout_s": 2,
+    }  # fmt: skip
+    try:
+        started = time.monotonic()
+        code = Sidecar(settings, run_id=run_id, endpoint="d",
+                       launcher=str(stalled)).run()  # fmt: skip
+        assert code == 1 and time.monotonic() - started < 10
+        (attempt,) = (tmp_path / "kvp").glob("attempt-*")
+        record = json.loads((attempt / "exit.json").read_text())
+        assert record["timed_out"] is True
+        assert not (tmp_path / "kvp" / "ready").exists()
+    finally:
+        (endpoint_dir / "exit").touch()
+        owner.wait(10)
+
+
+def test_a_restarted_server_s_new_generation_is_observed_the_old_one_kept(tmp_path):
+    """Each serving start records into its own generation directory: after a
+    restart the sidecar observes the generation whose processes are alive and
+    leaves the earlier one untouched."""
+    allowed = sorted(os.sched_getaffinity(0))
+    run_id = str(uuid4())
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    first, _, first_dir = start_recorded_endpoint(
+        tmp_path / "one", allowed[0], run_id=run_id
+    )
+    (first_dir / "close").touch()
+    wait_for(lambda: (first_dir / "closed").exists(), timeout=20)
+    (first_dir / "exit").touch()
+    first.wait(10)
+    second, _, second_dir = start_recorded_endpoint(
+        tmp_path / "two", allowed[0], run_id=run_id
+    )
+    generations = tmp_path / "endpoint" / "profiles"
+    generations.mkdir(parents=True)
+    (generations / "gen-1").symlink_to(first_dir / "profiles")
+    (generations / "gen-2").symlink_to(second_dir / "profiles")
+    before = sorted(p.name for p in (first_dir / "profiles" / run_id).iterdir())
+    sidecar = _sidecar(tmp_path, run_id, allowed[-1])
+    try:
+        wait_for(lambda: (tmp_path / "kvp" / "ready").exists(), timeout=30)
+        attempt = Path((tmp_path / "kvp" / "ready").read_text())
+        config = json.loads((attempt / "config.json").read_text())
+        assert config["input_dir"] == str(generations / "gen-2")
+        (second_dir / "close").touch()
+        wait_for(lambda: (second_dir / "closed").exists(), timeout=20)
+        (second_dir / "exit").touch()
+        second.wait(10)
+        sidecar.communicate(timeout=40)
+        assert sidecar.returncode == 0
+        assert _check(attempt, generations / "gen-2")["complete"]
+        after = sorted(p.name for p in (first_dir / "profiles" / run_id).iterdir())
+        assert after == before  # the earlier generation is kept as it was
+    finally:
+        if sidecar.poll() is None:
+            sidecar.kill()
+            sidecar.wait()
+        for directory, process in ((second_dir, second),):
+            if process.poll() is None:
+                (directory / "exit").touch()
+                process.wait(10)
+
+
+def _bare_sidecar(tmp_path, launcher, **settings):
+    """A Sidecar driven directly, with a stand-in observer process."""
+    from vllm.kv_profiling.endpoint_probes.sidecar import Sidecar
+
+    probes = ProbeConfig(interfaces=["lo"], required=["netdev"])
+    values = {
+        "probes": asdict(probes), "role": "decode",
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
+        "profiles_dir": str(tmp_path / "profiles"),
+        "observer_root": str(tmp_path / "kvp"),
+        "irq_policy": "virtual_not_applicable", "cpus": [0], **settings,
+    }  # fmt: skip
+    sidecar = Sidecar(values, run_id=str(uuid4()), endpoint="d", launcher=launcher)
+    sidecar.attempt = tmp_path / "attempt"
+    sidecar.attempt.mkdir()
+    sidecar.generation = tmp_path / "profiles"
+    return sidecar
+
+
+def _gone_process():
+    done = subprocess.Popen([sys.executable, "-c", "pass"])
+    identity = process_identity(done.pid)
+    done.wait()
+    return {"pid": identity["pid"], "start_ticks": identity["start_ticks"]}
+
+
+@pytest.mark.parametrize("case", ["all_gone", "owner_alive", "status_unreadable"])
+def test_draining_needs_every_serving_process_confirmed_gone(
+    tmp_path, monkeypatch, case
+):
+    """The recorders' processes and their owner (with data parallelism, the API
+    servers' parent) must all be confirmed gone; one alive, or one whose status
+    cannot be read, leaves the children not closed."""
+    from vllm.kv_profiling.endpoint_probes import sidecar as sidecar_module
+
+    # the L1 captures closed: only the processes' exit decides here
+    monkeypatch.setattr(sidecar_module, "core_completion",
+                        lambda *args: {"all_closed": True})  # fmt: skip
+    sidecar = _bare_sidecar(tmp_path, sys.executable, stop_grace_s=0.8)
+    sidecar.observer = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.3)"])  # fmt: skip
+    workers = [_gone_process() for _ in range(3)]
+    me = process_identity(os.getpid())
+    owner = {"pid": me["pid"], "start_ticks": me["start_ticks"]}
+    if case == "all_gone":
+        owner = _gone_process()
+    if case == "status_unreadable":
+        owner = _gone_process()
+        real = sidecar_module.Path.read_text
+        denied = f"/proc/{owner['pid']}/stat"
+
+        def read_text(path, *args, **kwargs):
+            if str(path) == denied:
+                raise PermissionError(13, "Permission denied", denied)
+            return real(path, *args, **kwargs)
+
+        monkeypatch.setattr(sidecar_module.Path, "read_text", read_text)
+    sidecar._stop(workers, owner)
+    children = json.loads((sidecar.attempt / "children.json").read_text())
+    assert children["children_closed"] is (case == "all_gone")
+
+
+def test_a_stalled_observer_stays_within_the_shutdown_budget(tmp_path):
+    """Stopping a stalled observer fits the one deadline (draining keeps time
+    for it) and is a timeout."""
+    sidecar = _bare_sidecar(tmp_path, sys.executable, stop_grace_s=0.8)
+    sidecar.observer = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"])  # fmt: skip
+    started = time.monotonic()
+    timed_out = sidecar._stop([_gone_process()])
+    assert timed_out is True and time.monotonic() - started < 1.5
+
+
+def test_sigterm_during_startup_is_a_cancellation_not_a_timeout(tmp_path):
+    """Termination while waiting for readiness cancels the attempt: the
+    observer is stopped, and the exit record is not a timeout."""
+    allowed = sorted(os.sched_getaffinity(0))
+    run_id = str(uuid4())
+    owner, _, endpoint_dir = start_recorded_endpoint(
+        tmp_path, allowed[0], run_id=run_id
+    )
+    stalled = tmp_path / "stalled.py"
+    stalled.write_text("import time\ntime.sleep(600)\n")
+    settings = tmp_path / "settings.json"
+    probes = ProbeConfig(interfaces=["lo"], required=["netdev"])
+    settings.write_text(json.dumps({
+        "probes": asdict(probes), "role": "decode",
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
+        "profiles_dir": str(endpoint_dir / "profiles"),
+        "observer_root": str(tmp_path / "kvp"),
+        "irq_policy": "virtual_not_applicable", "cpus": [allowed[-1]],
+        "startup_timeout_s": 30}))  # fmt: skip
+    code = (
+        "import sys; from vllm.kv_profiling.endpoint_probes.sidecar import main;"
+        f"sys.exit(main({str(settings)!r}, {run_id!r}, 'd', {str(stalled)!r}))"
+    )
+    sidecar = subprocess.Popen([sys.executable, "-c", code])
+    try:
+        wait_for(lambda: list((tmp_path / "kvp").glob("attempt-*/config.json")),
+                 timeout=30)  # fmt: skip
+        time.sleep(0.3)
+        started = time.monotonic()
+        sidecar.send_signal(signal.SIGTERM)
+        sidecar.wait(20)
+        assert sidecar.returncode == 1 and time.monotonic() - started < 10
+        (attempt,) = (tmp_path / "kvp").glob("attempt-*")
+        record = json.loads((attempt / "exit.json").read_text())
+        assert record["timed_out"] is False and record["killed"] == "signal"
+        assert "terminated before the observer was ready" in (
+            attempt / "sidecar.log").read_text()  # fmt: skip
+    finally:
+        if sidecar.poll() is None:
+            sidecar.kill()
+            sidecar.wait()
+        (endpoint_dir / "exit").touch()
+        owner.wait(10)
+
+
+def test_the_closure_scan_never_overruns_the_shutdown_deadline(
+    tmp_path, monkeypatch
+):
+    """Full L1 verification runs under the drain's deadline: a scan still
+    parsing when it expires leaves the children not closed, on time."""
+    from vllm.kv_profiling.endpoint_probes import sidecar as sidecar_module
+
+    def slow(*args):
+        time.sleep(5)  # a large trace being parsed
+        return {"all_closed": True}
+
+    monkeypatch.setattr(sidecar_module, "core_completion", slow)
+    sidecar = _bare_sidecar(tmp_path, sys.executable, stop_grace_s=0.8)
+    sidecar.observer = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"])  # fmt: skip
+    started = time.monotonic()
+    sidecar._stop([_gone_process()], _gone_process())
+    assert time.monotonic() - started < 1.5
+    children = json.loads((sidecar.attempt / "children.json").read_text())
+    assert children["children_closed"] is False
+
+
+def test_readiness_waits_for_every_recorder_confirmed_alive(tmp_path):
+    """Discovery needs each recorder's process confirmed running: while its
+    status cannot be read the sidecar is not ready, and once it can, it is."""
+    allowed = sorted(os.sched_getaffinity(0))
+    run_id = str(uuid4())
+    owner, _, endpoint_dir = start_recorded_endpoint(
+        tmp_path, allowed[0], run_id=run_id
+    )
+    deny = tmp_path / "deny"
+    deny.touch()
+    probes = ProbeConfig(interval_s=0.1, slow_interval_s=0.1, interfaces=["lo"],
+                         required=["netdev"])  # fmt: skip
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "probes": asdict(probes), "role": "decode",
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
+        "profiles_dir": str(endpoint_dir / "profiles"),
+        "observer_root": str(tmp_path / "kvp"),
+        "irq_policy": "virtual_not_applicable", "cpus": [allowed[-1]],
+        "startup_timeout_s": 60}))  # fmt: skip
+    stat, entry = f"/proc/{owner.pid}/stat", str(Path(probe.__file__))
+    code = "\n".join([
+        "import sys",
+        "from vllm.kv_profiling.endpoint_probes import sidecar",
+        "real = sidecar.Path.read_text",
+        "def read_text(path, *args, **kwargs):",
+        f"    if str(path) == {stat!r} and sidecar.Path({str(deny)!r}).exists():",
+        "        raise PermissionError(13, 'Permission denied', str(path))",
+        "    return real(path, *args, **kwargs)",
+        "sidecar.Path.read_text = read_text",
+        f"sys.exit(sidecar.main({str(settings)!r}, {run_id!r}, 'd', {entry!r}))",
+    ])  # fmt: skip
+    process = subprocess.Popen([sys.executable, "-c", code])
+    ready = tmp_path / "kvp" / "ready"
+    try:
+        time.sleep(2.5)
+        assert process.poll() is None and not ready.exists()
+        assert not list((tmp_path / "kvp").glob("attempt-*/config.json"))
+        deny.unlink()  # access returns
+        wait_for(ready.exists, timeout=30)
+    finally:
+        process.send_signal(signal.SIGTERM)
+        (endpoint_dir / "close").touch()
+        (endpoint_dir / "exit").touch()
+        process.wait(90)
+        owner.wait(10)
+
+
+def test_a_scan_finishing_in_the_last_poll_interval_is_used(tmp_path, monkeypatch):
+    """The scan's completion wakes the drain: a closed result delivered just
+    before the cutoff (inside what used to be the final sleep) counts."""
+    from vllm.kv_profiling.endpoint_probes import sidecar as sidecar_module
+
+    sidecar = _bare_sidecar(tmp_path, sys.executable, stop_grace_s=2.0)
+    cutoff_s = 2.0 - min(sidecar_module.FINALIZE_MAX_S,
+                         2.0 * sidecar_module.FINALIZE_SHARE)  # fmt: skip
+
+    def scan(*args):
+        time.sleep(cutoff_s - 0.08)  # done 80 ms before the cutoff
+        return {"all_closed": True}
+
+    monkeypatch.setattr(sidecar_module, "core_completion", scan)
+    sidecar.observer = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"])  # fmt: skip
+    sidecar._stop([_gone_process()], _gone_process())
+    children = json.loads((sidecar.attempt / "children.json").read_text())
+    assert children["children_closed"] is True

@@ -25,10 +25,13 @@ flowchart LR
     class DP,PP pod;
 ```
 
-| File | Contents |
+| Path | Contents |
 | :--- | :--- |
-| `prefill.yaml` | Prefill pods: vllm-decaf as the KV producer. |
-| `decode.yaml` | Decode pods: llm-d's disaggregation sidecar (unmodified) in front of vllm-decaf as the KV consumer. |
+| `serving/prefill.yaml` | Prefill pods: vllm-decaf as the KV producer. |
+| `serving/decode.yaml` | Decode pods: llm-d's disaggregation sidecar (unmodified) in front of vllm-decaf as the KV consumer. |
+| `l1/` | The same pods with the [KV transfer profiler](../../docs/observability/kv_profiler_core.md) at L1: see [Profiling](#profiling). |
+| `profiling/` | L1 plus the profiler's endpoint observer (L3) as a pod sidecar: see [Profiling](#profiling). |
+| `router/` | An optional in-cluster llm-d router (endpoint picker and Envoy) for clusters without llm-d's gateway: see [Without llm-d's gateway](#without-llm-ds-gateway). |
 
 What is real: vLLM's scheduling, metrics and KV cache on both sides, the
 sidecar's two-step request, and the KV bytes that cross the pod network.
@@ -48,7 +51,7 @@ run the published model.
 ## Deploy
 
 ```bash
-kubectl apply -n <namespace> -f deploy/llm-d/
+kubectl apply -n <namespace> -k deploy/llm-d/serving
 kubectl -n <namespace> rollout status deploy/vllm-decaf-prefill deploy/vllm-decaf-decode
 ```
 
@@ -85,7 +88,9 @@ decode pulled from a prefill pod instead of computing.
 
 As written, KV moves through vLLM's `NixlConnector` on NIXL's Mooncake
 backend (Mooncake's transfer engine over TCP). The other TCP paths are a
-few edits to **both** `prefill.yaml` and `decode.yaml`:
+few edits to **both** `serving/prefill.yaml` and `serving/decode.yaml` (with the
+profiler, to the server arguments in `l1/prefill.yaml` and `l1/decode.yaml`,
+which repeat them, and its `KV_TRANSFER_CONFIG` in `l1/` and `profiling/`):
 
 | KV path | `--kv-transfer-config` | Environment | Sidecar |
 | :--- | :--- | :--- | :--- |
@@ -98,3 +103,121 @@ few edits to **both** `prefill.yaml` and `decode.yaml`:
 `$(POD_IP)` inside `args` as it does inside `env`, so `rank_addresses` can
 name the pod's address directly; UCX and libfabric bind to the interface
 that holds it.
+
+## Profiling
+
+Two overlays add the [KV transfer profiler](../../docs/observability/kv_profiler_core.md)
+to the same pods, in place of `serving`:
+
+| Overlay | What it records |
+| :--- | :--- |
+| `l1` | L1: vLLM's own recorders (requests, transfers, peer clocks), no observer. |
+| `profiling` | L3: `l1`, plus an endpoint observer beside each server (its interface, the serving threads' CPU, interrupts). |
+
+```bash
+kubectl apply -n <namespace> -k deploy/llm-d/profiling   # or deploy/llm-d/l1
+```
+
+**One run per P/D pair.** The prefill and decode pods record one run, so their
+recordings join: the `kvp-run` ConfigMap's `run_id`. Set a new UUID in the
+overlay's `kustomization.yaml` (in `l1`, which `profiling` builds on) for each
+run and apply it again. The ConfigMap's name is a hash of its content, so both
+pod templates change and both Deployments roll out on the new run before the
+next workload. Wait for both rollouts before sending it.
+
+**Where it goes.** Each pod keeps its files on its node after the pod is gone,
+under `/var/lib/vllm-decaf/kvp/<pod UID>/`:
+- `profiles/gen-<start>/<run ID>/` holds the L1 recordings. Each start of the
+  vLLM container (a restart included) records into a generation of its own, so
+  recordings never mix.
+- `observer/attempt-*/` holds the observer's captures (`profiling`), one per
+  start of its sidecar.
+
+Any volume that outlives the pod can replace the `hostPath`, for example a
+PersistentVolumeClaim per replica.
+
+**The observer** (`profiling`) is a native sidecar (`kv-observer`): an init
+container with `restartPolicy: Always`, in the pod's network namespace and, with
+`shareProcessNamespace: true`, its PID namespace.
+- **Start:** it starts before vLLM without holding it back, finds the vLLM
+  start whose frontend, scheduler and worker recorders are running, and starts
+  the observer.
+- **Readiness:** the pod is Ready, and routed to, only while the observer is.
+  If the observer fails or stalls, the sidecar exits nonzero and Kubernetes
+  restarts it.
+- **Termination:** within `stop_grace_s` (and the pod's
+  `terminationGracePeriodSeconds`), the sidecar withdraws readiness at once.
+  It waits for vLLM's processes to exit, the serving parent included, and
+  their recordings to close. A process whose status it cannot read is never
+  taken as exited. It then stops the observer, within the same deadline, and
+  records its exit.
+
+Check an attempt with the same image's observer, by path, so it imports neither
+vLLM nor Torch (the attempt's `config.json` names its generation):
+
+```bash
+python /opt/venv/lib/python3.12/site-packages/vllm/kv_profiling/probe.py \
+  --check-capture <attempt> --core-dir <its generation>
+```
+
+Requirements of the observer:
+
+- **CPUs of its own.** The observer refuses to share CPUs with the server it
+  measures, so the pods need exclusive CPUs: the kubelet's `static` CPU manager
+  policy, and Guaranteed pods with whole CPUs. The overlay sets requests equal
+  to limits, integer CPUs, in every container. Without them the observer does
+  not start, and the pod never becomes Ready.
+- **Interrupts.** The overlay measures the pod's `eth0`, a virtual interface
+  (`irq_policy: virtual_not_applicable`). For a physical interface (a dedicated
+  KV network), verify its interrupt placement and set `operator_verified`.
+- **TCP sockets** are not sampled by default: the TCP source needs the
+  endpoints' addresses, which a pod network assigns at runtime. With fixed
+  addresses (a dedicated KV network), add `tcp` with `local_ips` and `peer_ips`
+  to the observer's probes.
+
+### eBPF events (opt-in)
+
+The observer can also record TCP retransmits, resets and state changes with its
+eBPF collector. It is off in the overlay; turning it on takes three changes, on
+nodes whose kernel has BTF (Linux 5.15 or newer):
+
+1. **The built package.** Build the artifacts with `tools/kv-profiler-ebpf/build.sh`
+   (in its tooling image), then make them available on each node, for example at
+   `/opt/kv-profiler-ebpf`.
+2. **Privileges and the mount** in the `kv-observer` container:
+   ```yaml
+   securityContext:
+     allowPrivilegeEscalation: false
+     capabilities:
+       add: [BPF, PERFMON]
+   volumeMounts:
+   - name: kv-profiler-ebpf
+     mountPath: /opt/kv-profiler-ebpf
+     readOnly: true
+   ```
+   with a `hostPath` volume `kv-profiler-ebpf` of that directory. Nothing broader
+   is needed, never `CAP_SYS_ADMIN`.
+3. **The probe settings** in `observer-<side>.json`. Add `"ebpf"` to `required`,
+   and:
+   ```json
+   "ebpf": {"enabled": true, "privileged_opt_in": true,
+            "mode": "tcp_tracepoints", "artifacts": "/opt/kv-profiler-ebpf"}
+   ```
+   In a pod the collector sees only the pod's own network namespace. For a
+   shared one, `local_ips` and `peer_ips` keep it to the KV link.
+
+## Without llm-d's gateway
+
+`deploy/llm-d/router` is an in-cluster llm-d router for a cluster that has no
+Gateway implementation serving InferencePools. llm-d's endpoint picker and Envoy
+run in one pod, with the configuration of llm-d v1.0's P/D guide, and the picker
+finds the pods through an InferencePool. It needs the InferencePool CRD of the
+release the picker is built against:
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api-inference-extension/releases/download/v1.6.2/manifests.yaml
+kubectl apply -n <namespace> -k deploy/llm-d/router
+```
+
+Send requests to the `llm-d-router` Service on port 80. With llm-d's gateway
+installed, point it at the `vllm-decaf` InferencePool instead.

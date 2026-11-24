@@ -842,6 +842,35 @@ refuses a process's namespace links (it holds capabilities the observer lacks, o
 is not dumpable), the error names the path, the errno and both causes.
 
 Start the observer before admitting workload and wait for its manifest's `ready`.
+
+`--sidecar SETTINGS --run-id <UUID> --endpoint <ID>` runs the launcher itself
+beside the server: a container of the server's pod, or any process that shares
+its namespaces. `SETTINGS` holds `probes`, `role`, `expected`, `profiles_dir`,
+`observer_root`, `irq_policy` and, optionally, `cpus` (the sidecar's own affinity
+by default), `startup_timeout_s` and `stop_grace_s`. Each start is a fresh
+attempt in its own directory under `observer_root`, so markers from an earlier
+attempt never apply. The sidecar:
+1. **Startup, within one deadline (`startup_timeout_s`):** it finds the serving
+   generation whose expected recorders are all running, without holding the
+   server back. That is `profiles_dir` itself, or one directory per serving
+   start beneath it, earlier ones left as they are. It then starts the observer
+   from the same entry point, and writes `observer_root/ready` (the attempt's
+   path) once the observer is ready, for a readiness probe. An observer that
+   fails, or is not ready by the deadline, makes the sidecar exit nonzero.
+2. **Shutdown, on SIGTERM or the server's exit:** it removes `ready` at once.
+   Then, within `stop_grace_s`, which it also gives the observer as its
+   owner-exit wait (`owner_exit_grace_s`), it waits for every frozen serving
+   process to exit and its L1 capture to close. The processes include the owner
+   (with several API servers, their parent), and a process whose status cannot
+   be read is never taken as exited. Part of the budget is kept for stopping the
+   observer. It writes the completion file (`children_closed` only if both
+   held), creates the stop file, reaps the observer by the deadline or kills it
+   (`timed_out`), and publishes its exit record. Termination during startup
+   cancels the attempt; it is not a timeout.
+
+The attempt directory is then checked with `--check-capture`, its `config.json`
+naming the generation. `deploy/llm-d/profiling` runs it as a Kubernetes native
+sidecar.
 After child/L1 completion, the controller writes the endpoint completion file:
 `{"run_id": "<UUID>", "endpoint": "<ID>", "children_closed": true}`, then
 creates `stop_file`. The observer independently checks the L1 manifests, samples

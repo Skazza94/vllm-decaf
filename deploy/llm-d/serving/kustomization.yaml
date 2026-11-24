@@ -1,0 +1,8 @@
+# vllm-decaf's llm-d prefill and decode pods:
+#   kubectl apply -n <namespace> -k deploy/llm-d/serving
+# With the KV transfer profiler at L3: -k deploy/llm-d/profiling
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- prefill.yaml
+- decode.yaml

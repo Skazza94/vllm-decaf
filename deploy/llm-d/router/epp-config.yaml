@@ -1,0 +1,35 @@
+# llm-d v1.0's P/D router plugins (guides/pd-disaggregation): every request
+# disaggregated, prefill by prefix affinity and queued prefill tokens, decode
+# by active requests. Pods are discovered through the InferencePool.
+apiVersion: llm-d.ai/v1
+kind: EndpointPickerConfig
+plugins:
+- type: always-disagg-pd-decider
+- type: disagg-profile-handler
+  parameters:
+    deciders:
+      prefill: always-disagg-pd-decider
+- type: prefill-filter
+- type: decode-filter
+- type: approx-prefix-cache-producer
+  parameters:
+    maxPrefixTokensToMatch: 131072
+- type: inflight-load-producer
+- type: prefix-cache-affinity-filter
+  parameters:
+    peakPrefillThroughput: 33821
+- type: token-load-scorer
+- type: active-request-scorer
+- type: max-score-picker
+schedulingProfiles:
+- name: prefill
+  plugins:
+  - pluginRef: prefill-filter
+  - pluginRef: prefix-cache-affinity-filter
+  - pluginRef: token-load-scorer
+  - pluginRef: max-score-picker
+- name: decode
+  plugins:
+  - pluginRef: decode-filter
+  - pluginRef: active-request-scorer
+  - pluginRef: max-score-picker

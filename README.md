@@ -279,10 +279,11 @@ disaggregation sidecar run unmodified: the picker reads the servers' real
 vLLM metrics, and decode pulls each request's KV cache from the prefill pod
 over the pod network.
 
-[`deploy/llm-d/`](deploy/llm-d/) has the two manifests, a prefill Deployment
-and a decode Deployment with llm-d's sidecar, and its
-[README](deploy/llm-d/README.md) walks through installing them next to
-llm-d's router.
+[`deploy/llm-d/`](deploy/llm-d/) has the prefill and decode Deployments (decode
+with llm-d's sidecar), overlays that add the KV transfer profiler at L1 and at
+L3 (its endpoint observer as a pod sidecar), and an optional in-cluster llm-d
+router for clusters without one. Its [README](deploy/llm-d/README.md) walks through
+installing them.
 
 ## Limitations
 

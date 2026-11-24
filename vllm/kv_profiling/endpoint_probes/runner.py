@@ -81,12 +81,20 @@ class Observer:
         owner_start=None,
         inventory=None,
         package_sha256=None,
+        owner_exit_grace_s=2.0,
     ):
         """A launcher names the ``expected`` recorders per role; the observer
         finds and freezes them and their owner itself (``identity.discover``).
         An explicit ``inventory`` with its ``owner_pid``/``owner_start`` is for
         callers that already hold them."""
         UUID(run_id)
+        if type(owner_exit_grace_s) not in (int, float) or not (
+            0 < owner_exit_grace_s <= 600
+        ):
+            raise ValueError("owner_exit_grace_s is in (0, 600] seconds")
+        # how long, after the owner exits, the launcher has to report its
+        # children closed and stop the observer (one deadline with the launcher)
+        self.owner_exit_grace_s = float(owner_exit_grace_s)
         owner_evidence = {"frontends": [], "parent": None, "supplied": True}
         if inventory is None:
             if expected is None or owner_pid is not None:
@@ -589,7 +597,7 @@ class Observer:
                             {"owner_exited": True, "children_closed": "unknown"},
                             kind="probe_status",
                         )
-                    if time.monotonic() - owner_exited_at >= 2:
+                    if time.monotonic() - owner_exited_at >= self.owner_exit_grace_s:
                         break
                 self.stop_event.wait(min(0.1, max(0, next_tick - time.monotonic())))
             self.sample(True)

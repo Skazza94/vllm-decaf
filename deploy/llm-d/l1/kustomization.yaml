@@ -1,0 +1,17 @@
+# vllm-decaf's llm-d P/D pods with the KV transfer profiler at L1:
+#   kubectl apply -n <namespace> -k deploy/llm-d/l1
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../serving
+patches:
+- path: prefill.yaml
+- path: decode.yaml
+configMapGenerator:
+# One run for the prefill and decode pods, so their recordings join: set a new
+# UUID for each run (python -c 'import uuid; print(uuid.uuid4())'). The
+# ConfigMap's name carries a hash of its content, so a new run ID changes both
+# pod templates and re-applying rolls both Deployments out.
+- name: kvp-run
+  literals:
+  - run_id=00000000-0000-4000-8000-000000000001

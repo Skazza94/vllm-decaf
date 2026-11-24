@@ -1,0 +1,11 @@
+# An in-cluster llm-d router for the vllm-decaf pods (see router.yaml):
+#   kubectl apply -n <namespace> -k deploy/llm-d/router
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- router.yaml
+configMapGenerator:
+- name: llm-d-router
+  files:
+  - epp-config.yaml
+  - envoy.yaml

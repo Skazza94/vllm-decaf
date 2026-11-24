@@ -1,0 +1,56 @@
+# The decode pods with the KV transfer profiler at L1: vLLM's own recorders,
+# no observer. One run (KVP_RUN_ID) spans the prefill and decode pods.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-decaf-decode
+spec:
+  template:
+    spec:
+      containers:
+      - name: vllm-decode
+        # Each start of this container records into its own generation
+        # directory, so a restarted server never mixes with the recordings of
+        # the one before (which stay). The KV transfer config is the base's,
+        # with the profiler; its run ID and output directory are filled in here,
+        # at start (no dependency on the order of the environment).
+        command: [/bin/sh, -c]
+        args:
+        - |
+          generation="/kvp/profiles/gen-$$(date +%s%N)"
+          mkdir -p "$generation"
+          exec /opt/venv/bin/vllm serve "$@" --kv-transfer-config "$$(printf '%s' "$KV_TRANSFER_CONFIG" | sed -e "s|@GENERATION@|$generation|" -e "s|@RUN_ID@|$KVP_RUN_ID|")"
+        - sh
+        - Qwen/Qwen3-8B
+        - --host=0.0.0.0
+        - --port=8200
+        - --simulate-forward
+        - --simulation-config
+        - '{"clock": "real", "timing": "aisimulate", "timing_args": {"gpu": "h100"}}'
+        - --kv-cache-memory-bytes=2147483648
+        - --block-size=16
+        - --max-model-len=4096
+        - --max-num-batched-tokens=2048
+        - --max-num-seqs=32
+        - --generation-config=vllm
+        - --enforce-eager
+        env:
+        - name: KVP_RUN_ID
+          valueFrom: {configMapKeyRef: {name: kvp-run, key: run_id}}
+        - name: POD_UID
+          valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+        - name: KV_TRANSFER_CONFIG
+          value: '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu", "kv_connector_extra_config": {"backends": ["Mooncake"], "network_profiler": {"level": "l1", "run_id": "@RUN_ID@", "output_dir": "@GENERATION@", "transport": "tcp"}}}'
+        volumeMounts:
+        - name: kvp
+          mountPath: /kvp
+          subPathExpr: $(POD_UID)
+      volumes:
+      # The recordings, kept on the node after the pod is gone:
+      # /var/lib/vllm-decaf/kvp/<pod UID>/profiles/gen-*/<run ID>/. Any volume
+      # that outlives the pod works, for example a PersistentVolumeClaim per
+      # replica.
+      - name: kvp
+        hostPath:
+          path: /var/lib/vllm-decaf/kvp
+          type: DirectoryOrCreate

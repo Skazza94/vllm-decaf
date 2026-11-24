@@ -1,0 +1,74 @@
+# The prefill pods with the KV transfer profiler at L3: the L1 overlay's
+# recorders, and the observer, a native sidecar in the same PID and network
+# namespaces, sampling the endpoint from outside it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-decaf-prefill
+spec:
+  template:
+    spec:
+      # The observer reads the serving processes' /proc: one PID namespace.
+      shareProcessNamespace: true
+      # Long enough for vLLM to close its recorders and the observer to finish
+      # (the sidecar's stop_grace_s, with margin).
+      terminationGracePeriodSeconds: 90
+      initContainers:
+      # Started before vLLM without holding it back, stopped after it
+      # (restartPolicy Always). It waits for vLLM's recorders, then starts the
+      # observer; the pod is Ready only while the observer is.
+      - name: kv-observer
+        image: vllm:cpu-aisim
+        imagePullPolicy: IfNotPresent
+        restartPolicy: Always
+        # The standalone entry point, by path: it never imports vLLM or Torch.
+        command:
+        - /opt/venv/bin/python
+        - /opt/venv/lib/python3.12/site-packages/vllm/kv_profiling/probe.py
+        args:
+        - --sidecar
+        - /etc/kv-observer/prefill.json
+        - --run-id
+        - $(KVP_RUN_ID)
+        - --endpoint
+        - $(POD_NAME)
+        env:
+        - name: KVP_RUN_ID
+          valueFrom: {configMapKeyRef: {name: kvp-run, key: run_id}}
+        - name: POD_UID
+          valueFrom: {fieldRef: {fieldPath: metadata.uid}}
+        - name: POD_NAME
+          valueFrom: {fieldRef: {fieldPath: metadata.name}}
+        readinessProbe:
+          exec:
+            command: [test, -f, /kvp/observer/ready]
+          periodSeconds: 2
+          failureThreshold: 1
+        # Its own whole CPU, disjoint from vLLM's under a static CPU manager
+        # policy; the observer refuses to share CPUs with the server.
+        resources:
+          requests: {cpu: "1", memory: 512Mi}
+          limits: {cpu: "1", memory: 512Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+        volumeMounts:
+        - name: kvp
+          mountPath: /kvp
+          subPathExpr: $(POD_UID)
+        - name: kv-observer
+          mountPath: /etc/kv-observer
+          readOnly: true
+      containers:
+      - name: vllm-prefill
+        env:
+        - name: KV_TRANSFER_CONFIG
+          value: '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu", "kv_connector_extra_config": {"backends": ["Mooncake"], "network_profiler": {"level": "l3", "run_id": "@RUN_ID@", "output_dir": "@GENERATION@", "transport": "tcp"}}}'
+        # Integer CPUs and requests equal to limits (Guaranteed QoS): exclusive
+        # CPUs under a static CPU manager policy.
+        resources:
+          requests: {cpu: "4", memory: 12Gi}
+          limits: {cpu: "4", memory: 12Gi}
+      volumes:
+      - name: kv-observer
+        configMap:
+          name: kv-observer

@@ -1,0 +1,15 @@
+# vllm-decaf's llm-d P/D pods with the KV transfer profiler at L3:
+#   kubectl apply -n <namespace> -k deploy/llm-d/profiling
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../l1
+patches:
+- path: prefill.yaml
+- path: decode.yaml
+configMapGenerator:
+# The observer's settings per side (sources, required ones, sampling).
+- name: kv-observer
+  files:
+  - prefill.json=observer-prefill.json
+  - decode.json=observer-decode.json
