@@ -9,8 +9,17 @@ The native recorder requires Linux tmpfs and GIL-enabled CPython.
 
 The profiler levels' overhead was measured with two-node serving A/Bs of one
 workload, profiler off against on, on latency and throughput: the NIXL pull
-connector at concurrency one. Every result below, the eBPF one included, was
-measured with `flush="end"`, not the default `background`.
+connector at concurrency one.
+
+We compared default L1 (`flush="background"`) with profiling off over UCX/TCP. The
+95% lower bound for throughput fell below its limit. The upper bounds for mean
+time to first token and for mean and p99 end-to-end latency exceeded theirs. All
+four point estimates favored L1. Variation among profiler-off runs accounted for
+most of the uncertainty in those estimates. P99 time to first token, mean time per
+output token, and mean and p99 inter-token latency passed. The gate recorded FAIL,
+and we accepted an exception for this workload.
+
+The results below were measured with `flush="end"`, the eBPF one included.
 
 - Over UCX/TCP, L2 passed every check. L1 (with the request timelines) and L3
   passed throughput and every mean latency; their 95% upper bounds for p99 time to
