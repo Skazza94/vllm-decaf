@@ -7,19 +7,31 @@ metadata:
 spec:
   template:
     spec:
+      # Long enough for vLLM's engine and workers to close their recorders.
+      terminationGracePeriodSeconds: 60
       containers:
       - name: vllm-prefill
         # Each start of this container records into its own generation
         # directory, so a restarted server never mixes with the recordings of
         # the one before (which stay). The KV transfer config is the base's,
         # with the profiler; its run ID and output directory are filled in here,
-        # at start (no dependency on the order of the environment).
+        # at start (no dependency on the order of the environment). vLLM runs in
+        # its own process group: SIGTERM is passed on, and the container stays
+        # until the whole group (the engine and its workers, which close their
+        # recorders last) has exited, within the grace period.
         command: [/bin/sh, -c]
         args:
         - |
           generation="/kvp/profiles/gen-$$(date +%s%N)"
           mkdir -p "$generation"
-          exec /opt/venv/bin/vllm serve "$@" --kv-transfer-config "$$(printf '%s' "$KV_TRANSFER_CONFIG" | sed -e "s|@GENERATION@|$generation|" -e "s|@RUN_ID@|$KVP_RUN_ID|")"
+          config="$$(printf '%s' "$KV_TRANSFER_CONFIG" | sed -e "s|@GENERATION@|$generation|" -e "s|@RUN_ID@|$KVP_RUN_ID|")"
+          setsid /opt/venv/bin/vllm serve "$@" --kv-transfer-config "$config" &
+          server=$$!
+          trap 'kill -TERM "$server" 2>/dev/null' TERM INT
+          wait "$server"; status=$$?
+          while kill -0 "$server" 2>/dev/null; do wait "$server"; status=$$?; done
+          while kill -0 "-$server" 2>/dev/null; do sleep 0.2; done
+          exit "$status"
         - sh
         - Qwen/Qwen3-8B
         - --host=0.0.0.0
@@ -41,6 +53,12 @@ spec:
           valueFrom: {fieldRef: {fieldPath: metadata.uid}}
         - name: KV_TRANSFER_CONFIG
           value: '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu", "kv_connector_extra_config": {"backends": ["Mooncake"], "network_profiler": {"level": "l1", "run_id": "@RUN_ID@", "output_dir": "@GENERATION@", "transport": "tcp"}}}'
+        # At vLLM's default --shutdown-timeout 0 the engine-core process, where
+        # the scheduler and worker recorders live, is force-killed on SIGTERM
+        # before they close; this is its cleanup grace, above the recorders'
+        # close deadlines and under the termination grace period.
+        - name: VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+          value: "30"
         volumeMounts:
         - name: kvp
           mountPath: /kvp

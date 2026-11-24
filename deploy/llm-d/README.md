@@ -125,6 +125,13 @@ run and apply it again. The ConfigMap's name is a hash of its content, so both
 pod templates change and both Deployments roll out on the new run before the
 next workload. Wait for both rollouts before sending it.
 
+**Closing on termination.** At vLLM's default `--shutdown-timeout 0` the
+engine-core process, which holds the scheduler and worker recorders, is
+force-killed on SIGTERM before they close. The `l1` overlay gives it a cleanup
+grace (`VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS`, under the pod's
+`terminationGracePeriodSeconds`), and its container exits only once vLLM's whole
+process group, the recorders' writers included, has exited.
+
 **Where it goes.** Each pod keeps its files on its node after the pod is gone,
 under `/var/lib/vllm-decaf/kvp/<pod UID>/`:
 - `profiles/gen-<start>/<run ID>/` holds the L1 recordings. Each start of the
