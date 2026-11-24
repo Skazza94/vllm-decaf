@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from . import netdev, rdma, tasks, tcp
 from .config import settings_dict
+from .exit_record import CAPTURE_FORMAT
 from .health import core_completion, validate_inventory
 from .identity import ownership, placement, process_identity
 from .netlink import ObservationError
@@ -53,6 +54,7 @@ def _time_namespace():
 # How long an observer waits for its eBPF collector to load and attach (or to
 # report itself unavailable) before it starts sampling.
 EBPF_ANSWER_TIMEOUT_S = 10.0
+
 
 class Observer:
     """Observe an explicit owner; never signals it, rewrites sockets or retunes IRQs."""
@@ -140,6 +142,7 @@ class Observer:
         self.metadata = {
             "schema": 1,
             "probe_schema": 1,
+            "capture_format": CAPTURE_FORMAT,
             "type": "metadata",
             "run_id": run_id,
             "process_id": self.process_id,

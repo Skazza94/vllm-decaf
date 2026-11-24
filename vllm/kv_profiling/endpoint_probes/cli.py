@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from .config import ProbeConfig
+from .exit_record import EXIT_SCHEMA, write_exit_record
 from .health import core_completion, endpoint_capture, inventory, validate_inventory
 from .netdev import read_small
 from .runner import Observer
@@ -31,7 +32,24 @@ def main():
     )
     parser.add_argument("--inventory")
     parser.add_argument("--run-id")
+    parser.add_argument(
+        "--record-exit",
+        metavar="DIRECTORY",
+        help="publish the observer's exit record in DIRECTORY, its fields as "
+        "JSON on stdin (for a launcher that reaped the observer)",
+    )
     args = parser.parse_args()
+    if args.record_exit:
+        fields = json.loads(sys.stdin.read(1 << 20))
+        if not isinstance(fields, dict):
+            raise ValueError("--record-exit takes a JSON object on stdin")
+        # the full record may be given: its schema must be this one
+        if "schema" in fields and (
+            type(fields["schema"]) is not int or fields.pop("schema") != EXIT_SCHEMA
+        ):
+            raise ValueError(f"--record-exit writes exit record schema {EXIT_SCHEMA}")
+        write_exit_record(args.record_exit, **fields)
+        return 0
     if args.inventory:
         result = inventory(args.inventory, args.run_id)
         validate_inventory(result, args.run_id)

@@ -845,9 +845,35 @@ The harness's `profiler.level: l3` additionally requires per-node `probes` and
 shared network/PID namespaces, a read-only profile mount and separate output,
 then collects manifests and logs. `observer.stdout.log` and
 `observer.stderr.log` preserve each Docker log stream; `observer.log` labels them
-without implying an order across streams. `endpoint-status.json` records log
-collection failures separately from the observer exit/timeout and cleanup.
+without implying an order across streams; the launcher's own evidence (the
+wait result, the inspected container, its removal, log collection) goes into the
+exit record's `evidence`.
 The generic CLI contains all probe logic.
+
+Whatever launched the observer and reaped it publishes its exit record,
+`exit.json`, in the observer's directory: with `--record-exit DIRECTORY` and the
+fields as JSON on stdin, or the same function from the package. The fields are
+`schema` (1), `run_id`, `endpoint`, `process_id` (the observer capture's own, so
+a record from an earlier attempt never certifies a later one; `null` when no
+capture exists), `exit_code`, `signal`, `killed` (`null`, `oom` or `signal`),
+`timed_out`, `launcher`, `problems` (what the launcher could not reconcile, each
+failing the check) and `evidence` (launcher detail, never checked). It holds no
+timestamp. `schema` may be omitted on stdin (it is written); a mistyped or
+missing field is refused before anything is written. For example:
+
+```console
+echo '{"run_id": "<UUID>", "endpoint": "decode0", "process_id": "<capture process ID>",
+       "exit_code": 0, "launcher": "my-launcher"}' |
+  python observer.pyz --record-exit <observer directory>
+```
+
+`signal`, `killed`, `timed_out`, `problems` and `evidence` default to a clean exit
+(`null`, `null`, `false`, `[]`, `{}`); `evidence: null` is written as `{}` as well,
+and the exit checks never read it. `--check-capture` requires a well-formed record of a clean exit of
+this attempt: exit 0, no signal, not killed, not timed out, no problems. It
+never reads a container runtime's own records. A capture carries
+`capture_format: 2` from its creation; an earlier capture is refused, to be
+rerun.
 Current-image availability and real serving shutdown are separate qualification
 steps; installing this code does not establish L3 overhead acceptance.
 

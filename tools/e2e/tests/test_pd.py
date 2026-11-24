@@ -5678,10 +5678,79 @@ class EndpointObserverCapabilities(unittest.TestCase):
                          [])
 
 
+class EndpointObserverExitRecord(unittest.TestCase):
+    """The Docker launcher publishes the deployment-neutral exit record only after reconciling its evidence."""
+
+    def stop_with(self, inspect, waited="0", removed=True, captures=1):
+        from harness.endpoint_observer import EndpointObserver, bundle
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output"
+            output.mkdir()
+            bundle(output / "observer.pyz")
+            for index in range(captures):
+                folder = output / "captures" / "run" / f"attempt-{index}"
+                folder.mkdir(parents=True)
+                (folder / "manifest.json").write_text(json.dumps({"process_id": f"attempt-{index}"}))
+            (root / "inspect.json").write_text(json.dumps(inspect))
+            docker = root / "docker"
+            docker.write_text(
+                f"#!{sys.executable}\n"
+                "import pathlib, sys\n"
+                "action = sys.argv[1]\n"
+                f"if action == 'wait': print({waited!r})\n"
+                f"elif action == 'inspect': print(pathlib.Path({str(root / 'inspect.json')!r}).read_text())\n"
+                f"elif action == 'rm': sys.exit({0 if removed else 1})\n"
+            )
+            docker.chmod(0o755)
+            observer = EndpointObserver("observer", output, "run", "decode", "owned-observer")
+            with mock.patch.dict(os.environ, {"PATH": str(root)}):
+                observer.stop(True)
+            return json.loads((output / "exit.json").read_text())
+
+    def state(self, **override):
+        return [{"Id": "owned-observer", "State": {"ExitCode": 0, "Running": False, "OOMKilled": False, **override}}]
+
+    def test_a_reconciled_clean_exit_is_recorded_for_this_attempt(self):
+        record = self.stop_with(self.state())
+        self.assertEqual((record["exit_code"], record["killed"], record["problems"], record["process_id"],
+                          record["launcher"]), (0, None, [], "attempt-0", "docker"))
+
+    def test_disagreeing_or_missing_evidence_is_never_a_clean_exit(self):
+        cases = {
+            "oom": (self.state(OOMKilled=True, ExitCode=137), "137", True, 1),
+            "another_container": ([{"Id": "other", "State": self.state()[0]["State"]}], "0", True, 1),
+            "still_running": (self.state(Running=True), "0", True, 1),
+            "exit_code_disagrees": (self.state(ExitCode=2), "0", True, 1),
+            "not_removed": (self.state(), "0", False, 1),
+            "no_capture": (self.state(), "0", True, 0),
+            # unknown or mistyped evidence is never a clean exit
+            "oom_missing": ([{"Id": "owned-observer", "State": {"ExitCode": 0, "Running": False}}], "0", True, 1),
+            "oom_null": (self.state(OOMKilled=None), "0", True, 1),
+            "oom_string": (self.state(OOMKilled="false"), "0", True, 1),
+            "exit_code_false": (self.state(ExitCode=False), "0", True, 1),
+            "exit_code_float": (self.state(ExitCode=0.0), "0", True, 1),
+            "running_missing": ([{"Id": "owned-observer", "State": {"ExitCode": 0, "OOMKilled": False}}], "0", True,
+                                1),
+            "no_state": ([{"Id": "owned-observer"}], "0", True, 1),
+            "empty_state": ([{"Id": "owned-observer", "State": {}}], "0", True, 1),
+        }
+        for name, (inspect, waited, removed, captures) in cases.items():
+            with self.subTest(name):
+                record = self.stop_with(inspect, waited, removed, captures)
+                if name == "oom":
+                    self.assertEqual(record["killed"], "oom")
+                elif name == "no_capture":
+                    self.assertIsNone(record["process_id"])
+                else:
+                    self.assertTrue(record["problems"], record)
+
+
 class EndpointObserverDiagnostics(unittest.TestCase):
     def test_stderr_only_failure_is_preserved_without_masking_exit_or_cleanup(self):
         """A fake Docker CLI keeps real subprocess stream handling, without Docker."""
-        from harness.endpoint_observer import EndpointObserver
+        from harness.endpoint_observer import EndpointObserver, bundle
 
         for logs_exit in (0, 23):
             with (
@@ -5707,6 +5776,7 @@ class EndpointObserverDiagnostics(unittest.TestCase):
                     "else: sys.exit(97)\n"
                 )
                 docker.chmod(0o755)
+                bundle(output / "observer.pyz")
                 observer = EndpointObserver(
                     "observer", output, "run", "decode", "owned-observer"
                 )
@@ -5716,11 +5786,12 @@ class EndpointObserverDiagnostics(unittest.TestCase):
                 stderr = b"only-stderr: startup failed\n"
                 self.assertEqual((output / "observer.stderr.log").read_bytes(), stderr)
                 self.assertIn(stderr, (output / "observer.log").read_bytes())
-                status = json.loads((output / "endpoint-status.json").read_text())
-                self.assertEqual(status["exit_code"], 1)
-                self.assertEqual(status["logs_exit_code"], logs_exit)
-                self.assertFalse(status["timed_out"])
-                self.assertTrue(status["removed"])
+                record = json.loads((output / "exit.json").read_text())
+                self.assertEqual(record["exit_code"], 1)
+                self.assertEqual(record["evidence"]["logs_exit_code"], logs_exit)
+                self.assertFalse(record["timed_out"])
+                self.assertTrue(record["evidence"]["removed"])
+                self.assertIn("the container could not be inspected", record["problems"])
                 self.assertTrue((root / "removed").exists())
 
 
@@ -5863,6 +5934,7 @@ class EndpointCaptureIntegrity(unittest.TestCase):
             meta = {
                 "schema": 1,
                 "probe_schema": 1,
+                "capture_format": 2,
                 "type": "metadata",
                 "run_id": run_id,
                 "process_id": process,
@@ -5966,32 +6038,11 @@ class EndpointCaptureIntegrity(unittest.TestCase):
                     }
                 )
             )
-            (directory / "container.json").write_text(
-                json.dumps(
-                    [
-                        {
-                            "Id": node,
-                            "State": {
-                                "ExitCode": 0,
-                                "Running": False,
-                                "OOMKilled": False,
-                            },
-                        }
-                    ]
-                )
-            )
-            (directory / "endpoint-status.json").write_text(
-                json.dumps(
-                    {
-                        "run_id": run_id,
-                        "endpoint": node,
-                        "container_id": node,
-                        "exit_code": 0,
-                        "removed": True,
-                        "timed_out": False,
-                    }
-                )
-            )
+            # what a launcher publishes after reaping the observer
+            (directory / "exit.json").write_text(json.dumps({
+                "schema": 1, "run_id": run_id, "endpoint": node, "process_id": process, "exit_code": 0,
+                "signal": None, "killed": None, "timed_out": False, "launcher": "test", "problems": [],
+                "evidence": {}}))
         return run
 
     def test_complete_flags_do_not_replace_capture_contents_or_matching_identity(self):
@@ -6013,6 +6064,13 @@ class EndpointCaptureIntegrity(unittest.TestCase):
                 "stale",
                 "exit",
                 "timeout",
+                "killed",
+                "signal",
+                "unreconciled",
+                "copied_from_another_attempt",
+                "malformed_exit",
+                "missing_exit_with_docker_records",
+                "earlier_capture_format",
             ):
                 out = root / fault
                 shutil.copytree(clean, out)
@@ -6027,12 +6085,28 @@ class EndpointCaptureIntegrity(unittest.TestCase):
                     config = json.loads((folder / "config.json").read_text())
                     config["endpoint" if fault == "swapped" else "run_id"] = "wrong"
                     (folder / "config.json").write_text(json.dumps(config))
+                elif fault == "malformed_exit":
+                    (folder / "exit.json").write_text(json.dumps({"schema": 1, "exit_code": "0"}))
+                elif fault == "missing_exit_with_docker_records":
+                    # a runtime's own records never stand in for the exit record
+                    (folder / "exit.json").unlink()
+                    (folder / "container.json").write_text(json.dumps(
+                        [{"Id": "d", "State": {"ExitCode": 0, "Running": False, "OOMKilled": False}}]))
+                    (folder / "endpoint-status.json").write_text(json.dumps(
+                        {"run_id": "the-run", "endpoint": "d", "exit_code": 0, "removed": True, "timed_out": False}))
+                elif fault == "earlier_capture_format":
+                    events = next((folder / "captures").glob("*/*/events.jsonl"))
+                    rows = [json.loads(line) for line in events.read_text().splitlines()]
+                    del rows[0]["capture_format"]
+                    events.write_text("".join(json.dumps(row) + "\n" for row in rows))
                 else:
-                    status = json.loads((folder / "endpoint-status.json").read_text())
-                    status["exit_code" if fault == "exit" else "timed_out"] = (
-                        1 if fault == "exit" else True
-                    )
-                    (folder / "endpoint-status.json").write_text(json.dumps(status))
+                    record = json.loads((folder / "exit.json").read_text())
+                    record.update({
+                        "exit": {"exit_code": 1}, "timeout": {"timed_out": True}, "killed": {"killed": "oom"},
+                        "signal": {"exit_code": None, "signal": 9}, "unreconciled": {"problems": ["not removed"]},
+                        "copied_from_another_attempt": {"process_id": "an-earlier-observer"},
+                    }[fault])
+                    (folder / "exit.json").write_text(json.dumps(record))
                 verdict = {"problems": []}
                 check_captures(out, run, verdict)
                 self.assertTrue(verdict["problems"], fault)

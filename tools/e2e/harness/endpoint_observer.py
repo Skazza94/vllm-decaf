@@ -1,5 +1,6 @@
 """L3 lifecycle only. The installed generic CLI owns all sampling and correlation."""
 
+import contextlib
 import hashlib
 import json
 import subprocess
@@ -146,9 +147,9 @@ class EndpointObserver:
         )
         notice.replace(self.output / "children.json")
         (self.output / "stop").touch()
+        # The Docker launcher's evidence, reconciled into the deployment-neutral
+        # exit record (endpoint_probes.exit_record) once the observer is reaped.
         status = {
-            "run_id": self.run_id,
-            "endpoint": self.endpoint,
             "container_id": self.container_id,
             "timed_out": False,
             "exit_code": None,
@@ -185,12 +186,55 @@ class EndpointObserver:
                 + stderr
             )
             inspect = shell.run(["docker", "inspect", self.container_id], check=False)
-            (self.output / "container.json").write_text(inspect)
+            (self.output / "container.json").write_text(inspect)  # diagnostics only
             try:
                 shell.run(["docker", "rm", "-f", self.container_id])
                 status["removed"] = True
+            except Exception as error:
+                status["remove_error"] = str(error)
             finally:
-                (self.output / "endpoint-status.json").write_text(json.dumps(status))
+                self._publish_exit(status, inspect)
+
+    def _publish_exit(self, status, inspect):
+        """The exit record from Docker's evidence: success only when the wait
+        result, the inspected container (this one, stopped, its exit code the
+        waited one, not OOM-killed) and its removal agree."""
+        problems, killed = [], None
+        try:
+            container = json.loads(inspect)[0]
+        except (ValueError, IndexError, KeyError, TypeError):
+            container = None
+        state = container.get("State") if isinstance(container, dict) else None
+        if not isinstance(state, dict):
+            problems.append("the container could not be inspected")
+            state = {}
+        elif container.get("Id") != self.container_id:
+            problems.append("the inspected container is not the launched one")
+        # each fact must be stated with its type: unknown evidence is never clean
+        # positive evidence only: an empty or partial State certifies nothing
+        oom = state.get("OOMKilled")
+        if type(oom) is not bool:
+            problems.append(f"the container's OOM state is unknown ({oom!r})")
+        elif oom is True:
+            killed = "oom"
+        if state.get("Running") is not False:
+            problems.append(f"the container is not shown stopped (Running {state.get('Running')!r})")
+        code = state.get("ExitCode")
+        if type(code) is not int or code != status["exit_code"]:
+            problems.append(f"inspected exit code {code!r} is not the waited {status['exit_code']!r}")
+        if not status["removed"]:
+            problems.append(f"the container was not removed: {status.get('remove_error')}")
+        captures = list((self.output / "captures").glob(f"{self.run_id}/*/manifest.json"))
+        process_id = None
+        if len(captures) == 1:
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                process_id = json.loads(captures[0].read_text()).get("process_id")
+        record = {"run_id": self.run_id, "endpoint": self.endpoint, "process_id": process_id,
+                  "exit_code": status["exit_code"], "killed": killed, "timed_out": status["timed_out"],
+                  "launcher": "docker", "problems": problems, "evidence": status}
+        # written by the frozen observer package itself, as check_captures reads it
+        subprocess.run([sys.executable, str(self.output / "observer.pyz"), "--record-exit", str(self.output)],
+                       input=json.dumps(record), text=True, check=True, timeout=10)
 
 
 def _stat(container, pid):

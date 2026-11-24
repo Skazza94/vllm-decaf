@@ -2643,3 +2643,156 @@ def test_ebpf_the_collector_s_plan_carries_the_address_allow_lists(
     lines = [plan.splitlines()[2:] for plan in launched]
     assert lines[0] == ["L ", "R 7", "LA 10.0.0.1", "RA 10.0.0.2 fd00::5"]
     assert lines[1] == ["L ", "R ", "LA ", "RA "]
+
+
+@pytest.mark.parametrize(
+    "change, problem",
+    [
+        ({}, None),
+        ({"exit_code": 3}, "not clean"),
+        ({"exit_code": None, "signal": 9, "killed": "signal"}, "not clean"),
+        ({"killed": "oom"}, "not clean"),
+        ({"timed_out": True}, "not clean"),
+        ({"problems": ["the container was not removed"]}, "not clean"),
+        ({"process_id": "a-previous-attempt"}, "another run, endpoint or attempt"),
+        ({"endpoint": "other"}, "another run, endpoint or attempt"),
+    ],
+)
+def test_the_exit_record_shows_this_observer_attempt_exited_cleanly(
+    tmp_path, change, problem
+):
+    """Any launcher publishes the record after reaping the observer; only a
+    clean exit of this run's, endpoint's and attempt's observer passes."""
+    from vllm.kv_profiling.endpoint_probes.exit_record import (
+        exit_problems,
+        write_exit_record,
+    )
+
+    fields = {"run_id": "run", "endpoint": "d", "process_id": "attempt",
+              "exit_code": 0, "launcher": "test"}  # fmt: skip
+    write_exit_record(tmp_path, **{**fields, **change})
+    found = exit_problems(tmp_path, "run", "d", "attempt")
+    assert (found == []) if problem is None else (problem in found[0])
+    assert not list(tmp_path.glob("*.tmp"))  # published atomically
+
+
+def test_a_missing_or_malformed_exit_record_is_never_a_clean_exit(tmp_path):
+    from vllm.kv_profiling.endpoint_probes.exit_record import exit_problems
+
+    assert exit_problems(tmp_path, "run", "d", "attempt") == [
+        "observer exit record missing"]  # fmt: skip
+    for text in ("{", json.dumps({"schema": 1, "exit_code": "0"}), "[]"):
+        (tmp_path / "exit.json").write_text(text)
+        assert exit_problems(tmp_path, "run", "d", "attempt")[0] in (
+            "observer exit record unreadable",
+            "observer exit record malformed",
+        )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"schema": True},
+        {"schema": 1.0},
+        {"launcher": ""},
+        {"run_id": ""},
+        {"process_id": ""},
+        {"exit_code": True},
+        {"exit_code": 0.0},
+        {"signal": "9"},
+        {"killed": "maybe"},
+        {"timed_out": 0},
+        {"problems": [1]},
+        {"evidence": []},
+        "drop:run_id",
+        "drop:signal",
+        "drop:evidence",
+    ],
+)
+def test_an_exit_record_with_a_wrong_type_or_missing_field_is_malformed(
+    tmp_path, change
+):
+    """Every field must be present with its type; a record that is not is
+    malformed, never an error and never a clean exit."""
+    from vllm.kv_profiling.endpoint_probes.exit_record import (
+        exit_problems,
+        write_exit_record,
+    )
+
+    write_exit_record(tmp_path, run_id="run", endpoint="d", process_id="attempt",
+                      exit_code=0, launcher="test")  # fmt: skip
+    record = json.loads((tmp_path / "exit.json").read_text())
+    if isinstance(change, str):
+        del record[change.split(":", 1)[1]]
+    else:
+        record.update(change)
+    (tmp_path / "exit.json").write_text(json.dumps(record))
+    assert exit_problems(tmp_path, "run", "d", "attempt") == [
+        "observer exit record malformed"]  # fmt: skip
+
+
+def test_overlapping_exit_publications_never_collide_or_leave_partial_records(
+    tmp_path,
+):
+    """Each publication writes its own temporary file and replaces the record
+    atomically: concurrent attempts leave one valid record and no residue."""
+    import multiprocessing
+
+    with multiprocessing.get_context("spawn").Pool(6) as pool:
+        results = pool.map(_publish_exit, [(str(tmp_path), n) for n in range(24)])
+    assert results == [None] * 24
+    from vllm.kv_profiling.endpoint_probes.exit_record import exit_problems
+
+    assert exit_problems(tmp_path, "run", "d", "attempt") == []
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["exit.json"]
+
+
+def _publish_exit(arguments):
+    from vllm.kv_profiling.endpoint_probes.exit_record import write_exit_record
+
+    directory, attempt = arguments
+    try:
+        write_exit_record(directory, run_id="run", endpoint="d",
+                          process_id="attempt", exit_code=0,
+                          launcher=f"writer-{attempt}")  # fmt: skip
+    except Exception as error:  # reported to the test, not raised in the pool
+        return repr(error)
+    return None
+
+
+@pytest.mark.parametrize(
+    "fields, accepted",
+    [
+        ({}, True),  # the guide's example
+        ({"schema": 1, "signal": None, "killed": None, "timed_out": False,
+          "problems": [], "evidence": {}}, True),  # the full record  # fmt: skip
+        ({"problems": {}}, False),
+        ({"evidence": []}, False),
+        ({"schema": True}, False),
+        ({"schema": 2}, False),
+        ({"exit_code": "0"}, False),
+        ({"killed": "maybe"}, False),
+    ],
+)
+def test_record_exit_through_the_cli_publishes_only_well_formed_input(
+    tmp_path, fields, accepted
+):
+    """The public ``--record-exit`` refuses mistyped input before writing
+    anything, rather than converting it into a clean-looking record."""
+    from vllm.kv_profiling.endpoint_probes.exit_record import exit_problems
+
+    root = Path(__file__).resolve().parents[3]
+    if not (root / "vllm/kv_profiling/probe.py").exists():
+        root = Path(os.environ["KV_PROFILER_SOURCE_ROOT"])
+    record = {"run_id": "run", "endpoint": "decode0", "process_id": "attempt",
+              "exit_code": 0, "launcher": "my-launcher", **fields}  # fmt: skip
+    done = subprocess.run(
+        [sys.executable, str(root / "vllm/kv_profiling/probe.py"),
+         "--record-exit", str(tmp_path)],
+        input=json.dumps(record), capture_output=True, text=True, timeout=30,
+    )  # fmt: skip
+    assert (done.returncode == 0) is accepted, done.stderr
+    if accepted:
+        assert exit_problems(tmp_path, "run", "decode0", "attempt") == []
+    else:
+        assert list(tmp_path.iterdir()) == []  # nothing written

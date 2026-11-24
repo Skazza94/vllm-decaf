@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from .config import ProbeConfig, settings_dict
+from .exit_record import CAPTURE_FORMAT, exit_problems
 from .records import validate
 
 
@@ -306,6 +307,11 @@ def endpoint_capture(directory, core_dir):
         health = inspect_trace(paths[0].with_name("events.jsonl"), probe=True)
         problems.extend(health["problems"])
         meta = health["metadata"]
+        if meta.get("capture_format") != CAPTURE_FORMAT:
+            raise ValueError(
+                f"capture format {meta.get('capture_format')!r} is an earlier "
+                f"observer's, not {CAPTURE_FORMAT}: rerun the capture"
+            )
         context = meta.get("context", {})
         # Every frontend (one API server, or one a DP rank) shares the
         # observer's boot and namespaces. The owner is the process the
@@ -401,23 +407,9 @@ def endpoint_capture(directory, core_dir):
             scope = "socket" if source == "tcp" else source
             if not health["scopes"].get(scope):
                 problems.append("required source observation missing: " + source)
-        status = read_json(directory / "endpoint-status.json")
-        container = json.loads((directory / "container.json").read_text())[0]
-        state = container["State"]
-        if (
-            status.get("run_id") != run
-            or status.get("endpoint") != endpoint
-            or status.get("container_id") != container.get("Id")
-            or status.get("timed_out") is not False
-            or status.get("removed") is not True
-            or type(status.get("exit_code")) is not int
-            or status.get("exit_code") != 0
-            or type(state.get("ExitCode")) is not int
-            or state.get("ExitCode") != 0
-            or state.get("Running") is not False
-            or state.get("OOMKilled") is not False
-        ):
-            problems.append("observer exit/timeout/cleanup status invalid")
+        # How the observer ended, from whatever launched and reaped it: never
+        # a container runtime's own records (any deployment writes this one).
+        problems.extend(exit_problems(directory, run, endpoint, meta.get("process_id")))
         closure = core_completion(core_dir, run, config["inventory"])
         problems.extend(closure["problems"])
     except (
