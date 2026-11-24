@@ -290,32 +290,6 @@ class ProfilerConfig(unittest.TestCase):
                 if label != "swapped endpoints":
                     self.assertTrue(all(p.startswith("decode d") for p in found), found)
 
-    def test_the_observer_owner_is_the_api_servers_common_parent(self):
-        """One API server is its own owner; several (data parallelism) give
-        their one common parent, checked against each server's start ticks."""
-        from harness import endpoint_observer
-
-        stats = {11: (7, 201), 12: (7, 202), 7: (1, 150), 13: (8, 203)}
-
-        def exec_in(container, command, **kwargs):
-            pid = int(command[1].split("/")[2])
-            parent, start = stats[pid]
-            fields = ["S", str(parent)] + ["0"] * 17 + [str(start)]
-            return f"{pid} (vllm) " + " ".join(fields) + "\n"
-
-        with mock.patch.object(endpoint_observer.topology, "exec_in", exec_in):
-            owner = endpoint_observer.endpoint_owner(
-                "c", [{"pid": 11, "start_ticks": 201}, {"pid": 12, "start_ticks": 202}])
-            self.assertEqual(owner, {"pid": 7, "start_ticks": 150})
-            self.assertEqual(endpoint_observer.endpoint_owner(
-                "c", [{"pid": 11, "start_ticks": 201}]), {"pid": 11, "start_ticks": 201})
-            with self.assertRaisesRegex(ValueError, "no single parent"):
-                endpoint_observer.endpoint_owner(
-                    "c", [{"pid": 11, "start_ticks": 201}, {"pid": 13, "start_ticks": 203}])
-            with self.assertRaisesRegex(ValueError, "changed"):
-                endpoint_observer.endpoint_owner(
-                    "c", [{"pid": 11, "start_ticks": 999}, {"pid": 12, "start_ticks": 202}])
-
     def test_off_leaves_the_connector_configuration_unchanged(self):
         run = self.run_with()
         for role in ("prefill", "decode"):
@@ -5859,7 +5833,8 @@ class EndpointCaptureIntegrity(unittest.TestCase):
                     "net_namespace": "net",
                     "pid_namespace": "pid",
                     "time_namespace": "time",
-                    "context": {"role": capture_role, "engine_id": node, "rank": 0},
+                    "context": {"role": capture_role, "engine_id": node, "rank": 0,
+                                "kv_role": "kv_producer" if role == "prefill" else "kv_consumer"},
                 }
                 entry = {
                     key: value
@@ -5899,16 +5874,19 @@ class EndpointCaptureIntegrity(unittest.TestCase):
                         {**meta, "saved": True, "complete": True, "stats": end["stats"]}
                     )
                 )
+            counts = {r: sum(e["context"]["role"] == r for e in entries) for r in ("frontend", "scheduler", "worker")}
+            import subprocess as digest_run
+
+            code_sha256 = digest_run.check_output(
+                [sys.executable, str(directory / "observer.pyz"), "--code-digest"], text=True).strip()
             config = {
                 "run_id": run_id,
                 "endpoint": node,
                 "role": role,
                 "probes": probes[node],
                 "cpus": profiler.observer_cpus[node],
-                "inventory": entries,
                 "package_sha256": digest,
-                "owner_pid": owner[0],
-                "owner_start": owner[1],
+                "expected": counts,
             }
             (directory / "config.json").write_text(json.dumps(config))
             # Get normalized defaults from the same immutable, stdlib-only package.
@@ -5953,6 +5931,13 @@ class EndpointCaptureIntegrity(unittest.TestCase):
                     normalized.strip().encode()
                 ).hexdigest(),
                 "inventory": entries,
+                "expected": counts,
+                # what discovery froze: each frontend's parent as read
+                "owner_evidence": {"frontends": [], "parent": None} if frontends == 1 else {
+                    "frontends": [{"pid": e["pid"], "start_ticks": e["start_ticks"], "parent_pid": owner[0]}
+                                  for e in entries if e["context"]["role"] == "frontend"],
+                    "parent": {"pid": owner[0], "start_ticks": owner[1]}},
+                "code_sha256": code_sha256,
                 "affinity": profiler.observer_cpus[node],
                 "owner": {
                     "pid": (recorded_owner or owner)[0],
@@ -6122,8 +6107,7 @@ class EndpointCaptureIntegrity(unittest.TestCase):
 
         cases = (
             ("parent of two API servers", {"frontends": 2}, True),
-            ("recorded owner is not the configured one",
-             {"frontends": 2, "recorded_owner": (99, 999)}, False),
+            ("the observer's recorders are not the expected ones", {"frontends": 2}, False),
             ("one API server, owner not the frontend",
              {"frontends": 1, "owner": (5, 500)}, False),
         )  # fmt: skip
@@ -6131,6 +6115,12 @@ class EndpointCaptureIntegrity(unittest.TestCase):
             with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
                 output = Path(temporary)
                 run = self.create(output, **kwargs)
+                if label.startswith("the observer's recorders"):
+                    for node in ("p", "d"):
+                        path = output / "endpoint-probes" / node / "config.json"
+                        config = json.loads(path.read_text())
+                        config["expected"]["frontend"] = 3
+                        path.write_text(json.dumps(config))
                 verdict = {"problems": []}
                 check_captures(output, run, verdict)
                 self.assertEqual(verdict["problems"] == [], clean, verdict["problems"])

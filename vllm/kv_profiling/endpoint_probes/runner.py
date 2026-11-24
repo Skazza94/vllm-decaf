@@ -14,10 +14,16 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from . import netdev, rdma, tasks, tcp
+from .code import code_digest
 from .config import settings_dict
 from .exit_record import CAPTURE_FORMAT
-from .health import core_completion, validate_inventory
-from .identity import ownership, placement, process_identity
+from .health import (
+    core_completion,
+    recorder_counts,
+    side_problems,
+    validate_inventory,
+)
+from .identity import discover, ownership, placement, process_identity
 from .netlink import ObservationError
 from .records import Writer, event
 
@@ -66,17 +72,36 @@ class Observer:
         run_id,
         endpoint,
         role,
-        owner_pid,
-        owner_start,
         cpus,
         input_dir,
         output_dir,
         irq_policy,
-        inventory,
+        expected=None,
+        owner_pid=None,
+        owner_start=None,
+        inventory=None,
         package_sha256=None,
     ):
+        """A launcher names the ``expected`` recorders per role; the observer
+        finds and freezes them and their owner itself (``identity.discover``).
+        An explicit ``inventory`` with its ``owner_pid``/``owner_start`` is for
+        callers that already hold them."""
         UUID(run_id)
+        owner_evidence = {"frontends": [], "parent": None, "supplied": True}
+        if inventory is None:
+            if expected is None or owner_pid is not None:
+                raise ValueError("observer discovery takes expected counts only")
+            inventory, found, owner_evidence = discover(
+                input_dir, run_id, expected, role
+            )
+            owner_pid, owner_start = found["pid"], found["start_ticks"]
         validate_inventory(inventory, run_id)
+        if wrong := side_problems(inventory, role):
+            raise ValueError(wrong[0])
+        if expected is None:
+            expected = recorder_counts(inventory)
+        if recorder_counts(inventory) != expected:
+            raise ValueError("the endpoint's recorders are not the expected ones")
         if role not in ("prefill", "decode") or not endpoint:
             raise ValueError("observer requires a prefill/decode endpoint")
         if irq_policy not in ("operator_verified", "virtual_not_applicable"):
@@ -160,6 +185,10 @@ class Observer:
             "owner": self.owner,
             "config": settings_dict(config),
             "inventory": inventory,
+            "expected": expected,
+            "owner_evidence": owner_evidence,
+            # what actually ran, wherever it came from (zipapp, tree, package)
+            "code_sha256": code_digest(),
             "package_sha256": package_sha256,
             "config_sha256": hashlib.sha256(
                 json.dumps(settings_dict(config), sort_keys=True).encode()

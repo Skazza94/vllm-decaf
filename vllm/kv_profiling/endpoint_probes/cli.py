@@ -9,9 +9,16 @@ import signal
 import sys
 from pathlib import Path
 
+from .code import code_digest
 from .config import ProbeConfig
 from .exit_record import EXIT_SCHEMA, write_exit_record
-from .health import core_completion, endpoint_capture, inventory, validate_inventory
+from .health import (
+    core_completion,
+    endpoint_capture,
+    inventory,
+    launch_config_problems,
+    validate_inventory,
+)
 from .netdev import read_small
 from .runner import Observer
 
@@ -38,7 +45,15 @@ def main():
         help="publish the observer's exit record in DIRECTORY, its fields as "
         "JSON on stdin (for a launcher that reaped the observer)",
     )
+    parser.add_argument(
+        "--code-digest",
+        action="store_true",
+        help="print the digest of this observer code, as captures record it",
+    )
     args = parser.parse_args()
+    if args.code_digest:
+        print(code_digest())
+        return 0
     if args.record_exit:
         fields = json.loads(sys.stdin.read(1 << 20))
         if not isinstance(fields, dict):
@@ -72,6 +87,15 @@ def main():
         and hashlib.sha256(Path(sys.argv[0]).read_bytes()).hexdigest() != expected_hash
     ):
         raise ValueError("observer package hash mismatch")
+    # one launch form: the launcher names the expected recorders and the
+    # observer finds and freezes them (identities supplied by a launcher would
+    # be a second, unchecked source of truth)
+    if problems := launch_config_problems(values):
+        raise ValueError(
+            "--config names the endpoint's expected recorders per role "
+            "(`expected`); the observer discovers its inventory and owner: "
+            + "; ".join(problems)
+        )
     config = ProbeConfig(**values.pop("probes"))
     stop_file = values.pop("stop_file")
     completion_file = values.pop("endpoint_complete_file")

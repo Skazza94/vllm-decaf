@@ -292,12 +292,10 @@ def test_real_cli_separates_owner_and_child_completion(tmp_path, termination, re
     )
     config = {
         "probes": asdict(settings),
-        "inventory": inventory,
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
         "run_id": run_id,
         "endpoint": "d",
         "role": "decode",
-        "owner_pid": owner.pid,
-        "owner_start": process_identity(owner.pid)["start_ticks"],
         "cpus": [allowed[-1]],
         "input_dir": str(core_dir),
         "output_dir": str(tmp_path / "output"),
@@ -622,17 +620,20 @@ def test_netdev_only_cli_rejects_missing_inventory_and_bad_worker_placement(
             "all_closed"
         ]
     if fault == "unverified":
-        # Corrupt input, not a patched process/object: the expected generation is stale.
-        worker["start_ticks"] += 1
+        # Corrupt input, not a patched process/object: the worker recorder's
+        # metadata names a stale generation, which discovery then freezes
+        events = directory / "profiles" / run_id / worker["process_id"] / "events.jsonl"
+        lines = events.read_text().splitlines(keepends=True)
+        meta = json.loads(lines[0])
+        meta["start_ticks"] += 1
+        events.write_text(json.dumps(meta) + "\n" + "".join(lines[1:]))
     settings = ProbeConfig(interfaces=["lo"], required=["netdev"], interval_s=0.1)
     cfg = {
         "probes": asdict(settings),
-        "inventory": entries,
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
         "run_id": run_id,
         "endpoint": "d",
         "role": "decode",
-        "owner_pid": process.pid,
-        "owner_start": process_identity(process.pid)["start_ticks"],
         "cpus": [cpus[-1]],
         "input_dir": str(directory / "profiles"),
         "output_dir": str(tmp_path / "out"),
@@ -1673,12 +1674,10 @@ def test_real_cli_records_the_serving_threads_and_host_network_interrupts(
     )
     config = {
         "probes": asdict(settings),
-        "inventory": inventory,
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
         "run_id": run_id,
         "endpoint": "d",
         "role": "decode",
-        "owner_pid": owner.pid,
-        "owner_start": process_identity(owner.pid)["start_ticks"],
         "cpus": [allowed[-1]],
         "input_dir": str(endpoint_dir / "profiles"),
         "output_dir": str(tmp_path / "output"),
@@ -2796,3 +2795,300 @@ def test_record_exit_through_the_cli_publishes_only_well_formed_input(
         assert exit_problems(tmp_path, "run", "decode0", "attempt") == []
     else:
         assert list(tmp_path.iterdir()) == []  # nothing written
+
+
+def test_the_observer_owner_is_the_api_servers_common_parent(monkeypatch):
+    """One API server is its own owner; several (data parallelism) give their
+    one common parent, checked against each server's start ticks, read by the
+    observer from its own /proc."""
+    from vllm.kv_profiling.endpoint_probes import identity
+
+    stats = {11: (7, 201), 12: (7, 202), 7: (1, 150), 13: (8, 203)}
+
+    def fields(pid):
+        parent, start = stats[pid]
+        return ["S", str(parent)] + ["0"] * 17 + [str(start)]
+
+    monkeypatch.setattr(identity, "_stat_fields", fields)
+    owner, evidence = identity.endpoint_owner(
+        [{"pid": 11, "start_ticks": 201}, {"pid": 12, "start_ticks": 202}]
+    )
+    assert owner == {"pid": 7, "start_ticks": 150}
+    # the evidence it froze: each frontend's parent as read
+    assert evidence == {
+        "frontends": [{"pid": 11, "start_ticks": 201, "parent_pid": 7},
+                      {"pid": 12, "start_ticks": 202, "parent_pid": 7}],
+        "parent": owner,
+    }  # fmt: skip
+    one = [{"pid": 11, "start_ticks": 201}]
+    assert identity.endpoint_owner(one) == (
+        {"pid": 11, "start_ticks": 201}, {"frontends": [], "parent": None})  # fmt: skip
+    with pytest.raises(ValueError, match="no single parent"):
+        identity.endpoint_owner(
+            [{"pid": 11, "start_ticks": 201}, {"pid": 13, "start_ticks": 203}]
+        )
+    with pytest.raises(ValueError, match="changed"):
+        identity.endpoint_owner(
+            [{"pid": 11, "start_ticks": 999}, {"pid": 12, "start_ticks": 202}]
+        )
+
+
+def test_a_bare_process_observer_discovers_its_endpoint_and_checks_complete(tmp_path):
+    """No container anywhere: a launcher names only the expected recorders; the
+    observer, run as a plain process from the standalone entry point, finds and
+    freezes the inventory and owner, the launcher records its exit, and the
+    capture checks complete."""
+    allowed = sorted(os.sched_getaffinity(0))
+    assert len(allowed) >= 2, "probe tests require separate owner/observer CPUs"
+    owner, inventory, endpoint_dir = start_recorded_endpoint(tmp_path, allowed[0])
+    run_id = inventory[0]["run_id"]
+    core_dir = endpoint_dir / "profiles"
+    observer_dir = tmp_path / "observer"
+    observer_dir.mkdir()
+    settings = ProbeConfig(interval_s=0.1, slow_interval_s=0.1, interfaces=["lo"],
+                           required=["netdev"])  # fmt: skip
+    config = {
+        "probes": asdict(settings),
+        "run_id": run_id,
+        "endpoint": "d",
+        "role": "decode",
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
+        "cpus": [allowed[-1]],
+        "input_dir": str(core_dir),
+        "output_dir": str(observer_dir / "captures"),
+        "irq_policy": "virtual_not_applicable",
+        "stop_file": str(observer_dir / "stop"),
+        "endpoint_complete_file": str(observer_dir / "children.json"),
+    }
+    (observer_dir / "config.json").write_text(json.dumps(config))
+    entry = str(Path(probe.__file__))
+    process = subprocess.Popen(
+        [sys.executable, entry, "--config", str(observer_dir / "config.json")],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    try:
+        manifest_glob = f"captures/{run_id}/*/manifest.json"
+        def ready():
+            paths = observer_dir.glob(manifest_glob)
+            return any(json.loads(p.read_text()).get("ready") for p in paths)
+
+        wait_for(ready, timeout=20)
+        (endpoint_dir / "close").touch()
+        wait_for(lambda: (endpoint_dir / "closed").exists(), timeout=20)
+        (observer_dir / "children.json").write_text(
+            json.dumps({"run_id": run_id, "endpoint": "d", "children_closed": True})
+        )
+        (observer_dir / "stop").touch()
+        stdout, stderr = process.communicate(timeout=20)
+        assert process.returncode == 0, stderr
+        manifest = next(observer_dir.glob(manifest_glob))
+        meta = json.loads(manifest.with_name("events.jsonl").open().readline())
+        assert meta["inventory"] == inventory
+        found = (meta["owner"]["pid"], meta["owner"]["start_ticks"])
+        assert found == (owner.pid, process_identity(owner.pid)["start_ticks"])
+        record = {
+            "run_id": run_id,
+            "endpoint": "d",
+            "process_id": meta["process_id"],
+            "exit_code": process.returncode,
+            "launcher": "test-process",
+        }
+        subprocess.run([sys.executable, entry, "--record-exit", str(observer_dir)],
+                       input=json.dumps(record), text=True, check=True)  # fmt: skip
+        checked = subprocess.run(
+            [sys.executable, entry, "--check-capture", str(observer_dir),
+             "--core-dir", str(core_dir)],
+            capture_output=True, text=True, timeout=30,
+        )  # fmt: skip
+        summary = json.loads(checked.stdout)
+        assert checked.returncode == 0 and summary["complete"], summary
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        (endpoint_dir / "exit").touch()
+        owner.wait(10)
+
+
+def test_discovery_refuses_recorders_other_than_the_expected_ones(tmp_path):
+    from vllm.kv_profiling.endpoint_probes.identity import discover
+
+    allowed = sorted(os.sched_getaffinity(0))
+    owner, inventory, endpoint_dir = start_recorded_endpoint(tmp_path, allowed[0])
+    try:
+        run_id = inventory[0]["run_id"]
+        one_each = {"frontend": 1, "scheduler": 1, "worker": 1}
+        found, found_owner, _ = discover(
+            endpoint_dir / "profiles", run_id, one_each, "decode"
+        )
+        assert found == inventory and found_owner["pid"] == owner.pid
+        with pytest.raises(ValueError, match="are not prefill's"):
+            discover(endpoint_dir / "profiles", run_id, one_each, "prefill")
+        for expected in ({"frontend": 1, "scheduler": 1, "worker": 2},
+                         {"frontend": 0, "scheduler": 1, "worker": 1},
+                         {"frontend": 1, "scheduler": 1}):  # fmt: skip
+            with pytest.raises(ValueError):
+                discover(endpoint_dir / "profiles", run_id, expected, "decode")
+    finally:
+        (endpoint_dir / "exit").touch()
+        owner.wait(10)
+
+
+def test_unreadable_namespaces_name_the_capability_cause(monkeypatch):
+    from vllm.kv_profiling.endpoint_probes import identity
+
+    real = identity.os.readlink
+
+    def denied(path, *args, **kwargs):
+        if "/ns/" in str(path) and not str(path).startswith("/proc/self"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(identity.os, "readlink", denied)
+    with pytest.raises(identity.NamespacesUnreadable) as raised:
+        identity.process_identity(os.getpid())
+    message = str(raised.value)
+    # the denied path and errno, and both kernel causes, are kept
+    for part in (f"/proc/{os.getpid()}/ns/net", "errno 13", "not dumpable",
+                 "CAP_SYS_PTRACE"):  # fmt: skip
+        assert part in message, message
+    assert issubclass(identity.NamespacesUnreadable, ObservationError)
+
+
+def test_the_code_digest_is_the_same_from_a_zipapp_and_from_the_tree(tmp_path):
+    """Captures record what actually ran; a zipapp of the same modules and the
+    source tree give the same digest."""
+    import zipfile
+
+    from vllm.kv_profiling.endpoint_probes.code import code_digest
+
+    package = Path(probe.__file__).with_name("endpoint_probes")
+    archive = tmp_path / "observer.pyz"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.write(probe.__file__, "__main__.py")
+        for source in sorted(package.glob("*.py")):
+            bundle.write(source, f"endpoint_probes/{source.name}")
+    zipped = subprocess.run([sys.executable, str(archive), "--code-digest"],
+                            capture_output=True, text=True, check=True)  # fmt: skip
+    assert zipped.stdout.strip() == code_digest()
+    # the launcher is part of what ran: a changed one changes the digest
+    changed = tmp_path / "changed.pyz"
+    with zipfile.ZipFile(archive) as source, zipfile.ZipFile(changed, "w") as bundle:
+        for item in source.namelist():
+            data = source.read(item)
+            if item == "__main__.py":
+                data += b"\n# changed\n"
+            bundle.writestr(item, data)
+    other = subprocess.run([sys.executable, str(changed), "--code-digest"],
+                           capture_output=True, text=True, check=True)  # fmt: skip
+    assert other.stdout.strip() != code_digest()
+
+
+def _observer_config(tmp_path, run_id, core_dir, cpu, **override):
+    settings = ProbeConfig(interval_s=0.1, slow_interval_s=0.1, interfaces=["lo"],
+                           required=["netdev"])  # fmt: skip
+    config = {
+        "probes": asdict(settings),
+        "run_id": run_id,
+        "endpoint": "d",
+        "role": "decode",
+        "expected": {"frontend": 1, "scheduler": 1, "worker": 1},
+        "cpus": [cpu],
+        "input_dir": str(core_dir),
+        "output_dir": str(tmp_path / "observer" / "captures"),
+        "irq_policy": "virtual_not_applicable",
+        "stop_file": str(tmp_path / "observer" / "stop"),
+        "endpoint_complete_file": str(tmp_path / "observer" / "children.json"),
+        **override,
+    }
+    (tmp_path / "observer").mkdir(exist_ok=True)
+    path = tmp_path / "observer" / "config.json"
+    path.write_text(json.dumps(config))
+    return path
+
+
+@pytest.mark.parametrize(
+    "override, refusal",
+    [
+        ({"role": "prefill"}, "are not prefill's"),
+        ({"expected": None}, "expected recorders"),
+        ({"inventory": []}, "expected recorders"),
+        ({"owner_pid": 1, "owner_start": 1}, "expected recorders"),
+    ],
+)
+def test_the_cli_launches_only_the_discovery_form_on_its_own_side(
+    tmp_path, override, refusal
+):
+    """One launch form (expected recorders, discovered by the observer), and
+    only on the endpoint side it is configured for: refused before readiness."""
+    allowed = sorted(os.sched_getaffinity(0))
+    owner, inventory, endpoint_dir = start_recorded_endpoint(tmp_path, allowed[0])
+    try:
+        run_id, core_dir = inventory[0]["run_id"], endpoint_dir / "profiles"
+        config = _observer_config(tmp_path, run_id, core_dir, allowed[-1], **override)
+        done = subprocess.run(
+            [sys.executable, str(Path(probe.__file__)), "--config", str(config)],
+            capture_output=True, text=True, timeout=30,
+        )  # fmt: skip
+        assert done.returncode != 0 and refusal in done.stderr, done.stderr
+        assert not list((tmp_path / "observer").glob("captures/*/*/manifest.json"))
+    finally:
+        (endpoint_dir / "exit").touch()
+        owner.wait(10)
+
+
+def test_the_owner_is_checked_offline_against_its_frozen_evidence():
+    """A saved capture's owner must be what discovery showed: the single
+    frontend, or the frontends' one recorded parent."""
+    from vllm.kv_profiling.endpoint_probes.health import owner_problems
+
+    def entry(role, pid, start):
+        return {"pid": pid, "start_ticks": start, "context": {"role": role}}
+
+    frozen = [entry("frontend", 11, 201), entry("frontend", 12, 202),
+              entry("scheduler", 13, 203), entry("worker", 14, 204)]  # fmt: skip
+    evidence = {"frontends": [{"pid": 11, "start_ticks": 201, "parent_pid": 7},
+                              {"pid": 12, "start_ticks": 202, "parent_pid": 7}],
+                "parent": {"pid": 7, "start_ticks": 150}}  # fmt: skip
+    owner = {"pid": 7, "start_ticks": 150}
+    assert owner_problems(owner, frozen, evidence) == []
+    for bad in ({}, {"pid": 7}, {"pid": 14, "start_ticks": 204},
+                {"pid": 7, "start_ticks": 151}):  # fmt: skip
+        assert owner_problems(bad, frozen, evidence)
+    assert owner_problems(owner, frozen, {**evidence, "supplied": True})
+    assert owner_problems(owner, frozen, None)
+    moved = {**evidence, "frontends": [{**evidence["frontends"][0], "start_ticks": 1},
+                                       evidence["frontends"][1]]}  # fmt: skip
+    assert owner_problems(owner, frozen, moved)
+    single = [entry("frontend", 11, 201), entry("worker", 14, 204)]
+    alone = {"frontends": [], "parent": None}
+    assert owner_problems({"pid": 11, "start_ticks": 201}, single, alone) == []
+    assert owner_problems({"pid": 14, "start_ticks": 204}, single, alone)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"owner_pid": 7},
+        {"inventory": None},
+        {"owner_start": None},
+        {"expected": {"frontend": 1, "scheduler": 1, "worker": 2.0}},
+        {"expected": {"frontend": 1, "scheduler": 1, "worker": True}},
+        {"expected": {"frontend": 0, "scheduler": 1, "worker": 1}},
+        {"expected": {"frontend": 1, "scheduler": 1}},
+        {"expected": None},
+    ],
+)
+def test_one_launch_config_rule_for_launch_and_check(change):
+    """Launch and offline check share one rule: reserved identity keys are
+    refused on presence, and role counts are integers."""
+    from vllm.kv_profiling.endpoint_probes.health import (
+        expected_problems,
+        launch_config_problems,
+    )
+
+    good = {"expected": {"frontend": 1, "scheduler": 1, "worker": 1}}
+    assert launch_config_problems(good) == []
+    assert launch_config_problems({**good, **change})
+    if "expected" in change:
+        assert expected_problems(change["expected"])

@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from .code import code_digest
 from .config import ProbeConfig, settings_dict
 from .exit_record import CAPTURE_FORMAT, exit_problems
 from .records import validate
@@ -170,6 +171,104 @@ def read_json(path, limit=1 << 20):
     return value
 
 
+ROLES = ("frontend", "scheduler", "worker")
+
+
+def recorder_counts(entries):
+    """Recorders per role of an inventory."""
+    return {role: sum(e["context"]["role"] == role for e in entries) for role in ROLES}
+
+
+# The KV roles a side's recorders may carry.
+SIDE_KV_ROLES = {
+    "prefill": ("kv_producer", "kv_both"),
+    "decode": ("kv_consumer", "kv_both"),
+}
+
+
+def side_problems(entries, endpoint_role):
+    """Recorders that are not this endpoint side's: each must carry a KV role
+    of its side (``kv_both`` is either)."""
+    allowed = SIDE_KV_ROLES.get(endpoint_role)
+    if allowed is None:
+        return [f"unknown endpoint role {endpoint_role!r}"]
+    wrong = sorted(
+        {
+            str(e["context"].get("kv_role"))
+            for e in entries
+            if e["context"].get("kv_role") not in allowed
+        }  # fmt: skip
+    )
+    return (
+        [f"the recorders' KV roles {wrong} are not {endpoint_role}'s"] if wrong else []
+    )
+
+
+# A launcher never supplies the identities the observer discovers.
+RESERVED_IDENTITY_KEYS = ("inventory", "owner_pid", "owner_start")
+
+
+def expected_problems(expected):
+    """Why ``expected`` is not a count per role: exactly the roles, each an
+    integer (not a bool or a float) of at least zero, at least one frontend."""
+    if not isinstance(expected, dict) or set(expected) != set(ROLES):
+        return [f"expected is a count per role {ROLES}"]
+    if any(type(expected[role]) is not int or expected[role] < 0 for role in ROLES):
+        return ["expected counts are non-negative integers"]
+    if expected["frontend"] < 1:
+        return ["expected names at least one frontend"]
+    return []
+
+
+def launch_config_problems(values):
+    """The one launch form, for the launcher's config at launch and at check:
+    the expected recorders, no supplied identity (by key, whatever its value)."""
+    if not isinstance(values, dict):
+        return ["the launch config is not an object"]
+    problems = [
+        f"the launch config supplies {key!r}; the observer discovers it"
+        for key in RESERVED_IDENTITY_KEYS
+        if key in values
+    ]
+    return problems + expected_problems(values.get("expected"))
+
+
+def owner_problems(owner, frozen, evidence):
+    """Why the recorded owner is not the one discovery showed: with one
+    frontend, that frontend; with several, their one recorded parent, each
+    frontend's evidence matching its inventory identity."""
+    fronts = [e for e in frozen if e["context"]["role"] == "frontend"]
+    if (
+        not isinstance(owner, dict)
+        or type(owner.get("pid")) is not int
+        or type(owner.get("start_ticks")) is not int
+    ):
+        return ["owner PID and start ticks missing"]
+    if not isinstance(evidence, dict) or evidence.get("supplied"):
+        return ["owner evidence missing (identities supplied, not discovered)"]
+    if len(fronts) == 1:
+        target = (fronts[0]["pid"], fronts[0]["start_ticks"])
+        if (owner["pid"], owner["start_ticks"]) != target:
+            return ["the owner is not the single frontend"]
+        return []
+    seen = evidence.get("frontends")
+    parent = evidence.get("parent")
+    if not isinstance(seen, list) or not isinstance(parent, dict):
+        return ["owner evidence malformed"]
+    if sorted((e.get("pid"), e.get("start_ticks")) for e in seen) != sorted(
+        (f["pid"], f["start_ticks"]) for f in fronts
+    ):
+        return ["owner evidence is not the frozen frontends'"]
+    if {e.get("parent_pid") for e in seen} != {owner["pid"]}:
+        return ["the owner is not the frontends' recorded parent"]
+    if (parent.get("pid"), parent.get("start_ticks")) != (
+        owner["pid"],
+        owner["start_ticks"],
+    ):
+        return ["the owner's start ticks are not the recorded parent's"]
+    return []
+
+
 def inventory(directory, run_id):
     """Freeze all observed process identities, including incomplete event files."""
     base = Path(directory) / run_id
@@ -290,16 +389,19 @@ def endpoint_capture(directory, core_dir):
     try:
         config = read_json(directory / "config.json")
         run, endpoint = config["run_id"], config["endpoint"]
-        validate_inventory(config["inventory"], run)
         expected_hash = hashlib.sha256(
             json.dumps(
                 settings_dict(ProbeConfig(**config["probes"])), sort_keys=True
             ).encode()
         ).hexdigest()
-        package = directory / "observer.pyz"
-        package_hash = hashlib.sha256(package.read_bytes()).hexdigest()
-        if package_hash != config["package_sha256"]:
-            problems.append("observer package hash mismatch")
+        # a launcher that ran a packaged zipapp names its hash; an installed
+        # package has none, and the executed code's digest is checked below
+        package_hash = None
+        if config.get("package_sha256") is not None:
+            package = directory / "observer.pyz"
+            package_hash = hashlib.sha256(package.read_bytes()).hexdigest()
+            if package_hash != config["package_sha256"]:
+                problems.append("observer package hash mismatch")
         paths = list((directory / "captures").glob(f"{run}/*/manifest.json"))
         if len(paths) != 1:
             raise ValueError("expected one observer capture")
@@ -313,15 +415,45 @@ def endpoint_capture(directory, core_dir):
                 f"observer's, not {CAPTURE_FORMAT}: rerun the capture"
             )
         context = meta.get("context", {})
+        # the identities the observer found and froze before it was ready,
+        # against the recorders its launcher expected
+        frozen = meta.get("inventory")
+        validate_inventory(frozen, run)
+        # the launch config as the CLI accepts it, and the frozen counts with
+        # the same types, before any comparison
+        for problem in launch_config_problems(config):
+            problems.append("observer launch config: " + problem)
+        for problem in expected_problems(meta.get("expected")):
+            problems.append("observer frozen counts: " + problem)
+        if meta.get("expected") != config.get("expected") or recorder_counts(
+            frozen
+        ) != config.get("expected"):
+            problems.append(
+                "observer inventory is not the launcher's expected recorders"
+            )
+        if config.get("role") not in ("prefill", "decode") or side_problems(
+            frozen, config["role"]
+        ):
+            problems.append("observer recorders are not this endpoint side's")
+        if owner_problems(meta.get("owner"), frozen, meta.get("owner_evidence")):
+            problems.append(
+                "observer owner not shown by its frozen evidence: "
+                + "; ".join(
+                    owner_problems(
+                        meta.get("owner"), frozen, meta.get("owner_evidence")
+                    )
+                )  # fmt: skip
+            )
+        if meta.get("code_sha256") != code_digest():
+            problems.append(
+                "observer code differs from this checker's: check a capture with "
+                "the observer code that made it"
+            )
         # Every frontend (one API server, or one a DP rank) shares the
         # observer's boot and namespaces. The owner is the process the
         # controller configured: the frontend itself when there is one, else
         # the API servers' common parent (the serving process).
-        fronts = [
-            item
-            for item in config["inventory"]
-            if item["context"]["role"] == "frontend"
-        ]
+        fronts = [item for item in frozen if item["context"]["role"] == "frontend"]
         owner = meta.get("owner", {})
         if (
             not fronts
@@ -338,8 +470,6 @@ def endpoint_capture(directory, core_dir):
                 for front in fronts
                 for key in ("boot_id", "net_namespace", "pid_namespace")
             )
-            or (owner.get("pid"), owner.get("start_ticks"))
-            != (config.get("owner_pid"), config.get("owner_start"))
             or (
                 len(fronts) == 1
                 and (owner.get("pid"), owner.get("start_ticks"))
@@ -357,10 +487,7 @@ def endpoint_capture(directory, core_dir):
             or context.get("endpoint_role") != config["role"]
             or meta.get("config_sha256") != expected_hash
             or meta.get("package_sha256") != package_hash
-            or meta.get("inventory") != config["inventory"]
             or meta.get("affinity") != config["cpus"]
-            or meta.get("owner", {}).get("pid") != config["owner_pid"]
-            or meta.get("owner", {}).get("start_ticks") != config["owner_start"]
         ):
             problems.append("observer run/endpoint/config identity mismatch")
         if (
@@ -410,7 +537,7 @@ def endpoint_capture(directory, core_dir):
         # How the observer ended, from whatever launched and reaped it: never
         # a container runtime's own records (any deployment writes this one).
         problems.extend(exit_problems(directory, run, endpoint, meta.get("process_id")))
-        closure = core_completion(core_dir, run, config["inventory"])
+        closure = core_completion(core_dir, run, frozen)
         problems.extend(closure["problems"])
     except (
         OSError,

@@ -809,24 +809,39 @@ vLLM/Torch in the observer:
 .venv/bin/python /installed/vllm/kv_profiling/probe.py --config endpoint.json
 ```
 
-`endpoint.json` has the following runtime fields in addition to `probes`:
+`endpoint.json` has the following runtime fields in addition to `probes`. There
+is one launch form: the launcher names how many recorders of each role the
+endpoint has, and the observer finds them and the process to follow itself. A
+config that supplies an inventory or an owner is refused.
 
 | Field | Meaning |
 |---|---|
 | `run_id`, `endpoint`, `role` | Shared UUID, endpoint ID, `prefill` or `decode` |
-| `owner_pid`, `owner_start` | Shared-namespace server PID and proc start ticks: the frontend's process with one API server, else the API servers' common parent (the serving process); the capture check compares the observer's recorded owner with them |
+| `expected` | Recorders per role, `{"frontend": n, "scheduler": n, "worker": n}`: one of each per DP rank and TP rank as the server runs them, at least one frontend |
 | `cpus` | Nonempty observer CPU list, disjoint from serving CPUs |
 | `irq_policy` | `operator_verified` or `virtual_not_applicable` |
 | `input_dir`, `output_dir` | Read-only L1 root and separate probe output |
 | `stop_file`, `endpoint_complete_file` | Stop and child-closure paths |
 
 Share the endpoint network and PID namespaces. Check physical IRQ affinities
-externally; the observer never retunes them. Existing L1 opening metadata makes
-worker discovery possible without adding transfer-path I/O. PID start ticks,
-namespace identities, engine and rank are validated before optional fd ownership
-reads. Permission denial remains unavailable; do not add privileges to hide it.
+externally; the observer never retunes them. The observer discovers its
+endpoint from the L1 recorders' opening metadata in `input_dir`, without
+transfer-path I/O:
+- the recorders must be exactly the `expected` ones, each carrying a KV role of
+  the configured side (`kv_producer` for prefill, `kv_consumer` for decode,
+  `kv_both` for either);
+- the owner is the single frontend's process, or, with several API servers, their
+  one common parent, each read from the observer's own `/proc`.
 
-Start the observer before admitting workload and wait for its opening manifest.
+It freezes the inventory, the owner, the evidence for the owner (each frontend's
+parent as read) and the digest of the observer code that ran (`code_sha256`) in
+its capture before it is ready. `--check-capture` checks the owner against that
+evidence and the code against its own. PID start ticks, namespace identities,
+engine and rank are validated before optional fd ownership reads. If the kernel
+refuses a process's namespace links (it holds capabilities the observer lacks, or
+is not dumpable), the error names the path, the errno and both causes.
+
+Start the observer before admitting workload and wait for its manifest's `ready`.
 After child/L1 completion, the controller writes the endpoint completion file:
 `{"run_id": "<UUID>", "endpoint": "<ID>", "children_closed": true}`, then
 creates `stop_file`. The observer independently checks the L1 manifests, samples
@@ -920,13 +935,12 @@ the gate and it was accepted after review.
 
 ### Capture inventory and deployment snapshot
 
-The observer runtime config requires `inventory`: the frozen identities of
-**every** expected frontend, scheduler and worker capture on that endpoint.
-`--inventory <profiles-root> --run-id <UUID>` emits the observed opening
-metadata; the deployment must also check those counts against its topology.
-The harness checks one frontend, one scheduler per local engine and one worker
-per local rank. Unknown, extra, missing or identity-mismatched captures cannot
-close successfully. Both the native event stream's terminal/loss state and its
+The observer freezes the identities of **every** expected frontend, scheduler
+and worker capture on that endpoint when it starts, and refuses any other set.
+`--inventory <profiles-root> --run-id <UUID>` prints what it would find. The
+harness expects one frontend per local DP rank, one scheduler per local engine
+and one worker per local rank. Unknown, extra, missing or identity-mismatched
+captures cannot close successfully. Both the native event stream's terminal/loss state and its
 matching manifest are required; a manifest alone is insufficient.
 
 CPU isolation is mandatory for all probe configurations, including netdev-only

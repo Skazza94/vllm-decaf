@@ -10,7 +10,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from . import shell, topology
+from . import shell
 
 
 @dataclass
@@ -39,41 +39,9 @@ class EndpointObserver:
         output = Path(output).resolve()
         output.mkdir(parents=True, exist_ok=False)
         package_hash = bundle(output / "observer.pyz")
-        remote_package = "/e2e/observer.pyz"
-        shell.run(
-            [
-                "docker",
-                "cp",
-                str(output / "observer.pyz"),
-                f"{container}:{remote_package}",
-            ]
-        )
-        inventory = json.loads(
-            topology.exec_in(
-                container,
-                [
-                    "/opt/venv/bin/python",
-                    remote_package,
-                    "--inventory",
-                    "/e2e/profiles",
-                    "--run-id",
-                    run_id,
-                ],
-            )
-        )
-        counts = {
-            role: sum(m["context"]["role"] == role for m in inventory)
-            for role in ("frontend", "scheduler", "worker")
-        }
-        if counts != {
-            "frontend": expected_frontends,
-            "scheduler": expected_schedulers,
-            "worker": expected_workers,
-        }:
-            raise ValueError("endpoint capture inventory count mismatch")
-        owner = endpoint_owner(
-            container, [m for m in inventory if m["context"]["role"] == "frontend"]
-        )
+        # the observer finds, verifies and freezes these recorders and their
+        # owner itself (endpoint_probes.identity.discover): no docker exec here
+        expected = {"frontend": expected_frontends, "scheduler": expected_schedulers, "worker": expected_workers}
         description = json.loads(shell.run(["docker", "inspect", container]))[0]
         input_path, input_strategy = profile_backing(description)
         (output / "profile-input.json").write_text(
@@ -82,13 +50,11 @@ class EndpointObserver:
         name = f"kv-observer-{run_id[:8]}-{endpoint}"
         config = {
             "probes": probes,
-            "inventory": inventory,
             "package_sha256": package_hash,
             "run_id": run_id,
             "endpoint": endpoint,
             "role": role,
-            "owner_pid": owner["pid"],
-            "owner_start": owner["start_ticks"],
+            "expected": expected,
             "cpus": cpus,
             "input_dir": "/input",
             "output_dir": "/output/captures",
@@ -123,7 +89,10 @@ class EndpointObserver:
                     shell.run(["docker", "inspect", observer.container_id])
                 )[0]["State"]
                 if not state["Running"]:
-                    raise RuntimeError("endpoint observer exited before readiness")
+                    logs = subprocess.run(["docker", "logs", observer.container_id], capture_output=True,
+                                          text=True, timeout=10, check=False)
+                    raise RuntimeError("endpoint observer exited before readiness: "
+                                       + (logs.stdout + logs.stderr)[-2000:])
                 time.sleep(0.05)
             raise TimeoutError("endpoint observer readiness timeout")
         except BaseException:
@@ -235,33 +204,6 @@ class EndpointObserver:
         # written by the frozen observer package itself, as check_captures reads it
         subprocess.run([sys.executable, str(self.output / "observer.pyz"), "--record-exit", str(self.output)],
                        input=json.dumps(record), text=True, check=True, timeout=10)
-
-
-def _stat(container, pid):
-    """(parent PID, start ticks) of a process in the container, from its stat
-    (fields after the command's final ')': state, ppid, ..., starttime)."""
-    fields = topology.exec_in(container, ["cat", f"/proc/{pid}/stat"]).rsplit(")", 1)[1]
-    fields = fields.split()
-    return int(fields[1]), int(fields[19])
-
-
-def endpoint_owner(container, frontends):
-    """The process the observer follows: the frontend itself when it is the
-    server's process (one API server), else the API server processes' one
-    common parent, the ``vllm serve`` process that runs until the end (data
-    parallelism runs an API server a DP rank, each a child)."""
-    if len(frontends) == 1:
-        return {"pid": frontends[0]["pid"], "start_ticks": frontends[0]["start_ticks"]}
-    parents = set()
-    for frontend in frontends:
-        parent, start = _stat(container, frontend["pid"])
-        if start != frontend["start_ticks"]:
-            raise ValueError("an API server's process changed before the observer")
-        parents.add(parent)
-    if len(parents) != 1:
-        raise ValueError("the API servers have no single parent process")
-    (parent,) = parents
-    return {"pid": parent, "start_ticks": _stat(container, parent)[1]}
 
 
 def profile_backing(description):
