@@ -3,6 +3,7 @@
 """Unattached recorder lifecycle; no serving or connector imports."""
 
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -15,7 +16,37 @@ from pathlib import Path
 from uuid import uuid4
 
 from .config import NetworkProfilerConfig
-from .sink import FINISHED, OUTPUT_FAILED, RUNNING
+from .sink import FINISHED, OUTPUT_FAILED, RUNNING, remove_staging
+
+
+def ring_bytes(config: NetworkProfilerConfig) -> int:
+    """The shared-memory bytes one recorder's ring takes (the native layout: a
+    4 KiB header, 128-byte records, 32-byte identity and handle slots, doubled,
+    and the identity arena, its end aligned to 64 bytes)."""
+    identities_end = (
+        4096 + config.ring_records * 128 + 2 * config.id_slots * 32 + config.id_bytes
+    )
+    return ((identities_end + 63) & ~63) + 2 * config.handle_slots * 32
+
+
+def _no_room(config: NetworkProfilerConfig, error: OSError) -> OSError:
+    """The ring did not fit in ``shared_dir``: say where, how much and what to do."""
+    try:
+        stat = os.statvfs(config.shared_dir)
+        free = f"{stat.f_bavail * stat.f_frsize / 2**20:.1f} MiB free of "
+        free += f"{stat.f_blocks * stat.f_frsize / 2**20:.1f} MiB"
+    except OSError:
+        free = "unknown free space"
+    return OSError(
+        errno.ENOSPC,
+        f"KV profiler: no room for a recorder's ring in {config.shared_dir} "
+        f"({free}); each recorder needs {ring_bytes(config) / 2**20:.2f} MiB "
+        f"(ring_records={config.ring_records}, id_slots={config.id_slots}, "
+        f"id_bytes={config.id_bytes}, handle_slots={config.handle_slots}), and a "
+        "server opens one per scheduler, worker and API server process. Give it "
+        "a larger tmpfs (for a container, docker run --shm-size) or lower "
+        f"ring_records. ({error.strerror})",
+    )
 
 
 def _time_namespace():
@@ -54,19 +85,24 @@ class ProcessRecorder:
 
         self.config = config
         self.process_id = str(uuid4())
-        self.ring_dir = Path(
-            tempfile.mkdtemp(
-                prefix="kvprof-",
-                dir=config.shared_dir,
+        try:
+            self.ring_dir = Path(
+                tempfile.mkdtemp(prefix="kvprof-", dir=config.shared_dir)
             )
-        )
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                raise _no_room(config, exc) from exc
+            raise
+        self.native = None
         self.writer = None
         self._result = None
         try:
             # Everything after the ring directory exists is inside the cleanup
             # scope: a metadata or snapshot failure leaves nothing behind.
+            # absolute from the start: a restarted helper, capture.json and the
+            # close result all name the same directory whatever the cwd becomes
             self.output_dir = (
-                Path(config.output_dir) / str(config.run_id) / self.process_id
+                Path(config.output_dir).resolve() / str(config.run_id) / self.process_id
             )
             self.metadata = {
                 "run_id": config.run_id,
@@ -92,18 +128,30 @@ class ProcessRecorder:
                 # The configuration snapshot, beside (not inside) the caller's context.
                 self.metadata["config"] = settings
             _fit_metadata(self.metadata)
-            self.native = _kv_profiler.create(
-                str(self.ring_dir / "ring"),
-                config.ring_records,
-                config.id_slots,
-                config.id_bytes,
-                config.handle_slots,
-            )
-            (self.ring_dir / "metadata.json").write_text(json.dumps(self.metadata))
+            try:
+                self.native = _kv_profiler.create(
+                    str(self.ring_dir / "ring"),
+                    config.ring_records,
+                    config.id_slots,
+                    config.id_bytes,
+                    config.handle_slots,
+                )
+                (self.ring_dir / "metadata.json").write_text(json.dumps(self.metadata))
+                # where this live capture is written: a replacement resumes it
+                (self.ring_dir / "capture.json").write_text(
+                    json.dumps({"output_dir": str(self.output_dir)})
+                )
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC:
+                    raise _no_room(config, exc) from exc
+                raise
             self.record = self.native.record
             if start_writer:
                 self.start_writer()
         except BaseException:
+            # release an allocated ring now, not when the exception is collected
+            if self.native is not None:
+                self.native.close()
             shutil.rmtree(self.ring_dir)
             raise
 
@@ -140,12 +188,31 @@ class ProcessRecorder:
             time.sleep(0.005)
         return False
 
+    def _reader_attached(self) -> bool:
+        """Whether a process holds the ring's reader lease (its ``flock``), read
+        from ``/proc/locks`` without taking the lock; unknown counts as held."""
+        try:
+            info = os.stat(self.ring_dir / "ring")
+        except FileNotFoundError:
+            return False
+        device = f"{os.major(info.st_dev):02x}:{os.minor(info.st_dev):02x}"
+        target = f"{device}:{info.st_ino}"
+        try:
+            locks = Path("/proc/locks").read_text().splitlines()
+        except OSError:
+            return True
+        return any(
+            len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == target
+            for fields in (line.split() for line in locks)
+        )
+
     def close(self) -> CloseResult:
         """No output I/O here; each helper join/termination has a deadline."""
         if self._result is not None:
             return self._result
         self.native.finish()
         timeout = self.config.shutdown_timeout_s
+        deadline = time.monotonic() + timeout
         timed_out = False
         if self.writer is not None:
             try:
@@ -160,6 +227,29 @@ class ProcessRecorder:
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         self.writer.wait(timeout)
         state = self.native.stats()
+        # A writer this process did not start (a replacement or recovery helper)
+        # still holds the ring's reader lease: its terminal state is awaited
+        # within the same deadline.
+        # From the moment it holds the lease, whatever state its predecessor
+        # left (initial, OUTPUT_FAILED): one still working at the deadline is
+        # a timeout.
+        while (
+            not timed_out
+            and state["writer_state"] != FINISHED
+            and self._reader_attached()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+            state = self.native.stats()
+        # FINISHED precedes the helper's removal of the ring: the lease can be
+        # gone with a terminal state this loop has not read yet
+        state = self.native.stats()
+        if (
+            not timed_out
+            and state["writer_state"] != FINISHED
+            and self._reader_attached()
+        ):
+            timed_out = True
         saved = state["writer_state"] == FINISHED and not timed_out
         lost = sum(v for k, v in state.items() if k.startswith("drop_"))
         complete = saved and not lost and not state["unknown_handles"]
@@ -181,7 +271,8 @@ class ProcessRecorder:
         )
         self.native.close()
         if saved:
-            shutil.rmtree(self.ring_dir)
+            # normally its helper removed it already; repeating it is harmless
+            remove_staging(self.ring_dir)
         # On failure retain the fixed-size ring for an explicit recovery tool.
         return self._result
 

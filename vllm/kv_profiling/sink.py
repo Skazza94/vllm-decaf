@@ -153,16 +153,75 @@ def recover_output(stream, tids: set | None = None, names: dict | None = None) -
     return last_sequence
 
 
+ALIVE, EXITED, UNVERIFIABLE = "alive", "exited", "unverifiable"
+
+
+def producer_state(metadata: dict) -> str:
+    """The recorded producer's state, by its identity, never by a parent PID:
+    ``alive``, ``exited`` (gone, a zombie, or its PID now another process's), or
+    ``unverifiable`` (another PID namespace, or its status unreadable)."""
+    try:
+        own_namespace = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return UNVERIFIABLE  # a missing PID is meaningful only in its namespace
+    if own_namespace != metadata.get("pid_namespace"):
+        return UNVERIFIABLE
+    try:
+        stat = Path(f"/proc/{metadata['pid']}/stat").read_text()
+    except FileNotFoundError:
+        return EXITED
+    except OSError:
+        return UNVERIFIABLE
+    fields = stat.rsplit(")", 1)[1].split()
+    if int(fields[19]) != metadata["start_ticks"] or fields[0] in ("Z", "X"):
+        return EXITED
+    return ALIVE
+
+
+def remove_staging(ring_dir: Path) -> None:
+    """Remove a saved capture's shared-memory staging: the ring and its metadata,
+    then the directory if nothing else is in it. Repeating it is harmless."""
+    for name in ("ring", "metadata.json", "capture.json"):
+        with contextlib.suppress(FileNotFoundError):
+            (ring_dir / name).unlink()
+    with contextlib.suppress(FileNotFoundError, OSError):
+        ring_dir.rmdir()
+
+
+class WriterRefused(Exception):
+    """This helper may not write the capture; nothing of the capture was
+    touched (its manifest stays the current writer's)."""
+
+
 def writer_main(ring_dir: str, output_dir: str, mode: str, batch: int):
     """Helper entry point. All potentially blocking durable output stays here."""
-    ring_dir, output_dir = Path(ring_dir), Path(output_dir)
+    ring_dir, output_dir = Path(ring_dir), Path(output_dir).resolve()
     sink = None
     metadata = json.loads((ring_dir / "metadata.json").read_text())
     manifest = output_dir / "manifest.json"
-    watch_parent = os.getppid() == metadata["pid"]
-    producer_gone = not watch_parent
+    # The owner's own helper (its child, the identity verified) watches its
+    # parent; any other helper (a recovery) checks the producer's identity.
+    producer = producer_state(metadata)
+    watch_parent = os.getppid() == metadata["pid"] and producer == ALIVE
+    producer_gone = not watch_parent and producer == EXITED
+    saved = False
+    # Refusals happen before the lease and before any manifest write, so a
+    # refused attempt never replaces the capture's own manifest.
+    if not watch_parent and producer == UNVERIFIABLE:
+        raise WriterRefused(
+            "producer_unverifiable: neither alive nor exited can be shown; "
+            "the ring is kept"
+        )
+    if producer != EXITED:
+        # a live capture resumes where it is: its files and its result agree
+        recorded = json.loads((ring_dir / "capture.json").read_text())["output_dir"]
+        if Path(recorded) != output_dir:
+            raise WriterRefused(f"live_capture_elsewhere: its output is {recorded}")
     try:
         sink = JsonlSink(str(ring_dir / "ring"))
+    except BlockingIOError as exc:
+        raise WriterRefused("reader_lease_held: another writer has the ring") from exc
+    try:
         if producer_gone:
             sink.ring.finish()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -184,6 +243,14 @@ def writer_main(ring_dir: str, output_dir: str, mode: str, batch: int):
                     # end keeps the name it had when last seen here.
                     names.update(thread_names(metadata["pid"]))
                     names_at = time.monotonic()
+                    # unverifiable keeps waiting: only an exit ends the ring
+                    if (
+                        not watch_parent
+                        and not producer_gone
+                        and producer_state(metadata) == EXITED
+                    ):
+                        producer_gone = True
+                        sink.ring.finish()
                 if watch_parent and os.getppid() != metadata["pid"]:
                     producer_gone = True
                     sink.ring.finish()
@@ -222,32 +289,33 @@ def writer_main(ring_dir: str, output_dir: str, mode: str, batch: int):
                         ),
                     )
                     os.fsync(stream.fileno())
-                    atomic_json(
-                        manifest,
-                        {
-                            **metadata,
-                            "complete": complete,
-                            "saved": True,
-                            "reason": (
-                                "producer_gone"
-                                if producer_gone
-                                else "complete"
-                                if complete
-                                else "loss_or_unknown"
-                            ),
-                            "stats": state,
-                            "threads": threads,
-                            # The helper's lifetime CPU up to this manifest:
-                            # startup, background drains and the end flush. A run's
-                            # accounting subtracts what it had used when its
-                            # workload ended to get the shutdown share.
-                            "writer_cpu_s": time.process_time(),
-                        },
-                    )
-                    sink.ring.set_writer_state(FINISHED)
-                    return
+                    final = {
+                        **metadata,
+                        "complete": complete,
+                        "saved": True,
+                        "reason": (
+                            "producer_gone"
+                            if producer_gone
+                            else "complete"
+                            if complete
+                            else "loss_or_unknown"
+                        ),
+                        "stats": state,
+                        "threads": threads,
+                        # The helper's lifetime CPU up to this manifest:
+                        # startup, background drains and the end flush. A run's
+                        # accounting subtracts what it had used when its
+                        # workload ended to get the shutdown share.
+                        "writer_cpu_s": time.process_time(),
+                    }
+                    break
                 if mode == "end" or state["head"] == state["tail"]:
                     time.sleep(0.005)
+        # Success is published only once the output stream closed cleanly: a
+        # failure up to here leaves OUTPUT_FAILED and the ring for recovery.
+        atomic_json(manifest, final)
+        sink.ring.set_writer_state(FINISHED)
+        saved = True
     except Exception as exc:
         if sink is not None:
             sink.ring.set_writer_state(OUTPUT_FAILED, getattr(exc, "errno", 0) or 0)
@@ -264,6 +332,11 @@ def writer_main(ring_dir: str, output_dir: str, mode: str, batch: int):
     finally:
         if sink is not None:
             sink.close()
+        if saved:
+            # Every record is in the saved capture. The helper owns this cleanup,
+            # so it holds even if the owner dies before its own close finishes;
+            # an unsaved capture keeps its ring for recovery.
+            remove_staging(ring_dir)
 
 
 if __name__ == "__main__":
@@ -275,4 +348,10 @@ if __name__ == "__main__":
     parser.add_argument("mode", choices=("background", "end"))
     parser.add_argument("batch", type=int)
     args = parser.parse_args()
-    writer_main(args.ring_dir, args.output_dir, args.mode, args.batch)
+    try:
+        writer_main(args.ring_dir, args.output_dir, args.mode, args.batch)
+    except WriterRefused as refused:
+        import sys
+
+        print(f"kv profiler writer refused: {refused}", file=sys.stderr)
+        sys.exit(3)

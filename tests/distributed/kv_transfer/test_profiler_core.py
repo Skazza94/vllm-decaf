@@ -748,8 +748,60 @@ def test_orphaned_helper_finishes_with_incomplete_manifest(tmp_path):
     manifest = output / "manifest.json"
     wait_for(lambda: json.loads(manifest.read_text()).get("reason") == "producer_gone")
     saved = json.loads(manifest.read_text())
-    assert not saved["complete"]
-    shutil.rmtree(saved["recovery_directory"])
+    assert not saved["complete"] and saved["saved"]
+    # its owner is gone and every record is saved: the helper frees the ring
+    wait_for(lambda: not Path(saved["recovery_directory"]).exists())
+
+
+@pytest.mark.parametrize(
+    "sizes",
+    [{}, {"ring_records": 64, "id_slots": 32, "id_bytes": 4097, "handle_slots": 8}],
+)
+def test_ring_bytes_is_the_native_ring_s_size(rings, sizes):
+    """The size the no-room error reports is the one the native ring takes."""
+    from vllm.kv_profiling.core import ring_bytes
+
+    config = NetworkProfilerConfig(
+        level="l1", run_id=str(uuid4()), output_dir="/unused", **sizes
+    )
+    ring, path = rings(
+        capacity=config.ring_records,
+        ids=config.id_slots,
+        id_bytes=config.id_bytes,
+        handles=config.handle_slots,
+    )
+    assert ring_bytes(config) == ring.stats()["memory_bytes"] == path.stat().st_size
+
+
+def test_a_full_shared_memory_says_where_how_much_and_what_to_do(
+    tmp_path, monkeypatch
+):
+    """No room for the ring is a clear profiler error, not a bare ENOSPC, and
+    leaves no ring directory behind."""
+    import errno
+
+    from vllm import _kv_profiler
+
+    def full(*args):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(_kv_profiler, "create", full)
+    shared = tmp_path / "shm"
+    shared.mkdir()
+    config = NetworkProfilerConfig(
+        level="l1",
+        run_id=str(uuid4()),
+        output_dir=str(tmp_path / "out"),
+        shared_dir=str(shared),
+    )
+    with pytest.raises(OSError) as raised:
+        ProcessRecorder(config)
+    message = str(raised.value)
+    assert raised.value.errno == errno.ENOSPC
+    for part in (f"in {shared}", "MiB free of", "each recorder needs 17.25 MiB",
+                 "ring_records=65536", "--shm-size", "No space left on device"):
+        assert part in message, (part, message)
+    assert list(shared.iterdir()) == []
 
 
 def test_partial_durable_dictionary_is_trimmed_and_replayed(rings, tmp_path):
@@ -1319,3 +1371,399 @@ def test_any_number_of_threads_stays_readable_by_recovery_and_the_reader(
     assert {str(t): n for t, n in names.items() if str(t) in synthetic} == synthetic
     capture = load_capture(path)
     assert {k: v for k, v in capture["threads"].items() if k in synthetic} == synthetic
+
+
+def _small(tmp_path, **extra):
+    return NetworkProfilerConfig(
+        level="l1",
+        run_id=str(uuid4()),
+        output_dir=str(tmp_path / "out"),
+        ring_records=64,
+        id_slots=32,
+        id_bytes=4096,
+        handle_slots=8,
+        **extra,
+    )
+
+
+def _producer_without_helper(config, location):
+    recorder = ProcessRecorder(config, start_writer=False)
+    recorder.record(*fields(request="before-exit"))
+    Path(location).write_text(str(recorder.ring_dir))
+    os._exit(0)
+
+
+def _owner_dies_right_after_its_helper(config, location):
+    recorder = ProcessRecorder(config)
+    assert recorder.wait_ready()
+    recorder.record(*fields(request="before-close"))
+    Path(location).write_text(
+        json.dumps([str(recorder.ring_dir), str(recorder.output_dir)])
+    )
+    wait = recorder.writer.wait
+
+    def exit_after_save(*args, **kwargs):
+        code = wait(*args, **kwargs)
+        os._exit(0)  # between the helper's exit and the owner's own cleanup
+        return code
+
+    recorder.writer.wait = exit_after_save
+    recorder.close()
+
+
+def test_a_recovery_helper_never_ends_a_live_producer_s_capture(tmp_path):
+    """A helper that is not the owner's child checks the recorded producer's
+    identity: while it runs, the helper waits for its close instead of ending
+    the ring, and only a saved capture's staging is removed."""
+    import threading
+
+    from vllm.kv_profiling.sink import writer_main
+
+    recorder = ProcessRecorder(_small(tmp_path), start_writer=False)
+    recorder.record(*fields(request="live"))
+    helper = threading.Thread(
+        target=writer_main,
+        args=(str(recorder.ring_dir), str(recorder.output_dir), "end", 256),
+    )
+    helper.start()
+    time.sleep(1.5)  # past the helper's once-a-second identity check
+    assert recorder.native.stats()["closing"] == 0 and helper.is_alive()
+    assert recorder.ring_dir.exists()
+    # the public close awaits the attached outside writer within its deadline
+    result = recorder.close()
+    helper.join(10)
+    assert not helper.is_alive() and result.saved and result.complete
+    manifest = json.loads((recorder.output_dir / "manifest.json").read_text())
+    assert manifest["saved"] and manifest["reason"] != "producer_gone"
+    assert not recorder.ring_dir.exists()
+
+
+def test_a_dead_producer_s_recovery_keeps_output_written_inside_its_ring_dir(
+    tmp_path,
+):
+    """Recovering a dead producer's ring into a directory inside the ring's own
+    staging directory removes only the ring and its metadata."""
+    import multiprocessing
+
+    from vllm.kv_profiling.sink import writer_main
+
+    location = tmp_path / "location"
+    producer = multiprocessing.get_context("spawn").Process(
+        target=_producer_without_helper, args=(_small(tmp_path), str(location))
+    )
+    producer.start()
+    producer.join(15)
+    assert producer.exitcode == 0
+    ring_dir = Path(location.read_text())
+    output = ring_dir / "recovered"
+    writer_main(str(ring_dir), str(output), "end", 256)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["saved"] and manifest["reason"] == "producer_gone"
+    assert (output / "events.jsonl").stat().st_size > 0
+    assert sorted(p.name for p in ring_dir.iterdir()) == ["recovered"]
+    shutil.rmtree(ring_dir)
+
+
+def test_a_saved_capture_s_ring_is_freed_even_if_its_owner_dies_mid_close(
+    tmp_path,
+):
+    """The helper removes a saved capture's staging itself: an owner killed
+    between its helper's exit and its own cleanup leaves no ring behind."""
+    import multiprocessing
+
+    location = tmp_path / "location"
+    owner = multiprocessing.get_context("spawn").Process(
+        target=_owner_dies_right_after_its_helper,
+        args=(_small(tmp_path), str(location)),
+    )
+    owner.start()
+    owner.join(20)
+    assert owner.exitcode == 0
+    ring_dir, output = map(Path, json.loads(location.read_text()))
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["saved"] and manifest["complete"]
+    assert not ring_dir.exists()
+
+
+@pytest.mark.parametrize("stage", ["directory", "metadata"])
+def test_every_shared_memory_startup_stage_explains_a_full_tmpfs(
+    tmp_path, monkeypatch, stage
+):
+    """No room while creating the ring's directory or writing its metadata is
+    the same clear error as for the ring, and an allocated ring is released at
+    once, not when the exception is collected."""
+    import errno
+    import tempfile
+
+    from vllm import _kv_profiler
+
+    def full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    shared = Path(tempfile.mkdtemp(prefix="kvprof-test-", dir="/dev/shm"))
+    created = []
+    if stage == "directory":
+        monkeypatch.setattr(tempfile, "mkdtemp", full)
+    else:
+        create = _kv_profiler.create
+
+        def tracked(*args):
+            created.append(create(*args))
+            return created[-1]
+
+        write_text = Path.write_text
+
+        def write(path, *args, **kwargs):
+            if path.name == "metadata.json":
+                full()
+            return write_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(_kv_profiler, "create", tracked)
+        monkeypatch.setattr(Path, "write_text", write)
+    try:
+        with pytest.raises(OSError) as raised:
+            ProcessRecorder(_small(tmp_path, shared_dir=str(shared)))
+        assert raised.value.errno == errno.ENOSPC
+        assert f"no room for a recorder's ring in {shared}" in str(raised.value)
+        assert list(shared.iterdir()) == []
+        for ring in created:
+            with pytest.raises(ValueError, match="closed ring"):
+                ring.stats()
+        assert len(created) == (stage == "metadata")
+    finally:
+        shutil.rmtree(shared)
+
+
+def test_an_output_failure_at_close_keeps_the_ring_and_publishes_no_success(
+    tmp_path, monkeypatch
+):
+    """Success (the saved manifest, FINISHED, removing the staging) is published
+    only after the output stream closed cleanly."""
+    import errno
+    import io
+    import threading
+
+    from vllm.kv_profiling import sink as sink_module
+    from vllm.kv_profiling.sink import OUTPUT_FAILED, writer_main
+
+    class FailingClose(io.FileIO):
+        failed = False
+
+        def close(self):
+            super().close()
+            if not FailingClose.failed:
+                FailingClose.failed = True
+                raise OSError(errno.EIO, "injected close failure")
+
+    real_open = sink_module.Path.open
+
+    def open_events(path, mode="r", buffering=-1, *args, **kwargs):
+        if path.name == "events.jsonl":
+            return FailingClose(path, "a+")
+        return real_open(path, mode, buffering, *args, **kwargs)
+
+    monkeypatch.setattr(sink_module.Path, "open", open_events)
+    recorder = ProcessRecorder(_small(tmp_path), start_writer=False)
+    recorder.record(*fields(request="close-fails"))
+    helper = threading.Thread(
+        target=writer_main,
+        args=(str(recorder.ring_dir), str(recorder.output_dir), "end", 256),
+    )
+    helper.start()
+    wait_for(lambda: recorder.native.stats()["writer_state"] != 0)  # attached
+    result = recorder.close()
+    helper.join(10)
+    manifest = json.loads((recorder.output_dir / "manifest.json").read_text())
+    assert FailingClose.failed and not manifest["saved"]
+    assert result.stats["writer_state"] == OUTPUT_FAILED and not result.saved
+    assert (recorder.ring_dir / "ring").exists()
+    shutil.rmtree(recorder.ring_dir)
+
+
+def test_the_producer_is_judged_by_identity_and_an_unverifiable_one_is_kept(
+    tmp_path, monkeypatch
+):
+    """Exited covers a zombie and a reused PID; an unreadable status or another
+    PID namespace is unverifiable, and a recovery helper then never ends the
+    ring: it keeps it and says why."""
+    import subprocess
+    import sys
+
+    from vllm.kv_profiling import sink as sink_module
+    from vllm.kv_profiling.sink import (
+        ALIVE,
+        EXITED,
+        UNVERIFIABLE,
+        WriterRefused,
+        producer_state,
+        writer_main,
+    )
+
+    def identity(pid):
+        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return {"pid": pid, "start_ticks": int(stat[19]),
+                "pid_namespace": os.readlink("/proc/self/ns/pid")}  # fmt: skip
+
+    own = identity(os.getpid())
+    assert producer_state(own) == ALIVE
+    assert producer_state({**own, "start_ticks": own["start_ticks"] + 1}) == EXITED
+    assert producer_state({**own, "pid_namespace": "pid:[1]"}) == UNVERIFIABLE
+    child = subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
+    try:
+        exited = identity(child.pid)
+        child.stdin.close()  # it exits, unreaped: a zombie
+        wait_for(lambda: Path(f"/proc/{child.pid}/stat").read_text()
+                 .rsplit(")", 1)[1].split()[0] == "Z")  # fmt: skip
+        assert producer_state(exited) == EXITED
+    finally:
+        child.wait(10)
+    assert producer_state(exited) == EXITED  # reaped: gone
+    real_read = sink_module.Path.read_text
+
+    def denied(path, *args, **kwargs):
+        if str(path) == f"/proc/{os.getpid()}/stat":
+            raise PermissionError("injected")
+        return real_read(path, *args, **kwargs)
+
+    real_readlink = sink_module.os.readlink
+
+    def no_namespace_link(path, *args, **kwargs):
+        if str(path) == "/proc/self/ns/pid":
+            raise FileNotFoundError(path)
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(sink_module.os, "readlink", no_namespace_link)
+    # the helper's own namespace is unknown: a missing PID proves nothing
+    assert producer_state(own) == UNVERIFIABLE
+    assert producer_state({**own, "pid": 2**22 + 1}) == UNVERIFIABLE
+    monkeypatch.setattr(sink_module.os, "readlink", real_readlink)
+    monkeypatch.setattr(sink_module.Path, "read_text", denied)
+    assert producer_state(own) == UNVERIFIABLE
+    recorder = ProcessRecorder(_small(tmp_path), start_writer=False)
+    recorder.record(*fields(request="kept"))
+    with pytest.raises(WriterRefused, match="producer_unverifiable"):
+        writer_main(str(recorder.ring_dir), str(recorder.output_dir), "end", 256)
+    # refused before the lease and any write: no manifest, the ring untouched
+    assert not (recorder.output_dir / "manifest.json").exists()
+    assert recorder.native.stats()["closing"] == 0
+    assert (recorder.ring_dir / "ring").exists()
+    monkeypatch.undo()
+    recorder.close()
+    shutil.rmtree(recorder.ring_dir, ignore_errors=True)
+
+
+def test_a_refused_attempt_never_replaces_the_capture_s_manifest(
+    tmp_path, monkeypatch
+):
+    """Only the lease holder publishes the manifest: an attempt refused for a
+    held lease or an unverifiable producer leaves the writer's result alone."""
+    from vllm.kv_profiling import sink as sink_module
+    from vllm.kv_profiling.sink import UNVERIFIABLE, WriterRefused, writer_main
+
+    recorder = ProcessRecorder(_small(tmp_path))
+    assert recorder.wait_ready()
+    recorder.record(*fields(request="kept"))
+    manifest = recorder.output_dir / "manifest.json"
+    wait_for(manifest.exists)
+    before = manifest.read_bytes()
+    arguments = (str(recorder.ring_dir), str(recorder.output_dir), "end", 256)
+    with pytest.raises(WriterRefused, match="reader_lease_held"):
+        writer_main(*arguments)
+    monkeypatch.setattr(sink_module, "producer_state", lambda metadata: UNVERIFIABLE)
+    with pytest.raises(WriterRefused, match="producer_unverifiable"):
+        writer_main(*arguments)
+    assert manifest.read_bytes() == before
+    monkeypatch.undo()
+    result = recorder.close()
+    saved = json.loads(manifest.read_text())
+    assert result.complete and saved["saved"] and saved["complete"]
+
+
+def test_a_live_capture_is_resumed_only_in_its_own_directory(tmp_path):
+    """A replacement writer for a live producer must resume the capture's own
+    directory, so the saved result and its files agree."""
+    from vllm.kv_profiling.sink import WriterRefused, writer_main
+
+    recorder = ProcessRecorder(_small(tmp_path), start_writer=False)
+    elsewhere = tmp_path / "elsewhere"
+    with pytest.raises(WriterRefused, match="live_capture_elsewhere"):
+        writer_main(str(recorder.ring_dir), str(elsewhere), "end", 256)
+    assert not elsewhere.exists()
+    recorder.close()
+    shutil.rmtree(recorder.ring_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("released", [True, False])
+def test_close_waits_from_the_lease_and_times_out_a_writer_still_working(
+    tmp_path, monkeypatch, released
+):
+    """Public close waits for a writer from the moment it holds the lease,
+    whatever state its predecessor left; one still working at the deadline is
+    a timeout."""
+    import threading
+
+    from vllm.kv_profiling import sink as sink_module
+    from vllm.kv_profiling.sink import OUTPUT_FAILED, writer_main
+
+    gate = threading.Event()
+    real = sink_module.atomic_json
+
+    def slow_start(path, value):
+        if value.get("reason") == "open":
+            gate.wait(20)  # the writer holds the lease, its output not open yet
+        real(path, value)
+
+    monkeypatch.setattr(sink_module, "atomic_json", slow_start)
+    recorder = ProcessRecorder(
+        _small(tmp_path, shutdown_timeout_s=1), start_writer=False
+    )
+    recorder.record(*fields(request="slow"))
+    recorder.native.set_writer_state(OUTPUT_FAILED)  # left by a predecessor
+    helper = threading.Thread(
+        target=writer_main,
+        args=(str(recorder.ring_dir), str(recorder.output_dir), "end", 256),
+    )
+    helper.start()
+    wait_for(recorder._reader_attached)
+    if released:
+        threading.Timer(0.3, gate.set).start()
+    result = recorder.close()
+    gate.set()
+    helper.join(10)
+    if released:
+        assert result.saved and result.complete
+    else:
+        assert not result.saved and result.reason == "writer_timeout"
+    shutil.rmtree(recorder.ring_dir, ignore_errors=True)
+
+
+def test_a_relative_output_dir_is_anchored_when_the_recorder_opens(
+    tmp_path, monkeypatch
+):
+    """The capture directory is resolved once, at creation: a writer restarted
+    after the working directory changed resumes the same directory, so every
+    record and the saved result stay together."""
+    import dataclasses
+
+    monkeypatch.chdir(tmp_path)
+    recorder = ProcessRecorder(
+        dataclasses.replace(_small(tmp_path), output_dir="profiles")
+    )
+    assert recorder.wait_ready()
+    assert recorder.output_dir.is_absolute()
+    assert str(recorder.output_dir).startswith(str(tmp_path / "profiles"))
+    recorder.record(*fields(request="first"))
+    os.kill(recorder.writer.pid, signal.SIGKILL)
+    recorder.writer.wait(5)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    recorder.start_writer()
+    assert recorder.wait_ready()
+    recorder.record(*fields(request="second"))
+    result = recorder.close()
+    assert result.saved and Path(result.output_dir) == recorder.output_dir
+    lines = (recorder.output_dir / "events.jsonl").read_text().splitlines()
+    events = [json.loads(line) for line in lines]
+    assert sum(row.get("type") == "event" for row in events) == 2
+    assert not (elsewhere / "profiles").exists()

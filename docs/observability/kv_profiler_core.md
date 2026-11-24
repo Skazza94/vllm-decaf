@@ -5,7 +5,14 @@ the Mooncake connector and the frontend attach to it (see the adapters below).
 Without `kv_connector_extra_config["network_profiler"]` the serving processes
 start no profiler helpers and record no events.
 
-The native recorder requires Linux tmpfs and GIL-enabled CPython.
+The native recorder requires Linux tmpfs and GIL-enabled CPython. Each recording
+process (every scheduler, worker and API server) allocates its ring in
+`shared_dir` (`/dev/shm` by default) when the profiler starts: 17.25 MiB at the
+default sizes. Docker's default `/dev/shm` (64 MB) holds three, fewer than a
+tensor-parallel server opens, so give containers a larger one
+(`docker run --shm-size`) or lower `ring_records`. Without room, the server fails
+at startup with an error that names the directory, its free space and the size
+each recorder needs.
 
 The profiler levels' overhead was measured with two-node serving A/Bs of one
 workload, profiler off against on, on latency and throughput: the NIXL pull
@@ -183,7 +190,8 @@ then applies bounded join/terminate/kill waits. When possible an initially
 incomplete manifest remains after a stopped/dead/failed helper. The returned
 `CloseResult` reports saving and completeness separately; loss is not success.
 Failed captures retain their fixed-size shared-memory directory for explicit
-recovery. A hard kill can still lose uncommitted records. Do not infer zero
+recovery. When the recording process dies, its helper saves what the ring holds
+and, once saved, removes the ring's directory itself. A hard kill can still lose uncommitted records. Do not infer zero
 loss from a missing end record.
 
 There is no serving-process JSON writer thread and no recording-path
