@@ -4,6 +4,7 @@
 
 import ast
 import dataclasses
+import errno
 import gc
 import json
 import os
@@ -639,9 +640,7 @@ def test_neither_a_hook_error_nor_the_shutdown_waits_on_a_log_handler(tmp_path):
     try:
         h = handle(0x3100)
         p.read_context("r", "q", "engine-P", 0)
-        outcome = run_with_deadline(
-            lambda: p.transfer_prepared(h, "not-an-int", 1, 3)
-        )
+        outcome = run_with_deadline(lambda: p.transfer_prepared(h, "not-an-int", 1, 3))
         assert "error" not in outcome and p.hook_errors == 1
         assert p.first_error == "TypeError"
         for _ in range(5):  # repeated calls after disabling stay inert and fast
@@ -707,21 +706,21 @@ def test_a_failing_peer_output_still_stops_the_clock_server_and_the_recorder(
 
 
 # ------------------------------------------------------------ clock peers
-def server_for(profiler_or_gen, run_id):
+def server_for(profiler_or_gen, run_id, engine_id=None, port=0):
     generation = (
         profiler_or_gen
         if isinstance(profiler_or_gen, str)
         else profiler_or_gen.recorder.metadata["clock_id"]
     )
-    return ClockServer(run_id, generation=generation, host="127.0.0.1", port=0)
+    return ClockServer(
+        run_id, generation=generation, engine_id=engine_id, host="127.0.0.1", port=port
+    )
 
 
 def consumer(tmp_path, **kw):
     kw.setdefault("clock_port_offset", 1000)
     p = profiler(tmp_path, context={"role": "scheduler"}, **kw)
-    p.peers = PeerClocks(
-        p.config, p.config.run_id, p.recorder.metadata["clock_id"]
-    )
+    p.peers = PeerClocks(p.config, p.config.run_id, p.recorder.metadata["clock_id"])
     return p
 
 
@@ -734,18 +733,20 @@ def wait_results(p, count, timeout=15):
 
 def test_a_peer_is_calibrated_once_at_start_and_end_and_kept_after_it_drains(tmp_path):
     p = consumer(tmp_path)
-    remote = server_for(str(uuid4()), p.config.run_id)
+    other = str(uuid4())
+    remote = server_for(str(uuid4()), p.config.run_id, "engine-P")
+    second = server_for(str(uuid4()), p.config.run_id, other)
     try:
         port = remote.address[1] - 1000
-        other = str(uuid4())
+        ports = {"engine-P": port, other: second.address[1] - 1000}
         for engine in ("engine-P", other, "engine-P", other, "engine-P"):
-            p.handoff_in("d", "q", engine, "127.0.0.1", port)
-        # The second engine shares the server, so both calibrate; alternating
-        # requests never grow the table or recalibrate.
+            p.handoff_in("d", "q", engine, "127.0.0.1", ports[engine])
+        # Each engine calibrates against its own server; alternating requests
+        # never grow the table or recalibrate.
         assert p.peers.tail == 2
         wait_results(p, 2)
         for engine in ("engine-P", other):
-            p.handoff_in("d", "q", engine, "127.0.0.1", port)
+            p.handoff_in("d", "q", engine, "127.0.0.1", ports[engine])
         time.sleep(0.3)
         assert len(p.peers.results) == 2
         p.close()
@@ -764,6 +765,7 @@ def test_a_peer_is_calibrated_once_at_start_and_end_and_kept_after_it_drains(tmp
         assert mapping.start.remote_generation == first["remote_generation"]
     finally:
         remote.close()
+        second.close()
 
 
 def test_unreachable_and_silent_peers_fail_within_their_deadline(tmp_path):
@@ -837,6 +839,297 @@ def test_a_producer_clock_server_is_stopped_with_the_profiler(tmp_path):
     while psutil.pid_exists(helper) and psutil.Process(helper).status() != "zombie":
         assert time.monotonic() < deadline
         time.sleep(0.02)
+
+
+# ------------------------------------------------------- clock listener families
+def _ipv6_loopback() -> bool:
+    """Whether this host can actually bind ``::1`` (support alone is not
+    enough: IPv6 may be disabled on the interface)."""
+    try:
+        with socket.socket(socket.AF_INET6) as probe:
+            probe.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+needs_ipv6 = pytest.mark.skipif(not _ipv6_loopback(), reason="cannot bind ::1")
+needs_dual_stack = pytest.mark.skipif(
+    not (socket.has_dualstack_ipv6() and _ipv6_loopback()),
+    reason="no dual-stack IPv6 with a bindable ::1",
+)
+
+
+def _reached(server, host):
+    """One real clock exchange with ``server`` at ``host``."""
+    samples = measure_peer(
+        (host, server.address[1]), server.run_id, str(uuid4()), samples=2
+    )
+    return [x.remote_generation for x in samples] == [server.generation] * 2
+
+
+@needs_dual_stack
+def test_a_wildcard_clock_server_is_dual_stack_and_answers_both_families():
+    with ClockServer(str(uuid4()), host=None) as server:
+        assert (server.family, server.fallback) == ("dual", None)
+        assert _reached(server, "127.0.0.1") and _reached(server, "::1")
+
+
+def test_a_wildcard_without_dual_stack_falls_back_to_ipv4(monkeypatch):
+    """IPv4-only hosts keep a clock: the wildcard binds IPv4 and says why."""
+    monkeypatch.setattr(socket, "has_dualstack_ipv6", lambda: False)
+    with ClockServer(str(uuid4()), host=None) as server:
+        assert (server.family, server.fallback) == (
+            "ipv4",
+            "dual-stack IPv6 not supported",
+        )
+        assert _reached(server, "127.0.0.1")
+
+
+def test_a_wildcard_whose_ipv6_bind_is_refused_falls_back_to_ipv4(monkeypatch):
+    real = socket.create_server
+
+    def create_server(address, *, family=socket.AF_INET, **kw):
+        if family == socket.AF_INET6:
+            raise OSError(errno.EADDRNOTAVAIL, os.strerror(errno.EADDRNOTAVAIL))
+        return real(address, family=family, **kw)
+
+    monkeypatch.setattr(socket, "has_dualstack_ipv6", lambda: True)
+    monkeypatch.setattr(socket, "create_server", create_server)
+    with ClockServer(str(uuid4()), host=None) as server:
+        assert server.family == "ipv4"
+        assert server.fallback == (
+            f"IPv6 unavailable: {os.strerror(errno.EADDRNOTAVAIL)}"
+        )
+
+
+def test_an_occupied_port_and_an_absent_ipv6_address_raise_their_own_errors():
+    with ClockServer(str(uuid4()), host="127.0.0.1") as taken:
+        with pytest.raises(OSError) as busy:
+            ClockServer(str(uuid4()), host="127.0.0.1", port=taken.address[1])
+        assert busy.value.errno == errno.EADDRINUSE
+    # an occupied port is never taken as missing IPv6 for a wildcard (dual-stack
+    # or IPv4, whichever this host gives)
+    with ClockServer(str(uuid4()), host=None) as wild:
+        with pytest.raises(OSError) as again:
+            ClockServer(str(uuid4()), host=None, port=wild.address[1])
+        assert again.value.errno == errno.EADDRINUSE
+    # an explicit IPv6 bind never falls back, with or without IPv6 in the kernel
+    with pytest.raises(OSError) as absent:
+        ClockServer(str(uuid4()), host="2001:db8::1")
+    assert isinstance(absent.value, socket.gaierror) or absent.value.errno in (
+        errno.EADDRNOTAVAIL,
+        errno.EAFNOSUPPORT,
+    )
+
+
+def test_out_of_range_clock_ports_are_refused_and_port_zero_stays_ephemeral(
+    tmp_path,
+):
+    """A side-channel port near the top plus the offset is past 65535: refused
+    with its value, never wrapped by the resolver into another port."""
+    with pytest.raises(ValueError, match="65536"):
+        ClockServer(str(uuid4()), port=65536)
+    with ClockServer(str(uuid4()), port=0) as ephemeral:
+        assert ephemeral.address[1] > 0
+    producer = _scheduler(tmp_path / "p", "kv_producer", ("127.0.0.1", 64536))
+    assert producer.server is None
+    assert producer.server_report["state"] == "unavailable"
+    assert "65536" in producer.server_report["error"]
+    producer.close()
+    consumer = _scheduler(tmp_path / "d", "kv_consumer", ("127.0.0.1", 9))
+    consumer.handoff_in("d", "q", "engine-high", "127.0.0.1", 64536)
+    wait_results(consumer, 1)
+    (peer,) = consumer.peers.results
+    assert peer["status"] == "failed" and "65536" in peer["detail"]
+    consumer.close()
+
+
+def test_a_same_run_server_on_a_colliding_port_is_never_taken_for_the_peer(
+    tmp_path,
+):
+    """Producer B cannot listen where producer A does (same run): B is
+    unavailable, and a consumer asking B's endpoint for B gets A's answer,
+    refused as another engine's: B stays unaligned, A calibrates."""
+    run = str(uuid4())
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        side = probe.getsockname()[1] - 1000
+    a = _scheduler(tmp_path / "a", "kv_producer", ("127.0.0.1", side), run_id=run)
+    b = _build_engine(tmp_path / "b", "engine-B", ("127.0.0.1", side), run)
+    d = _scheduler(tmp_path / "d", "kv_consumer", ("127.0.0.1", 9), run_id=run)
+    try:
+        assert a.server is not None and b.server is None
+        assert b.server_report["state"] == "unavailable"
+        d.handoff_in("d1", "q1", "engine-B", "127.0.0.1", side)
+        d.handoff_in("d2", "q2", "engine-kv_producer", "127.0.0.1", side)
+        wait_results(d, 2)
+    finally:
+        d.close()
+        b.close()
+        a.close()
+    peers = {
+        x["engine_id"]: x
+        for x in json.loads((d.output_dir / "calibration.json").read_text())["peers"]
+    }
+    assert peers["engine-B"]["status"] == "failed"
+    assert peers["engine-B"]["detail"] == "clock answered by another engine"
+    assert "calibration_file" not in peers["engine-B"]
+    assert peers["engine-kv_producer"]["status"] == "ok"
+    assert (
+        peers["engine-kv_producer"]["remote_generation"]
+        == a.recorder.metadata["clock_id"]
+    )
+
+
+def test_a_clock_helper_that_fails_to_start_leaks_no_descriptor(monkeypatch):
+    from vllm.kv_profiling import clock
+
+    def refuse(*args, **kwargs):
+        raise OSError(errno.EAGAIN, "no process for you")
+
+    def descriptors():
+        return len(os.listdir("/proc/self/fd"))
+
+    monkeypatch.setattr(clock.subprocess, "Popen", refuse)
+    before = descriptors()
+    for _ in range(3):
+        server, report = clock.start_server(
+            str(uuid4()), str(uuid4()), "engine", "127.0.0.1", 0
+        )
+        assert server is None and report["state"] == "unavailable"
+        assert "no process for you" in report["error"]
+    assert descriptors() == before
+
+
+def test_a_clock_server_whose_readiness_pipe_is_above_1023_starts_and_answers():
+    """The readiness wait takes any descriptor number (select cannot)."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < 2048:
+        pytest.skip(f"descriptor limit {hard} too low")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 2048), hard))
+    held = []
+    try:
+        while (fd := os.dup(0)) < 1100:
+            held.append(fd)
+        held.append(fd)
+        with ClockServer(str(uuid4()), engine_id="high") as server:
+            samples = measure_peer(
+                server.address,
+                server.run_id,
+                str(uuid4()),
+                expected_engine="high",
+                samples=2,
+            )
+            assert [x.remote_generation for x in samples] == [server.generation] * 2
+    finally:
+        for fd in held:
+            os.close(fd)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_a_readiness_error_after_the_helper_starts_frees_its_port(monkeypatch):
+    """A failure after the spawn stops and reaps the helper and closes the
+    listener: the report is unavailable and nothing answers on the port."""
+    from vllm.kv_profiling import clock
+
+    spawned = []
+    real_popen = clock.subprocess.Popen
+
+    def popen(*args, **kwargs):
+        spawned.append(real_popen(*args, **kwargs))
+        return spawned[-1]
+
+    class BrokenPoll:
+        def register(self, fd, events):
+            pass
+
+        def poll(self, timeout):
+            time.sleep(0.5)  # the helper is listening by now
+            raise OSError(errno.EIO, "injected readiness failure")
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    monkeypatch.setattr(clock.subprocess, "Popen", popen)
+    monkeypatch.setattr(clock.select, "poll", BrokenPoll)
+    server, report = clock.start_server(
+        str(uuid4()), str(uuid4()), "engine", "127.0.0.1", port
+    )
+    assert server is None and report["state"] == "unavailable"
+    assert "injected readiness failure" in report["error"]
+    (helper,) = spawned
+    assert helper.returncode is not None  # reaped
+    monkeypatch.undo()
+    with ClockServer(
+        str(uuid4()), engine_id="next", host="127.0.0.1", port=port
+    ) as again:
+        assert again.address[1] == port
+        assert measure_peer(
+            again.address, again.run_id, str(uuid4()), expected_engine="next", samples=1
+        )
+
+
+def _scheduler(tmp_path, kv_role, side_channel, **kw):
+    from vllm.kv_profiling.nixl import _build
+
+    cfg = config(tmp_path, context={"role": "scheduler"}, **kw)
+    return _build(cfg, "scheduler", f"engine-{kv_role}", 0, side_channel, kv_role)
+
+
+def _build_engine(tmp_path, engine_id, side_channel, run_id):
+    from vllm.kv_profiling.nixl import _build
+
+    cfg = config(tmp_path, context={"role": "scheduler"}, run_id=run_id)
+    return _build(cfg, "scheduler", engine_id, 0, side_channel, "kv_producer")
+
+
+@needs_ipv6
+def test_nixl_calibrates_a_producer_and_consumer_over_ipv6(tmp_path):
+    with socket.socket(socket.AF_INET6) as probe:
+        probe.bind(("::1", 0))
+        side = probe.getsockname()[1]
+    run = str(uuid4())  # one run: a peer of another run is refused
+    producer = _scheduler(
+        tmp_path / "p", "kv_producer", ("::1", side - 1000), run_id=run
+    )
+    consumer = _scheduler(tmp_path / "d", "kv_consumer", ("::1", side + 7), run_id=run)
+    try:
+        assert producer.server_report["family"] == "ipv6"
+        assert producer.server_report["address"] == ["::1", side]
+        consumer.handoff_in("d", "q", "engine-kv_producer", "::1", side - 1000)
+        wait_results(consumer, 1)
+    finally:
+        consumer.close()
+        producer.close()
+    manifest = json.loads((consumer.output_dir / "calibration.json").read_text())
+    (peer,) = manifest["peers"]
+    assert peer["status"] == "ok" and peer["address"] == ["::1", side]
+    assert peer["remote_generation"] == producer.recorder.metadata["clock_id"]
+    report = json.loads((producer.output_dir / "profiler.json").read_text())
+    assert report["clock"]["server"]["state"] == "available"
+    assert report["complete"] is True
+
+
+def test_a_clock_server_that_cannot_bind_leaves_the_recorder_running(tmp_path):
+    """Only the clock is unavailable: the profiler starts, records and closes
+    complete, and its report names the bind error."""
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        producer = _scheduler(tmp_path, "kv_producer", ("127.0.0.1", port - 1000))
+        assert producer.server is None
+        producer.request_bound("r")
+        producer.close()
+    report = json.loads((producer.output_dir / "profiler.json").read_text())
+    server = report["clock"]["server"]
+    assert server["state"] == "unavailable"
+    assert (server["host"], server["port"]) == ("127.0.0.1", port)
+    assert f"[Errno {errno.EADDRINUSE}]" in server["error"]
+    assert report["complete"] is True and report["hook_errors"] == 0
 
 
 # ------------------------------------------------------ owners and lifetimes
@@ -1214,7 +1507,9 @@ def build_interposer(tmp_path):
     return interposer
 
 
-ACCOUNTING = LOOPBACK + r"""
+ACCOUNTING = (
+    LOOPBACK
+    + r"""
 import json, sys
 import _profiler_allocations
 from pathlib import Path
@@ -1399,6 +1694,7 @@ for text, places in json.loads(sys.argv[2]).items():
 (out / "callsites.json").write_text(json.dumps(callsites, indent=1))
 print("accounted", len(report), len(callsites))
 """
+)
 
 
 def test_every_enabled_hook_is_accounted_for_and_retains_nothing(tmp_path):
@@ -1629,7 +1925,6 @@ def test_a_transfer_is_attributed_to_the_thread_that_posted_it(tmp_path):
     assert by_state["failed"]["thread_name"] is None
 
 
-
 def _kv_config(extra, connector="NixlConnector", role="kv_producer"):
     from vllm.config import KVTransferConfig, VllmConfig
 
@@ -1738,6 +2033,7 @@ def test_credentials_never_reach_the_saved_metadata_or_manifest(tmp_path, monkey
          "transports": {"hp_tcp": {"enable": True}}}))  # fmt: skip
     extra = {**_profiler_extra(tmp_path), "nested": {"access_token": "FAKE-SECRET-2"},
              "backends": ["UCX"]}  # fmt: skip
+
     class EchoingAgent:
         backends = {"UCX": object()}
 
@@ -1766,7 +2062,9 @@ def test_credentials_never_reach_the_saved_metadata_or_manifest(tmp_path, monkey
         "etcd://<redacted>@h:2379/x?session_id=<redacted>"
         "&credential=<redacted>&region=eu"
     )
-    assert tent["versioned"] == "etcd://h:2379/x;version=1?session_id=<redacted>&region=eu"
+    assert (
+        tent["versioned"] == "etcd://h:2379/x;version=1?session_id=<redacted>&region=eu"
+    )
     # One URL per value: its boundary is the value's end, apostrophe or not.
     assert tent["quoted"] == "etcd://h:2379/it's;v=1?session_id=<redacted>&region=eu"
     # A comma-separated endpoint list, item by item; anything else ambiguous, whole.
@@ -1815,7 +2113,6 @@ def test_settings_that_distinguish_runs_are_recorded(tmp_path, monkeypatch):
     assert a != b
 
 
-
 def test_a_non_finite_setting_is_kept_as_text_and_the_recorder_starts(tmp_path):
     """Strict JSON has no infinity: an optional connector setting such as an
     infinite TTL is recorded as text instead of aborting attachment."""
@@ -1843,7 +2140,6 @@ def test_a_recorder_that_cannot_start_leaves_no_ring_directory(tmp_path, monkeyp
         assert list(shared.iterdir()) == []
     finally:
         shutil.rmtree(shared, ignore_errors=True)
-
 
 
 def test_a_frontend_in_an_api_server_child_records_its_shutdown_risk(monkeypatch):

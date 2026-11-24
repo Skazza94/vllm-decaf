@@ -1168,16 +1168,19 @@ def test_clock_endpoints_are_explicit_and_calibrate_a_real_pair(tmp_path):
     )
     summary = json.loads((consumer._kvp.output_dir / "profiler.json").read_text())
     assert summary["clock"] == {
-        "server": False,
+        "server": None,
         "peers_configured": 1,
         "unmapped_engines": [],
     }
-    assert (
-        json.loads((producer._kvp.output_dir / "profiler.json").read_text())["clock"][
-            "server"
-        ]
-        is True
-    )
+    server = json.loads((producer._kvp.output_dir / "profiler.json").read_text())[
+        "clock"
+    ]["server"]
+    assert server == {
+        "state": "available",
+        "family": "ipv4",
+        "fallback": None,
+        "address": ["127.0.0.1", port],
+    }
 
 
 def test_each_dp_rank_s_clock_server_binds_its_own_port(tmp_path):

@@ -190,6 +190,7 @@ class NixlProfiler(TimelineMixin, _Profiler):
         self.engine_id = engine_id
         self.peers: PeerClocks | None = None
         self.server = None
+        self.server_report: dict | None = None  # the producer's clock server
         # Request context of the READ being posted (worker main thread).
         self._request = self._remote_request = self._peer = None
         self._source_rank = 0
@@ -478,7 +479,7 @@ class NixlProfiler(TimelineMixin, _Profiler):
         self._timeline_close()
 
     def _extra_summary(self) -> dict:
-        return self._timeline_summary()
+        return {**self._timeline_summary(), "clock": {"server": self.server_report}}
 
     def _close_helpers(self) -> list:
         failures = []
@@ -661,16 +662,17 @@ def _build(
     profiler = NixlProfiler(config, recorder, rank=rank, engine_id=engine_id)
     try:
         if role == "scheduler" and config.clock and side_channel is not None:
-            from .clock import ClockServer
+            from .clock import start_server
 
             generation = recorder.metadata["clock_id"]
             host, port = side_channel
             if kv_role in ("kv_producer", "kv_both"):
-                profiler.server = ClockServer(
+                profiler.server, profiler.server_report = start_server(
                     config.run_id,
-                    generation=generation,
-                    host=host,
-                    port=port + config.clock_port_offset,
+                    generation,
+                    engine_id,
+                    host,
+                    port + config.clock_port_offset,
                 )
             if kv_role in ("kv_consumer", "kv_both"):
                 profiler.peers = PeerClocks(config, config.run_id, generation)

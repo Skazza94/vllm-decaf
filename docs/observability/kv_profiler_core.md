@@ -217,7 +217,7 @@ cover cached and first-seen IDs; they do not qualify a future adapter.
 bounded exchanges over its own TCP socket. They do not touch a connector
 protocol. There is no automatic discovery/connection hook in this checkpoint.
 
-Frames are network byte order: 56-byte PROBE and 88-byte REPLY. Seven samples
+Frames are network byte order: 56-byte PROBE and 104-byte REPLY (version 2). Seven samples
 by default retain t1/t2/t3/t4 and both clock generations. Select minimum
 network RTT; retain raw RTT as sample uncertainty. Persist
 `ClockMapping.from_samples(start, end).to_json()` including all samples.
@@ -225,6 +225,21 @@ Use the recorder metadata's `clock_id` as the local generation when starting
 its `ClockServer` and measuring peers. Missing end calibration means drift
 unknown. A generation change is rejected. Failed exchanges produce no mapping;
 they must remain unaligned. Helpers exit when their parent disappears.
+
+A clock server listens on the family its host resolves to (an IPv6 literal
+listens on IPv6 only). A wildcard host listens dual-stack where the host
+supports it, and on IPv4 otherwise. A server that cannot listen or start (an
+occupied port, an address the host does not have) leaves only the clock
+unavailable: the recorder runs, and `profiler.json` reports `clock.server`
+with its `state`, its `family` (`ipv4`, `ipv6` or `dual`), the `fallback`
+reason of a wildcard that listens on IPv4 only, and the error of an
+unavailable one. A port past 65535 (a side-channel port plus the offset, for
+example) is refused with its value on both ends, never wrapped; port 0 asks for
+an ephemeral one. A reply names its server's engine (a digest of its ID), and a
+consumer accepts only the engine it asked for: a peer whose server is
+unavailable, even when another server of the run answers on its port, is
+recorded as failed with the reason in `calibration.json` (`detail`) and stays
+unaligned.
 
 Projection uses integer differences and rational arithmetic before converting
 to trace microseconds. Linear drift interpolation is an estimate, not a bound

@@ -91,6 +91,7 @@ class PeerClocks:
                 address,
                 self.run_id,
                 self.local_generation,
+                expected_engine=self.engine[index],
                 samples=self.config.clock_samples,
                 timeout_s=1,
             )
@@ -100,7 +101,7 @@ class PeerClocks:
                 start=samples,
             )
         except Exception as exc:
-            entry.update(status=PEER_FAILED, error=type(exc).__name__)
+            entry.update(status=PEER_FAILED, error=type(exc).__name__, detail=str(exc))
         self.results.append(entry)
 
     def close(self, output_dir: Path, join_s: float) -> dict:
@@ -133,6 +134,7 @@ class PeerClocks:
             record["status"] = entry["status"]
             if entry["status"] != PEER_OK:
                 record["error"] = entry["error"]
+                record["detail"] = entry.get("detail")
                 peers.append(record)
                 continue
             record["remote_generation"] = entry["remote_generation"]
@@ -144,6 +146,7 @@ class PeerClocks:
                         tuple(record["address"]),
                         self.run_id,
                         self.local_generation,
+                        expected_engine=record["engine_id"],
                         expected_remote=entry["remote_generation"],
                         samples=self.config.clock_samples,
                         timeout_s=min(1, remaining),

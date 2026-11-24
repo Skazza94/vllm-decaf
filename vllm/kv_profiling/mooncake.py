@@ -89,6 +89,7 @@ class MooncakeProfiler(TimelineMixin, _Profiler):
         self.kv_role = kv_role
         self.peers: PeerClocks | None = None
         self.server = None
+        self.server_report: dict | None = None  # the producer's clock server
         self._clock_peers = config.clock_peer_endpoints() if config.clock else {}
         self.unmapped_clock_engines: list[str] = []
         # Open generations: handle -> phase. Guarded by ``_glock``, which also
@@ -619,7 +620,7 @@ class MooncakeProfiler(TimelineMixin, _Profiler):
             "unbound_batches": self.unbound_batches,
             "inflight_cap": self._cap,
             "clock": {
-                "server": self.server is not None,
+                "server": self.server_report,
                 "peers_configured": len(self._clock_peers),
                 "unmapped_engines": list(self.unmapped_clock_engines),
             },
@@ -745,16 +746,17 @@ def _build(
     )
     try:
         if role == "scheduler" and config.clock:
-            from .clock import ClockServer
+            from .clock import start_server
 
             generation = recorder.metadata["clock_id"]
             if kv_role in ("kv_producer", "kv_both") and config.clock_bind:
                 host, _, port = config.clock_bind.rpartition(":")
-                profiler.server = ClockServer(
+                profiler.server, profiler.server_report = start_server(
                     config.run_id,
-                    generation=generation,
-                    host=host.strip("[]"),
-                    port=clock_bind_port(int(port), config.context.get("dp_rank")),
+                    generation,
+                    engine_id,
+                    host.strip("[]"),
+                    clock_bind_port(int(port), config.context.get("dp_rank")),
                 )
             if kv_role in ("kv_consumer", "kv_both") and config.clock_peers:
                 profiler.peers = PeerClocks(config, config.run_id, generation, offset=0)
