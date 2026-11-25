@@ -3,6 +3,7 @@
 """The Mooncake L1 adapter on the real connector's scheduler and worker."""
 
 import asyncio
+import contextlib
 import gc
 import json
 import os
@@ -83,18 +84,13 @@ def test_invalid_configuration_is_refused_even_when_it_is_off_or_unknown(tmp_pat
     for bad in (
         {"level": "l3"},
         {"level": "l1"},
-        {"level": "off", "clock_bind": "nohost"},
+        {"level": "off", "clock_bind": "127.0.0.1:9"},  # removed: unknown now
+        {"level": "off", "clock_peers": {}},
         {
             "level": "l1",
             "run_id": "6e4c5b6b-7a77-4c51-93f2-0d2d0f8b8c11",
             "output_dir": str(tmp_path),
-            "clock_bind": ":9",
-        },
-        {
-            "level": "l1",
-            "run_id": "6e4c5b6b-7a77-4c51-93f2-0d2d0f8b8c11",
-            "output_dir": str(tmp_path),
-            "clock_peers": {"e": "h:70000"},
+            "clock_discovery_s": 0,
         },
         {
             "level": "l1",
@@ -1121,131 +1117,613 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def test_clock_endpoints_are_explicit_and_calibrate_a_real_pair(tmp_path):
-    from tests.v1.kv_connector.unit.utils import create_request
+def _registry(route=True):
+    """A real Mooncake bootstrap server on a free port, with the clock route
+    unless ``route`` is False (an older or external registry); its URL."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (  # noqa: E501
+        MooncakeBootstrapServer,
+    )
+    from vllm.kv_profiling.clock_registry import ClockRegistry, add_routes
 
-    port = _free_port()
-    run = profiler_extra(tmp_path)
-    producer = make_scheduler(
-        "kv_producer",
-        {
-            "network_profiler": {
-                **run["network_profiler"],
-                "clock_bind": f"127.0.0.1:{port}",
-            }
-        },
-        engine_id="engine-p",
-    )
-    assert producer._kvp.server is not None
-    consumer = make_scheduler(
-        "kv_consumer",
-        {
-            "network_profiler": {
-                **run["network_profiler"],
-                "clock_peers": {"engine-p": f"127.0.0.1:{port}"},
-            }
-        },
-        engine_id="engine-d",
-    )
-    request = _params(
-        create_request(request_id=7, do_remote_prefill=True),
-        transfer_id="tx-7",
-        remote_engine_id="engine-p",
-    )
-    consumer.on_new_request(request)
-    deadline = time.monotonic() + 10
-    while not consumer._kvp.peers.results and time.monotonic() < deadline:
-        time.sleep(0.05)
-    consumer._kvp.close()
-    producer._kvp.close()
-    calibration = json.loads(
-        (consumer._kvp.output_dir / "calibration.json").read_text()
-    )
-    (peer,) = calibration["peers"]
-    assert peer["engine_id"] == "engine-p" and peer["status"] == "ok"
-    assert peer["address"] == ["127.0.0.1", port], (
-        "the explicit endpoint, no side-channel offset added"
-    )
-    summary = json.loads((consumer._kvp.output_dir / "profiler.json").read_text())
-    assert summary["clock"] == {
-        "server": None,
-        "peers_configured": 1,
-        "unmapped_engines": [],
-    }
-    server = json.loads((producer._kvp.output_dir / "profiler.json").read_text())[
-        "clock"
-    ]["server"]
-    assert server == {
-        "state": "available",
-        "family": "ipv4",
-        "fallback": None,
-        "address": ["127.0.0.1", port],
-    }
+    server = MooncakeBootstrapServer("127.0.0.1", _free_port())
+    if route:
+        server.clock_registry = ClockRegistry()
+        add_routes(server.app, server.clock_registry)
+    server.start()
+    return server, f"http://127.0.0.1:{server.port}"
 
 
-def test_each_dp_rank_s_clock_server_binds_its_own_port(tmp_path):
-    """With data parallelism every DP rank is one engine with its own scheduler:
-    ``clock_bind`` names DP rank 0's port and DP rank d's server binds the port + d,
-    so an instance's engines never share one; a port past 65535 is refused."""
-    from mooncake_profiled import _make_test_kv_cache_config, vllm_config
+def _clock_profiler(tmp_path, role, kv_role, run_id, engine_id, **context):
+    from vllm.kv_profiling.config import NetworkProfilerConfig
+    from vllm.kv_profiling.mooncake import _build
 
-    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (  # noqa: E501
-        MooncakeConnectorScheduler,
-    )
-    from vllm.kv_profiling.mooncake import clock_bind_port
+    config = NetworkProfilerConfig(
+        level="l1",
+        run_id=run_id,
+        output_dir=str(tmp_path / engine_id),
+        shutdown_timeout_s=5,
+        clock_discovery_s=context.pop("discovery", 30),
+        context={"role": role, "kv_role": kv_role, "engine_id": engine_id,
+                 "rank": 0, "connector": "mooncake", **context},
+    )  # fmt: skip
+    return _build(config, role, engine_id, 0, kv_role)
 
-    assert clock_bind_port(9000, None) == clock_bind_port(9000, 0) == 9000
-    assert clock_bind_port(9000, 3) == 9003
-    with pytest.raises(ValueError, match="is not a port"):
-        clock_bind_port(65535, 1)
-    port = _free_port()
-    run = profiler_extra(tmp_path)
-    config = vllm_config(
-        "kv_producer",
-        {
-            "network_profiler": {
-                **run["network_profiler"],
-                "clock_bind": f"127.0.0.1:{port - 1}",
-            }
-        },
-    )
-    config.parallel_config.data_parallel_index = 1
-    producer = MooncakeConnectorScheduler(
-        config, "engine-p_dp1", _make_test_kv_cache_config()
-    )
+
+def _clock_worker(tmp_path, run_id, engine_id, registry, host="127.0.0.1", dp=0):
+    return _clock_profiler(
+        tmp_path, "worker", "kv_producer", run_id, engine_id, tp_rank=0, pp_rank=0,
+        clock_host=host, clock_registry=registry, registration_dp_rank=dp,
+    )  # fmt: skip
+
+
+def _consumer(tmp_path, run_id, **context):
+    return _clock_profiler(tmp_path, "scheduler", "kv_consumer", run_id, "engine-d",
+                           **context)  # fmt: skip
+
+
+def _until(predicate, timeout=15):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+
+
+def _advertised(worker):
+    _until(lambda: worker.advertised is not None)
+    return worker.advertised
+
+
+def _peers(consumer):
+    consumer.close()
+    manifest = json.loads((consumer.output_dir / "calibration.json").read_text())
+    return {peer["engine_id"]: peer for peer in manifest["peers"]}
+
+
+def test_a_worker_clock_is_advertised_and_calibrated_through_the_bootstrap_route(
+    tmp_path,
+):
+    """The producer's TP0/PP0 worker serves its clock on its KV host and an
+    ephemeral port, advertised to the bootstrap server; the consumer finds it
+    from the request's bootstrap address and requires the advertised engine and
+    generation from the first exchange on."""
+    server, url = _registry()
+    run = str(uuid4())
     try:
-        assert producer._kvp.server.address[1] == port
+        worker = _clock_worker(tmp_path, run, "engine-p", url)
+        assert _advertised(worker)["state"] == "ok"
+        consumer = _consumer(tmp_path, run)
+        consumer.handoff_in("d1", "tx-1", "engine-p", url)
+        consumer.handoff_in("d2", "tx-2", "engine-p", url)  # once per engine
+        _until(lambda: consumer.peers.results)
+        peer = _peers(consumer)["engine-p"]
+        worker.close()
     finally:
-        producer._kvp.close()
+        server.shutdown()
+    generation = worker.recorder.metadata["clock_id"]
+    assert peer["status"] == "ok" and peer["bootstrap"] == url
+    assert peer["advertised_generation"] == peer["remote_generation"] == generation
+    assert peer["address"] == list(worker.server_report["address"])
+    assert peer["end_missing"] is False and "calibration_file" in peer
+    report = json.loads((worker.output_dir / "profiler.json").read_text())["clock"]
+    assert report["server"]["state"] == "available"
+    assert report["server"]["family"] == "ipv4"
+    assert report["advertised"]["state"] == "ok"
+    assert report["advertised"]["answer"] == "registered"
+    summary = json.loads((consumer.output_dir / "profiler.json").read_text())
+    assert summary["clock"]["unaddressed_engines"] == [] and summary["complete"]
 
 
-def test_a_peer_without_a_clock_mapping_stays_unaligned_with_a_reason(tmp_path):
+def test_each_dp_engine_of_one_instance_calibrates_against_its_own_clock(tmp_path):
+    server, url = _registry()
+    run = str(uuid4())
+    try:
+        workers = [
+            _clock_worker(tmp_path, run, f"engine-p_dp{d}", url, dp=d) for d in (0, 1)
+        ]
+        assert all(_advertised(w)["state"] == "ok" for w in workers)
+        listing = server.clock_registry.listing(run)
+        assert {e: v["dp_rank"] for e, v in listing.items()} == {
+            "engine-p_dp0": 0,
+            "engine-p_dp1": 1,
+        }
+        consumer = _consumer(tmp_path, run)
+        for d in (1, 0):
+            consumer.handoff_in(f"d{d}", f"tx-{d}", f"engine-p_dp{d}", url)
+        _until(lambda: len(consumer.peers.results) == 2)
+        peers = _peers(consumer)
+        for w in workers:
+            w.close()
+    finally:
+        server.shutdown()
+    for d, w in enumerate(workers):
+        peer = peers[f"engine-p_dp{d}"]
+        assert peer["status"] == "ok"
+        assert peer["remote_generation"] == w.recorder.metadata["clock_id"]
+
+
+def _register(server, run, engine, clock, dp=0):
+    """Register a live ``ClockServer`` the way a worker does."""
+    return server.clock_registry.register({
+        "run_id": run, "engine_id": engine, "dp_rank": dp,
+        "endpoint": f"127.0.0.1:{clock.address[1]}", "generation": clock.generation,
+    })  # fmt: skip
+
+
+def _raw(server, run, engine, endpoint, generation=None, dp=0):
+    """An entry placed in the registry as is (as an older or external registry
+    may hold it), bypassing its verification."""
+    server.clock_registry._records[(run, engine)] = {
+        "run_id": run, "engine_id": engine, "dp_rank": dp, "endpoint": endpoint,
+        "generation": generation or str(uuid4()),
+    }  # fmt: skip
+
+
+def test_the_registry_orders_replacements_by_the_live_clocks():
+    """A registration whose clock does not answer as it claims is refused;
+    identical retries change nothing; another generation replaces only a clock
+    that no longer answers, and two live clocks of one engine conflict. So a
+    retired worker's delayed retry never displaces its successor, whatever its
+    host's wall clock says."""
+    from vllm.kv_profiling.clock import ClockServer
+    from vllm.kv_profiling.clock_registry import ClockRegistry
+
+    run = str(uuid4())
+    registry = ClockRegistry()
+
+    def record(server, generation=None):
+        return {"run_id": run, "engine_id": "e", "dp_rank": 0,
+                "endpoint": f"127.0.0.1:{server.address[1]}",
+                "generation": generation or server.generation}  # fmt: skip
+
+    retired = ClockServer(run, engine_id="e")
+    first = record(retired)
+    assert registry.register(first) == (201, {"status": "registered"})
+    assert registry.register(first) == (200, {"status": "unchanged"})
+    with ClockServer(run, engine_id="e") as live:
+        code, body = registry.register(record(live))  # the first still answers
+        assert code == 409 and body["status"] == "conflict"
+        retired.close()
+        assert registry.register(record(live)) == (200, {"status": "replaced"})
+        code, body = registry.register(first)  # the retired one's late retry
+        assert code == 422 and body["status"] == "unverified"
+        assert registry.listing(run)["e"]["generation"] == live.generation
+        code, _ = registry.register(record(live, str(uuid4())))  # a false claim
+        assert code == 422
+    assert registry.register({**first, "extra": 1})[0] == 400
+    assert registry.register({**first, "endpoint": "h:70000"})[0] == 400
+    assert registry.listing(str(uuid4())) == {}
+
+
+def test_an_advertised_generation_another_server_answers_for_fails_the_peer(
+    tmp_path,
+):
+    """A stale clock still answering at the advertised endpoint, for the same
+    engine, is refused on the first exchange (the generation must be the
+    advertised one), and keeps failing until the window ends."""
+    from vllm.kv_profiling.clock import ClockServer
+
+    server, url = _registry()
+    run = str(uuid4())
+    try:
+        with ClockServer(run, generation=str(uuid4()), engine_id="engine-p") as stale:
+            _raw(server, run, "engine-p", f"127.0.0.1:{stale.address[1]}")
+            consumer = _consumer(tmp_path, run, discovery=1)
+            consumer.handoff_in("d", "tx", "engine-p", url)
+            _until(lambda: consumer.peers.results)
+            peer = _peers(consumer)["engine-p"]
+    finally:
+        server.shutdown()
+    assert peer["status"] == "failed" and "clock generation changed" in peer["detail"]
+    assert "calibration_file" not in peer
+
+
+def test_an_advertisement_without_a_generation_is_never_measured(tmp_path):
+    """A listing whose generation is missing or not a UUID cannot pin the
+    answering clock: the peer fails before any exchange."""
+    from vllm.kv_profiling.clock import ClockServer
+
+    server, url = _registry()
+    run = str(uuid4())
+    try:
+        with ClockServer(run, engine_id="engine-p") as clock:
+            endpoint = f"127.0.0.1:{clock.address[1]}"
+            for engine, generation in (("null", None), ("text", "not-a-uuid")):
+                server.clock_registry._records[(run, engine)] = {
+                    "run_id": run, "engine_id": engine, "dp_rank": 0,
+                    "endpoint": endpoint, "generation": generation,
+                }  # fmt: skip
+            consumer = _consumer(tmp_path, run)
+            consumer.handoff_in("d1", "tx-1", "null", url)
+            consumer.handoff_in("d2", "tx-2", "text", url)
+            _until(lambda: len(consumer.peers.results) == 2)
+            peers = _peers(consumer)
+    finally:
+        server.shutdown()
+    for engine in ("null", "text"):
+        assert peers[engine]["status"] == "failed"
+        assert "advertised clock is unusable" in peers[engine]["detail"]
+        assert peers[engine]["address"] is None
+        assert "calibration_file" not in peers[engine]
+
+
+def _fake_registry(answer):
+    """An HTTP server whose clock route answers ``answer(method)`` as
+    (status, body bytes); its URL and server."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _reply(self):
+            if self.command == "POST":
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            code, body = answer(self.command)
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _reply
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{httpd.server_address[1]}", httpd
+
+
+def test_a_producer_accepts_only_a_recognized_acknowledgement(tmp_path):
+    """An empty object, a JSON array or a non-JSON body is no acknowledgement:
+    the advertisement fails with the reply, and never raises."""
+    run = str(uuid4())
+    for body in (b"{}", b"[]", b"not json", b'{"status": "maybe"}'):
+        url, httpd = _fake_registry(lambda method, body=body: (200, body))
+        try:
+            worker = _clock_worker(tmp_path / str(len(body)), run, "engine-p", url)
+            advertised = _advertised(worker)
+            worker.close()
+        finally:
+            httpd.shutdown()
+        assert advertised["state"] == "failed", body
+        assert "unrecognized registry reply" in advertised["detail"]
+
+
+def test_a_cached_endpoint_that_fails_its_check_is_looked_up_again(tmp_path):
+    """The listing was fetched (for another engine) while B's previous worker
+    was registered; B's successor replaced it since. B's first exchange fails
+    against the cached endpoint, the listing is refreshed, and B calibrates
+    against its current clock within its window."""
+    from vllm.kv_profiling.clock import ClockServer
+
+    server, url = _registry()
+    run = str(uuid4())
+    try:
+        with (
+            ClockServer(run, engine_id="A") as a,
+            ClockServer(run, engine_id="B") as old,
+        ):
+            for engine, clock in (("A", a), ("B", old)):
+                assert _register(server, run, engine, clock)[0] == 201
+            consumer = _consumer(tmp_path, run, discovery=10)
+            consumer.handoff_in("d1", "tx-1", "A", url)  # caches both entries
+            _until(lambda: 0 in consumer.peers.results)
+            old.close()
+            with ClockServer(run, engine_id="B") as new:
+                code, _ = server.clock_registry.register({"run_id": run,
+                    "engine_id": "B", "dp_rank": 1,
+                    "endpoint": f"127.0.0.1:{new.address[1]}",
+                    "generation": new.generation})  # fmt: skip
+                assert code == 200
+                consumer.handoff_in("d2", "tx-2", "B", url)
+                _until(lambda: 1 in consumer.peers.results)
+                peers = _peers(consumer)
+    finally:
+        server.shutdown()
+    assert peers["B"]["status"] == "ok"
+    assert peers["B"]["remote_generation"] == new.generation
+
+
+def test_a_slow_registry_never_delays_another_and_its_window_holds(tmp_path):
+    """One registry takes 550 ms to answer: its peer, with a 200 ms window,
+    fails at that window; a peer of a healthy registry is looked up at once
+    and calibrates."""
+    import time as clock_time
+
+    from vllm.kv_profiling.clock import ClockServer
+
+    healthy, healthy_url = _registry()
+    run = str(uuid4())
+
+    def slow(method):
+        clock_time.sleep(0.55)
+        return 200, b"{}"
+
+    slow_url, httpd = _fake_registry(slow)
+    try:
+        with ClockServer(run, engine_id="fast") as clock:
+            healthy.clock_registry.register({"run_id": run, "engine_id": "fast",
+                "dp_rank": 0, "endpoint": f"127.0.0.1:{clock.address[1]}",
+                "generation": clock.generation})  # fmt: skip
+            consumer = _consumer(tmp_path, run, discovery=0.2)
+            start = time.monotonic()
+            consumer.handoff_in("d1", "tx-1", "slowpoke", slow_url)
+            consumer.handoff_in("d2", "tx-2", "fast", healthy_url)
+            _until(lambda: 1 in consumer.peers.results)
+            fast_done = time.monotonic() - start
+            _until(lambda: 0 in consumer.peers.results)
+            peers = _peers(consumer)
+    finally:
+        httpd.shutdown()
+        healthy.shutdown()
+    assert fast_done < 0.4, fast_done
+    assert peers["fast"]["status"] == "ok"
+    assert peers["slowpoke"]["status"] == "failed"
+    assert "not advertised" in peers["slowpoke"]["detail"]
+
+
+def test_bootstrap_credentials_never_reach_saved_diagnostics(tmp_path):
+    from vllm.kv_profiling.clock import ClockServer
+
+    server, url = _registry()
+    run = str(uuid4())
+    secret = url.replace("http://", "http://user:s3cr3t-t0ken@")
+    try:
+        with ClockServer(run, engine_id="other") as clock:
+            _raw(server, run, "engine-p", f"127.0.0.1:{clock.address[1]}")
+            consumer = _consumer(tmp_path, run, discovery=0.5)
+            consumer.handoff_in("d", "tx", "engine-p", secret + "/?token=t0p")
+            consumer.handoff_in("d2", "tx2", "missing", secret + "/?token=t0p")
+            _until(lambda: len(consumer.peers.results) == 2)
+            _peers(consumer)
+    finally:
+        server.shutdown()
+    saved = (consumer.output_dir / "calibration.json").read_text()
+    saved += (consumer.output_dir / "profiler.json").read_text()
+    assert "s3cr3t" not in saved and "t0p" not in saved
+    assert "<redacted>" in saved
+
+
+def test_a_registry_without_the_clock_route_leaves_both_sides_recording(tmp_path):
+    """An external or older bootstrap registry (no clock route, HTTP 404): the
+    producer's advertisement and the consumer's peer fail with that reason,
+    and both recorders close complete."""
+    server, url = _registry(route=False)
+    run = str(uuid4())
+    try:
+        worker = _clock_worker(tmp_path, run, "engine-p", url)
+        advertised = _advertised(worker)
+        consumer = _consumer(tmp_path, run)
+        consumer.handoff_in("d", "tx", "engine-p", url)
+        _until(lambda: consumer.peers.results)
+        peer = _peers(consumer)["engine-p"]
+        worker.close()
+    finally:
+        server.shutdown()
+    assert advertised["state"] == "failed" and "HTTP 404" in advertised["detail"]
+    assert peer["status"] == "failed" and "no clock route (HTTP 404)" in peer["detail"]
+    for profiler in (worker, consumer):
+        summary = json.loads((profiler.output_dir / "profiler.json").read_text())
+        assert summary["complete"] is True and summary["hook_errors"] == 0
+
+
+def _forward(target_port, delay=0.0):
+    """A TCP forwarder (a remapped Service port, say), connecting ``delay``
+    seconds after each accept: its listening socket."""
+    import socket
+    import threading
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+
+    def pipe(a, b):
+        try:
+            while data := a.recv(65536):
+                b.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in (a, b):
+                with contextlib.suppress(OSError):
+                    s.shutdown(socket.SHUT_RDWR)
+
+    def serve():
+        while True:
+            try:
+                client, _ = listener.accept()
+            except OSError:
+                return
+            time.sleep(delay)
+            upstream = socket.create_connection(("127.0.0.1", target_port))
+            for a, b in ((client, upstream), (upstream, client)):
+                threading.Thread(target=pipe, args=(a, b), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return listener
+
+
+def test_a_remapped_bootstrap_port_and_a_separate_worker_address_calibrate(
+    tmp_path,
+):
+    """The consumer reaches the registry through another port (a Service), and
+    the clock on the worker's own KV address (127.0.0.2, not the registry's):
+    the advertised endpoint is used as is, never derived from either."""
+    server, url = _registry()
+    forwarder = _forward(server.port)
+    forwarded = forwarder.getsockname()[1]
+    remapped = f"http://127.0.0.1:{forwarded}"
+    run = str(uuid4())
+    try:
+        worker = _clock_worker(tmp_path, run, "engine-p", url, host="127.0.0.2")
+        assert _advertised(worker)["state"] == "ok"
+        consumer = _consumer(tmp_path, run)
+        consumer.handoff_in("d", "tx", "engine-p", remapped)
+        _until(lambda: consumer.peers.results)
+        peer = _peers(consumer)["engine-p"]
+        worker.close()
+    finally:
+        forwarder.close()
+        server.shutdown()
+    assert peer["status"] == "ok" and peer["bootstrap"] == remapped
+    assert peer["address"][0] == "127.0.0.2"
+    assert peer["address"][1] not in (server.port, forwarded)
+
+
+def test_unusable_advertised_endpoints_fail_their_peer_and_keep_recording(
+    tmp_path,
+):
+    """A blocked clock port (nothing answers) and a port past 65535 (a DP
+    rank's, say) fail that peer with a specific reason and the endpoint; the
+    consumer's recorder closes complete."""
+    import socket
+
+    server, url = _registry()
+    run = str(uuid4())
+    with socket.socket() as closed:
+        closed.bind(("127.0.0.1", 0))
+        blocked = closed.getsockname()[1]
+    try:
+        # neither would pass this registry's checks (an unanswered clock, a
+        # port past 65535): an older or external registry may hold them
+        _raw(server, run, "blocked", f"127.0.0.1:{blocked}", dp=1)
+        _raw(server, run, "overflow_dp1", "127.0.0.1:65536", dp=1)
+        consumer = _consumer(tmp_path, run, discovery=1)
+        consumer.handoff_in("d1", "tx-1", "blocked", url)
+        consumer.handoff_in("d2", "tx-2", "overflow_dp1", url)
+        _until(lambda: len(consumer.peers.results) == 2)
+        peers = _peers(consumer)
+    finally:
+        server.shutdown()
+    assert peers["blocked"]["status"] == "failed"
+    assert peers["blocked"]["address"] == ["127.0.0.1", blocked]
+    assert peers["blocked"]["error"] == "ConnectionRefusedError"
+    assert peers["overflow_dp1"]["status"] == "failed"
+    assert "clock port 65536 is out of range 1-65535" in peers["overflow_dp1"]["detail"]
+    summary = json.loads((consumer.output_dir / "profiler.json").read_text())
+    assert summary["complete"] is True and summary["hook_errors"] == 0
+
+
+def test_an_engine_still_being_looked_up_never_holds_up_another(tmp_path):
+    """The first engine is never advertised: the second calibrates while the
+    first backs off, and the first fails only when its window ends."""
+    server, url = _registry()
+    run = str(uuid4())
+    try:
+        worker = _clock_worker(tmp_path, run, "present", url)
+        assert _advertised(worker)["state"] == "ok"
+        consumer = _consumer(tmp_path, run, discovery=3)
+        start = time.monotonic()
+        consumer.handoff_in("d1", "tx-1", "missing", url)
+        consumer.handoff_in("d2", "tx-2", "present", url)
+        _until(lambda: 1 in consumer.peers.results)
+        calibrated = time.monotonic() - start
+        assert 0 not in consumer.peers.results  # still backing off
+        _until(lambda: 0 in consumer.peers.results)
+        failed = time.monotonic() - start
+        peers = _peers(consumer)
+        worker.close()
+    finally:
+        server.shutdown()
+    assert calibrated < 2 < 3 <= failed + 0.5
+    assert peers["present"]["status"] == "ok"
+    assert peers["missing"]["status"] == "failed"
+    assert "not advertised" in peers["missing"]["detail"]
+
+
+def test_shutdown_during_discovery_records_the_pending_peer(tmp_path):
+    server, url = _registry()
+    run = str(uuid4())
+    try:
+        consumer = _consumer(tmp_path, run)
+        consumer.handoff_in("d", "tx", "never", url)
+        time.sleep(0.6)  # looked up, then backing off
+        start = time.monotonic()
+        peers = _peers(consumer)
+        assert time.monotonic() - start < 5
+    finally:
+        server.shutdown()
+    manifest = json.loads((consumer.output_dir / "calibration.json").read_text())
+    assert manifest["clock_thread"] == "joined"
+    assert peers["never"]["status"] == "pending_at_close"
+    assert "not yet advertised" in peers["never"]["detail"]
+
+
+def test_a_worker_advertises_to_a_registry_that_starts_later(tmp_path):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (  # noqa: E501
+        MooncakeBootstrapServer,
+    )
+    from vllm.kv_profiling.clock_registry import ClockRegistry, add_routes
+
+    port = _free_port()
+    run = str(uuid4())
+    worker = _clock_worker(tmp_path, run, "engine-p", f"http://127.0.0.1:{port}")
+    time.sleep(1)  # refused meanwhile, retried
+    server = MooncakeBootstrapServer("127.0.0.1", port)
+    server.clock_registry = ClockRegistry()
+    add_routes(server.app, server.clock_registry)
+    server.start()
+    try:
+        advertised = _advertised(worker)
+        worker.close()
+    finally:
+        server.shutdown()
+    assert advertised["state"] == "ok" and advertised["attempts"] > 1
+    assert "engine-p" in server.clock_registry.listing(run)
+
+
+def test_a_handoff_without_a_bootstrap_address_stays_unaligned_with_a_reason(
+    tmp_path,
+):
     from tests.v1.kv_connector.unit.utils import create_request
 
-    run = profiler_extra(tmp_path)
-    consumer = make_scheduler(
-        "kv_consumer",
-        {
-            "network_profiler": {
-                **run["network_profiler"],
-                "clock_peers": {"other": "127.0.0.1:9"},
-            }
-        },
-    )
+    consumer = make_scheduler("kv_consumer", profiler_extra(tmp_path))
     request = _params(
         create_request(request_id=8, do_remote_prefill=True),
         transfer_id="tx-8",
         remote_engine_id="engine-x",
     )
+    request.kv_transfer_params.pop("remote_bootstrap_addr", None)
     consumer.on_new_request(request)
     consumer.on_new_request(request)
     consumer._kvp.close()
     summary = json.loads((consumer._kvp.output_dir / "profiler.json").read_text())
-    assert summary["clock"]["unmapped_engines"] == ["engine-x"]
+    assert summary["clock"]["unaddressed_engines"] == ["engine-x"]
     assert (
         json.loads((consumer._kvp.output_dir / "calibration.json").read_text())["peers"]
         == []
     )
+
+
+def test_the_connector_runs_the_clock_on_the_producer_tp0_worker_only(tmp_path):
+    """Under Mooncake a producer engine's clock is its TP0/PP0 worker's (with
+    the worker's KV host and registry in its context); its scheduler runs no
+    clock server, and the bootstrap server gets the clock route."""
+    from mooncake_profiled import vllm_config
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (  # noqa: E501
+        MooncakeBootstrapServer,
+    )
+    from vllm.kv_profiling.mooncake import serve_clock_registry
+
+    extra = profiler_extra(tmp_path)
+    scheduler = make_scheduler("kv_producer", extra)
+    assert scheduler._kvp.server is None and scheduler._kvp.peers is None
+    scheduler._kvp.close()
+    with worker_of("kv_producer", extra) as worker:
+        context = worker._kvp.config.context
+        assert worker._kvp.server is not None
+        assert context["clock_host"] == "127.0.0.1"
+        assert context["clock_registry"].startswith("http://")
+        assert context["capabilities"]["clock_server"] is True
+    bootstrap = MooncakeBootstrapServer("127.0.0.1", _free_port())
+    serve_clock_registry(bootstrap, vllm_config("kv_producer", extra))
+    assert bootstrap.clock_registry is not None
+    off = MooncakeBootstrapServer("127.0.0.1", _free_port())
+    serve_clock_registry(
+        off, vllm_config("kv_producer", {"network_profiler": {"level": "off"}})
+    )
+    assert not hasattr(off, "clock_registry")
 
 
 def test_capabilities_follow_the_kv_role_and_the_process_role(tmp_path):
@@ -1437,3 +1915,452 @@ def test_an_exceptional_and_a_no_data_batch_have_no_successful_return_in_the_rea
     assert (
         "write batch failed" in names_ and "write batch with no data movement" in names_
     )
+
+
+def test_an_immediate_listing_is_measured_at_once_within_a_short_window(tmp_path):
+    """The listing arrives at once: the exchange starts without waiting for a
+    lookup backoff and completes inside a 200 ms window."""
+    from vllm.kv_profiling.clock import ClockServer
+
+    server, url = _registry()
+    run = str(uuid4())
+    try:
+        with ClockServer(run, engine_id="engine-p") as clock:
+            assert _register(server, run, "engine-p", clock)[0] == 201
+            consumer = _consumer(tmp_path, run, discovery=0.2)
+            start = time.monotonic()
+            consumer.handoff_in("d", "tx", "engine-p", url)
+            _until(lambda: consumer.peers.results)
+            took = time.monotonic() - start
+            peer = _peers(consumer)["engine-p"]
+    finally:
+        server.shutdown()
+    assert peer["status"] == "ok" and took < 0.2, took
+
+
+def test_an_exchange_never_outlasts_its_window(tmp_path):
+    """A clock that accepts but never answers: the exchange is bounded by the
+    window left and the peer fails at the window, with no mapping."""
+    import socket
+
+    server, url = _registry()
+    run = str(uuid4())
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen(4)
+    try:
+        _raw(server, run, "engine-p", f"127.0.0.1:{silent.getsockname()[1]}")
+        consumer = _consumer(tmp_path, run, discovery=0.4)
+        start = time.monotonic()
+        consumer.handoff_in("d", "tx", "engine-p", url)
+        _until(lambda: consumer.peers.results)
+        took = time.monotonic() - start
+        peer = _peers(consumer)["engine-p"]
+    finally:
+        silent.close()
+        server.shutdown()
+    assert peer["status"] == "failed" and "calibration_file" not in peer
+    assert 0.35 < took < 0.7, took
+
+
+def test_a_producer_acknowledgement_after_its_budget_does_not_count():
+    import threading
+
+    from vllm.kv_profiling.clock_registry import advertise
+
+    def late(method):
+        time.sleep(0.15)
+        return 201, b'{"status": "registered"}'
+
+    url, httpd = _fake_registry(late)
+    try:
+        start = time.monotonic()
+        report = advertise(url, {"engine_id": "e"}, 0.05, threading.Event())
+        took = time.monotonic() - start
+    finally:
+        httpd.shutdown()
+    assert (
+        report["state"] == "failed" and "not accepted within 0.05 s" in report["detail"]
+    )
+    assert took < 0.15, took
+
+
+def test_malformed_error_replies_fail_the_advertisement_safely():
+    """Error bodies that are not an object with a text detail, and secret
+    fields in any reply, give a failed report with the HTTP status and a
+    redacted summary; nothing raises."""
+    import threading
+
+    from vllm.kv_profiling.clock_registry import advertise
+
+    replies = (
+        (400, b"[]"),
+        (422, b"null"),
+        (400, b'{"detail": "bad engine", "token": "s3cr3t"}'),
+        (409, b'{"detail": ["not", "text"], "token": "s3cr3t"}'),
+        (200, b'{"token": "s3cr3t"}'),
+        (201, b"[1, 2]"),
+    )
+    for code, body in replies:
+        url, httpd = _fake_registry(lambda method, code=code, body=body: (code, body))
+        try:
+            report = advertise(url, {"engine_id": "e"}, 2, threading.Event())
+        finally:
+            httpd.shutdown()
+        assert report["state"] == "failed", (code, body)
+        assert "s3cr3t" not in json.dumps(report), report
+        if code >= 400:
+            assert report["status"] == code and f"HTTP {code}" in report["detail"]
+
+
+def test_the_bootstrap_server_stays_responsive_while_a_clock_is_verified():
+    """A registration's verification (here 0.6 s) holds no lock a listing or
+    Mooncake's own /query needs, and blocks no event loop."""
+    import threading
+    import urllib.request
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (  # noqa: E501
+        MooncakeBootstrapServer,
+    )
+    from vllm.kv_profiling.clock_registry import ClockRegistry, add_routes
+
+    def slow(record):
+        time.sleep(0.6)
+        return None
+
+    server = MooncakeBootstrapServer("127.0.0.1", _free_port())
+    server.clock_registry = ClockRegistry(verify=slow)
+    add_routes(server.app, server.clock_registry)
+    server.start()
+    base = f"http://127.0.0.1:{server.port}"
+    run = str(uuid4())
+    record = {"run_id": run, "engine_id": "e", "dp_rank": 0,
+              "endpoint": "127.0.0.1:4000", "generation": str(uuid4())}  # fmt: skip
+    try:
+        post = threading.Thread(
+            target=lambda: urllib.request.urlopen(
+                urllib.request.Request(
+                    base + "/kv_profiler/clocks", json.dumps(record).encode(),
+                    {"Content-Type": "application/json"}, method="POST",
+                ),
+                timeout=5,
+            ).read()
+        )  # fmt: skip
+        post.start()
+        time.sleep(0.15)  # verifying now
+        for path in ("/query", f"/kv_profiler/clocks?run_id={run}"):
+            start = time.monotonic()
+            urllib.request.urlopen(base + path, timeout=5).read()
+            assert time.monotonic() - start < 0.2, path
+        post.join(5)
+        assert "e" in server.clock_registry.listing(run)
+    finally:
+        server.shutdown()
+
+
+def test_the_clock_io_workers_stop_at_close(tmp_path):
+    """No worker starts for a profiler without peers, and the ones a lookup
+    started exit at close."""
+    import threading
+
+    def workers():
+        return [
+            t for t in threading.enumerate() if t.name.startswith("kvprof-clock-io")
+        ]
+
+    before = len(workers())
+    for n in range(3):
+        _consumer(tmp_path / f"idle-{n}", str(uuid4())).close()
+    assert len(workers()) == before
+    server, url = _registry()
+    try:
+        consumer = _consumer(tmp_path / "busy", str(uuid4()), discovery=5)
+        consumer.handoff_in("d", "tx", "never", url)
+        _until(lambda: len(workers()) > before)
+        consumer.close()
+        _until(lambda: len(workers()) == before, timeout=5)
+    finally:
+        server.shutdown()
+
+
+def _silent(count):
+    """``count`` listeners that accept and never answer, counting accepts."""
+    import socket
+    import threading
+
+    accepted = []
+    listeners = []
+    for _ in range(count):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        listeners.append(listener)
+
+        def serve(listener=listener):
+            held = []
+            while True:
+                try:
+                    held.append(listener.accept()[0])
+                    accepted.append(listener.getsockname()[1])
+                except OSError:
+                    return
+
+        threading.Thread(target=serve, daemon=True).start()
+    return listeners, accepted
+
+
+def test_queued_probes_expire_with_their_window(tmp_path):
+    """Twelve advertised clocks that never answer, four I/O workers, a 200 ms
+    window: every peer is final at the window, with its endpoint, and no probe
+    starts after it."""
+    server, url = _registry()
+    run = str(uuid4())
+    listeners, accepted = _silent(12)
+    ports = [listener.getsockname()[1] for listener in listeners]
+    try:
+        for n, listener in enumerate(listeners):
+            _raw(server, run, f"e{n}", f"127.0.0.1:{listener.getsockname()[1]}")
+        consumer = _consumer(tmp_path, run, discovery=0.2)
+        start = time.monotonic()
+        for n in range(12):
+            consumer.handoff_in(f"d{n}", f"tx{n}", f"e{n}", url)
+        _until(lambda: len(consumer.peers.results) == 12)
+        took = time.monotonic() - start
+        time.sleep(0.3)
+        started = len(accepted)
+        peers = _peers(consumer)
+    finally:
+        for listener in listeners:
+            listener.close()
+        server.shutdown()
+    assert took < 0.35, took
+    assert started <= 4, started  # the queued eight never started
+    for n, port in enumerate(ports):
+        peer = peers[f"e{n}"]
+        assert peer["status"] == "failed" and "calibration_file" not in peer
+        assert peer["address"] == ["127.0.0.1", port]
+
+
+def test_an_empty_listing_fails_the_peer_at_its_window(tmp_path):
+    server, url = _registry()
+    try:
+        consumer = _consumer(tmp_path, str(uuid4()), discovery=0.15)
+        start = time.monotonic()
+        consumer.handoff_in("d", "tx", "absent", url)
+        _until(lambda: consumer.peers.results)
+        took = time.monotonic() - start
+        peers = _peers(consumer)
+    finally:
+        server.shutdown()
+    assert peers["absent"]["status"] == "failed" and took < 0.27, took
+
+
+def test_close_cancels_the_queued_probes_before_waiting(tmp_path):
+    """Eight clocks that never answer and four workers: at close, the four
+    queued probes never start; the running four end within the budget."""
+    server, url = _registry()
+    run = str(uuid4())
+    listeners, accepted = _silent(8)
+    try:
+        for n, listener in enumerate(listeners):
+            _raw(server, run, f"e{n}", f"127.0.0.1:{listener.getsockname()[1]}")
+        consumer = _consumer(tmp_path, run, discovery=10)
+        for n in range(8):
+            consumer.handoff_in(f"d{n}", f"tx{n}", f"e{n}", url)
+        _until(lambda: len(accepted) >= 4)
+        consumer.close()
+        time.sleep(1.5)
+    finally:
+        for listener in listeners:
+            listener.close()
+        server.shutdown()
+    assert len(accepted) == 4, accepted
+
+
+def test_a_direct_peer_keeps_its_own_exchange_bound(tmp_path):
+    """NIXL-style direct peers have no discovery window: one needing 60 ms
+    calibrates even with a 25 ms Mooncake window configured."""
+    from vllm.kv_profiling.clock import ClockServer
+    from vllm.kv_profiling.config import NetworkProfilerConfig
+    from vllm.kv_profiling.peers import PeerClocks
+
+    run = str(uuid4())
+    config = NetworkProfilerConfig(clock_discovery_s=0.025, clock_samples=2)
+    with ClockServer(run, engine_id="nixl-p") as clock:
+        slow = _forward(clock.address[1], delay=0.06)
+        try:
+            peers = PeerClocks(config, run, str(uuid4()), offset=0)
+            peers.admit("nixl-p", "127.0.0.1", slow.getsockname()[1])
+            _until(lambda: peers.results)
+            manifest = peers.close(tmp_path, 2)
+        finally:
+            slow.close()
+    (peer,) = manifest["peers"]
+    assert peer["status"] == "ok", peer
+
+
+def test_an_interrupted_reply_keeps_its_status_in_a_failed_report():
+    """A body cut short (fewer bytes than its Content-Length), on a 2xx or a
+    4xx, is a failed report with that status; 404s and malformed 2xx replies
+    keep theirs too."""
+    import http.server
+    import threading
+
+    from vllm.kv_profiling.clock_registry import advertise
+
+    def serve(code, body, length=None):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(code)
+                self.send_header("Content-Length", str(length or len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
+                self.close_connection = True
+
+            def log_message(self, *args):
+                pass
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{httpd.server_address[1]}", httpd
+
+    cases = (
+        (201, b'{"status": "regis', 64, "interrupted"),
+        (422, b'{"detail": "no', 64, "interrupted"),
+        (200, b"[]", None, "unrecognized"),
+        (404, b"", None, "no clock route"),
+    )
+    for code, body, length, words in cases:
+        url, httpd = serve(code, body, length)
+        try:
+            report = advertise(url, {"engine_id": "e"}, 2, threading.Event())
+        finally:
+            httpd.shutdown()
+        assert report["state"] == "failed", (code, report)
+        assert report["status"] == code and words in report["detail"], report
+
+
+def test_close_during_the_first_worker_creation_leaves_no_worker(tmp_path):
+    """Close begins while the pool is creating its first worker: stopping
+    waits for the registration, so that worker is told to exit too."""
+    import threading
+    from unittest.mock import patch
+
+    from vllm.kv_profiling import peers as peers_module
+
+    p = _consumer(tmp_path, str(uuid4())).peers
+    constructing, resume = threading.Event(), threading.Event()
+    real_init = threading.Thread.__init__
+
+    def paused_init(thread, *args, **kwargs):
+        real_init(thread, *args, **kwargs)
+        if (kwargs.get("name") or "").startswith("kvprof-clock-io-"):
+            constructing.set()
+            resume.wait(5)
+
+    results = []
+    with (
+        patch.object(threading.Thread, "__init__", paused_init),
+        patch.object(peers_module, "lookup", return_value={}),
+    ):
+        p.admit_advertised("producer", "http://registry.invalid")
+        assert constructing.wait(5)
+        closer = threading.Thread(
+            target=lambda: results.append(p.close(tmp_path / "first", 1))
+        )
+        closer.start()
+        time.sleep(0.2)  # close has begun, its stop waits for the registration
+        resume.set()
+        closer.join(5)
+    assert results and results[0]["clock_thread"] == "joined"
+    for thread in p._pool._threads:
+        thread.join(2)
+    assert not any(thread.is_alive() for thread in p._pool._threads)
+
+
+def test_close_during_the_first_claim_never_lets_a_probe_start_after_it(tmp_path):
+    """A worker about to claim its task when close begins either claims it
+    first (close then waits for it) or finds the pool stopped: no probe enters
+    the transport after close returns."""
+    import threading
+    from unittest.mock import patch
+
+    from vllm.kv_profiling import peers as peers_module
+
+    p = _consumer(tmp_path, str(uuid4())).peers
+    lock = p._pool._lock
+    entering, resume = threading.Event(), threading.Event()
+
+    class Gated:
+        def __enter__(self):
+            if threading.current_thread().name.startswith("kvprof-clock-io-"):
+                if not entering.is_set():
+                    entering.set()
+                    resume.wait(5)
+            return lock.__enter__()
+
+        def __exit__(self, *exc):
+            return lock.__exit__(*exc)
+
+    after_close = []
+    returned = threading.Event()
+
+    def exchange(*args, **kwargs):
+        after_close.append(returned.is_set())
+        raise TimeoutError("test transport")
+
+    with (
+        patch.object(p._pool, "_lock", Gated()),
+        patch.object(peers_module, "measure_peer", exchange),
+    ):
+        p.admit("direct", "127.0.0.1", 1200)
+        assert entering.wait(5)
+        closer = threading.Thread(target=lambda: p.close(tmp_path / "claim", 0.5))
+        closer.start()
+        time.sleep(0.1)
+        resume.set()
+        closer.join(5)
+        returned.set()
+        for thread in p._pool._threads:
+            thread.join(2)
+    assert not any(after_close)
+
+
+def test_a_deadline_exit_keeps_the_last_status_received():
+    """A 503 retried to the deadline, and a 201 whose status line arrives in
+    time but whose acknowledgement comes after the deadline, both fail with the
+    last HTTP status they received."""
+    import http.server
+    import threading
+
+    from vllm.kv_profiling.clock_registry import advertise
+
+    class Late(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = b'{"status": "registered"}'
+            self.send_response(201)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(0.15)
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    late = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Late)
+    threading.Thread(target=late.serve_forever, daemon=True).start()
+    busy_url, busy = _fake_registry(lambda method: (503, b"{}"))
+    try:
+        for url, code, budget in (
+            (busy_url, 503, 0.3),
+            (f"http://127.0.0.1:{late.server_address[1]}", 201, 0.1),
+        ):
+            report = advertise(url, {"engine_id": "e"}, budget, threading.Event())
+            assert report["state"] == "failed" and report["status"] == code, report
+    finally:
+        busy.shutdown()
+        late.shutdown()

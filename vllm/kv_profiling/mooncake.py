@@ -90,8 +90,10 @@ class MooncakeProfiler(TimelineMixin, _Profiler):
         self.peers: PeerClocks | None = None
         self.server = None
         self.server_report: dict | None = None  # the producer's clock server
-        self._clock_peers = config.clock_peer_endpoints() if config.clock else {}
-        self.unmapped_clock_engines: list[str] = []
+        self.advertised: dict | None = None  # its advertisement, once it ends
+        self._advertiser: threading.Thread | None = None
+        self._stop_advertising = threading.Event()
+        self.unaddressed_clock_engines: list[str] = []
         # Open generations: handle -> phase. Guarded by ``_glock``, which also
         # serializes every generation record with ``close`` so that nothing is
         # recorded for a generation after its RETIRE.
@@ -504,7 +506,11 @@ class MooncakeProfiler(TimelineMixin, _Profiler):
         except Exception as exc:
             self._error(exc)
 
-    def handoff_in(self, request_id, transfer_id, remote_engine_id) -> None:
+    def handoff_in(
+        self, request_id, transfer_id, remote_engine_id, remote_bootstrap_addr=None
+    ) -> None:
+        """``remote_bootstrap_addr`` (the request's own) is where the remote
+        engine's clock is advertised; the measuring thread looks it up."""
         try:
             self._record(
                 _HANDOFF, self.rank, request_id, transfer_id, remote_engine_id, None,
@@ -512,14 +518,16 @@ class MooncakeProfiler(TimelineMixin, _Profiler):
                 self._transport, 0, 0,
             )  # fmt: skip
             if self.peers is not None:
-                endpoint = self._clock_peers.get(remote_engine_id)
-                if endpoint is None:
+                if not remote_bootstrap_addr:
                     if (
-                        remote_engine_id not in self.unmapped_clock_engines
-                        and len(self.unmapped_clock_engines) < _UNMAPPED_CAP
+                        remote_engine_id not in self.unaddressed_clock_engines
+                        and len(self.unaddressed_clock_engines) < _UNMAPPED_CAP
                     ):
-                        self.unmapped_clock_engines.append(remote_engine_id)
-                elif self.peers.admit(remote_engine_id, *endpoint) < 0:
+                        self.unaddressed_clock_engines.append(remote_engine_id)
+                elif (
+                    self.peers.admit_advertised(remote_engine_id, remote_bootstrap_addr)
+                    < 0
+                ):
                     self._record(
                         _FAILED, self.rank, None, None, remote_engine_id, None,
                         None, None, None, None, None, None, None,
@@ -621,13 +629,34 @@ class MooncakeProfiler(TimelineMixin, _Profiler):
             "inflight_cap": self._cap,
             "clock": {
                 "server": self.server_report,
-                "peers_configured": len(self._clock_peers),
-                "unmapped_engines": list(self.unmapped_clock_engines),
+                "advertised": self.advertised,
+                "unaddressed_engines": list(self.unaddressed_clock_engines),
             },
         }
 
+    def advertise(self, base: str, record: dict, deadline_s: float) -> None:
+        """Advertise this engine's clock to ``base``'s registry in the
+        background: serving never waits, and the outcome goes into
+        ``profiler.json``."""
+        from .clock_registry import advertise
+
+        def run():
+            self.advertised = advertise(
+                base, record, deadline_s, self._stop_advertising
+            )
+
+        self._advertiser = threading.Thread(
+            target=run, name="kvprof-clock-advertise", daemon=True
+        )
+        self._advertiser.start()
+
     def _close_helpers(self) -> list:
         failures = []
+        if self._advertiser is not None:
+            self._stop_advertising.set()
+            self._advertiser.join(self.config.shutdown_timeout_s)
+            if self.advertised is None:
+                self.advertised = {"state": "abandoned"}
         if self.peers is not None:
             try:
                 self.peers.close(self.output_dir, self.config.shutdown_timeout_s)
@@ -668,26 +697,57 @@ def capabilities(role: str, kv_role: str | None, config=None) -> dict:
         "router_id": role == "frontend",
         "push_mode": False,
         "receive_completion": (worker or scheduler) and consumer,
-        "clock_server": bool(scheduler and producer and clock and config.clock_bind),
-        "clock_peers": bool(scheduler and consumer and clock and config.clock_peers),
+        "clock_server": bool(worker and producer and clock and _clock_worker(config)),
+        "clock_peers": bool(scheduler and consumer and clock),
         "transport_metrics": "collector",
     }
 
 
-def clock_bind_port(port: int, dp_rank) -> int:
-    """The port DP rank ``dp_rank``'s scheduler clock server binds: ``clock_bind``
-    names DP rank 0's, and each DP rank (one engine, its own ``<id>_dp<rank>``
-    engine ID) binds the next port, so the engines of one instance never share
-    one.
+def _clock_worker(config) -> bool:
+    """Whether this worker runs its engine's clock server: the TP0/PP0 worker,
+    given where it serves KV (its host) and its registry."""
+    context = config.context
+    return (
+        context.get("tp_rank") == 0
+        and context.get("pp_rank") == 0
+        and bool(context.get("clock_host"))
+        and bool(context.get("clock_registry"))
+    )
 
-    Raises:
-        ValueError: the rank's port is past 65535.
 
-    """
-    bound = port + (dp_rank or 0)
-    if not 1 <= bound <= 65535:
-        raise ValueError(f"clock_bind port {port} + DP rank {dp_rank} is not a port")
-    return bound
+def clock_context(vllm_config, hostname: str, dp_rank: int) -> dict:
+    """A worker's profiler context for its engine's clock: the host it serves
+    KV from, the registry it registers with (the bootstrap server) and its
+    registration DP rank; empty when the profiler is not configured."""
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    if "network_profiler" not in extra:
+        return {}
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import (  # noqa: E501
+        get_mooncake_bootstrap_addr,
+    )
+    from vllm.utils.network_utils import make_zmq_path
+
+    host, port = get_mooncake_bootstrap_addr(vllm_config)
+    return {
+        "clock_host": hostname,
+        "clock_registry": make_zmq_path("http", host, port),
+        "registration_dp_rank": dp_rank,
+    }
+
+
+def serve_clock_registry(server, vllm_config) -> None:
+    """Add the clock route to an embedded bootstrap server (before it starts),
+    when the profiler is enabled with clocks."""
+    from .clock_registry import ClockRegistry, add_routes
+    from .config import profiler_config
+
+    config = profiler_config(
+        vllm_config.kv_transfer_config.kv_connector_extra_config, {}
+    )
+    if config is None or not config.clock:
+        return
+    server.clock_registry = ClockRegistry()
+    add_routes(server.app, server.clock_registry)
 
 
 def attach_mooncake(
@@ -745,21 +805,36 @@ def _build(
         config, recorder, rank=rank, engine_id=engine_id, kv_role=kv_role
     )
     try:
-        if role == "scheduler" and config.clock:
+        generation = recorder.metadata["clock_id"]
+        producer = kv_role in ("kv_producer", "kv_both")
+        if config.clock and role == "worker" and producer and _clock_worker(config):
+            # An engine's clock is its TP0/PP0 worker's, on the host it serves
+            # KV from and an ephemeral port; calibrating it aligns every process
+            # of its clock domain (its scheduler on that host included).
             from .clock import start_server
+            from .clock_registry import endpoint_text
 
-            generation = recorder.metadata["clock_id"]
-            if kv_role in ("kv_producer", "kv_both") and config.clock_bind:
-                host, _, port = config.clock_bind.rpartition(":")
-                profiler.server, profiler.server_report = start_server(
-                    config.run_id,
-                    generation,
-                    engine_id,
-                    host.strip("[]"),
-                    clock_bind_port(int(port), config.context.get("dp_rank")),
+            profiler.server, profiler.server_report = start_server(
+                config.run_id, generation, engine_id, config.context["clock_host"], 0
+            )
+            if profiler.server is not None:
+                profiler.advertise(
+                    config.context["clock_registry"],
+                    {
+                        "run_id": config.run_id,
+                        "engine_id": engine_id,
+                        "dp_rank": int(config.context.get("registration_dp_rank") or 0),
+                        "endpoint": endpoint_text(*profiler.server.address),
+                        "generation": generation,
+                    },
+                    config.clock_discovery_s,
                 )
-            if kv_role in ("kv_consumer", "kv_both") and config.clock_peers:
-                profiler.peers = PeerClocks(config, config.run_id, generation, offset=0)
+        if (
+            config.clock
+            and role == "scheduler"
+            and kv_role in ("kv_consumer", "kv_both")
+        ):
+            profiler.peers = PeerClocks(config, config.run_id, generation)
     except BaseException:
         profiler.close()
         raise
@@ -769,7 +844,8 @@ def _build(
 __all__ = [
     "MooncakeProfiler",
     "attach_mooncake",
-    "clock_bind_port",
     "capabilities",
+    "clock_context",
     "close_with_owner",
+    "serve_clock_registry",
 ]

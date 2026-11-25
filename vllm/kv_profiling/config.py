@@ -49,12 +49,9 @@ class NetworkProfilerConfig:
     shutdown_timeout_s: float = 2
     step_window_s: float = 1.0
     """Length of the step rollup windows (0 disables the rollups)."""
-    clock_bind: str | None = None
-    """Mooncake producer: ``host:port`` its scheduler's clock server binds; with
-    data parallelism DP rank d's binds ``port + d``."""
-    clock_peers: dict[str, str] = field(default_factory=dict)
-    """Mooncake consumer: remote engine ID (``<id>_dp<rank>`` for a data-parallel
-    producer) -> that engine's clock ``host:port``."""
+    clock_discovery_s: float = 30
+    """Mooncake consumer: how long a remote engine's advertised clock endpoint is
+    looked up (with backoff, off the request path) before the peer fails."""
     inflight_cap: int | None = None
     """Mooncake: bound on generations open at once (a write batch is one); None is
     1024 or the handle slots, whichever is smaller."""
@@ -125,19 +122,12 @@ class NetworkProfilerConfig:
             raise ValueError("clock_end_budget_s must be finite in (0, 10]")
         if len(json.dumps(self.context).encode()) > 2048:
             raise ValueError("context exceeds 2 KiB")
-        if self.clock_bind is not None:
-            _endpoint(self.clock_bind, "clock_bind")
         if (
-            type(self.clock_peers) is not dict
-            or len(self.clock_peers) > self.clock_max_peers
+            type(self.clock_discovery_s) not in (int, float)
+            or not math.isfinite(self.clock_discovery_s)
+            or not 0 < self.clock_discovery_s <= 600
         ):
-            raise ValueError(
-                "clock_peers must be a mapping of at most clock_max_peers engines"
-            )
-        for engine, endpoint in self.clock_peers.items():
-            if type(engine) is not str or not engine:
-                raise ValueError("clock_peers keys must be nonempty engine IDs")
-            _endpoint(endpoint, f"clock_peers[{engine!r}]")
+            raise ValueError("clock_discovery_s must be finite in (0, 600]")
         if self.inflight_cap is not None and (
             type(self.inflight_cap) is not int
             or not 1 <= self.inflight_cap <= self.handle_slots
@@ -161,10 +151,6 @@ class NetworkProfilerConfig:
     def enabled(self) -> bool:
         """Whether this configuration attaches a recorder (its level is enabled)."""
         return self.level in ENABLED_LEVELS
-
-    def clock_peer_endpoints(self) -> dict[str, tuple[str, int]]:
-        """The validated ``clock_peers`` as (host, port) pairs."""
-        return {e: _endpoint(v, "clock_peers") for e, v in self.clock_peers.items()}
 
     @classmethod
     def from_extra_config(cls, extra: dict[str, Any]):

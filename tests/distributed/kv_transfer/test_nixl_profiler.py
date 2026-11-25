@@ -940,7 +940,7 @@ def test_out_of_range_clock_ports_are_refused_and_port_zero_stays_ephemeral(
     consumer = _scheduler(tmp_path / "d", "kv_consumer", ("127.0.0.1", 9))
     consumer.handoff_in("d", "q", "engine-high", "127.0.0.1", 64536)
     wait_results(consumer, 1)
-    (peer,) = consumer.peers.results
+    (peer,) = consumer.peers.results.values()
     assert peer["status"] == "failed" and "65536" in peer["detail"]
     consumer.close()
 

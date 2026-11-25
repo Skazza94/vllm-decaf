@@ -1210,14 +1210,40 @@ with `loss: true` and names the interruption (`failure_class:
 observation_interrupted`), distinct from a connector-reported failure. Closing does
 not wait for a transfer and serving shutdown is unchanged.
 
-Clocks: the producer's scheduler binds an explicit `clock_bind` (`host:port`) and the
-consumer's maps each remote engine ID to the producer's advertised clock endpoint in
-`clock_peers`; no wire message changes and no side-channel offset is added. With data
-parallelism each DP rank is an engine of its own (vLLM's `<engine ID>_dp<rank>`) with its
-own scheduler: `clock_bind` names DP rank 0's endpoint and DP rank d's binds its port + d,
-and `clock_peers` maps every producer DP engine to its own endpoint. A peer
-without a mapping stays unaligned and is listed in `profiler.json`
-(`clock.unmapped_engines`). Capabilities are by process role and KV role
+Clocks: nothing is configured. Each producer engine's clock (with data parallelism
+each DP rank is an engine of its own, vLLM's `<engine ID>_dp<rank>`) is served by its
+TP0/PP0 worker, on the host the worker serves KV from (the address it registers) and an
+ephemeral port, and advertised to the instance's bootstrap server under one more route,
+`/kv_profiler/clocks`: its run, engine ID, registration DP rank, endpoint and the worker
+recorder's `clock_id`. The embedded bootstrap server gets the route when the profiler is
+on; the bootstrap server's own `/register` and `/query` are unchanged. The worker retries
+in the background (the registry may start later) for `clock_discovery_s`, and
+`profiler.json` reports `clock.server` and `clock.advertised`: `ok`, or why not (an
+external or older registry without the route answers HTTP 404; only a recognized
+acknowledgement counts). The clocks themselves order registrations, never a timestamp:
+the registry accepts one only if its endpoint answers as its engine with its generation,
+another generation of the same engine replaces the stored one only if the stored clock
+no longer answers, and two live clocks of one engine are a conflict. A late retry of a
+retired worker therefore never displaces its successor; an identical retry changes
+nothing.
+
+The consumer's scheduler looks each new remote engine up at the `remote_bootstrap_addr`
+of the request that names it, on its clock thread (never in a hook), with its lookups
+and exchanges on a few I/O workers: one lookup is in flight per bootstrap server and
+serves all its engines, bounded by the time left in their windows, so a slow registry
+delays no other one. A missing engine is looked up again with backoff until
+`clock_discovery_s` ends; an exchange that fails within it (a moved endpoint, another
+generation) refreshes the listing and retries. The first and last exchanges require the
+advertised engine and generation, and an entry without a generation UUID is never
+measured. An engine never advertised, an unusable endpoint (malformed, or a port past
+65535), an unreachable clock or a registry without the route fails that peer with its
+`detail` and endpoint in `calibration.json` (bootstrap URLs and details with their
+credentials redacted); local recording is unaffected. A handoff without a
+bootstrap address is listed in `profiler.json` (`clock.unaddressed_engines`). Calibrating
+an engine's worker aligns every capture of its clock domain (boot ID, time namespace,
+clock source), its scheduler on that host included; a process in another domain stays
+unaligned. The clock probes travel on the worker's KV address and a few kilobytes of
+them count in that interface's bytes. Capabilities are by process role and KV role
 (`capabilities` in the metadata): a worker or scheduler without the producer role does
 not claim write batches or handoff blocks.
 
@@ -1284,16 +1310,13 @@ as a helper of its own kind (`collector_s`).
 
 The same harness turns the Mooncake adapter on with the run's `profiler` key (L1 or L3, any data-parallel size;
 at L3 each endpoint's observer as under NIXL):
-both servers get one run ID, every instance a pinned engine ID (`<role>-<node>`, which vLLM suffixes
-`_dp<rank>` for each DP rank; all written to `profile-identities.json`), each prefill instance's schedulers
-bind their clock servers on the node's control address (`BOOTSTRAP_PORT + clock_port_offset`, + the DP rank,
-so the clock traffic never rides the KV network the checks count) and the decode instance maps each prefill
-DP engine ID to its endpoint (`clock_peers`). The run is refused before any server starts when the last prefill
-DP rank's clock port would pass 65535 or the prefill engines would be more clock peers than the profiler's
-default `clock_max_peers` (64). The verdict requires every successful calibration to be answered by the
-engine it names: an engine of `profile-identities.json` (once), at that engine's endpoint, with its recorded
-prefill scheduler's clock and a mapping file of the same run and clock pair; idle and unaligned peers keep
-their status. The servers are stopped as under NIXL (decode first, so the clock servers are alive for the
+both servers get one run ID and nothing else: the clocks are served and advertised as above. The run is
+refused before any server starts when the prefill engines would be more clock peers than the profiler's
+default `clock_max_peers` (64). The verdict works from the captures alone: every prefill engine a decode
+scheduler handed off from (its recorded handoffs) calibrates once, `ok`, against that engine's TP0/PP0
+worker clock (that capture's `clock_id`, served and advertised), with a mapping file of the same run and
+clock pair; a calibration of an engine it never handed off from, or a handoff whose peer
+its capture's dictionary does not resolve, fails too. The servers are stopped as under NIXL (decode first, so the clock servers are alive for the
 end calibration) before the profile directories are copied. With `collector` as well, each producer rank's
 batches can be checked against its TENT counters: the batches' bytes equal the collector's write bytes, and
 TENT's requests (it merges adjacent descriptors of a batch) are at most the batches' descriptors.

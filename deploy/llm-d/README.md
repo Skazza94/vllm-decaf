@@ -132,6 +132,11 @@ grace (`VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS`, under the pod's
 `terminationGracePeriodSeconds`), and its container exits only once vLLM's whole
 process group, the recorders' writers included, has exited.
 
+**Ending a run.** Delete the decode Deployment first and the prefill one after
+its pods are gone: decode takes its end clock calibration against prefill's
+clocks as it closes. Deleted together, the mappings keep their start anchors
+only (drift unknown).
+
 **Where it goes.** Each pod keeps its files on its node after the pod is gone,
 under `/var/lib/vllm-decaf/kvp/<pod UID>/`:
 - `profiles/gen-<start>/<run ID>/` holds the L1 recordings. Each start of the

@@ -327,145 +327,97 @@ class ProfilerConfig(unittest.TestCase):
     INSTANCES = {"prefill": {"p0": {"control": "10.250.0.2"}, "p1": {"control": "10.250.0.3"}},
                  "decode": {"d0": {"control": "10.250.0.4"}}}
 
-    def test_profiled_mooncake_servers_pin_engine_ids_and_clock_endpoints_on_the_control_network(self):
-        run = self.run_with(server=self.MOONCAKE, profiler=pd.Profiler(clock_port_offset=1500))
-        identities = pd.profile_identities(run, self.INSTANCES)
-        clock = f"10.250.0.3:{pd.BOOTSTRAP_PORT + 1500}"
-        self.assertEqual(identities["prefill"]["p1"], {"engine_id": "prefill-p1", "clock": clock,
-                                                       "engines": {"prefill-p1": clock}})
-
-        def transfer(role, node):
-            command = pd.server_command(run, role, ["10.100.0.1"], profile_id="id-1", node=node, identities=identities)
-            return json.loads(command[command.index("--kv-transfer-config") + 1])
-
-        producer = transfer("prefill", "p1")
-        profile = producer["kv_connector_extra_config"]["network_profiler"]
-        self.assertEqual((producer["engine_id"], profile["clock_bind"]), ("prefill-p1", identities["prefill"]["p1"]["clock"]))
-        self.assertNotIn("clock_peers", profile)
-        self.assertNotIn("clock_port_offset", profile)
-        consumer = transfer("decode", "d0")
-        profile = consumer["kv_connector_extra_config"]["network_profiler"]
-        self.assertEqual(consumer["engine_id"], "decode-d0")
-        self.assertEqual(profile["clock_peers"], {"prefill-p0": f"10.250.0.2:{pd.BOOTSTRAP_PORT + 1500}",
-                                                  "prefill-p1": f"10.250.0.3:{pd.BOOTSTRAP_PORT + 1500}"})
-        self.assertNotIn("clock_bind", profile)
-        for missing in ({"node": None}, {"identities": None}):
-            with self.assertRaisesRegex(ValueError, "needs its node and the instances' identities"):
-                pd.server_command(run, "prefill", ["10.100.0.1"], profile_id="id-1",
-                                  **{"node": "p0", "identities": identities, **missing})
-        # Off, or under NIXL, no engine ID is pinned and nothing of the clock is added.
-        plain = pd.server_command(self.run_with(server=self.MOONCAKE), "prefill", ["10.100.0.1"])
-        self.assertNotIn("engine_id", json.loads(plain[plain.index("--kv-transfer-config") + 1]))
+    def test_profiled_mooncake_servers_pin_nothing_for_their_clocks(self):
+        """The servers' clocks are served and advertised by the servers themselves: no engine ID, clock endpoint
+        or side-channel offset is given to a profiled Mooncake server, with or without data parallelism."""
+        for dp in (1, 2):
+            side = {"prefill": pd.Side("p0", "data0", data_parallel_size=dp),
+                    "decode": pd.Side("d0", "data0", data_parallel_size=dp)}  # fmt: skip
+            run = self.run_with(server=self.MOONCAKE, profiler=pd.Profiler(), model=MOE_MODEL, **side)
+            for role in ("prefill", "decode"):
+                with self.subTest(dp=dp, role=role):
+                    command = pd.server_command(run, role, ["10.100.0.1"], profile_id="id-1", node=f"{role[0]}0")
+                    transfer = json.loads(command[command.index("--kv-transfer-config") + 1])
+                    profile = transfer["kv_connector_extra_config"]["network_profiler"]
+                    self.assertNotIn("engine_id", transfer)
+                    for key in ("clock_bind", "clock_peers", "clock_port_offset"):
+                        self.assertNotIn(key, profile)
         nixl = pd.server_command(self.run_with(profiler=pd.Profiler()), "prefill", ["10.100.0.1"], profile_id="id-1")
         self.assertNotIn("engine_id", json.loads(nixl[nixl.index("--kv-transfer-config") + 1]))
 
-    def test_profiled_mooncake_dp_engines_get_their_own_clock_endpoints(self):
-        """With data parallelism vLLM names DP rank d's engine ``<pinned>_dp<d>`` and the profiler binds its clock
-        server on the instance's clock port + d: the consumer maps every producer DP engine to its own port, and
-        each server still pins the instance's ID once."""
-        side = {"prefill": pd.Side("p0", "data0", data_parallel_size=2),
-                "decode": pd.Side("d0", "data0", data_parallel_size=2)}  # fmt: skip
-        run = self.run_with(server=self.MOONCAKE, profiler=pd.Profiler(clock_port_offset=1500), model=MOE_MODEL,
-                            **side)
-        instances = {"prefill": {"p0": {"control": "10.250.0.2"}}, "decode": {"d0": {"control": "10.250.0.4"}}}
-        identities = pd.profile_identities(run, instances)
-        port = pd.BOOTSTRAP_PORT + 1500
-        self.assertEqual(identities["prefill"]["p0"]["engines"],
-                         {"prefill-p0_dp0": f"10.250.0.2:{port}", "prefill-p0_dp1": f"10.250.0.2:{port + 1}"})
-
-        def transfer(role, node):
-            command = pd.server_command(run, role, ["10.100.0.1"], profile_id="id-1", node=node, identities=identities)
-            return json.loads(command[command.index("--kv-transfer-config") + 1])
-
-        producer = transfer("prefill", "p0")
-        self.assertEqual((producer["engine_id"], producer["kv_connector_extra_config"]["network_profiler"]["clock_bind"]),
-                         ("prefill-p0", f"10.250.0.2:{port}"))
-        consumer = transfer("decode", "d0")
-        self.assertEqual(consumer["kv_connector_extra_config"]["network_profiler"]["clock_peers"],
-                         identities["prefill"]["p0"]["engines"])
-
     def test_each_mooncake_clock_calibration_is_answered_by_the_producer_it_names(self):
-        """A decode scheduler's ``ok`` calibration peers must be engines of the run, each at its own endpoint, with
-        the clock of that engine's recorded prefill scheduler and a mapping file of the same pair: both peers
-        pointed at DP rank 0's samples, swapped engine labels, a wrong clock or an unknown engine fail; idle and
-        unaligned peers keep their status."""
+        """From the captures alone: every prefill engine a decode scheduler handed off from (its recorded handoffs)
+        calibrates once, ok, against that engine's TP0/PP0 worker clock (served and advertised), with a mapping file
+        of the same pair. A wrong or swapped clock, a missing, failed or duplicate calibration, a calibration of an
+        engine never handed off from, or an unadvertised clock fail; a start-only mapping passes."""
         import tempfile
         import uuid
 
-        def write(root):
+        engines = ("prefill-p_dp0", "prefill-p_dp1")
+
+        def write(root, change=None):
             run_id = str(uuid.uuid4())
-            identities = {"prefill": {"p": {"engine_id": "prefill-p", "clock": "10.0.0.1:9998", "engines": {
-                "prefill-p_dp0": "10.0.0.1:9998", "prefill-p_dp1": "10.0.0.1:9999"}}}}
-            (root / "profile-identities.json").write_text(json.dumps(identities))
             clocks = {}
-            for engine in ("prefill-p_dp0", "prefill-p_dp1"):
+            for engine in engines:
                 clocks[engine] = str(uuid.uuid4())
                 folder = root / "profiles/prefill/p" / run_id / str(uuid.uuid4())
                 folder.mkdir(parents=True)
                 (folder / "events.jsonl").write_text(json.dumps({"run_id": run_id, "clock_id": clocks[engine],
-                    "context": {"role": "scheduler", "engine_id": engine}}) + "\n")  # fmt: skip
+                    "context": {"role": "worker", "engine_id": engine, "tp_rank": 0, "pp_rank": 0}}) + "\n")  # fmt: skip
+                report = {"server": {"state": "available"}, "advertised": {"state": "ok"}}
+                if change == "unadvertised" and engine == engines[1]:
+                    report["advertised"] = {"state": "failed", "detail": "HTTP 404"}
+                (folder / "profiler.json").write_text(json.dumps({"clock": report}))
             local = str(uuid.uuid4())
             folder = root / "profiles/decode/d" / run_id / str(uuid.uuid4())
             folder.mkdir(parents=True)
-            (folder / "events.jsonl").write_text(json.dumps({"run_id": run_id, "clock_id": local,
-                "context": {"role": "scheduler", "engine_id": "decode-d"}}) + "\n")  # fmt: skip
+            rows = [{"run_id": run_id, "clock_id": local, "context": {"role": "scheduler", "engine_id": "decode-d"}}]
+            for key, engine in enumerate(engines, 1):
+                rows.append({"schema": 1, "sequence": 2 * key - 1, "type": "dictionary_fragment", "id": key,
+                             "length": len(engine), "offset": 0, "encoding": "utf8", "payload": engine.encode().hex()})
+                rows.append({"schema": 1, "sequence": 2 * key, "type": "event", "kind": "handoff", "peer_ref": key})
+            (folder / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
             peers = []
-            for i, (engine, port) in enumerate((("prefill-p_dp0", 9998), ("prefill-p_dp1", 9999))):
+            for i, engine in enumerate(engines):
                 sample = {"run_id": run_id, "local_generation": local, "remote_generation": clocks[engine],
                           "t1": 1, "t2": 2, "t3": 3, "t4": 4}
                 (folder / f"calibration-{i}.json").write_text(json.dumps({"start": [sample], "end": [sample]}))
-                peers.append({"engine_id": engine, "address": ["10.0.0.1", port], "status": "ok",
-                              "remote_generation": clocks[engine], "calibration_file": f"calibration-{i}.json"})
-            peers.append({"engine_id": "prefill-p_dp2", "status": "unavailable"})
+                peers.append({"engine_id": engine, "address": ["10.0.0.1", 40000 + i], "status": "ok",
+                              "advertised_generation": clocks[engine], "remote_generation": clocks[engine],
+                              "calibration_file": f"calibration-{i}.json"})
+            if change == "wrong clock":
+                peers[1].update(remote_generation=clocks[engines[0]], advertised_generation=clocks[engines[0]],
+                                calibration_file="calibration-0.json")
+            elif change == "swapped labels":
+                peers[0]["engine_id"], peers[1]["engine_id"] = engines[1], engines[0]
+            elif change == "failed":
+                peers[1] = {"engine_id": engines[1], "status": "failed", "detail": "not advertised"}
+            elif change == "missing":
+                peers.pop()
+            elif change == "duplicate":
+                peers.append(dict(peers[0]))
+            elif change == "never handed off":
+                peers.append({"engine_id": "prefill-q_dp0", "status": "failed"})
+            if change == "unresolved handoffs":  # the dictionary lost: nothing to verify against
+                rows = [row for row in rows if row.get("type") != "dictionary_fragment"]
+                peers = []
+                (folder / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
             (folder / "calibration.json").write_text(json.dumps({"run_id": run_id, "local_generation": local,
                                                                  "peers": peers}))
-            return folder / "calibration.json"
-
-        def edit(path, change):
-            manifest = json.loads(path.read_text())
-            if change.__name__ in ("no_peers", "null_peers"):
-                manifest["peers"] = [] if change.__name__ == "no_peers" else None
-            else:
-                change(manifest["peers"])
-            path.write_text(json.dumps(manifest))
-
-        def mapping_of(path, peer):
-            return path.parent / json.loads(path.read_text())["peers"][peer]["calibration_file"]
-
-        def no_peers(peers):
-            pass
-
-        def null_peers(peers):
-            pass
-
-        def same_samples(peers):
-            peers[1]["calibration_file"] = peers[0]["calibration_file"]
-
-        def both_on_rank0(peers):
-            peers[1].update(remote_generation=peers[0]["remote_generation"],
-                            calibration_file=peers[0]["calibration_file"])
-
-        def swapped(peers):
-            peers[0]["engine_id"], peers[1]["engine_id"] = peers[1]["engine_id"], peers[0]["engine_id"]
+            return folder
 
         run = self.run_with(server=self.MOONCAKE, profiler=pd.Profiler())
-        cases = {"clean": None, "rank 1 on rank 0's samples": same_samples,
-                 "both on rank 0's clock": both_on_rank0, "swapped labels": swapped,
-                 "unknown engine": lambda peers: peers[0].update(engine_id="prefill-q_dp0"),
-                 "null peers": null_peers, "no peers": no_peers}  # fmt: skip
-        for label, change in cases.items():
-            with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
-                path = write(Path(tmp))
-                if change:
-                    edit(path, change)
+        for change in (None, "wrong clock", "swapped labels", "failed", "missing", "duplicate", "never handed off",
+                       "unadvertised", "unresolved handoffs"):
+            with self.subTest(change), tempfile.TemporaryDirectory() as tmp:
+                write(Path(tmp), change)
                 verdict = {"problems": []}
                 pd.check_mooncake_clocks(Path(tmp), run, verdict)
-                self.assertEqual(verdict["problems"] == [], change in (None, no_peers), verdict["problems"])
+                self.assertEqual(verdict["problems"] == [], change is None, verdict["problems"])
         # anchors: an end without a start cannot align the producer; a start-only mapping can (drift unknown)
         for label, anchors, clean in (("end only", ("end",), False), ("start only", ("start",), True)):
             with self.subTest(label), tempfile.TemporaryDirectory() as tmp:
-                path = write(Path(tmp))
-                file = mapping_of(path, 1)
+                file = write(Path(tmp)) / "calibration-1.json"
                 mapping = json.loads(file.read_text())
                 file.write_text(json.dumps({"start": mapping["start"] if "start" in anchors else [],
                                             "end": mapping["end"] if "end" in anchors else []}))
@@ -473,22 +425,17 @@ class ProfilerConfig(unittest.TestCase):
                 pd.check_mooncake_clocks(Path(tmp), run, verdict)
                 self.assertEqual(verdict["problems"] == [], clean, verdict["problems"])
 
-    def test_the_mooncake_clock_peer_map_is_checked_before_any_server_starts(self):
-        """Each prefill DP engine's clock binds the instance's clock port + its rank, and the decode holds one
-        clock peer per prefill engine: a last port past 65535 or more peers than the profiler's default bound are
-        refused when the run is parsed."""
+    def test_the_mooncake_clock_peer_count_is_checked_before_any_server_starts(self):
+        """The decode holds one clock peer per prefill engine: more peers than the profiler's default bound are
+        refused when the run is parsed (the clocks' own ports are ephemeral, never derived)."""
         raw = {"name": "t", "topology": "t", "model": "/m", "client": "c", "control_network": "control",
                "decode": {"node": "d", "kv_network": "data0"}, "router": {"gateway": "gw"},
                "server": {"connector": "mooncake", "timing": "linear"}}
-        offset = 65535 - pd.BOOTSTRAP_PORT  # DP rank 0 on 65535
         with mock.patch.object(pd.models, "resolve", lambda model, fetch=False: Path(model)):
             def parse(dp, **profiler):
                 return pd.parse({**raw, "prefill": {"node": "p", "kv_network": "data0", "data_parallel_size": dp},
                                  "profiler": profiler}, Path("/r.yaml"))
 
-            self.assertEqual(parse(1, clock_port_offset=offset).profiler.clock_port_offset, offset)
-            with self.assertRaisesRegex(ValueError, "puts prefill DP rank 1's clock on port 65536"):
-                parse(2, clock_port_offset=offset)
             self.assertEqual(parse(pd.MOONCAKE_CLOCK_MAX_PEERS).prefill.data_parallel_size, pd.MOONCAKE_CLOCK_MAX_PEERS)
             with self.assertRaisesRegex(ValueError, "more clock peers than the profiler's clock_max_peers"):
                 parse(pd.MOONCAKE_CLOCK_MAX_PEERS + 1)

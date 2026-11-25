@@ -341,10 +341,9 @@ class Profiler:
     ``kv_connector_extra_config.network_profiler``, one run ID for both (L1
     or L3, with NIXL or Mooncake). Each server closes its recorders when
     it is stopped; the harness stops them, then copies the profile directories
-    to ``profiles/<role>/<node>/``. Under Mooncake each instance gets a pinned
-    engine ID, prefill's scheduler serves the clock on its control address at
-    ``BOOTSTRAP_PORT + clock_port_offset`` and decode's maps each prefill
-    engine ID to that endpoint (``clock_peers``)."""
+    to ``profiles/<role>/<node>/``. Under Mooncake each prefill engine's TP0/PP0
+    worker serves its clock and advertises it to the instance's bootstrap
+    server, where decode finds it: nothing is pinned or configured here."""
 
     transport: str = "tcp"
     clock_port_offset: int = 1000
@@ -497,12 +496,8 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
                 or not 1 <= profiler.clock_port_offset <= 65535):
             raise ValueError("profiler.clock_port_offset is a port offset in 1..65535")
         if run.server.connector == "mooncake":
-            # every prefill DP engine gets its own clock port and a peer on the decode
+            # every prefill DP engine is a clock peer of the decode
             prefill_dp = 1 if run.prefill.instances else run.prefill.data_parallel_size
-            last = BOOTSTRAP_PORT + profiler.clock_port_offset + prefill_dp - 1
-            if last > 65535:
-                raise ValueError(f"profiler.clock_port_offset {profiler.clock_port_offset} puts prefill DP rank "
-                                 f"{prefill_dp - 1}'s clock on port {last}, past 65535")
             if (peers := len(run.prefill.nodes) * prefill_dp) > MOONCAKE_CLOCK_MAX_PEERS:
                 raise ValueError(f"{peers} prefill engines are more clock peers than the profiler's "
                                  f"clock_max_peers ({MOONCAKE_CLOCK_MAX_PEERS})")
@@ -1037,28 +1032,6 @@ def kv_events_topic(control: str, endpoint_port: int) -> str:
     return f"kv@{control}:{endpoint_port}@{MODEL_NAME}"
 
 
-def profile_identities(run: Run, instances: dict) -> dict[str, dict[str, dict]]:
-    """Mooncake's profiled instances: each one's pinned engine ID and the clock
-    endpoint its scheduler would serve (its control address, ``BOOTSTRAP_PORT``
-    plus the profiler's offset), by role and node; and ``engines``, each engine
-    of the instance with its clock endpoint: with data parallelism vLLM names DP
-    rank d's engine ``<pinned>_dp<d>`` and the profiler binds its clock on the
-    port + d."""
-    port = BOOTSTRAP_PORT + run.profiler.clock_port_offset
-    found = {}
-    for role, nodes in instances.items():
-        side = getattr(run, role)
-        dp = 1 if side.instances else side.data_parallel_size
-        found[role] = {}
-        for node, where in nodes.items():
-            engine = f"{role}-{node}"
-            found[role][node] = {
-                "engine_id": engine, "clock": f"{where['control']}:{port}",
-                "engines": ({engine: f"{where['control']}:{port}"} if dp == 1 else
-                            {f"{engine}_dp{d}": f"{where['control']}:{port + d}" for d in range(dp)})}
-    return found
-
-
 def nixl_telemetry_arm(run: Run) -> str | None:
     """The run's NIXL telemetry arm: ``exporter`` with the collector's NIXL source, else the server's own."""
     if run.collector is not None and run.collector.nixl_telemetry:
@@ -1079,8 +1052,7 @@ def nixl_telemetry_env(arm: str) -> dict[str, str]:
 def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SERVER_PORT,
                    endpoint: tuple[str, int] | None = None,
                    profile_id: str | None = None,
-                   node: str | None = None,
-                   identities: dict | None = None) -> list[str]:
+                   node: str | None = None) -> list[str]:
     """``vllm serve`` for ``role`` (prefill or decode) on HTTP ``port``, TP
     rank r's KV on ``kv_addresses[r]`` in every DP rank (their own:
     ``rank_addresses``, DP rank by TP rank). ``endpoint``: the control
@@ -1126,17 +1098,8 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
             "level": run.profiler.level, "run_id": profile_id, "output_dir": PROFILES,
             "transport": run.profiler.transport, "clock_port_offset": run.profiler.clock_port_offset,
             "flush": run.profiler.flush, "shutdown_timeout_s": 10}
-        if not nixl:
-            if identities is None or node is None:
-                raise ValueError("a profiled Mooncake server needs its node and the instances' identities")
-            kv_transfer["engine_id"] = identities[role][node]["engine_id"]
-            profile = kv_transfer["kv_connector_extra_config"]["network_profiler"]
-            del profile["clock_port_offset"]
-            if role == "prefill":
-                profile["clock_bind"] = identities[role][node]["clock"]
-            else:
-                profile["clock_peers"] = {engine: clock for one in identities["prefill"].values()
-                                          for engine, clock in one["engines"].items()}
+        if not nixl:  # Mooncake clocks are advertised (no side-channel offset)
+            del kv_transfer["kv_connector_extra_config"]["network_profiler"]["clock_port_offset"]
         if run.profiler.level == "l3":
             if node is None:
                 raise ValueError("L3 server command needs its endpoint node")
@@ -1445,16 +1408,11 @@ def execute(run: Run, output: Path | None = None) -> dict:
     collectors: list = []
 
     commands: dict[str, dict[str, list[str]]] = {}
-    identities = (profile_identities(run, instances)
-                  if run.profiler is not None and run.server.connector == "mooncake" else None)
-    if identities is not None:
-        # The engine IDs and clock endpoints the profiled Mooncake servers were given.
-        (output / "profile-identities.json").write_text(json.dumps(identities, indent=2) + "\n")
     for role, side in roles:
         for node in side.nodes:
             command = server_command(run, role, instances[role][node]["kv"], front.server_port(role),
                                      (instances[role][node]["control"], front.endpoint_port(role)),
-                                     profile_id, node=node, identities=identities)
+                                     profile_id, node=node)
             commands.setdefault(role, {})[node] = command
             _background(container[node], command, f"{WORK}/logs/{role}.log")
     # Each server as it was started: its environment and flags.
@@ -1698,22 +1656,37 @@ def _ebpf_artifacts_problem(artifacts) -> str | None:
     return None
 
 
-def check_mooncake_clocks(output: Path, run: Run, verdict: dict) -> None:
-    """Every successful Mooncake clock calibration answered by the producer it names: for each decode scheduler
-    capture, its calibration manifest's local generation is that scheduler's clock, and each ``ok`` peer is an
-    engine of ``profile-identities.json`` (once), at that engine's clock endpoint, with the remote generation of
-    that engine's recorded prefill scheduler, and its mapping file's samples carry this run and the same two
-    generations. A peer that is idle or explicitly unaligned keeps its own status."""
-    problems = verdict["problems"]
-    try:
-        identities = json.loads((output / "profile-identities.json").read_text())
-        endpoints = {engine: clock for one in identities["prefill"].values()
-                     for engine, clock in one["engines"].items()}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
-        problems.append(f"Mooncake clocks: no usable profile-identities.json ({error})")
-        return
+def recorded_handoff_peers(events: Path) -> tuple[set[str], int]:
+    """The remote engine IDs of a capture's recorded handoffs (its rows'
+    ``peer_ref``, resolved through the capture's own dictionary), and how many
+    handoffs name no peer or one the dictionary cannot resolve."""
+    import importlib.util
 
-    def schedulers(role):
+    spec = importlib.util.spec_from_file_location("kvp_schema", REPOSITORY / "vllm" / "kv_profiling" / "schema.py")
+    schema = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(schema)
+    decoder, refs = schema.DictionaryDecoder(), []
+    with events.open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            if row.get("type") == "dictionary_fragment":
+                decoder.feed(row)
+            elif row.get("type") == "event" and row.get("kind") == "handoff":
+                refs.append(row.get("peer_ref"))
+    peers = [decoder.resolve(ref) if ref else None for ref in refs]
+    return {peer for peer in peers if isinstance(peer, str)}, sum(not isinstance(peer, str) for peer in peers)
+
+
+def check_mooncake_clocks(output: Path, run: Run, verdict: dict) -> None:
+    """Every prefill engine a decode scheduler handed off from calibrated against that engine's own clock, from
+    the recorded captures alone: an engine's clock is its prefill TP0/PP0 worker's (that capture's ``clock_id``),
+    served and advertised (its ``profiler.json``); each decode scheduler's contacted engines are its recorded
+    handoffs' remote engines, and each has exactly one ``ok`` peer in its calibration manifest, of that clock
+    (advertised and answered), whose mapping file's samples carry this run and the same two generations. A
+    calibrated engine the scheduler never handed off from is a problem too."""
+    problems = verdict["problems"]
+
+    def captures(role, process):
         found = {}
         for path in sorted((output / "profiles" / role).glob("*/*/*/events.jsonl")):
             try:
@@ -1721,43 +1694,65 @@ def check_mooncake_clocks(output: Path, run: Run, verdict: dict) -> None:
                     meta = json.loads(stream.readline())
             except (OSError, ValueError):
                 continue  # unreadable captures are check_profiles' problem
-            if (meta.get("context") or {}).get("role") == "scheduler":
+            if (meta.get("context") or {}).get("role") == process:
                 found[path.parent] = meta
         return found
 
     producers = {}
-    for meta in schedulers("prefill").values():
-        producers.setdefault(meta["context"].get("engine_id"), []).append(meta.get("clock_id"))
-    for folder, meta in schedulers("decode").items():
+    for folder, meta in captures("prefill", "worker").items():
+        context = meta.get("context") or {}
+        if (context.get("tp_rank"), context.get("pp_rank")) != (0, 0):
+            continue
+        engine = context.get("engine_id")
+        producers.setdefault(engine, []).append(meta.get("clock_id"))
+        try:
+            clock = json.loads((folder / "profiler.json").read_text())["clock"]
+            server, advertised = clock["server"] or {}, clock["advertised"] or {}
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            problems.append(f"Mooncake clocks: prefill engine {engine}'s clock worker has no usable report ({error})")
+            continue
+        if server.get("state") != "available" or advertised.get("state") != "ok":
+            problems.append(f"Mooncake clocks: prefill engine {engine}'s clock was not served and advertised "
+                            f"(server {server}, advertised {advertised})")
+    for folder, meta in captures("decode", "scheduler").items():
         where = f"Mooncake clocks: decode scheduler {folder.name[:8]}"
         path = folder / "calibration.json"
         try:
+            contacted, unresolved = recorded_handoff_peers(folder / "events.jsonl")
             manifest = json.loads(path.read_text())
             peers = manifest["peers"]
-            if not isinstance(peers, list):
-                raise TypeError(f"peers is {type(peers).__name__}, not a list")
+            if not isinstance(peers, list) or not all(isinstance(peer, dict) for peer in peers):
+                raise TypeError("peers is not a list of records")
         except (OSError, ValueError, KeyError, TypeError) as error:
-            problems.append(f"{where}: no usable calibration.json ({error})")
+            problems.append(f"{where}: no usable handoff records or calibration.json ({error})")
             continue
         if manifest.get("local_generation") != meta.get("clock_id") or manifest.get("run_id") != meta.get("run_id"):
             problems.append(f"{where}: its calibration manifest is of clock {manifest.get('local_generation')} and run "
                             f"{manifest.get('run_id')}, not its own")
-        seen = []
+        if unresolved:
+            problems.append(f"{where}: {unresolved} handoff(s) name no peer its dictionary resolves, so their "
+                            "engines' calibration cannot be verified")
+        by_engine = {}
         for peer in peers:
-            if not isinstance(peer, dict) or peer.get("status") != "ok":
+            by_engine.setdefault(peer.get("engine_id"), []).append(peer)
+        for engine in sorted(set(by_engine) - contacted, key=str):
+            problems.append(f"{where}: calibrated against {engine!r}, which it never handed off from")
+        for engine in sorted(contacted):
+            records = by_engine.get(engine, [])
+            if len(records) != 1:
+                problems.append(f"{where}: {engine} has {len(records)} calibration records, not one")
                 continue
-            engine = peer.get("engine_id")
-            seen.append(engine)
-            host, _, port = endpoints.get(engine, ":").rpartition(":")
-            if engine not in endpoints:
-                problems.append(f"{where}: calibrated against {engine!r}, no engine of this run")
+            peer = records[0]
+            if peer.get("status") != "ok":
+                problems.append(f"{where}: {engine} did not calibrate ({peer.get('status')}: {peer.get('detail')})")
                 continue
-            if peer.get("address") != [host, int(port)]:
-                problems.append(f"{where}: {engine}'s calibration reached {peer.get('address')}, not its endpoint "
-                                f"{endpoints[engine]}")
-            if producers.get(engine) != [peer.get("remote_generation")]:
-                problems.append(f"{where}: {engine}'s calibration is of clock {peer.get('remote_generation')}, not "
-                                f"that engine's recorded scheduler's {producers.get(engine)}")
+            if len(producers.get(engine, [])) != 1:
+                problems.append(f"{where}: {engine} has {len(producers.get(engine, []))} recorded clock workers, not one")
+                continue
+            if not peer.get("remote_generation") == peer.get("advertised_generation") == producers[engine][0]:
+                problems.append(f"{where}: {engine}'s calibration answered clock {peer.get('remote_generation')} "
+                                f"(advertised {peer.get('advertised_generation')}), not its recorded worker's "
+                                f"{producers[engine][0]}")
             try:
                 mapping = json.loads((folder / peer["calibration_file"]).read_text())
                 start, end = mapping["start"], mapping.get("end") or []
@@ -1776,8 +1771,6 @@ def check_mooncake_clocks(output: Path, run: Run, verdict: dict) -> None:
                    for x in samples):
                 problems.append(f"{where}: {engine}'s mapping file ({peer['calibration_file']}) holds samples of "
                                 f"another run or clock pair")
-        if len(seen) != len(set(seen)):
-            problems.append(f"{where}: an engine calibrated more than once {sorted(seen)}")
 
 
 def api_server_slots(run: Run, side: Side) -> list[str]:

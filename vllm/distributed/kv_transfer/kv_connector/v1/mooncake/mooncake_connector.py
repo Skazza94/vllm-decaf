@@ -120,7 +120,7 @@ ReqId = str  # Internal scheduler request ID
 TransferId = str  # KV transfer coordination ID (shared by P/D)
 
 
-def _attach_profiler(vllm_config, role, engine_id, rank, context=None):
+def _attach_profiler(vllm_config, role, engine_id, rank, context=None, clock=None):
     """The KV network profiler of this scheduler or worker, or None.
 
     None when the shared configuration attaches nothing.
@@ -132,9 +132,11 @@ def _attach_profiler(vllm_config, role, engine_id, rank, context=None):
     extra = vllm_config.kv_transfer_config.kv_connector_extra_config
     if "network_profiler" not in extra:
         return None
-    from vllm.kv_profiling.mooncake import attach_mooncake
+    from vllm.kv_profiling.mooncake import attach_mooncake, clock_context
 
     parallel = vllm_config.parallel_config
+    if clock is not None:  # a worker: where its engine's clock would serve
+        context = {**(context or {}), **clock_context(vllm_config, *clock)}
     return attach_mooncake(
         vllm_config,
         role,
@@ -1237,6 +1239,7 @@ class MooncakeConnectorScheduler:
                     request.request_id,
                     params["transfer_id"],
                     params["remote_engine_id"],
+                    params.get("remote_bootstrap_addr"),
                 )
 
         if (
@@ -1668,6 +1671,10 @@ class MooncakeConnectorWorker:
             if should_launch_bootstrap_server(vllm_config):
                 _, port = get_mooncake_bootstrap_addr(vllm_config)
                 self.bootstrap_server = MooncakeBootstrapServer("0.0.0.0", port)
+                if "network_profiler" in kv_transfer_config.kv_connector_extra_config:
+                    from vllm.kv_profiling.mooncake import serve_clock_registry
+
+                    serve_clock_registry(self.bootstrap_server, vllm_config)
                 self.bootstrap_server.start()
 
         if not self.is_kv_producer:
@@ -1735,6 +1742,7 @@ class MooncakeConnectorWorker:
             engine_id,
             self.tp_rank,
             {"tp_rank": self.tp_rank, "pp_rank": self.pp_rank},
+            clock=(self.hostname, self.dp_rank),
         )
 
     def close_profiler(self) -> None:
@@ -2479,7 +2487,12 @@ class MooncakeConnectorWorker:
                     remote_tp_size=agent_meta.remote_tp_size,
                 )
                 plans.add(
-                    (should_transfer, src_region_offset, dst_region_offset, transfer_len)
+                    (
+                        should_transfer,
+                        src_region_offset,
+                        dst_region_offset,
+                        transfer_len,
+                    )
                 )
                 if not should_transfer:
                     # Replicated KV cache: only one producer rank in the TP group
