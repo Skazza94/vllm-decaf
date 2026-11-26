@@ -4,6 +4,7 @@
 
 import collections
 import contextlib
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -12,6 +13,9 @@ import re
 import selectors
 import signal
 import subprocess
+import sys
+import termios
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,7 +118,9 @@ def decode_row(line):
     if len(line) + 1 > RECORD_BYTES:
         raise ValueError("native record bound")
     row = json.loads(line)
-    if not isinstance(row, dict) or row.get("type") not in {
+    if not isinstance(row, dict) or not isinstance(row.get("type"), str):
+        raise ValueError("unknown native row")
+    if row["type"] not in {
         "tcp_event",
         "loss",
         "ready",
@@ -146,6 +152,15 @@ def decode_row(line):
             )
         ):
             raise ValueError("invalid native acknowledgement")
+        # the fields the channel reads, present (an R's admission may be null)
+        required = (
+            ("cookie", "count", "first_ns", "last_ns")
+            if row["type"] == "rejected"
+            else ("seq", "cookie", "applied_ns")
+            + (("admission", "before_ns") if row["op"] in ("A", "D") else ())
+        )
+        if any(type(row.get(key)) is not int for key in required):
+            raise ValueError(f"incomplete native {row['type']} row")
         return row
     if row["type"] == "tcp_event":
         if row.get("schema") != 3 or row.get("event") not in EVENTS:
@@ -240,6 +255,176 @@ def event_loss(losses, terminal):
     return loss
 
 
+class _Reader(threading.Thread):
+    """Reads an owned collector's stdout and stderr, nothing else: complete
+    stdout lines are queued, in arrival order and bounded (backpressure when
+    full: it stops reading, so loss stays the collector's and the kernel's,
+    counted there), and stderr goes to ``native.stderr``. It touches no channel
+    state; its errors and EOF are reported to the consuming thread."""
+
+    def __init__(self, stdout, stderr, directory, wake):
+        super().__init__(name="kvp-ebpf-reader", daemon=True)
+        self.out, self.err = stdout, stderr
+        self.directory = Path(directory)
+        self.wake = wake
+        self.lock = threading.Condition()
+        # queued (line, the stream offset just past its newline)
+        self.lines: collections.deque = collections.deque()
+        self.queued_bytes = 0
+        self.read_bytes = 0  # stdout bytes read since the start
+        # marks: (a time T, a stream offset P): every byte the collector wrote
+        # to stdout before T lies before P (bytes read by then, plus what the
+        # pipe held after T). The oldest unconsumed mark stays fixed until the
+        # consumer has handled the lines up to it; newer ones replace the next.
+        self.mark: tuple | None = None
+        self.next_mark: tuple | None = None
+        self.partial = bytearray()
+        self.stderr_bytes = 0
+        self.error: str | None = None
+        self.stdout_eof = self.stderr_eof = False
+        self.halt = False
+
+    def run(self):
+        selector = selectors.DefaultSelector()
+        selector.register(self.out, selectors.EVENT_READ, "stdout")
+        selector.register(self.err, selectors.EVENT_READ, "stderr")
+        try:
+            while selector.get_map() and not self.halt and self.error is None:
+                with self.lock:
+                    # full: stop reading until the consumer catches up
+                    while self._full() and not self.halt:
+                        self.lock.wait(0.05)
+                if self.halt:
+                    break
+                if not self.stdout_eof:
+                    self._mark()
+                ready = selector.select(0.05)
+                for key, _ in ready:
+                    data = os.read(key.fileobj.fileno(), READ_BYTES)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        self._on_eof(key.data)
+                    elif key.data == "stderr":
+                        self._on_stderr(data)
+                    else:
+                        self._on_stdout(data)
+        except (OSError, ValueError) as error:
+            self._on_error(str(error))
+        finally:
+            selector.close()
+            self.wake.set()
+
+    def _mark(self):
+        when = time.monotonic_ns()  # first the time, then what the pipe holds
+        waiting = int.from_bytes(
+            fcntl.ioctl(self.out.fileno(), termios.FIONREAD, bytes(4)), sys.byteorder
+        )
+        self._add_mark((when, self.read_bytes + waiting))
+
+    def _add_mark(self, mark):
+        with self.lock:
+            if self.mark is None:
+                self.mark = mark
+            else:
+                self.next_mark = mark
+
+    def _full(self, incoming=None):
+        """No room for one more line (of ``incoming`` bytes); an empty queue
+        always takes one, a line being bounded by RECORD_BYTES."""
+        if not self.lines:
+            return False
+        size = 1 if incoming is None else len(incoming)
+        return (
+            self.queued_bytes + size > QUEUE_BYTES or len(self.lines) + 1 > QUEUE_LINES
+        )
+
+    def passed(self, handled_offset) -> int | None:
+        """The latest mark time whose offset the handled lines have reached:
+        a reply not among them was not written by then. None if none was."""
+        with self.lock:
+            when = None
+            while self.mark is not None and self.mark[1] <= handled_offset:
+                when = self.mark[0]
+                self.mark, self.next_mark = self.next_mark, None
+            return when
+
+    def _on_stdout(self, data):
+        start = self.read_bytes - len(self.partial)  # the partial's offset
+        self.read_bytes += len(data)
+        self.partial.extend(data)
+        lines = []
+        while (end := self.partial.find(b"\n")) >= 0:
+            lines.append((bytes(self.partial[:end]), start + end + 1))
+            start += end + 1
+            del self.partial[: end + 1]
+        # one read's lines are the only batch in flight (READ_BYTES at most):
+        # each waits for room, so the queue never exceeds its bounds; they are
+        # queued before any error of the bytes after them
+        for line, offset in lines:
+            with self.lock:
+                while self._full(line) and not self.halt:
+                    self.lock.wait(0.05)
+                if self.halt:
+                    return
+                self.lines.append((line, offset))
+                self.queued_bytes += len(line)
+                self.lock.notify_all()
+            self.wake.set()
+        if len(self.partial) >= RECORD_BYTES:
+            raise ValueError("unterminated native record bound")
+
+    def _on_stderr(self, data):
+        self.stderr_bytes += len(data)
+        if self.stderr_bytes > 1 << 20:
+            raise ValueError("native stderr limit")
+        with (self.directory / "native.stderr").open("ab") as stream:
+            stream.write(data)
+
+    def _on_eof(self, name):
+        with self.lock:
+            if name == "stdout":
+                self.stdout_eof = True
+                if self.partial:
+                    self.error = self.error or "truncated native record"
+            else:
+                self.stderr_eof = True
+            self.lock.notify_all()
+        if name == "stdout":
+            self._add_mark((time.monotonic_ns(), self.read_bytes))
+        self.wake.set()
+
+    def _on_error(self, reason):
+        with self.lock:
+            self.error = self.error or reason
+            self.lock.notify_all()
+        self.wake.set()
+
+    def take(self, limit, timeout):
+        """Up to ``limit`` queued (line, offset), in order, waiting up to
+        ``timeout`` for the first; and whether more remain."""
+        with self.lock:
+            if not self.lines and timeout > 0 and self.is_alive():
+                self.lock.wait(timeout)
+            taken = []
+            while self.lines and len(taken) < limit:
+                line, offset = self.lines.popleft()
+                self.queued_bytes -= len(line)
+                taken.append((line, offset))
+            self.lock.notify_all()
+            return taken, bool(self.lines)
+
+    def finished(self):
+        """Both pipes at EOF, every queued line taken."""
+        with self.lock:
+            return self.stdout_eof and self.stderr_eof and not self.lines
+
+    def stop(self, timeout):
+        self.halt = True
+        with self.lock:
+            self.lock.notify_all()
+        self.join(max(0, timeout))
+
+
 class Channel:
     """Bounded pipes for an already-owned child; never enables kernel probes."""
 
@@ -248,9 +433,13 @@ class Channel:
         self.inventory = inventory
         self.directory = Path(directory)
         self.child = child
-        self.selector = None
-        self.buffers = {}
-        self.stderr_bytes = 0
+        self.reader: _Reader | None = None
+        self.wake = threading.Event()  # set when the reader queued lines
+        self.handled_offset = 0  # stdout offset past the last line handled
+        self.malformed: str | None = None  # the first row that did not decode
+        self.reported: set = set()  # errors raised once already
+        self.backlog = False  # lines still queued after the last poll
+        self.writer_blocked = False  # the last poll took none: the writer was full
         self.final_usage = None
         self.reaped = False
         self.accounting_error = None
@@ -320,14 +509,12 @@ class Channel:
                     "monotonic"
                 ]
         os.set_blocking(self.child.stdin.fileno(), False)
-        self.selector = selectors.DefaultSelector()
-        for name, stream in (
-            ("stdout", self.child.stdout),
-            ("stderr", self.child.stderr),
-        ):
+        for stream in (self.child.stdout, self.child.stderr):
             os.set_blocking(stream.fileno(), False)
-            self.selector.register(stream, selectors.EVENT_READ, name)
-            self.buffers[name] = bytearray()
+        self.reader = _Reader(
+            self.child.stdout, self.child.stderr, self.directory, self.wake
+        )
+        self.reader.start()
         self.started = True
         self.status["state"] = "starting"
 
@@ -495,14 +682,14 @@ class Channel:
             self.outbox.popleft()
             self.pending[item["seq"]] = {**item, "sent_ns": time.monotonic_ns()}
 
-    def expire(self, timeout_ns=None) -> None:
-        """Commands unacknowledged for ACK_TIMEOUT_NS, once every reply that was
-        readable has been read: the cookie's kernel state is unknown from when
-        the command was sent until a readback establishes it."""
-        now = time.monotonic_ns()
-        timeout_ns = ACK_TIMEOUT_NS if timeout_ns is None else timeout_ns
+    def expire(self, caught_up_ns=None) -> None:
+        """Commands unacknowledged ACK_TIMEOUT_NS after they were sent, as of a
+        moment (caught_up_ns) when the reader had read everything written
+        and every line read was handled: the cookie's kernel state is unknown
+        from when the command was sent until a readback establishes it."""
+        when = time.monotonic_ns() if caught_up_ns is None else caught_up_ns
         for seq, sent in list(self.pending.items()):
-            if now - sent["sent_ns"] < timeout_ns:
+            if when - sent["sent_ns"] < ACK_TIMEOUT_NS:
                 continue
             del self.pending[seq]
             self.expired.add(seq)
@@ -652,89 +839,96 @@ class Channel:
         return {"verified": True}
 
     def poll(self, writer, timeout=0):
-        if not self.child or not self.selector:
+        """Handle, in order, at most POLL_LINES of the lines the reader has
+        queued (waiting up to timeout for the first), then expire the
+        commands whose replies cannot be among them."""
+        if not self.child or self.reader is None:
             return []
         self.pump()
         self._resources()
-        rows: list[dict] = []
-        drained = self._read(rows, timeout)
-        while drained and len(rows) < 2048 and self.selector.get_map():
-            drained = self._read(rows, 0)
-        # every reply readable now has been read: only then can one be late (a
-        # backlog still unread defers it, up to twice the timeout)
-        self.expire(ACK_TIMEOUT_NS if not drained else 2 * ACK_TIMEOUT_NS)
-        self.pump()
-        return rows
-
-    def _read(self, rows, timeout) -> bool:
-        """One read of each ready pipe; whether anything was ready."""
         if any(
             os.readlink("/proc/self/ns/" + name) != value
             for name, value in self.namespaces.items()
         ):
             raise ValueError("observer namespace changed")
-        ready = self.selector.select(timeout)
-        for key, _ in sorted(ready, key=lambda item: item[0].data == "stdout"):
-            data = os.read(key.fileobj.fileno(), 65536)
-            if not data:
-                self.selector.unregister(key.fileobj)
-                if key.data == "stdout" and self.buffers["stdout"]:
-                    raise ValueError("truncated native record")
-                continue
-            if key.data == "stderr":
-                self.stderr_bytes += len(data)
-                if self.stderr_bytes > 1 << 20:
-                    raise ValueError("native stderr limit")
-                with (self.directory / "native.stderr").open("ab") as stream:
-                    stream.write(data)
-                continue
-            buffer = self.buffers[key.data]
-            buffer.extend(data)
-            if len(buffer) > 1 << 20:
-                raise ValueError("native output limit")
-            while b"\n" in buffer:
-                line, _, remainder = buffer.partition(b"\n")
-                buffer[:] = remainder
-                row = decode_row(line)
-                if len(rows) >= 4096:
-                    raise ValueError("native queue bound")
-                if row.get("type") == "ready":
-                    self.status.update(
-                        available=True,
-                        state="partial",
-                        mode=self.settings.mode,
-                        kernel_miss_visibility="unverified",
-                    )
-                elif row.get("type") == "status":
-                    self.status.update(
-                        row,
-                        state="failed"
-                        if row.get("outcome") == "FAIL"
-                        else "unavailable",
-                    )
-                elif row.get("type") == "resource":
-                    self.status["resource"] = row
-                elif row.get("type") == "loss" and isinstance(row.get("value"), int):
-                    # cumulative counters: the highest value of each is its total
-                    key = (row.get("scope"), row.get("counter"))
-                    self.losses[key] = max(self.losses.get(key, 0), row["value"])
-                elif row.get("type") == "ack":
-                    self.acknowledged(row)
-                elif row.get("type") == "rejected":
-                    # the terminal counter of a cookie: each rejection once
-                    self.rejected[row["cookie"]] = row
-                elif row.get("type") == "end":
-                    self.terminal = row
-                    if row.get("failed") is True:
-                        self.fail("native_terminal_failure")
-                if row.get("outcome") == "FAIL":
-                    self.fail(self.status.get("reason", "native_collector_failure"))
-                elif self.failed_reason is not None:
-                    self.fail(self.failed_reason)
-                rows.append(row)
-            if len(buffer) >= RECORD_BYTES:
-                raise ValueError("unterminated native record bound")
-        return bool(ready)
+        # an error once, at the poll after the rows read before it were
+        # delivered, before any further row is taken (it stands to the end)
+        for error in (
+            self.malformed,
+            None if self.reader.lines else self.reader.error,
+        ):
+            if error is not None and error not in self.reported:
+                self.reported.add(error)
+                raise ValueError(error)
+        # flow control: no more rows than the capture writer can take now,
+        # a quarter of its queue left to the other sources; the rest waits in
+        # the reader's queue (and, past it, the collector's), never dropped
+        limit = POLL_LINES
+        room = getattr(writer, "room", None)
+        if room is not None:
+            limit = min(limit, max(0, room() - writer.queue.maxsize // 4))
+        self.writer_blocked = limit == 0
+        if self.writer_blocked:
+            lines, self.backlog = [], bool(self.reader.lines)
+            if timeout > 0:
+                time.sleep(min(timeout, WRITER_WAIT_S))
+        else:
+            lines, self.backlog = self.reader.take(limit, timeout)
+        rows = []
+        for line, offset in lines:
+            # a row that does not decode is the collector's bug: the rows
+            # around it still count, the first such error stands to the end
+            try:
+                rows.append(self._handle(line))
+            except (ValueError, KeyError, TypeError) as error:
+                # any record shape the decoding missed is malformed too
+                self.malformed = self.malformed or f"malformed native row: {error!r}"
+            self.handled_offset = offset
+        # a reply is late only if the reader caught up with the pipe after its
+        # deadline and every line read until then has been handled; once the
+        # collector's output ended and all of it was handled, none can come
+        when = self.reader.passed(self.handled_offset)
+        if self.reader.stdout_eof and not self.reader.lines:
+            self.expire(caught_up_ns=ENDED_NS)
+        elif when is not None:
+            self.expire(caught_up_ns=when)
+        self.pump()
+        return rows
+
+    def _handle(self, line) -> dict:
+        row = decode_row(line)
+        if row.get("type") == "ready":
+            self.status.update(
+                available=True,
+                state="partial",
+                mode=self.settings.mode,
+                kernel_miss_visibility="unverified",
+            )
+        elif row.get("type") == "status":
+            self.status.update(
+                row,
+                state="failed" if row.get("outcome") == "FAIL" else "unavailable",
+            )
+        elif row.get("type") == "resource":
+            self.status["resource"] = row
+        elif row.get("type") == "loss" and isinstance(row.get("value"), int):
+            # cumulative counters: the highest value of each is its total
+            key = (row.get("scope"), row.get("counter"))
+            self.losses[key] = max(self.losses.get(key, 0), row["value"])
+        elif row.get("type") == "ack":
+            self.acknowledged(row)
+        elif row.get("type") == "rejected":
+            # the terminal counter of a cookie: each rejection once
+            self.rejected[row["cookie"]] = row
+        elif row.get("type") == "end":
+            self.terminal = row
+            if row.get("failed") is True:
+                self.fail("native_terminal_failure")
+        if row.get("outcome") == "FAIL":
+            self.fail(self.status.get("reason", "native_collector_failure"))
+        elif self.failed_reason is not None:
+            self.fail(self.failed_reason)
+        return row
 
     def stop(self, writer, consume=None):
         if self.stopped_result is not None:
@@ -787,17 +981,23 @@ class Channel:
                 except (OSError, subprocess.TimeoutExpired):
                     self.error = "native child not reaped within deadline"
         finally:
-            # EOF and diagnostics are independent of stdin and child liveness.
+            # EOF and diagnostics are independent of stdin and child liveness:
+            # every queued line, in order, until both pipes end
             while (
-                self.selector
-                and self.selector.get_map()
+                self.reader is not None
+                and not self.reader.finished()
                 and time.monotonic() < deadline
             ):
                 drain(min(0.01, max(0, deadline - time.monotonic())))
-            if (self.selector and self.selector.get_map()) or self.buffers.get(
-                "stdout"
-            ):
-                self.fail("native_output_incomplete")
+            if self.reader is not None:
+                self.reader.stop(deadline - time.monotonic())
+                if not self.reader.finished() or self.reader.is_alive():
+                    self.fail("native_output_incomplete")
+                for error in (self.reader.error, self.malformed):
+                    if error is not None:
+                        # its pipes may have closed: the error stands
+                        self.error = self.error or error
+                        self.fail("native_output_incomplete")
             if self.child.returncode not in (0, 2, None):
                 self.fail("native_collector_failure")
             if (
@@ -812,8 +1012,6 @@ class Channel:
                     self.accounting_error or "owned child final accounting unavailable"
                 )
                 self.fail("native_final_accounting_unavailable")
-            if self.selector:
-                self.selector.close()
             for stream in (self.child.stdin, self.child.stdout, self.child.stderr):
                 stream.close()
         loss = event_loss(self.losses, self.terminal)
@@ -956,6 +1154,12 @@ def _converted(kernel_ns, offset):
 
 
 ACK_TIMEOUT_NS = 1_000_000_000
+READ_BYTES = 65536  # one pipe read
+QUEUE_BYTES = 16 << 20  # queued collector output, per channel
+QUEUE_LINES = 65536  # queued collector rows, per channel
+POLL_LINES = 2048  # rows handled per poll: the observer's loop runs between
+WRITER_WAIT_S = 0.005  # a full capture writer's wait, before trying again
+ENDED_NS = 1 << 62  # "never": the collector's output ended, no reply can come
 OWNERSHIP_ATTEMPTS = 4  # commands per cookie toward one decision
 OWNERSHIP_DRAIN_S = 0.75  # at stop, for the commands in flight
 UNKNOWN = "unknown"

@@ -328,6 +328,9 @@ static int harvest(struct bpf_object *obj, u64 cookie, struct kvp_rejected *seen
 }
 static char line_buffer[256];
 static size_t line_used;
+/* Output queue slots one buffer of commands can need: the shortest command
+   ("R 1 1\n") is 6 bytes, so a full buffer holds at most 42, one ack each. */
+#define KVP_COMMAND_ACKS (sizeof(line_buffer) / 6 + 1)
 static int command(struct bpf_object *obj, char *line) {
   unsigned long long seq, cookie, admission;
   char extra;
@@ -504,13 +507,17 @@ static int run(struct bpf_object *obj, struct plan *p) {
          "\"partial\"}");
   u64 next = monotonic_ns() + 1000000000ULL;
   while (!failed) {
-    struct pollfd fds[] = {{0, POLLIN | POLLHUP, 0},
+    /* Commands are read only while their acknowledgements have room, so a slow
+       reader of stdout holds the commands back (backpressure on stdin) rather
+       than failing an acknowledgement. */
+    int room = KVP_QUEUE - count >= KVP_COMMAND_ACKS;
+    struct pollfd fds[] = {{room ? 0 : -1, POLLIN | POLLHUP, 0},
                            {ring_buffer__epoll_fd(ring), POLLIN, 0}};
     if (poll(fds, 2, 20) < 0 && errno != EINTR) {
       failed = 1;
       break;
     }
-    if (fds[0].revents) {
+    if (room && fds[0].revents) {
       int result = commands(obj);
       if (result > 0) break;
       if (result < 0) {
@@ -523,7 +530,9 @@ static int run(struct bpf_object *obj, struct plan *p) {
       break;
     }
     u64 now = monotonic_ns();
-    if (now >= next) {
+    /* The periodic counters are cumulative: a report waits until all its rows
+       fit (a slow reader of stdout) rather than failing. */
+    if (now >= next && KVP_QUEUE - count >= STAT_COUNT) {
       if (losses(obj)) {
         failed = 1;
         break;

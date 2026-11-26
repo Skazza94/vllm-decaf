@@ -773,9 +773,23 @@ class Observer:
                         )
                     if time.monotonic() - owner_exited_at >= self.owner_exit_grace_s:
                         break
+                # the collector's output wakes the loop as it arrives (the
+                # reader sets the event); the 100 ms bound keeps the stop and
+                # owner-exit checks while its pipes are quiet
+                waker = self.stop_event
+                if self.ebpf is not None and self.ebpf.reader is not None:
+                    waker = self.ebpf.wake
+                    waker.clear()
                 self.service_ebpf()
                 wake = next_tick if cadence is None else min(next_tick, cadence.next)
-                self.stop_event.wait(min(0.1, max(0, wake - time.monotonic())))
+                # rows still queued: the next batch at once, after this pass's
+                # sampling and stop checks (a full writer first drains a little)
+                timeout = min(0.1, max(0, wake - time.monotonic()))
+                if self.ebpf is not None and self.ebpf.backlog:
+                    from .ebpf import WRITER_WAIT_S
+
+                    timeout = WRITER_WAIT_S if self.ebpf.writer_blocked else 0
+                waker.wait(timeout)
             if self.discovery is not None:
                 self.discover()  # the last readings, sampled once below
             self.sample(True)

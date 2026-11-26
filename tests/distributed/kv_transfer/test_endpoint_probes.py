@@ -4937,3 +4937,554 @@ def test_a_live_observer_selects_its_endpoint_s_sockets_in_the_kernel(tmp_path):
     )  # fmt: skip
     summary = json.loads(checked.stdout)
     assert checked.returncode == 0 and summary["complete"], summary
+
+
+_SCRIPTED_COLLECTOR = r"""
+import json, os, sys, time
+# argv: a JSON plan. "burst": rows written once "go" exists (then "done" is
+# touched); "ack_behind": rows written before each admit's ack; "lose": seqs
+# whose ack never comes; "heartbeat_s": a row every so often, until stop;
+# "exit_with": rows and stderr written right away, then exit 2
+plan = json.loads(sys.argv[1])
+def say(row):
+    sys.stdout.write(json.dumps(row) + "\n"); sys.stdout.flush()
+def filler(i):
+    return {"type": "loss", "scope": "filter_exclusion",
+            "counter": "excluded_namespace", "value": i, "pad": "x" * 400}
+if "exit_with" in plan:
+    for i in range(plan["exit_with"]):
+        say(filler(i))
+    sys.stderr.write("diagnostics to keep"); sys.stderr.flush()
+    say({"type": "end", "complete": False, "coverage": "partial", "output_drops": 0,
+         "malformed": 0, "rejected_complete": True, "failed": False})
+    sys.exit(2)
+say({"type": "ready", "available": True, "exact": False, "coverage": "partial"})
+os.set_blocking(0, False)
+go, done = plan.get("go"), plan.get("done")
+beat, last, pending = plan.get("heartbeat_s"), time.monotonic(), b""
+while True:
+    if go and os.path.exists(go):
+        for i in range(plan["burst"]):
+            say(filler(i))
+        open(done, "w").write(str(time.monotonic()))
+        go = None
+    if beat and time.monotonic() - last >= beat:
+        if plan.get("chunked"):  # one prebuilt write: the pipe stays full
+            chunk = plan.get("_chunk") or "".join(
+                json.dumps(filler(-1)) + "\n" for _ in range(plan["beat_rows"]))
+            plan["_chunk"] = chunk
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+        else:
+            for _ in range(plan.get("beat_rows", 1)):
+                say(filler(-1))
+        last = time.monotonic()
+    try:
+        pending += os.read(0, 4096) or b"stop\n"
+    except BlockingIOError:
+        if not plan.get("chunked"):  # a flood never pauses
+            time.sleep(0.005)
+        continue
+    while b"\n" in pending:
+        line, _, pending = pending.partition(b"\n")
+        words = line.decode().split()
+        if words == ["stop"]:
+            say({"type": "end", "complete": False, "coverage": "partial",
+                 "output_drops": 0, "malformed": 0, "rejected_complete": True,
+                 "failed": False})
+            sys.exit(2)
+        if plan.get("exit_on_command"):
+            sys.exit(3)  # gone without a reply
+        op, seq, cookie = words[0], int(words[1]), int(words[2])
+        for i in range(plan.get("ack_behind", 0)):
+            say(filler(i))
+        if seq in plan.get("lose", []):
+            continue
+        now = time.monotonic_ns()
+        row = {"type": "ack", "op": op, "seq": seq, "cookie": cookie, "ok": True,
+               "errno": 0, "before_ns": now, "applied_ns": now}
+        if op == "A":
+            row.update(admission=int(words[3]), rejected=0, rejected_first_ns=0,
+                       rejected_errno=0)
+        say(row)
+"""
+
+
+def _scripted(tmp_path, **plan):
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel, Settings
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", _SCRIPTED_COLLECTOR, json.dumps(plan)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    channel = Channel(child, tmp_path, Settings(enabled=True, privileged_opt_in=True,
+                                                mode="tcp_tracepoints"))  # fmt: skip
+    channel.monotonic_offset = 0
+    return channel
+
+
+def _pipe_capacity(stream):
+    import fcntl
+
+    return fcntl.fcntl(stream.fileno(), 1032)  # F_GETPIPE_SZ
+
+
+def test_ebpf_a_stalled_observer_does_not_stall_the_collector_s_output(tmp_path):
+    """While the observer's main thread is busy (a discovery scan), the reader
+    keeps draining: a burst four times the pipe's capacity is written in full
+    during the stall, then every row is handled, in order."""
+    go, done = tmp_path / "go", tmp_path / "done"
+    channel = _scripted(tmp_path, go=str(go), done=str(done), burst=0)
+    burst = 4 * _pipe_capacity(channel.child.stdout) // 450 + 1
+    channel.child.kill()
+    channel.child.wait()
+    channel = _scripted(tmp_path / "run", go=str(go), done=str(done), burst=burst)
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        go.touch()
+        time.sleep(0.5)  # the main thread stalled
+        assert done.exists(), "the collector blocked on a full pipe"
+        values = []
+        deadline = time.monotonic() + 60  # generous: a loaded host is slow
+        while len(values) < burst and time.monotonic() < deadline:
+            values += [r["value"] for r in channel.poll(None, 0.05)
+                       if r.get("type") == "loss"]  # fmt: skip
+        assert values == list(range(burst))
+    finally:
+        channel.stop(None)
+
+
+def test_ebpf_a_timely_acknowledgement_behind_a_backlog_is_not_lost(
+    tmp_path, monkeypatch
+):
+    """The admit's acknowledgement is written right away, behind a backlog the
+    observer handles only in small batches, long after the deadline: read
+    before its deadline, it is never declared lost."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "ACK_TIMEOUT_NS", 100_000_000)
+    monkeypatch.setattr(ebpf, "POLL_LINES", 50)
+    channel = _scripted(tmp_path, ack_behind=2000)
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        channel.admit(42, 7)
+        time.sleep(0.4)  # the whole reply is queued; its deadline passed
+        _settle(channel, until=lambda: channel.kernel.get(42) == 7)
+        assert channel.kernel.get(42) == 7
+        assert not channel.ack_failures and not channel.unknown
+    finally:
+        channel.stop(None)
+
+
+def test_ebpf_a_missing_acknowledgement_expires_while_events_keep_arriving(
+    tmp_path, monkeypatch
+):
+    """Rows keep arriving, but the admit's acknowledgement never does: once the
+    reader has caught up past the deadline, the command is declared lost."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "ACK_TIMEOUT_NS", 200_000_000)
+    channel = _scripted(tmp_path, lose=[1], heartbeat_s=0.01)
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        channel.admit(42, 7)
+        deadline = time.monotonic() + 5
+        while not channel.ack_failures and time.monotonic() < deadline:
+            channel.poll(None, 0.02)
+        assert channel.ack_failures[0]["reason"] == "no acknowledgement"
+        assert time.monotonic() < deadline
+    finally:
+        channel.stop(None)
+
+
+def test_ebpf_a_full_reader_queue_applies_backpressure_without_loss(
+    tmp_path, monkeypatch
+):
+    """With the queue's bound reached the reader stops reading (the collector
+    blocks), and the queue never exceeds it; consumed, every row arrives, in
+    order."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "QUEUE_LINES", 20)
+    go, done = tmp_path / "go", tmp_path / "done"
+    channel = _scripted(tmp_path, go=str(go), done=str(done), burst=2000)
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        go.touch()
+        time.sleep(0.5)
+        assert len(channel.reader.lines) <= 20
+        assert not done.exists(), "the collector should be blocked"
+        values = []
+        deadline = time.monotonic() + 60  # generous: a loaded host is slow
+        while len(values) < 2000 and time.monotonic() < deadline:
+            assert len(channel.reader.lines) <= 20
+            values += [r["value"] for r in channel.poll(None, 0.05)
+                       if r.get("type") == "loss"]  # fmt: skip
+        assert values == list(range(2000)) and done.exists()
+    finally:
+        channel.stop(None)
+
+
+def test_ebpf_stop_drains_a_full_output_and_stderr_of_an_exited_collector(
+    tmp_path, monkeypatch
+):
+    """The collector filled its pipe (the reader's queue bound reached, the rest
+    unread) and wrote its diagnostics, then exited before any poll: stop
+    drains every row in order and keeps the stderr, joining the reader within
+    its deadline."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "QUEUE_LINES", 5)
+    probe = _scripted(tmp_path / "probe", exit_with=0)
+    rows = _pipe_capacity(probe.child.stdout) * 7 // 8 // 450
+    probe.stop(None)
+    channel = _scripted(tmp_path, exit_with=rows)
+    channel.child.wait(10)  # exited, its output still in the pipe
+    assert len(channel.reader.lines) <= 5
+    captured = []
+    began = time.monotonic()
+    result = channel.stop(None, captured.append)
+    assert time.monotonic() - began < 2.5
+    values = [r["value"] for r in captured if r.get("type") == "loss"]
+    assert values == list(range(rows)) and captured[-1]["type"] == "end"
+    assert (tmp_path / "native.stderr").read_bytes() == b"diagnostics to keep"
+    assert not channel.reader.is_alive() and result["native_exit"] == 2
+
+
+def test_ebpf_valid_rows_before_a_truncated_tail_are_delivered_and_fail_the_run(
+    tmp_path,
+):
+    """Valid rows, then an unterminated tail, then exit: the rows are delivered
+    once, and the truncation fails the run although both pipes closed."""
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel, Settings
+
+    rows = [{"type": "ready", "available": True, "exact": False, "coverage": "partial"},
+            {"type": "end", "complete": False, "coverage": "partial",
+             "output_drops": 0, "malformed": 0, "rejected_complete": True,
+             "failed": False}]  # fmt: skip
+    code = ("import json,sys;rows=json.loads(sys.argv[1]);"
+            "[print(json.dumps(r)) for r in rows];sys.stdout.write('{tail');"
+            "sys.stdout.flush();sys.exit(2)")  # fmt: skip
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, json.dumps(rows)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    channel = Channel(child, tmp_path, Settings(enabled=True, privileged_opt_in=True,
+                                                mode="tcp_tracepoints"))  # fmt: skip
+    child.wait(10)
+    wait_for(lambda: not channel.reader.is_alive())
+    delivered = channel.poll(None, 0.1)  # the rows and the error arrive together
+    assert [r["type"] for r in delivered] == ["ready", "end"]
+    with pytest.raises(ValueError, match="truncated"):
+        channel.poll(None, 0)
+    result = channel.stop(None)
+    assert result["clean"] is False and "truncated" in (result["error"] or "")
+
+
+def test_ebpf_an_acknowledgement_read_on_time_behind_a_full_queue_is_not_lost(
+    tmp_path, monkeypatch
+):
+    """The queue is full and the reader waits for room; the acknowledgement is
+    written at once, behind it, and handled long after its deadline: the
+    reader's marks carry their reads' times, so it is never declared lost."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "ACK_TIMEOUT_NS", 160_000_000)
+    monkeypatch.setattr(ebpf, "QUEUE_LINES", 5)
+    monkeypatch.setattr(ebpf, "POLL_LINES", 2)
+    go, done = tmp_path / "go", tmp_path / "done"
+    channel = _scripted(tmp_path, go=str(go), done=str(done), burst=100)
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        go.touch()
+        wait_for(done.exists)  # the burst fits the pipe and the queue
+        channel.admit(42, 7)
+        time.sleep(0.4)  # far past the deadline, with the queue still full
+        _settle(channel, until=lambda: channel.kernel.get(42) == 7)
+        assert channel.kernel.get(42) == 7 and not channel.ack_failures
+    finally:
+        channel.stop(None)
+
+
+def test_ebpf_a_missing_acknowledgement_expires_behind_a_steady_backlog(
+    tmp_path, monkeypatch
+):
+    """Rows keep arriving faster than one small batch per poll handles, so a
+    backlog stays; a missing acknowledgement still expires within a few
+    deadlines, the oldest caught-up mark held until it is passed."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "ACK_TIMEOUT_NS", 100_000_000)
+    monkeypatch.setattr(ebpf, "POLL_LINES", 4)
+    channel = _scripted(tmp_path, lose=[1], heartbeat_s=0.001, beat_rows=10)
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        channel.admit(42, 7)
+        began = time.monotonic()
+        backlogged = False
+        while not channel.ack_failures and time.monotonic() - began < 5:
+            channel.poll(None, 0)
+            backlogged |= bool(channel.reader.lines)
+            time.sleep(0.003)
+        assert backlogged and channel.ack_failures
+        assert channel.ack_failures[0]["reason"] == "no acknowledgement"
+        assert time.monotonic() - began < 1.0  # within ten deadlines
+    finally:
+        channel.stop(None)
+
+
+def test_ebpf_the_reader_queue_s_byte_bound_includes_the_incoming_line(
+    tmp_path, monkeypatch
+):
+    """With room for one row's bytes only, a second never joins the queue."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "QUEUE_BYTES", 600)
+    go, done = tmp_path / "go", tmp_path / "done"
+    channel = _scripted(tmp_path, go=str(go), done=str(done), burst=50)
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        go.touch()
+        time.sleep(0.3)
+        assert len(channel.reader.lines) == 1
+        assert channel.reader.queued_bytes <= 600
+        values = []
+        while len(values) < 50:
+            values += [r["value"] for r in channel.poll(None, 0.05)
+                       if r.get("type") == "loss"]  # fmt: skip
+            assert channel.reader.queued_bytes <= 600
+        assert values == list(range(50))
+    finally:
+        channel.stop(None)
+
+
+@pytest.mark.parametrize("backlog", [True, False])
+def test_the_observer_loop_skips_its_wait_only_while_rows_remain(backlog):
+    """With collector rows still queued, the loop runs its next pass at once
+    (sampling and stop checks in between); with none, it waits, its 100 ms
+    bound kept for the stop and owner-exit checks."""
+    import threading
+    from types import SimpleNamespace
+
+    from vllm.kv_profiling.endpoint_probes import runner
+
+    class Halt(Exception):
+        pass
+
+    passes = []
+
+    def service():
+        passes.append(time.monotonic())
+        if len(passes) == 6:
+            raise Halt
+
+    observer = runner.Observer.__new__(runner.Observer)
+    observer.config = ProbeConfig(interval_s=3600, slow_interval_s=3600)
+    observer.writer = SimpleNamespace(error=None)
+    observer.discovery, observer.endpoint, observer.gaps = None, "d", 0
+    observer.sample = lambda slow: None
+    observer.emit = lambda *a, **kw: None
+    observer.stop_event = threading.Event()
+    observer.ebpf = SimpleNamespace(reader=object(), wake=threading.Event(),
+                                    backlog=backlog, writer_blocked=False,
+                                    child=None)  # fmt: skip
+    observer.service_ebpf = service
+    observer.pidfd = os.open("/dev/null", os.O_RDONLY)
+    quiet = mock.patch.object(runner.select, "select", return_value=([], [], []))
+    with quiet, pytest.raises(Halt):  # the observer closes its pidfd itself
+        observer.run(stop_file="/nonexistent/stop",
+                     endpoint_complete_file="/nonexistent/done")  # fmt: skip
+    elapsed = passes[-1] - passes[0]
+    assert elapsed < 0.1 if backlog else elapsed >= 0.4
+
+
+def test_ebpf_a_burst_is_handed_to_the_capture_writer_only_as_it_has_room(tmp_path):
+    """A burst arriving during a stall, with a writer queue of eight rows: rows
+    are taken only as the writer can take them (a quarter of its queue left to
+    the other sources), the rest waits in the reader's queue, and every row is
+    saved, in order, none dropped."""
+    go, done = tmp_path / "go", tmp_path / "done"
+    channel = _scripted(tmp_path, go=str(go), done=str(done), burst=500)
+    writer = Writer(tmp_path / "writer", metadata(), ProbeConfig(queue_rows=8))
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        go.touch()
+        time.sleep(0.5)  # the main thread stalled: the burst is read meanwhile
+        values = []
+        deadline = time.monotonic() + 60
+        while len(values) < 500 and time.monotonic() < deadline:
+            for row in channel.poll(writer, 0.05):
+                if row.get("type") == "loss":
+                    values.append(row["value"])
+                now = time.monotonic_ns()
+                writer.put(event("endpoint_metrics", "ebpf", "d", now, now, row))
+        assert values == list(range(500)) and writer.dropped == 0
+    finally:
+        channel.stop(writer)
+        assert writer.close(True, "test", {}) is True
+    lines = (tmp_path / "writer/events.jsonl").read_text().splitlines()
+    observed = [json.loads(line).get("observation") or {} for line in lines]
+    saved = [o["value"] for o in observed if o.get("type") == "loss"]
+    assert saved[:500] == list(range(500))
+
+
+def test_ebpf_a_full_capture_writer_takes_no_rows_and_keeps_the_backlog(tmp_path):
+    from types import SimpleNamespace
+
+    go, done = tmp_path / "go", tmp_path / "done"
+    channel = _scripted(tmp_path, go=str(go), done=str(done), burst=20)
+    full = SimpleNamespace(room=lambda: 2, queue=SimpleNamespace(maxsize=8))
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        go.touch()
+        wait_for(lambda: len(channel.reader.lines) == 20)
+        assert channel.poll(full, 0) == []
+        assert channel.writer_blocked and channel.backlog
+        assert len(channel.reader.lines) == 20
+    finally:
+        channel.stop(None)
+
+
+def test_ebpf_pending_commands_expire_once_the_collector_s_output_ended(tmp_path):
+    """The collector exits on the first command, without a reply: once its
+    output ended and every row read was handled, no reply can come, so the
+    command is declared lost at once, not after its deadline."""
+    channel = _scripted(tmp_path, exit_on_command=True)
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        sent = time.monotonic()
+        channel.admit(42, 7)
+        while not channel.ack_failures and time.monotonic() - sent < 5:
+            channel.poll(None, 0.02)
+        assert channel.ack_failures[0]["reason"] == "no acknowledgement"
+        assert time.monotonic() - sent < 0.5  # well before the 1 s deadline
+    finally:
+        channel.stop(None)
+
+
+def test_ebpf_a_reader_paused_after_an_empty_wait_never_dates_a_mark_late(
+    tmp_path, monkeypatch
+):
+    """The reader is descheduled right after finding nothing to read; the
+    acknowledgement is written meanwhile, at once: a mark is dated before the
+    wait, so the reply is never declared missing."""
+    import selectors as real_selectors
+    import threading
+
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    pausing = threading.Event()
+
+    class Pausing(real_selectors.DefaultSelector):
+        def select(self, timeout=None):
+            ready = super().select(timeout)
+            if self.delay_next and ready:
+                self.delay_next = False
+                time.sleep(0.2)  # and descheduled again before the next read
+            if not ready and getattr(self, "armed", False):
+                Pausing.armed = False
+                pausing.set()
+                time.sleep(0.4)  # descheduled after an empty wait
+                self.delay_next = True
+            return ready
+
+        delay_next = False
+
+    monkeypatch.setattr(ebpf.selectors, "DefaultSelector", Pausing)
+    monkeypatch.setattr(ebpf, "ACK_TIMEOUT_NS", 160_000_000)
+    channel = _scripted(tmp_path)
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        Pausing.armed = True
+        assert pausing.wait(5)  # the reader is inside the pause: admit now
+        channel.admit(42, 7)
+        _settle(channel, until=lambda: channel.kernel.get(42) == 7)
+        assert channel.kernel.get(42) == 7 and not channel.ack_failures
+    finally:
+        channel.stop(None)
+
+
+def test_ebpf_a_missing_acknowledgement_expires_under_uninterrupted_full_reads(
+    tmp_path, monkeypatch
+):
+    """The collector writes faster than the reader reads, so every read fills
+    its buffer and none is ever short: marks still carry a finite stream
+    position, so the missing acknowledgement expires."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "ACK_TIMEOUT_NS", 30_000_000)
+    monkeypatch.setattr(ebpf, "READ_BYTES", 512)  # every read a full one
+    channel = _scripted(tmp_path, lose=[1], heartbeat_s=0.001, beat_rows=1000,
+                        chunked=True)  # fmt: skip
+    try:
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        channel.admit(42, 7)
+        began = time.monotonic()
+        while not channel.ack_failures and time.monotonic() - began < 10:
+            channel.poll(None, 0)
+        assert channel.ack_failures[0]["reason"] == "no acknowledgement"
+        assert time.monotonic() - began < 3
+    finally:
+        channel.stop(None)
+
+
+@pytest.mark.parametrize(
+    "bad, diagnostic",
+    [
+        ("oversized_tail", "unterminated"),
+        ("unknown_row", "unknown native row"),
+        ("rejected_without_cookie", "incomplete native rejected"),
+        ("array_type", "unknown native row"),
+    ],
+)
+def test_ebpf_valid_rows_before_malformed_output_are_kept_and_the_error_stands(
+    tmp_path, bad, diagnostic
+):
+    """Two valid rows, then malformed output in the same write (an oversized
+    unterminated tail, a complete row of an unknown type, a row missing a
+    field the channel reads, or a type that is no string), then a normal end:
+    both valid rows are delivered once, the diagnostic is raised once, and the
+    run is not clean."""
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel, Settings
+
+    good = [{"type": "ready", "available": True, "exact": False, "coverage": "partial"},
+            {"type": "resource", "cpu_s": 0}]  # fmt: skip
+    end = {"type": "end", "complete": False, "coverage": "partial", "output_drops": 0,
+           "malformed": 0, "rejected_complete": True, "failed": False}  # fmt: skip
+    malformed = {
+        "oversized_tail": "x" * 3000,  # no newline: the reader's framing check
+        "unknown_row": '{"type": "bogus"}',
+        "rejected_without_cookie": '{"type": "rejected", "count": 1, '
+        '"first_ns": 1, "last_ns": 1}',
+        "array_type": '{"type": ["loss"]}',
+    }[bad]
+    tail = malformed
+    if bad != "oversized_tail":
+        tail += "\n" + json.dumps(end)
+    code = ("import json,sys,time;good=json.loads(sys.argv[1]);"
+            "rows=''.join(json.dumps(r)+'\\n' for r in good);"
+            "tail=sys.argv[2];end='' if tail[0]=='x' else '\\n';"
+            "sys.stdout.write(rows+tail+end);"
+            "sys.stdout.flush();time.sleep(0.5)")  # fmt: skip
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, json.dumps(good), tail],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    channel = Channel(child, tmp_path, Settings(enabled=True, privileged_opt_in=True,
+                                                mode="tcp_tracepoints"))  # fmt: skip
+    delivered, raised = [], []
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not channel.reader.finished():
+        try:
+            delivered += channel.poll(None, 0.05)
+        except ValueError as error:
+            raised.append(str(error))
+    try:
+        delivered += channel.poll(None, 0)
+    except ValueError as error:
+        raised.append(str(error))
+    result = channel.stop(None)
+    assert [r["type"] for r in delivered][:2] == ["ready", "resource"]
+    assert sum(r["type"] == "resource" for r in delivered) == 1  # once
+    assert len(raised) == 1 and diagnostic in raised[0]
+    assert result["clean"] is False and diagnostic in result["error"]

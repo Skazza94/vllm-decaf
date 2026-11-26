@@ -131,6 +131,10 @@ class Writer:
         self.manifest["ready"] = True
         atomic_json(self.directory / "manifest.json", self.manifest)
 
+    def room(self) -> int:
+        """Rows the queue can take now (approximately: its thread drains it)."""
+        return max(0, self.queue.maxsize - self.queue.qsize())
+
     def put(self, row):
         validate(row)
         self.sequence += 1

@@ -1131,9 +1131,22 @@ each cookie over the collector's stdin, one command per cookie in flight:
 sequenced commands (`A`dmit a cookie under an admission, replacing any entry;
 `D`elete it only if still under that admission, so a stale delete never
 removes a newer one; `R`ead it back), each acknowledged with when it was
-applied. Replies are read as they come, apart from sampling, and a command is
-unacknowledged only once every readable reply has been read and its second
-has passed. An unacknowledged command, a failed update or delete, or an entry
+applied. The collector's output is read on a thread of its own, so discovery
+scans and sampling never pause it: the thread only reads, queueing complete
+rows in order (at most 16 MiB and 65,536 rows per collector) and writing the
+diagnostics to `native.stderr`. When the queue is full it stops reading, so the
+collector's queue and the ring absorb a backlog, and what they cannot is
+counted there as eBPF loss. The observer's main thread handles the queued rows
+in order, in batches of 2,048, so its other work still runs under load; every
+decision (acknowledgements, ownership, verification) stays on it. It takes no
+more rows than its capture writer can accept at that moment, leaving a quarter
+of the writer's queue to the other sources: a burst waits in the reader's queue
+until the writer has written what came before, and is never dropped by the
+writer. A command is unacknowledged only once the observer has handled every row
+the collector wrote before some time past its second (the reader takes the time,
+then the pipe's fill, so the stream position holding everything written by then
+is known even when every read is a full one): a reply waiting in the queue is
+never declared lost. An unacknowledged command, a failed update or delete, or an entry
 that could not be read makes the cookie's kernel state unknown from the
 command until a readback establishes it; the readback is followed by the
 command that still moves the entry to the decision (a retired cookie's stale
@@ -1230,7 +1243,11 @@ The observer runs the collector as `collector --arm <plan> <observe.bpf.o>`
 programs). The plan file names the observer process, its network namespace and
 the port lists; the ownership commands go over the collector's stdin, one per
 line (`A <seq> <cookie> <admission>`, `D <seq> <cookie> <admission>`,
-`R <seq> <cookie>`, and `stop`). Exit 2 has two meanings, told apart by the rows:
+`R <seq> <cookie>`, and `stop`). It reads commands only while its output queue has
+room for every acknowledgement they can produce, and its periodic counter report
+waits until all its rows fit (the counters are cumulative), so a slow reader of
+its output holds them back rather than failing one. Exit 2 has two meanings, told
+apart by the rows:
 a run that started (a `ready` row) and ended normally, its coverage partial as
 always, with its `end` row; and a refusal to start (an invalid plan, missing
 privilege or a dead parent, an object that does not open or load), with a
@@ -1264,7 +1281,15 @@ read losses, counter wraps, the collector's output drops) marks the capture
 `ebpf_degraded`, with the counts in `ebpf_event_loss`: it stands, but its events
 cannot certify agreement with other sources. A malformed row is no loss but a
 collector bug: the collector exits with an error (status 3), so the run is not
-clean and a required eBPF source fails; the count stays in its terminal record. Namespace,
+clean and a required eBPF source fails; the count stays in its terminal record.
+A row the observer cannot frame or decode is the same: the rows read before it
+are still handled, and the error stands to the end of the run, which is not
+clean. The
+capture writer's own rate is the ceiling for a sustained event rate: above it,
+the backlog fills the reader's queue, then the collector's and the ring, and the
+excess is counted as eBPF loss (the source degraded) rather than dropped by the
+writer, whose drops (`drop_probe_rows`) would leave the whole capture
+incomplete. Namespace,
 protocol, family and port exclusions, ownership rejections (counted apart) and global
 unknown exclusions are not loss.
 

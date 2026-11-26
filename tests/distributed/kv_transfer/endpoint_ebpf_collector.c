@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <pthread.h>
 #include <stdio.h>
 static int fixture_load(struct bpf_object *);
 static struct bpf_link *fixture_attach(const struct bpf_program *);
@@ -300,6 +301,92 @@ static char *run_with_input(struct bpf_object *obj, struct plan *p, const char *
   fclose(captured);
   return text;
 }
+/* A reader of stdout that starts late: what it read, once the pipe ends. */
+struct late_reader {
+  int fd;
+  unsigned int delay_us;
+  char *text;
+  size_t used;
+};
+static void *read_late(void *arg) {
+  struct late_reader *r = arg;
+  usleep(r->delay_us);
+  int flags = fcntl(r->fd, F_GETFL);
+  fcntl(r->fd, F_SETFL, flags & ~O_NONBLOCK);
+  size_t cap = 1 << 20;
+  r->text = malloc(cap);
+  ssize_t n;
+  while ((n = read(r->fd, r->text + r->used, cap - 1 - r->used)) > 0) r->used += n;
+  r->text[r->used] = 0;
+  return NULL;
+}
+/* Commands fed as the collector takes them (a pipe of any size). */
+struct feeder {
+  int fd;
+  unsigned int commands;
+};
+static void *feed(void *arg) {
+  struct feeder *f = arg;
+  char line[64];
+  /* the shortest command: one buffer holds the most, so the queue can come
+     within one slot of full */
+  for (unsigned int i = 1; i <= f->commands; i++) {
+    int n = snprintf(line, sizeof(line), "R 1 4\n");
+    assert(write(f->fd, line, n) == n);
+  }
+  assert(write(f->fd, "stop\n", 5) == 5);
+  close(f->fd);
+  return NULL;
+}
+static void test_commands_wait_for_output_room(struct bpf_object *obj, struct plan *p) {
+  /* More commands than the output queue holds, through 4 KiB pipes, while
+     nothing reads stdout for 1.4 s (past a periodic counter report): the
+     collector holds the commands back (backpressure on stdin) and defers the
+     report instead of failing, and once stdout is read every command is
+     acknowledged, the counters reported. */
+  reset();
+  enum { COMMANDS = 5000 };
+  int in[2], out[2];
+  assert(!pipe(in) && !pipe(out));
+  fcntl(in[1], 1031 /* F_SETPIPE_SZ */, 4096);
+  fcntl(out[1], 1031 /* F_SETPIPE_SZ */, 4096);
+  fcntl(out[1], F_SETFL, fcntl(out[1], F_GETFL) | O_NONBLOCK);
+  int saved_in = dup(0), saved_out = dup(1);
+  assert(dup2(in[0], 0) == 0 && dup2(out[1], 1) == 1);
+  close(in[0]);
+  close(out[1]);
+  struct late_reader reader = {.fd = out[0], .delay_us = 1400000};
+  struct feeder feeder = {.fd = in[1], .commands = COMMANDS};
+  pthread_t reading, feeding;
+  /* the pipe full, and output queued within ten slots of full: the periodic
+     report falls due while it has no room for its rows */
+  unsigned int piped = 0;
+  while (write(1, "{\"type\":\"pad\"}\n", 15) == 15) piped++;
+  for (unsigned int i = 0; i < KVP_QUEUE - 10; i++)
+    assert(!output(0, "{\"type\":\"pad\",\"i\":%u}", i));
+  assert(!pthread_create(&reading, NULL, read_late, &reader));
+  assert(!pthread_create(&feeding, NULL, feed, &feeder));
+  int rc = run(obj, p);
+  while (count && !flush()) usleep(1000);
+  assert(dup2(saved_out, 1) == 1 && dup2(saved_in, 0) == 0);
+  close(saved_out);
+  close(saved_in);
+  assert(!pthread_join(feeding, NULL) && !pthread_join(reading, NULL));
+  close(out[0]);
+  unsigned int acks = 0, reports = 0;
+  for (char *at = reader.text; (at = strstr(at, "\"op\":\"R\"")); at++) acks++;
+  for (char *at = reader.text; (at = strstr(at, "\"counter\":\"counter_wrap\""));
+       at++)
+    reports++;
+  unsigned int pads = 0;
+  for (char *at = reader.text; (at = strstr(at, "\"type\":\"pad\"")); at++) pads++;
+  assert(pads == piped + KVP_QUEUE - 10);
+  assert(rc == 2 && acks == COMMANDS && reports >= 2); /* a periodic and the final */
+  assert(strstr(reader.text, "\"failed\":false"));
+  free(reader.text);
+  puts("PASS: commands and a periodic report wait for output room: backpressure on "
+       "stdin through small pipes, a stall past a report, no failed acknowledgement");
+}
 static void test_ownership_commands(struct bpf_object *obj, struct plan *p) {
   /* Admit (with the cookie's rejections so far), a stale delete across a
      replacement, a real delete, readbacks, a failed delete, the terminal
@@ -480,6 +567,7 @@ int main(int argc, char **argv) {
       "PASS: exact pinned libbpf consumed 1024 events in <=256-record batches; "
       "256 events flushed and stop checked before shutdown drained the other 768");
   test_ownership_commands(obj, &p);
+  test_commands_wait_for_output_room(obj, &p);
   reset();
   struct kvp_event e = {.schema = 3,
                         .size = 256,
