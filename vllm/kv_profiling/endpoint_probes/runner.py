@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from . import netdev, rdma, tasks, tcp
+from . import netdev, rdma, tasks
 from .code import code_digest
 from .config import settings_dict
 from .exit_record import CAPTURE_FORMAT
@@ -23,7 +23,7 @@ from .health import (
     side_problems,
     validate_inventory,
 )
-from .identity import discover, ownership, placement, process_identity
+from .identity import discover, placement, process_identity
 from .netlink import ObservationError
 from .records import Writer, event
 
@@ -34,6 +34,8 @@ SPLITTABLE = (
     "qps",
     "disappeared",
     "ownership_unavailable",
+    "owners",
+    "holders",
     "snapshots",
     "threads",
     "irqs",
@@ -145,9 +147,6 @@ class Observer:
             raise ValueError("owner changed while opening pidfd")
         self.ebpf = None
         self.config, self.run_id, self.role = config, run_id, role
-        self.tcp_reader = (
-            tcp.SocketReader(config.tcp, config.max_sockets) if config.tcp else None
-        )
         self.input_dir, self.endpoint = input_dir, endpoint
         self.process_id = str(uuid4())
         self.stop_event = threading.Event()
@@ -167,6 +166,29 @@ class Observer:
         targets.setdefault(owner_pid, {
             "pid": owner_pid, "start_ticks": owner_start, "role": "owner"})  # fmt: skip
         self.thread_targets = list(targets.values())
+        # The endpoint's connector sockets, by identity: TCP sampling and eBPF
+        # select these, never an address.
+        self.discovery = self.tracker = self.last_scan = None
+        self.discovery_failures = 0
+        self.sampled_scan = None  # the scan whose sockets were last sampled
+        if config.tcp or config.ebpf.get("enabled"):
+            from .sockets import Discovery, Tracker
+
+            self.discovery = Discovery(
+                [
+                    {
+                        "pid": meta["pid"],
+                        "start_ticks": meta["start_ticks"],
+                        "role": meta["context"]["role"],
+                        "engine_id": meta["context"].get("engine_id"),
+                        "rank": meta["context"].get("rank"),
+                        "net_namespace": meta.get("net_namespace"),
+                        "pid_namespace": meta.get("pid_namespace"),
+                    }
+                    for meta in inventory
+                ]
+            )
+            self.tracker = Tracker()
         self.samples = self.gaps = 0
         self.previous = {}
         self.seen_identities = {}
@@ -211,7 +233,9 @@ class Observer:
                 "exact_read_to_flow": False,
                 "exact_read_to_qp": False,
                 "short_lived_flows": "may_be_unobserved",
-                "ownership": "optional_proc_snapshot",
+                # a socket is the connector's when one of its scheduler or worker
+                # processes held it across a scan (cookie identity)
+                "ownership": "cookie_verified_owner_fds",
                 "eBPF": False,
                 "eBPF_requested": bool(config.ebpf.get("enabled", False)),
                 "L2": False,
@@ -237,9 +261,17 @@ class Observer:
         self.writer.publish_ready()
 
     def emit(
-        self, scope, entity, begin, data, transport="unknown", kind="endpoint_metrics"
+        self,
+        scope,
+        entity,
+        begin,
+        data,
+        transport="unknown",
+        kind="endpoint_metrics",
+        end=None,
     ):
-        row = event(kind, scope, entity, begin, time.monotonic_ns(), data, transport)
+        end = time.monotonic_ns() if end is None else end
+        row = event(kind, scope, entity, begin, end, data, transport)
         if len(json.dumps(row, allow_nan=False)) <= ROW_BUDGET:
             return self.writer.put(row)
         # Over the writer's row limit: split the row's list items (all splittable
@@ -265,7 +297,7 @@ class Observer:
                 part[key] = values[begin_at:end_at]
                 part["slices"][key] = [first + begin_at, first + end_at, whole]
                 offset += len(values)
-            result = self.emit(scope, entity, begin, part, transport, kind)
+            result = self.emit(scope, entity, begin, part, transport, kind, end)
         return result
 
     def failure(self, source, error, begin):
@@ -344,47 +376,100 @@ class Observer:
         except (OSError, ValueError, ObservationError) as error:
             self.failure(source, error, begin)
 
-    def sample_tcp(self):
+    def discover(self):
+        """One discovery scan: its changes, and its failure if incomplete (which
+        suspends every admission until a complete scan confirms it again)."""
         begin = time.monotonic_ns()
-        try:
-            rows = self.tcp_reader.read()
-            owners, unavailable, _ = ownership(
-                self.input_dir,
-                self.run_id,
-                self.role,
-                self.metadata["net_namespace"],
-                self.metadata["affinity"],
+        scan = self.discovery.scan()
+        for change in self.tracker.apply(scan):
+            self.emit(
+                "socket_ownership",
+                str(change["cookie"]),
+                begin,
+                change,
+                kind="probe_status",
             )
-            now = {}
-            for row in rows:
-                identity = json.dumps(
-                    {
-                        key: row[key]
-                        for key in (
-                            "family",
-                            "local_ip",
-                            "local_port",
-                            "peer_ip",
-                            "peer_port",
-                            "cookie",
-                        )
+        status = {
+            "complete": scan.complete,
+            "reason": scan.reason,
+            "owned": len(self.tracker.active),
+            "dumped_sockets": scan.dumped,
+            "unreadable_owners": scan.unreadable,
+            # retired, not failures: confirmed exits (an orderly shutdown)
+            "exited_owners": scan.exited,
+            "mismatched_owners": scan.mismatched,
+            "families_unavailable": scan.families_unavailable,
+            "holder_read_failures": scan.holder_failures,
+            "holders_truncated": scan.holders_truncated,
+            "duration_ns": (scan.finished_ns or begin) - scan.started_ns,
+        }
+        self.emit("discovery", self.endpoint, begin, status, kind="probe_status")
+        # a live owner whose sockets cannot be verified (unreadable, or in other
+        # namespaces for now) is a coverage gap; a confirmed exit is not
+        if not scan.complete or scan.unreadable or scan.mismatched:
+            self.discovery_failures += 1
+            if self.config.tcp:
+                why = scan.reason or (
+                    "owners unreadable"
+                    if scan.unreadable
+                    else "owner identity mismatch"
+                )
+                self.failure("tcp", f"socket discovery: {why}", begin)
+        self.last_scan = scan
+
+    @staticmethod
+    def _narrowed(row, selectors) -> bool:
+        return all(
+            not selectors.get(key) or row[field] in selectors[key]
+            for key, field in (
+                ("local_ports", "local_port"),
+                ("peer_ports", "peer_port"),
+            )
+        ) and not {row["local_port"], row["peer_port"]}.intersection(
+            selectors.get("exclude_ports", [])
+        )
+
+    def sample_tcp(self):
+        """TCP_INFO of the owned sockets in force, from the latest complete
+        discovery scan's dump: each observation once, timed by that dump's own
+        interval (when the kernel read it), with its owners' recorder
+        identities and admission."""
+        begin = time.monotonic_ns()
+        scan = self.last_scan
+        if scan is None or not scan.complete:
+            self.failure("tcp", "no complete socket discovery to sample", begin)
+            return
+        if self.sampled_scan is scan:
+            return  # already recorded; the next scan brings new readings
+        self.sampled_scan = scan
+        acquired = (scan.dump_started_ns, scan.dump_finished_ns)
+        try:
+            now, sampled = {}, 0
+            for admission, record in sorted(
+                self.tracker.owned_rows(scan), key=lambda item: item[0]
+            ):
+                row = record["row"]
+                if not self._narrowed(row, self.config.tcp):
+                    continue
+                sampled += 1
+                if sampled > self.config.max_sockets:
+                    raise ObservationError("socket selector limit exceeded")
+                identity = f"{record['cookie']}"
+                # the owners themselves are in the admission's record (its
+                # socket_ownership row), which readers resolve by admission
+                row = {
+                    **row,
+                    "selection": {
+                        "by": "owned_socket",
+                        "cookie": record["cookie"],
+                        "admission": admission,
+                        "owner_roles": sorted({o["role"] for o in record["owners"]}),
+                        "owner_count": len(record["owner_pids"]),
+                        "frontend_colocated": record["frontend_colocated"],
+                        "shared": record["shared"],
+                        "loopback": record["loopback"],
                     },
-                    sort_keys=True,
-                )
-                if row["cookie"] is None:
-                    identity += f":unidentified_snapshot:{begin}"
-                row["owners"] = owners.get(row["inode"], [])
-                row["ownership_basis"] = "proc_inode_snapshot_not_cookie_verified"
-                row["ownership_unavailable"] = unavailable
-                row["association"] = (
-                    "process_owned" if row["owners"] else "configured_filter"
-                )
-                row["continuity"] = (
-                    "observed_cookie_and_tuple"
-                    if (row["cookie"] is not None and identity in self.previous)
-                    else "new_or_unknown"
-                )
-                row["reuse_between_polls_excluded"] = False
+                }
                 values = {
                     name: field["value"]
                     for name, field in row["fields"].items()
@@ -395,10 +480,16 @@ class Observer:
                     name in prior and value < prior[name]
                     for name, value in values.items()
                 )
-                if row["counter_reset"]:
-                    row["continuity"] = "counter_reset"
+                # one cookie is one socket: continuity is the cookie's
+                row["continuity"] = (
+                    "counter_reset"
+                    if row["counter_reset"]
+                    else "same_socket"
+                    if identity in self.previous
+                    else "new"
+                )
                 now[identity] = values
-                self.emit("socket", identity, begin, row, "tcp")
+                self.emit("socket", identity, acquired[0], row, "tcp", end=acquired[1])
                 if (
                     "tcp" in self.config.required
                     and row["tcp_info_expected"]
@@ -408,15 +499,15 @@ class Observer:
             self.emit(
                 "tcp_poll",
                 self.endpoint,
-                begin,
+                acquired[0],
                 {
-                    "matched_sockets": len(rows),
-                    "empty_snapshot": not rows,
+                    "matched_sockets": sampled,
+                    "empty_snapshot": not sampled,
                     "unobserved_short_lived_flows_possible": True,
                     "disappeared": sorted(set(self.previous) - set(now)),
-                    "ownership_unavailable": unavailable,
                 },
                 kind="probe_status",
+                end=acquired[1],
             )
             self.previous = now
         except (OSError, ValueError, KeyError, ObservationError) as error:
@@ -555,6 +646,11 @@ class Observer:
 
     def run(self, *, stop_file, endpoint_complete_file):
         next_tick = next_slow = time.monotonic()
+        cadence = None
+        if self.discovery is not None:
+            from .sockets import Cadence
+
+            cadence = Cadence(self.config.discovery_interval_s, next_tick)
         reason, controller = "owner_exit_timeout", False
         owner_exited_at = None
         try:
@@ -563,6 +659,18 @@ class Observer:
                 if self.writer.error:
                     reason = "writer_error"
                     break
+                if cadence is not None:
+                    due, missed = cadence.due(now)
+                    if missed:
+                        self.emit(
+                            "discovery",
+                            self.endpoint,
+                            time.monotonic_ns(),
+                            {"missed_periods": missed, "missed_total": cadence.missed},
+                            kind="probe_status",
+                        )
+                    if due:
+                        self.discover()
                 if now >= next_tick:
                     self.sample(now >= next_slow)
                     if now >= next_slow:
@@ -599,7 +707,10 @@ class Observer:
                         )
                     if time.monotonic() - owner_exited_at >= self.owner_exit_grace_s:
                         break
-                self.stop_event.wait(min(0.1, max(0, next_tick - time.monotonic())))
+                wake = next_tick if cadence is None else min(next_tick, cadence.next)
+                self.stop_event.wait(min(0.1, max(0, wake - time.monotonic())))
+            if self.discovery is not None:
+                self.discover()  # the last readings, sampled once below
             self.sample(True)
             if Path(endpoint_complete_file).exists():
                 notice = json.loads(netdev.read_small(endpoint_complete_file))

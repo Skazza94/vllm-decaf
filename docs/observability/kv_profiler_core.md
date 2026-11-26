@@ -738,12 +738,52 @@ callback. The native L1 ring ABI and transfer metrics are unchanged.
 
 Use `network_profiler.level: l3`, the same run UUID as L1, and a `probes` object.
 `probes` accepts `interval_s` (default 1), `slow_interval_s` (default 5), `tcp`,
-`interfaces`, `driver_statistics`, `rdma_ports`, `qp`, `threads`, `max_threads`
-(default 256), `interrupts` and `required`. TCP needs
-explicit `local_ips` and `peer_ips`; optional `local_ports`, `peer_ports` and
-`exclude_ports` narrow discovery. Both address families have kernel and user
-filters. Interface names and RDMA `{device, port}` entries are explicit endpoint
-allowlists. No intermediate-network observation or packet modification occurs.
+`discovery_interval_s` (default 0.25), `interfaces`, `driver_statistics`,
+`rdma_ports`, `qp`, `threads`, `max_threads` (default 256), `interrupts` and
+`required`. Interface names and RDMA `{device, port}` entries are explicit
+endpoint allowlists.
+
+TCP sampling (`tcp: {"owned_sockets": true}`; `tcp: {}` is off) takes the
+`TCP_INFO` of the sockets the endpoint's connector processes own, never an
+address: there are no address selectors, and optional `local_ports`,
+`peer_ports` and `exclude_ports` only narrow it. A socket is identified by its
+network namespace and kernel cookie, unique per boot and never reused, so a
+frontend reusing a worker's address tuple is another socket. Every
+`discovery_interval_s` (whenever TCP sampling or eBPF is enabled) the observer
+reads the fd tables of the inventory's processes that host a scheduler or
+worker, once per process whatever number of recorders it hosts, each recorder
+identity verified on its own against its frozen start ticks and namespaces;
+takes one bounded `sock_diag` dump of the namespace's TCP sockets (with
+`TCP_INFO`, which sampling reads from); and reads those fd tables again. A
+socket is owned when a process held it in both reads with the same verified
+scheduler or worker identity in both. A frontend process owns none, so its HTTP connections are never
+selected, even between the same addresses; a process that hosts a frontend as
+well as a scheduler or worker owns its frontend's sockets too, which cannot be
+told apart (`frontend_colocated` in the record). Other processes holding a
+socket are recorded, read last on a best-effort budget; a socket held by more
+than one process is `shared`. Owned sockets span every interface of the
+namespace, loopback included (`loopback` in each record): the selection is by
+owner, never by interface. Each change is a `socket_ownership` record:
+`admitted` (an admission ID, the socket, its owners' recorder identities and
+its other holders, as lists that split like any long row), `removed` (gone,
+its owner unreadable, in other namespaces, or exited), `reversioned` (its
+verified owner identities, in full, or its holders changed, so a new process
+generation under the same PID is another owner: a new admission with
+`supersedes` takes over, and the old record stays as it was for late events)
+and `suspended`. An admission never changes once
+recorded. A scan whose owner reads, dump or record construction did not finish
+within its bounds admits nothing and suspends every admission until a complete
+scan confirms it again (under a new admission). An owner confirmed to have
+exited (gone, a zombie, or another process under its PID), before or during an
+fd read, is retired, as in an orderly shutdown. One with its frozen start ticks
+but other namespaces, for now, holds nothing until they match again (it is not
+retired); it, one that is alive but unreadable, and an incomplete scan fail the
+TCP source. Every scan is bounded (/proc entries and processes, fds per
+process, all fds, sockets, and time) and reported (`discovery`), and discovery
+runs on a fixed schedule whose skipped periods are counted. Each sampled socket
+row is one observation, timed by its dump's own interval, and carries
+`selection`: its cookie, admission (whose record names the owners), owner roles
+and count. A socket that opens and closes between two scans is never observed. No intermediate-network observation or packet modification occurs.
 `required` names enabled sources (`tcp`, `netdev`, `driver`, `rdma`, `qp`,
 `threads`, `interrupts`). The kernel reports request sockets (`SYN_RECV`,
 timer 1) and time-wait sockets (`FIN_WAIT2` or `TIME_WAIT` after close, timer 3)
@@ -801,18 +841,15 @@ For example, the probe settings for a TCP endpoint might be:
 {
   "interval_s": 1,
   "slow_interval_s": 5,
-  "tcp": {
-    "local_ips": ["192.0.2.1"],
-    "peer_ips": ["192.0.2.2"],
-    "exclude_ports": [5559, 6559]
-  },
+  "tcp": {"owned_sockets": true},
   "interfaces": ["eth0"],
   "required": ["tcp", "netdev"]
 }
 ```
 
-Replace the documentation addresses, interface and exclusions with the actual
-endpoint configuration. An IP match alone can include control traffic.
+Replace the interface with the actual endpoint's. The owned sockets are all of
+the scheduler's and workers': the KV transport, its side channels and, on a
+Mooncake prefill engine's TP0 worker, its bootstrap server and clock.
 
 ### Deployment and lifecycle
 

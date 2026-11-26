@@ -182,10 +182,11 @@ Requirements of the observer:
 - **Interrupts.** The overlay measures the pod's `eth0`, a virtual interface
   (`irq_policy: virtual_not_applicable`). For a physical interface (a dedicated
   KV network), verify its interrupt placement and set `operator_verified`.
-- **TCP sockets** are not sampled by default: the TCP source needs the
-  endpoints' addresses, which a pod network assigns at runtime. With fixed
-  addresses (a dedicated KV network), add `tcp` with `local_ips` and `peer_ips`
-  to the observer's probes.
+- **TCP sockets** are not sampled by default. Add `"tcp": {"owned_sockets":
+  true}` to `observer-<side>.json`'s probes to sample the sockets vLLM's
+  scheduler and workers own, found at runtime: no address is configured, and
+  the frontend's HTTP connections are never included (unless the frontend runs
+  in the same process as a scheduler or worker, which the records say).
 
 ### eBPF events (opt-in)
 

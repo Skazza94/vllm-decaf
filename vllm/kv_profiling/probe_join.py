@@ -8,6 +8,38 @@ from .endpoint_probes.health import inspect_trace
 from .perfetto import _clock_aliases, _domain, _load
 
 
+def _admitted_owners(samples) -> dict:
+    """Each admission's owners, from the capture's ``socket_ownership``
+    admitted records, a record split over several rows reassembled from its
+    slices; an admission whose slices are incomplete is left out (its owners
+    unavailable)."""
+    parts = {}
+    for row in samples:
+        observation = row.get("observation") or {}
+        if row.get("scope") != "socket_ownership" or observation.get("change") != (
+            "admitted"
+        ):
+            continue
+        owners = observation.get("owners") or []
+        start, _, total = (observation.get("slices") or {}).get(
+            "owners", (0, len(owners), len(owners))
+        )
+        entry = parts.setdefault(observation.get("admission"), [total, {}])
+        for offset, owner in enumerate(owners):
+            entry[1][start + offset] = owner
+    return {
+        admission: [items[index] for index in range(total)]
+        for admission, (total, items) in parts.items()
+        if len(items) == total and all(index in items for index in range(total))
+    }
+
+
+def _owners(flow, admitted) -> list:
+    """A sampled flow's owners: its admission's, or those it carries."""
+    admission = (flow.get("selection") or {}).get("admission")
+    return admitted.get(admission) or flow.get("owners") or []
+
+
 def _with_tcp_events(samples):
     """Offer tuple/cookie inventory candidates, never event-time ownership proof."""
     result = list(samples)
@@ -44,6 +76,7 @@ def _with_tcp_events(samples):
                         "tcp": {
                             **tcp,
                             "owners": data.get("owners", []),
+                            "selection": data.get("selection"),
                             "candidate_owner_basis": "tuple_cookie_inventory"
                             if cookie and tcp.get("cookie")
                             else "tuple_inventory_only",
@@ -115,11 +148,12 @@ def candidates(core_paths, probe_paths, group=None):
                     for problem in probe_health[observed["process_id"]]["problems"]
                 )
                 same = _domain(meta) == _domain(observed) and all(_domain(meta))
+                admitted = _admitted_owners(samples)
                 for sample in _with_tcp_events(samples):
                     if sample.get("scope") != "socket":
                         continue
                     flow = sample["transport"]["tcp"]
-                    owners = flow.get("owners", [])
+                    owners = _owners(flow, admitted)
                     if not any(
                         owner.get("engine_id") == engine
                         and owner.get("rank") == rank

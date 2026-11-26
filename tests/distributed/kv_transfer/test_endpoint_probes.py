@@ -20,6 +20,7 @@ import sysconfig
 import time
 from dataclasses import asdict
 from pathlib import Path
+from unittest import mock
 from uuid import uuid4
 
 import pytest
@@ -49,10 +50,26 @@ def wait_for(predicate, timeout=5):
         time.sleep(0.005)
 
 
+def _me(role="worker", pid=None, **identity):
+    """An owner as the observer builds it from a recorder's metadata."""
+    pid = pid or os.getpid()
+    return {**process_identity(pid), "role": role, **identity}
+
+
+def _owned_by_inode(scan):
+    return {record["inode"]: record for record in scan.owned.values()}
+
+
 @pytest.mark.parametrize(
     "family,address", [(socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")]
 )
-def test_real_tcp_dump_is_filtered_and_reports_cookie_and_bytes(family, address):
+def test_discovery_reports_an_owned_socket_with_its_cookie_and_tcp_info(
+    family, address
+):
+    """The dump that decides ownership carries each socket's cookie and
+    TCP_INFO, which the TCP source samples."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery
+
     with socket.socket(family) as listener, socket.socket(family) as client:
         listener.bind((address, 0))
         listener.listen()
@@ -61,25 +78,206 @@ def test_real_tcp_dump_is_filtered_and_reports_cookie_and_bytes(family, address)
         with server:
             client.sendall(b"payload")
             assert server.recv(7) == b"payload"
-            selectors = {
-                "local_ips": [address],
-                "peer_ips": [address],
-                "local_ports": [client.getsockname()[1]],
-                "peer_ports": [listener.getsockname()[1]],
-            }
-            rows = tcp.sockets(selectors)
-            assert len(rows) == 1
-            row = rows[0]
-            assert row["cookie"] is not None
-            assert row["inode"] > 0
-            assert row["tcp_info_length"] >= 104
-            assert row["fields"]["bytes_acked"]["value"] >= 1
-            assert row["fields"]["rtt_us"]["unit"] == "us"
-            assert row["send_queue_bytes"] >= 0
-            assert (
-                tcp.sockets({**selectors, "exclude_ports": selectors["peer_ports"]})
-                == []
-            )
+            scan = Discovery([_me()]).scan()
+            client_inode = os.fstat(client.fileno()).st_ino
+            listener_inode = os.fstat(listener.fileno()).st_ino
+    assert scan.complete, scan.reason
+    owned = _owned_by_inode(scan)
+    record = owned[client_inode]
+    assert record["cookie"] > 0 and record["loopback"] and not record["listening"]
+    assert record["owners"][0]["pid"] == os.getpid()
+    row = record["row"]
+    assert row["tcp_info_length"] >= 104
+    assert row["fields"]["bytes_acked"]["value"] >= 1
+    assert row["fields"]["rtt_us"]["unit"] == "us"
+    assert owned[listener_inode]["listening"]
+
+
+_HOLDER = """
+import socket, sys, time
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+print(__import__("os").fstat(s.fileno()).st_ino, flush=True)
+time.sleep(30)
+"""
+
+
+def test_a_frontend_socket_on_the_same_address_pair_is_never_owned():
+    """A worker and a frontend each connect to one listener over the same
+    addresses: only the worker's socket is owned (frontends own none), and a
+    socket the observer's own process holds is a recorded holder only."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        worker, frontend = (
+            subprocess.Popen(
+                [sys.executable, "-c", _HOLDER, str(port)],
+                stdout=subprocess.PIPE,
+                text=True,
+            )  # fmt: skip
+            for _ in range(2)
+        )
+        try:
+            inodes = {p: int(p.stdout.readline()) for p in (worker, frontend)}
+            accepted = [listener.accept()[0] for _ in range(2)]
+            scan = Discovery([_me("worker", worker.pid),
+                              _me("frontend", frontend.pid)]).scan()  # fmt: skip
+            for sock in accepted:
+                sock.close()
+        finally:
+            for p in (worker, frontend):
+                p.kill()
+                p.wait()
+    assert scan.complete, scan.reason
+    owned = _owned_by_inode(scan)
+    assert set(owned) == {inodes[worker]}
+    record = owned[inodes[worker]]
+    assert [o["role"] for o in record["owners"]] == ["worker"]
+    assert record["peer_port"] == port and not record["shared"]
+
+
+def test_a_listener_child_is_owned_only_once_accepted():
+    """A connection to a worker's listening port is not the worker's until
+    accept() puts it in its fd table; the listener itself is."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery
+
+    with socket.socket() as listener, socket.socket() as client:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        discovery = Discovery([_me()])
+        client_inode = os.fstat(client.fileno()).st_ino
+        # the client is the test's too: drop it from what counts
+        client.connect(listener.getsockname())
+        before = discovery.scan()
+        server, _ = listener.accept()
+        with server:
+            after = discovery.scan()
+            server_inode = os.fstat(server.fileno()).st_ino
+    pending = [
+        r
+        for r in before.owned.values()
+        if r["local_port"] == port and not r["listening"]
+    ]
+    assert pending == []
+    assert server_inode in _owned_by_inode(after)
+    assert client_inode in _owned_by_inode(after)
+
+
+def test_empty_discovery_owns_nothing():
+    """An owner without sockets, or no scheduler or worker at all: an empty,
+    complete scan (it never falls back to every socket)."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery, Tracker
+
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        for owners in ([_me("worker", sleeper.pid)], [_me("frontend")], []):
+            scan = Discovery(owners).scan()
+            assert scan.complete and scan.owned == {}, owners
+            tracker = Tracker()
+            assert tracker.apply(scan) == [] and tracker.active == {}
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+def _scan(owned, complete=True, unreadable=None, reason=None):
+    from vllm.kv_profiling.endpoint_probes.sockets import Scan
+
+    scan = Scan(time.monotonic_ns())
+    scan.complete, scan.reason = complete, reason
+    scan.unreadable = unreadable or {}
+    scan.finished_ns = time.monotonic_ns()
+
+    def record(cookie, owners):
+        pids, holders = owners if isinstance(owners, tuple) else (owners, [])
+        return {"cookie": cookie, "inode": cookie, "owner_pids": sorted(pids),
+                "owners": [{"pid": pid, "start_ticks": 1, "role": "worker"}
+                           for pid in pids],
+                "holders": [{"pid": h, "start_ticks": 1} for h in holders],
+                "shared": len(pids) > 1 or bool(holders), "row": {},
+                "frontend_colocated": False, "loopback": True}  # fmt: skip
+
+    scan.owned = {cookie: record(cookie, owners) for cookie, owners in owned.items()}
+    return scan
+
+
+def test_the_tracker_admits_removes_suspends_and_keeps_every_admission():
+    """Admissions are immutable: a change of owning processes or observed
+    holders is a new admission superseding the old, whose record stays as it
+    was for late events."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Tracker
+
+    tracker = Tracker()
+
+    def kinds(changes):
+        return [(c["change"], c["cookie"]) for c in changes]
+
+    assert kinds(tracker.apply(_scan({10: [1], 11: [1, 2]}))) == [
+        ("admitted", 10), ("admitted", 11)]  # fmt: skip
+    first = dict(tracker.active)
+    # owner 1 unreadable: 10 is removed with that reason; 11 is kept, owner 2
+    # still holding it, under a new admission
+    changes = tracker.apply(_scan({11: [2]}, unreadable={1: "EACCES"}))
+    assert kinds(changes) == [("removed", 10), ("reversioned", 11), ("admitted", 11)]
+    assert changes[0]["reason"] == "owner unreadable"
+    assert changes[2]["supersedes"] == first[11]
+    assert tracker.admissions[first[11]]["owner_pids"] == [1, 2]  # as admitted
+    second = tracker.active[11]
+    assert tracker.admissions[second]["owner_pids"] == [2]
+    # a newly observed outside holder: another new admission
+    changes = tracker.apply(_scan({11: ([2], [99])}))
+    assert kinds(changes) == [("reversioned", 11), ("admitted", 11)]
+    assert tracker.admissions[second]["holders"] == []
+    # an unchanged scan changes nothing
+    assert tracker.apply(_scan({11: ([2], [99])})) == []
+    # an interrupted dump suspends every admission at once
+    changes = tracker.apply(_scan({}, complete=False, reason="netlink deadline"))
+    assert kinds(changes) == [("suspended", 11)] and tracker.active == {}
+    # confirmed again: a new admission; the old ones stay resolvable
+    changes = tracker.apply(_scan({11: [2]}))
+    assert kinds(changes) == [("admitted", 11)]
+    assert tracker.active[11] not in (first[11], second)
+    assert {first[11], second} <= set(tracker.admissions)
+
+
+def test_an_unreadable_owner_and_an_interrupted_dump_admit_nothing(monkeypatch):
+    from vllm.kv_profiling.endpoint_probes import sockets
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        stale = {**_me(), "start_ticks": _me()["start_ticks"] - 1}
+        scan = sockets.Discovery([stale]).scan()
+        assert scan.complete and scan.owned == {}
+        assert os.getpid() in scan.exited  # another process under its PID
+
+        def interrupted(budget, unavailable):
+            raise ObservationError("netlink deadline")
+
+        monkeypatch.setattr(sockets, "_dump", interrupted)
+        scan = sockets.Discovery([_me()]).scan()
+    assert not scan.complete and "netlink deadline" in scan.reason
+    assert scan.owned == {}
+
+
+def test_discovery_is_bounded_as_a_whole_and_per_process():
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery, Limits
+
+    with socket.socket(), socket.socket():
+        for name, limits in (
+            ("per-process", Limits(fds_per_process=1)),
+            ("total", Limits(total_fds=1)),
+            ("deadline", Limits(deadline_s=0)),
+        ):
+            scan = Discovery([_me()], limits).scan()
+            assert not scan.complete and scan.reason, name
+            assert scan.owned == {}, name
+        # other holders are best effort: their bound truncates them only
+        scan = Discovery([_me()], Limits(processes=0)).scan()
+        assert scan.complete and scan.holders_truncated == "discovery bound"
 
 
 @pytest.mark.parametrize(
@@ -114,6 +312,10 @@ def test_short_tcp_info_and_rate_sentinel_remain_explicit():
         {"interval_s": 0},
         {"queue_rows": 513},
         {"tcp": {"local_ips": ["127.0.0.1"]}},
+        {"tcp": {"owned_sockets": True, "peer_ips": ["127.0.0.1"]}},
+        {"tcp": {"local_ports": [1]}},
+        {"tcp": {"owned_sockets": "yes"}},
+        {"discovery_interval_s": 0.01},
         {"interfaces": ["../net"]},
         {"required": ["tcp"]},
         {"qp": True},
@@ -232,7 +434,7 @@ def start_owner(cpu):
 
 
 def start_recorded_endpoint(
-    tmp_path, cpu, *, overlap_cpu=None, close_delay=0, run_id=None
+    tmp_path, cpu, *, overlap_cpu=None, close_delay=0, run_id=None, connect=None
 ):
     directory = tmp_path / "endpoint"
     run_id = run_id or str(uuid4())
@@ -251,6 +453,8 @@ def start_recorded_endpoint(
     ]
     if overlap_cpu is not None:
         command += ["--overlap-cpu", str(overlap_cpu)]
+    if connect is not None:
+        command += ["--connect", str(connect)]
     log = (tmp_path / "endpoint.log").open("w")
     process = subprocess.Popen(command, stdout=log, stderr=log)
     try:
@@ -395,7 +599,7 @@ def test_synthetic_read_windows_have_only_qualified_flow_candidates(
 ):
     """Real recorder and sockets, not evidence of a native NIXL handle/FD map."""
     from tests.distributed.kv_transfer.test_profiler_core import fields
-    from vllm.kv_profiling.endpoint_probes.identity import ownership
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery
 
     run_id = str(uuid4())
     core_dir = tmp_path / "core"
@@ -423,32 +627,26 @@ def test_synthetic_read_windows_have_only_qualified_flow_candidates(
     )
     core.record(*fields(EventKind.TRANSFER_BIND, handle=7, request="request"))
     core.record(*fields(EventKind.POST_RETURN, handle=7))
-    for index in range(flow_count):
+    for _ in range(flow_count):
         with socket.socket() as listener, socket.socket() as client:
             listener.bind(("127.0.0.1", 0))
             listener.listen()
             client.connect(listener.getsockname())
             server, _ = listener.accept()
             with server:
-                rows = tcp.sockets(
-                    {
-                        "local_ips": ["127.0.0.1"],
-                        "peer_ips": ["127.0.0.1"],
-                        "local_ports": [client.getsockname()[1]],
-                    }
-                )
-                owners, unavailable, _ = ownership(
-                    core_dir, run_id, "decode", os.readlink("/proc/self/ns/net")
-                )
-                assert not unavailable
-                assert owners[rows[0]["inode"]][0]["engine_id"] == "d"
-                row = {**rows[0], "owners": owners[rows[0]["inode"]]}
-                now = time.monotonic_ns()
-                writer.put(
-                    event(
-                        "endpoint_metrics", "socket", str(index), now, now, row, "tcp"
-                    )
-                )
+                # the real sampler's rows, as the observer records them
+                client_inode = os.fstat(client.fileno()).st_ino
+                discovery = Discovery([_me(engine_id="d", rank=0)])
+                scan = discovery.scan()
+                assert scan.complete, scan.reason
+                scan.owned = {
+                    cookie: record
+                    for cookie, record in scan.owned.items()
+                    if record["inode"] == client_inode
+                }
+                _sample_once(writer, scan)
+                row = next(iter(scan.owned.values()))["row"]
+                now = scan.dump_finished_ns
                 if rare_event:
                     native = {
                         **tcp_event_row(),
@@ -518,38 +716,16 @@ def test_synthetic_read_windows_have_only_qualified_flow_candidates(
         assert projected[0]["exact"] is False
 
 
-def test_worker_pid_generation_is_not_inferred_from_a_reused_pid(tmp_path):
-    from vllm.kv_profiling.endpoint_probes.identity import ownership
+def test_an_owner_pid_generation_is_not_inferred_from_a_reused_pid():
+    """An owner frozen with another start time (a reused PID) owns nothing."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery
 
-    run_id = str(uuid4())
-    core = ProcessRecorder(
-        NetworkProfilerConfig(
-            level="l3",
-            run_id=run_id,
-            output_dir=str(tmp_path),
-            ring_records=64,
-            context={
-                "role": "worker",
-                "engine_id": "d",
-                "rank": 0,
-                "kv_role": "kv_consumer",
-            },
-        )
-    )
-    assert core.wait_ready()
-    assert core.close().complete
-    path = core.output_dir / "events.jsonl"
-    rows = path.read_text().splitlines()
-    old = json.loads(rows[0])
-    old["start_ticks"] -= 1
-    rows[0] = json.dumps(old)
-    path.write_text("\n".join(rows) + "\n")
-    owners, unavailable, _ = ownership(
-        tmp_path, run_id, "decode", os.readlink("/proc/self/ns/net")
-    )
-    assert not owners
-    assert len(unavailable) == 1
-    assert "generation/namespace mismatch" in unavailable[0]["error"]
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        scan = Discovery([{**_me(), "start_ticks": _me()["start_ticks"] + 1}]).scan()
+    assert scan.complete and scan.owned == {}
+    assert "not the scheduler or worker it was frozen as" in scan.exited[os.getpid()]
 
 
 def test_uapi_layout_matches_real_headers(tmp_path):
@@ -835,13 +1011,22 @@ def test_candidate_uniqueness_is_qualified_when_either_stream_is_partial(
         {"enabled": False, "artifacts": "/unused"},
         {"enabled": True, "mode": "tcp_tracepoints", "local_ips": ["10.0.0.300"]},
         {"enabled": True, "mode": "tcp_tracepoints", "peer_ips": "10.0.0.1"},
-        {"enabled": True, "mode": "tcp_tracepoints",
-         "peer_ips": [f"10.0.0.{i}" for i in range(9)]},
-        {"enabled": True, "mode": "tcp_tracepoints",
-         "local_ips": ["10.0.0.1", "::ffff:10.0.0.1"]},
+        {
+            "enabled": True,
+            "mode": "tcp_tracepoints",
+            "peer_ips": [f"10.0.0.{i}" for i in range(9)],
+        },
+        {
+            "enabled": True,
+            "mode": "tcp_tracepoints",
+            "local_ips": ["10.0.0.1", "::ffff:10.0.0.1"],
+        },
         {"enabled": True, "mode": "tcp_tracepoints", "peer_ips": ["fe80::1%eth0"]},
-        {"enabled": True, "mode": "tcp_tracepoints",
-         "peer_ips": ["::ffff:10.0.0.1%eth0"]},
+        {
+            "enabled": True,
+            "mode": "tcp_tracepoints",
+            "peer_ips": ["::ffff:10.0.0.1%eth0"],
+        },
     ],
 )
 def test_ebpf_invalid_options_are_refused_before_start(value):
@@ -1615,9 +1800,7 @@ def test_interrupt_probe_reads_only_the_endpoint_nics_and_bounds_rows(tmp_path):
         "  31:          0          4          0   PCI-MSI dev0-comp\n"
         " NMI:          0          0          0   Non-maskable interrupts\n"
     )
-    data = tasks.nic_interrupts(
-        ["nic0", "veth0"], ["dev0"], proc=proc, sys=sys_root
-    )
+    data = tasks.nic_interrupts(["nic0", "veth0"], ["dev0"], proc=proc, sys=sys_root)
     assert [(i["irq"], i["owners"], i["per_cpu"]) for i in data["irqs"]] == [
         (30, ["interface:nic0"], {"2": 90, "0": 1}),
         (31, ["rdma_device:dev0"], {"1": 4}),
@@ -1952,7 +2135,6 @@ def test_missing_interrupt_coverage_fails_a_required_source(tmp_path):
                 if r["kind"] == "probe_status"] == [False]  # fmt: skip
 
 
-
 def _probe_rows(data, source, entity, config):
     """One observation through the observer's emit and failure paths, checked
     against the real writer's validation and row limit."""
@@ -2080,7 +2262,6 @@ def test_a_process_that_exits_while_its_tasks_are_listed_is_recorded_as_exited(
             child.wait()
 
 
-
 def test_a_shared_pci_function_splits_into_rows_the_writer_keeps(tmp_path):
     """Eight interfaces and an RDMA device sharing 256 vectors, eight visible on
     32 CPUs: rows over the writer's limit are split on their largest list, each
@@ -2192,7 +2373,6 @@ def test_a_masked_proc_interrupts_reads_the_kernel_irq_sysfs_counts(tmp_path):
         tasks.net_softirqs(proc=proc)
 
 
-
 def test_sysfs_interrupt_counts_follow_the_possible_cpus_and_complete_rows(tmp_path):
     """Per-IRQ sysfs counts are one per possible CPU, in that order: with
     possible CPUs 0,3-4 they map as the /proc row does; a row with another
@@ -2233,7 +2413,6 @@ def test_sysfs_interrupt_counts_follow_the_possible_cpus_and_complete_rows(tmp_p
     assert data["cpu_count"] == 3 and data["missing_count"] == 2
 
 
-
 def test_a_possible_cpu_list_or_counter_that_is_not_exact_never_moves_counts(
     tmp_path,
 ):
@@ -2270,16 +2449,51 @@ def test_a_possible_cpu_list_or_counter_that_is_not_exact_never_moves_counts(
     assert data["irqs"][1]["name"] == "nic0-�" and data["unreadable_irqs"] == []
 
 
+def _sampler(writer, required=()):
+    """An observer reduced to its TCP sampling, writing to ``writer``."""
+    from vllm.kv_profiling.endpoint_probes.runner import Observer
+    from vllm.kv_profiling.endpoint_probes.sockets import Tracker
+
+    observer = Observer.__new__(Observer)
+    observer.config = ProbeConfig(tcp={"owned_sockets": True}, required=list(required))
+    observer.tracker, observer.sampled_scan, observer.previous = Tracker(), None, {}
+    observer.failed_required, observer.endpoint, observer.writer = 0, "d", writer
+    return observer
+
+
+def _sample_once(writer, scan):
+    """Record ``scan`` as the observer does: its admissions (which name the
+    owners), then its TCP sample."""
+    observer = _sampler(writer)
+    for change in observer.tracker.apply(scan):
+        observer.emit("socket_ownership", str(change["cookie"]), scan.started_ns,
+                      change, kind="probe_status")  # fmt: skip
+    observer.last_scan = scan
+    observer.sample_tcp()
+    return observer
 
 
 def _tcp_required_failures(tmp_path, rows):
+    """Sample ``rows`` as discovery would: only full records with an inode
+    can be owned; the compact ones never are."""
     from vllm.kv_profiling.endpoint_probes.runner import Observer
+    from vllm.kv_profiling.endpoint_probes.sockets import Scan, Tracker, cookie_of
 
     observer = Observer.__new__(Observer)
-    observer.config = ProbeConfig(tcp={"local_ips": ["127.0.0.1"],
-                                       "peer_ips": ["127.0.0.1"]},
-                                  required=["tcp"])  # fmt: skip
-    observer.tcp_reader = type("Reader", (), {"read": lambda self: rows})()
+    observer.config = ProbeConfig(tcp={"owned_sockets": True}, required=["tcp"])
+    scan = Scan(time.monotonic_ns())
+    scan.complete, scan.finished_ns = True, time.monotonic_ns()
+    for row in rows:
+        if row["record"] == "full" and row["inode"]:
+            scan.owned[cookie_of(row)] = {
+                "cookie": cookie_of(row), "row": row, "shared": False,
+                "loopback": True, "owner_pids": [1], "holders": [],
+                "frontend_colocated": False,
+                "owners": [{"pid": 1, "start_ticks": 1, "role": "worker"}],
+            }  # fmt: skip
+    observer.tracker = Tracker()
+    observer.tracker.apply(scan)
+    observer.last_scan, observer.sampled_scan = scan, None
     observer.input_dir, observer.run_id, observer.role = tmp_path, str(uuid4()), "d"
     observer.metadata = {"net_namespace": os.readlink("/proc/self/ns/net"),
                          "affinity": []}  # fmt: skip
@@ -2295,12 +2509,22 @@ def test_the_kernels_compact_socket_records_are_not_required_failures(tmp_path):
     TCP_INFO: real ones are read here, and none fails a required TCP source;
     a full socket (FIN_WAIT2 while open) carries TCP_INFO and still fails
     the source when it lacks it."""
-    loopback = {"local_ips": ["127.0.0.1"], "peer_ips": ["127.0.0.1"]}
+    from vllm.kv_profiling.endpoint_probes.sockets import Budget, Limits, _dump
+
+    loopback = {}
+
+    def dumped(selectors):
+        return [
+            row
+            for row in _dump(Budget(Limits()), [])
+            if row["local_ip"] == "127.0.0.1"
+            and all(row[key[:-1]] in values for key, values in selectors.items())
+        ]
 
     def only(selectors, state, **expect):
-        wait_for(lambda: [(r["state"], r["record"]) for r in tcp.sockets(selectors)]
+        wait_for(lambda: [(r["state"], r["record"]) for r in dumped(selectors)]
                  == [(state, expect["record"])])  # fmt: skip
-        (row,) = tcp.sockets(selectors)
+        (row,) = dumped(selectors)
         assert {k: row[k] for k in expect} == expect
         return row
 
@@ -2414,11 +2638,15 @@ def _collector_code(ready_after_s, end_row, marker=None):
         lines.append(f"time.sleep({ready_after_s})")
         if marker is not None:
             lines.append(f"pathlib.Path({str(marker)!r}).touch()")
-        lines.append("print(json.dumps({'type':'ready','available':True,"
-                     "'exact':False,'coverage':'partial'}),flush=True)")
-    lines += ["sys.stdin.readline()",
-              f"print({json.dumps(json.dumps(end_row))},flush=True)",
-              "sys.exit(2)"]
+        lines.append(
+            "print(json.dumps({'type':'ready','available':True,"
+            "'exact':False,'coverage':'partial'}),flush=True)"
+        )
+    lines += [
+        "sys.stdin.readline()",
+        f"print({json.dumps(json.dumps(end_row))},flush=True)",
+        "sys.exit(2)",
+    ]
     return ";".join(lines)
 
 
@@ -2470,8 +2698,7 @@ def test_ebpf_the_capture_is_ready_only_after_the_collector_answers(
             for manifest in (tmp_path / "out").glob("*/*/manifest.json"):
                 with contextlib.suppress(ValueError):
                     ready = json.loads(manifest.read_text()).get("ready")
-                    seen.append((ready, answered.exists(),
-                                 time.monotonic() - started))
+                    seen.append((ready, answered.exists(), time.monotonic() - started))
             time.sleep(0.02)
         thread.join()
         observer = built[0]
@@ -2488,9 +2715,11 @@ def test_ebpf_the_capture_is_ready_only_after_the_collector_answers(
             assert observer.ebpf.status.get("available") is True
         (tmp_path / "stop").touch()
         (tmp_path / "children").write_text(
-            json.dumps({"run_id": run, "endpoint": "d", "children_closed": True}))
-        complete = observer.run(stop_file=tmp_path / "stop",
-                                endpoint_complete_file=tmp_path / "children")
+            json.dumps({"run_id": run, "endpoint": "d", "children_closed": True})
+        )
+        complete = observer.run(
+            stop_file=tmp_path / "stop", endpoint_complete_file=tmp_path / "children"
+        )
         stats = json.loads(manifest.read_text())["end"]["stats"]
         assert complete is on_time
         assert (stats["required_source_failures"] > 0) is (not on_time)
@@ -2505,8 +2734,14 @@ def test_ebpf_the_capture_is_ready_only_after_the_collector_answers(
     [
         ([("endpoint_namespace", "scoped_ring_drop", 2)], 0, True),
         ([], 3, True),
-        ([("filter_exclusion", "excluded_port", 5),
-          ("global_unknown", "global_nonfull", 4)], 0, False),
+        (
+            [
+                ("filter_exclusion", "excluded_port", 5),
+                ("global_unknown", "global_nonfull", 4),
+            ],
+            0,
+            False,
+        ),
     ],
 )
 def test_ebpf_known_event_loss_marks_a_clean_run_degraded(
@@ -2528,8 +2763,12 @@ def test_ebpf_known_event_loss_marks_a_clean_run_degraded(
                      "sys.stdin.readline()",
                      f"print({json.dumps(json.dumps(end_row))},flush=True)",
                      "sys.exit(2)"])  # fmt: skip
-    child = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    child = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     channel = Channel(child, tmp_path)
     writer = Writer(tmp_path / "writer", metadata(), ProbeConfig())
     try:
@@ -2544,8 +2783,10 @@ def test_ebpf_known_event_loss_marks_a_clean_run_degraded(
         assert result["degraded"] is degraded
         if output_drops:
             assert result["event_loss"]["terminal.output_drops"] == output_drops
-        assert not any(k.startswith(("filter_exclusion", "global_unknown"))
-                       for k in result["event_loss"])
+        assert not any(
+            k.startswith(("filter_exclusion", "global_unknown"))
+            for k in result["event_loss"]
+        )
     finally:
         if channel.running():
             child.kill()
@@ -2596,9 +2837,11 @@ def test_ebpf_saved_capture_loss_comes_from_the_recorded_counters(
         time.sleep(1.5)  # a sample or two: the loss rows are recorded
         (tmp_path / "stop").touch()
         (tmp_path / "children").write_text(
-            json.dumps({"run_id": run, "endpoint": "d", "children_closed": True}))
-        observer.run(stop_file=tmp_path / "stop",
-                     endpoint_complete_file=tmp_path / "children")
+            json.dumps({"run_id": run, "endpoint": "d", "children_closed": True})
+        )
+        observer.run(
+            stop_file=tmp_path / "stop", endpoint_complete_file=tmp_path / "children"
+        )
         events = next((tmp_path / "out").glob("*/*/events.jsonl"))
         derived = inspect_trace(events, probe=True)["ebpf_event_loss"]
         assert derived == {"endpoint_namespace.scoped_ring_drop": 2}
@@ -2625,13 +2868,23 @@ def test_ebpf_the_collector_s_plan_carries_the_address_allow_lists(
 
     def popen(argv, **kwargs):
         launched.append(Path(argv[2]).read_text())
-        return real_popen([sys.executable, "-c", "pass"], stdin=subprocess.PIPE,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return real_popen(
+            [sys.executable, "-c", "pass"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
     monkeypatch.setattr(ebpf.subprocess, "Popen", popen)
     for name, options in [
-        ("scoped", {"local_ips": ["::ffff:10.0.0.1"],
-                    "peer_ips": ["10.0.0.2", "fd00::5"], "peer_ports": [7]}),
+        (
+            "scoped",
+            {
+                "local_ips": ["::ffff:10.0.0.1"],
+                "peer_ips": ["10.0.0.2", "fd00::5"],
+                "peer_ports": [7],
+            },
+        ),
         ("any", {}),
     ]:
         collector = ebpf.Collector(
@@ -2766,8 +3019,17 @@ def _publish_exit(arguments):
     "fields, accepted",
     [
         ({}, True),  # the guide's example
-        ({"schema": 1, "signal": None, "killed": None, "timed_out": False,
-          "problems": [], "evidence": {}}, True),  # the full record  # fmt: skip
+        (
+            {
+                "schema": 1,
+                "signal": None,
+                "killed": None,
+                "timed_out": False,
+                "problems": [],
+                "evidence": {},
+            },
+            True,
+        ),  # the full record  # fmt: skip
         ({"problems": {}}, False),
         ({"evidence": []}, False),
         ({"schema": True}, False),
@@ -2871,6 +3133,7 @@ def test_a_bare_process_observer_discovers_its_endpoint_and_checks_complete(tmp_
     )  # fmt: skip
     try:
         manifest_glob = f"captures/{run_id}/*/manifest.json"
+
         def ready():
             paths = observer_dir.glob(manifest_glob)
             return any(json.loads(p.read_text()).get("ready") for p in paths)
@@ -3131,9 +3394,7 @@ def _check(attempt, core_dir):
 
 
 @pytest.mark.parametrize("ending", ["server_exits_then_sigterm", "sigterm_first"])
-def test_the_sidecar_follows_the_pod_lifecycle_to_a_complete_capture(
-    tmp_path, ending
-):
+def test_the_sidecar_follows_the_pod_lifecycle_to_a_complete_capture(tmp_path, ending):
     """Started before the server (which can then start), the sidecar waits for
     the expected recorders, marks readiness once its observer is ready, and on
     termination waits for the L1 captures to close, publishes completion, stops
@@ -3221,13 +3482,15 @@ def test_a_restarted_sidecar_never_uses_an_earlier_attempt_s_markers(tmp_path):
     stale.mkdir(parents=True)
     (stale / "stop").touch()
     (stale / "children.json").write_text(
-        json.dumps({"run_id": run_id, "endpoint": "d", "children_closed": True}))
+        json.dumps({"run_id": run_id, "endpoint": "d", "children_closed": True})
+    )
     (root / "ready").write_text(str(stale))
     owner, _, endpoint_dir = start_recorded_endpoint(
         tmp_path, allowed[0], run_id=run_id
     )
     sidecar = _sidecar(tmp_path, run_id, allowed[-1])
     try:
+
         def fresh_ready():
             marker = root / "ready"
             return marker.exists() and marker.read_text() != str(stale)
@@ -3486,9 +3749,7 @@ def test_sigterm_during_startup_is_a_cancellation_not_a_timeout(tmp_path):
         owner.wait(10)
 
 
-def test_the_closure_scan_never_overruns_the_shutdown_deadline(
-    tmp_path, monkeypatch
-):
+def test_the_closure_scan_never_overruns_the_shutdown_deadline(tmp_path, monkeypatch):
     """Full L1 verification runs under the drain's deadline: a scan still
     parsing when it expires leaves the children not closed, on time."""
     from vllm.kv_profiling.endpoint_probes import sidecar as sidecar_module
@@ -3575,3 +3836,478 @@ def test_a_scan_finishing_in_the_last_poll_interval_is_used(tmp_path, monkeypatc
     sidecar._stop([_gone_process()], _gone_process())
     children = json.loads((sidecar.attempt / "children.json").read_text())
     assert children["children_closed"] is True
+
+
+def test_an_observer_samples_the_endpoint_s_own_sockets_by_identity(tmp_path):
+    """TCP sampling with no address anywhere: the endpoint's process holds one
+    connection to the test's listener; the observer discovers and admits it by
+    cookie, samples it labelled with its admission (whose record names the
+    owners), never the listener's side (which only the test holds). As the pod
+    sidecar does, the observer is stopped only after the endpoint has exited:
+    its owner is retired as exited, and the capture with a required TCP source
+    checks complete."""
+    allowed = sorted(os.sched_getaffinity(0))
+    assert len(allowed) >= 2, "probe tests require separate owner/observer CPUs"
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        owner, inventory, endpoint_dir = start_recorded_endpoint(
+            tmp_path, allowed[0], connect=port
+        )
+        accepted, _ = listener.accept()
+        run_id = inventory[0]["run_id"]
+        core_dir = endpoint_dir / "profiles"
+        settings = ProbeConfig(
+            interval_s=0.1, slow_interval_s=0.1, interfaces=["lo"],
+            tcp={"owned_sockets": True}, discovery_interval_s=0.05,
+            required=["netdev", "tcp"],
+        )  # fmt: skip
+        path = _observer_config(tmp_path, run_id, core_dir, allowed[-1],
+                                probes=asdict(settings),
+                                owner_exit_grace_s=30)  # fmt: skip
+        observer_dir = path.parent
+        entry = str(Path(probe.__file__))
+        process = subprocess.Popen(
+            [sys.executable, entry, "--config", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )  # fmt: skip
+        try:
+            glob = f"captures/{run_id}/*/manifest.json"
+
+            def ready():
+                paths = observer_dir.glob(glob)
+                return any(json.loads(p.read_text()).get("ready") for p in paths)
+
+            wait_for(ready, timeout=20)
+            time.sleep(0.5)  # a few discovery and sampling ticks
+            (endpoint_dir / "close").touch()
+            wait_for(lambda: (endpoint_dir / "closed").exists(), timeout=20)
+            (endpoint_dir / "exit").touch()
+            owner.wait(timeout=20)
+            time.sleep(0.3)  # discovery ticks after the exit
+            closed = {"run_id": run_id, "endpoint": "d", "children_closed": True}
+            (observer_dir / "children.json").write_text(json.dumps(closed))
+            (observer_dir / "stop").touch()
+            _, stderr = process.communicate(timeout=20)
+            assert process.returncode == 0, stderr
+        finally:
+            accepted.close()
+            (endpoint_dir / "exit").touch()
+            owner.wait(timeout=20)
+            if process.poll() is None:
+                process.kill()
+    manifest = next(observer_dir.glob(glob))
+    rows = [json.loads(line) for line in manifest.with_name("events.jsonl").open()]
+    admitted = [r for r in rows if r.get("scope") == "socket_ownership"
+                and r["observation"]["change"] == "admitted"]  # fmt: skip
+    sockets_ = [r for r in rows if r.get("scope") == "socket"]
+    assert len(admitted) == 1, admitted
+    socket_record = admitted[0]["observation"]["socket"]
+    assert socket_record["peer_port"] == port
+    assert admitted[0]["observation"]["owners"][0]["pid"] == owner.pid
+    removed = [r["observation"] for r in rows if r.get("scope") == "socket_ownership"
+               and r["observation"]["change"] == "removed"]  # fmt: skip
+    # its socket closes during the exit, or its owner is found gone: either
+    # retires it, and neither fails the source
+    assert [r["reason"] in ("gone", "owner exited") for r in removed] == [True]
+    failures = [r for r in rows if r.get("scope") == "source"]
+    assert failures == [], failures
+    assert sockets_ and all(
+        r["transport"]["tcp"]["selection"]["cookie"] == socket_record["cookie"]
+        and r["transport"]["tcp"]["selection"]["admission"]
+        == socket_record["admission"]
+        and r["transport"]["tcp"]["peer_port"] == port
+        for r in sockets_
+    )
+    record = {"run_id": run_id, "endpoint": "d", "process_id": rows[0]["process_id"],
+              "exit_code": 0, "launcher": "test-process"}  # fmt: skip
+    subprocess.run([sys.executable, entry, "--record-exit", str(observer_dir)],
+                   input=json.dumps(record), text=True, check=True)  # fmt: skip
+    checked = subprocess.run(
+        [sys.executable, entry, "--check-capture", str(observer_dir),
+         "--core-dir", str(core_dir)],
+        capture_output=True, text=True, timeout=30,
+    )  # fmt: skip
+    summary = json.loads(checked.stdout)
+    assert checked.returncode == 0 and summary["complete"], summary
+
+
+class _Rows:
+    def __init__(self):
+        self.rows = []
+
+    def put(self, row):
+        self.rows.append(row)
+        return True
+
+
+def test_each_tcp_observation_is_recorded_once_at_its_acquisition_time():
+    """A socket's TCP_INFO is when the kernel dumped it: the row spans the
+    dump's own interval, and sampling the same scan again records nothing."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery
+
+    with socket.socket() as listener, socket.socket() as client:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        client.connect(listener.getsockname())
+        server, _ = listener.accept()
+        with server:
+            scan = Discovery([_me()]).scan()
+    sink = _Rows()
+    observer = _sample_once(sink, scan)
+    first = [r for r in sink.rows if r["scope"] == "socket"]
+    assert first and all(
+        (r["sample_begin_ns"], r["sample_end_ns"])
+        == (scan.dump_started_ns, scan.dump_finished_ns)
+        for r in first
+    )
+    assert scan.dump_started_ns <= scan.dump_finished_ns <= scan.finished_ns
+    count = len(sink.rows)
+    observer.sample_tcp()  # the same scan: already recorded
+    assert len(sink.rows) == count
+    selection = first[0]["transport"]["tcp"]["selection"]
+    # the owners are in the admission's record, not repeated in every sample
+    assert "owners" not in first[0]["transport"]["tcp"]
+    assert selection["by"] == "owned_socket" and selection["admission"] >= 1
+    assert selection["owner_count"] == 1
+
+
+def test_one_process_hosting_several_roles_is_read_once_with_all_of_them():
+    """Recorders of several roles in one process (a frontend among them): the
+    process is read once per pass, its sockets carry every role's identity,
+    and they say a frontend is colocated (its sockets cannot be told apart)."""
+    from vllm.kv_profiling.endpoint_probes import sockets
+
+    reads = []
+    real = sockets._inodes
+
+    def counted(pid, budget):
+        reads.append(pid)
+        return real(pid, budget)
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        owners = [_me(role, engine_id="d", rank=0)
+                  for role in ("frontend", "scheduler", "worker")]  # fmt: skip
+        with mock.patch.object(sockets, "_inodes", counted):
+            scan = sockets.Discovery(owners, sockets.Limits(processes=0)).scan()
+        record = _owned_by_inode(scan)[os.fstat(listener.fileno()).st_ino]
+    assert scan.complete and reads.count(os.getpid()) == 2  # both reads, once each
+    assert sorted(o["role"] for o in record["owners"]) == [
+        "frontend", "scheduler", "worker"]  # fmt: skip
+    assert record["frontend_colocated"] and record["owner_pids"] == [os.getpid()]
+
+
+def test_proc_is_streamed_under_the_process_bound(monkeypatch):
+    from vllm.kv_profiling.endpoint_probes import sockets
+
+    consumed = []
+    real = os.scandir
+
+    class Counting:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.entries.close()
+
+        def __iter__(self):
+            for entry in self.entries:
+                consumed.append(entry.name)
+                yield entry
+
+    def scandir(path):
+        entries = real(path)
+        return Counting(entries) if str(path) == "/proc" else entries
+
+    monkeypatch.setattr(sockets.os, "scandir", scandir)
+    scan = sockets.Discovery([_me()], sockets.Limits(processes=1)).scan()
+    assert scan.complete and scan.holders_truncated == "discovery bound"
+    assert len(consumed) <= 2, len(consumed)
+
+
+def test_a_scan_whose_matching_outlasts_its_deadline_admits_nothing(monkeypatch):
+    from vllm.kv_profiling.endpoint_probes import sockets
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        real = sockets.cookie_of
+
+        def slow(row):
+            time.sleep(0.001)
+            return real(row)
+
+        rows = sockets._dump(sockets.Budget(sockets.Limits()), [])
+        monkeypatch.setattr(sockets, "_dump", lambda budget, unavailable: rows * 100)
+        monkeypatch.setattr(sockets, "cookie_of", slow)
+        scan = sockets.Discovery([_me()], sockets.Limits(deadline_s=0.05)).scan()
+    assert not scan.complete and "deadline" in scan.reason and scan.owned == {}
+
+
+def test_discovery_periods_are_counted_against_their_scheduled_starts():
+    """0.25 s periods, 0.40 s of work per scan: starts slip, and each whole
+    period skipped is counted missed."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Cadence
+
+    cadence, now, starts, missed = Cadence(0.25, 0.0), 0.0, [], []
+    while now < 2.0:
+        due, skipped = cadence.due(now)
+        if due:
+            starts.append(round(now, 2))
+            missed.append(skipped)
+            now += 0.40  # the scan's work
+        else:
+            now = cadence.next
+    assert starts[:3] == [0.0, 0.4, 0.8] and sum(missed) == cadence.missed > 0
+
+
+def test_an_owner_in_another_namespace_or_unreadable_affects_only_itself():
+    """A frozen namespace that is not the live one makes that owner unreadable;
+    one owner whose namespace links are refused leaves a socket it shares with
+    a readable owner owned by that one."""
+    from vllm.kv_profiling.endpoint_probes import sockets
+    from vllm.kv_profiling.endpoint_probes.identity import NamespacesUnreadable
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        moved = {**_me(), "net_namespace": "net:[1]"}
+        scan = sockets.Discovery([moved]).scan()
+        assert scan.complete and scan.owned == {}
+        assert os.getpid() in scan.mismatched and not scan.unreadable
+        sharer = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            pass_fds=(listener.fileno(),),
+        )
+        try:
+            real = sockets.process_identity
+
+            def refused(pid):
+                if pid == sharer.pid:
+                    raise NamespacesUnreadable("namespace links denied")
+                return real(pid)
+
+            owners = [_me("worker"), {"pid": sharer.pid, "role": "scheduler",
+                                      "start_ticks": 1}]  # fmt: skip
+            with mock.patch.object(sockets, "process_identity", refused):
+                scan = sockets.Discovery(owners).scan()
+            record = _owned_by_inode(scan)[os.fstat(listener.fileno()).st_ino]
+        finally:
+            sharer.kill()
+            sharer.wait()
+    assert scan.complete and record["owner_pids"] == [os.getpid()]
+    assert "NamespacesUnreadable" in scan.unreadable[sharer.pid]
+
+
+def test_ipv4_sockets_stay_verified_when_the_kernel_has_no_ipv6():
+    from vllm.kv_profiling.endpoint_probes import sockets
+
+    real = sockets.query
+
+    def no_ipv6(protocol, kind, payload, **kwargs):
+        if payload[0] == socket.AF_INET6:
+            raise OSError(errno.EAFNOSUPPORT, "Address family not supported")
+        return real(protocol, kind, payload, **kwargs)
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        with mock.patch.object(sockets, "query", no_ipv6):
+            scan = sockets.Discovery([_me()]).scan()
+        inode = os.fstat(listener.fileno()).st_ino
+    assert scan.complete and scan.families_unavailable == ["ipv6"]
+    assert inode in _owned_by_inode(scan)
+
+
+def test_identities_under_one_pid_are_verified_each_whatever_their_order():
+    """A live frontend identity and a stale worker identity (an earlier
+    generation) under one PID: the PID is no owner in either order."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        live = _me("frontend")
+        stale = {**_me("worker"), "start_ticks": live["start_ticks"] - 1}
+        for owners in ([live, stale], [stale, live]):
+            scan = Discovery(owners).scan()
+            assert scan.complete and scan.owned == {}, owners
+            assert os.getpid() in scan.exited
+
+
+def test_building_the_owned_records_counts_against_the_deadline(monkeypatch):
+    from vllm.kv_profiling.endpoint_probes import sockets
+
+    real = sockets._record
+
+    def slow(*args):
+        time.sleep(0.06)
+        return real(*args)
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        monkeypatch.setattr(sockets, "_record", slow)
+        scan = sockets.Discovery([_me()], sockets.Limits(deadline_s=0.05)).scan()
+    assert not scan.complete and "deadline" in scan.reason and scan.owned == {}
+
+
+def test_an_owner_record_too_long_for_one_row_is_split_and_recovered():
+    """128 recorder identities share one socket: its admission splits over
+    rows within the limit, the join recovers all of them by admission, the
+    TCP row stays small, and every split row keeps its explicit end time."""
+    from vllm.kv_profiling.endpoint_probes.runner import ROW_BUDGET, Observer
+    from vllm.kv_profiling.endpoint_probes.sockets import Tracker
+    from vllm.kv_profiling.probe_join import _admitted_owners, _owners
+
+    scan = _scan({17: list(range(1000, 1128))})
+    for record in scan.owned.values():
+        record["owners"] = [
+            {**owner, "engine_id": "e" * 40, "rank": index,
+             "net_namespace": "net:[4026531840]", "pid_namespace": "pid:[4026531836]"}
+            for index, owner in enumerate(record["owners"])
+        ]  # fmt: skip
+    sink = _Rows()
+    observer = Observer.__new__(Observer)
+    observer.writer = sink
+    tracker = Tracker()
+    for change in tracker.apply(scan):
+        observer.emit("socket_ownership", "17", 5, change, kind="probe_status", end=9)
+    rows = [r for r in sink.rows if r["scope"] == "socket_ownership"]
+    assert len(rows) > 1 and all(len(json.dumps(r)) <= ROW_BUDGET for r in rows)
+    assert {(r["sample_begin_ns"], r["sample_end_ns"]) for r in rows} == {(5, 9)}
+    owners = _admitted_owners(rows)[tracker.active[17]]
+    assert [o["pid"] for o in owners] == list(range(1000, 1128))
+    flow = {"selection": {"admission": tracker.active[17]}}
+    assert len(_owners(flow, _admitted_owners(rows))) == 128
+    # an incomplete record resolves to nothing, never to part of its owners
+    assert _admitted_owners(rows[:1]) == {}
+    # a long status keeps the dump's interval in every part
+    sink.rows.clear()
+    gone = {"disappeared": [str(n) * 8 for n in range(1024)]}
+    observer.emit("tcp_poll", "d", 100, gone, kind="probe_status", end=120)
+    assert len(sink.rows) > 1
+    assert {(r["sample_begin_ns"], r["sample_end_ns"]) for r in sink.rows} == {
+        (100, 120)
+    }
+
+
+@pytest.mark.parametrize("read", [1, 2])
+def test_an_owner_exiting_during_either_fd_read_is_retired_not_failed(read):
+    """A real child exits cleanly right before its first or second fd read: the
+    read's ENOENT is confirmed as an exit, the owner is retired, and a
+    required TCP source records no failure."""
+    from vllm.kv_profiling.endpoint_probes import sockets
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE
+    )
+    real, calls = sockets._inodes, []
+
+    def racing(pid, budget):
+        if pid == child.pid:
+            calls.append(pid)
+            if len(calls) == read:
+                child.stdin.close()  # a clean exit
+                child.wait()
+        return real(pid, budget)
+
+    observer = _sampler(_Rows(), required=["tcp"])
+    observer.discovery = sockets.Discovery([_me("worker", child.pid)])
+    observer.last_scan = None
+    try:
+        with mock.patch.object(sockets, "_inodes", racing):
+            observer.discover()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    scan = observer.last_scan
+    assert scan.complete and child.pid in scan.exited, scan.exited
+    assert not scan.unreadable and child.pid in observer.discovery.retired
+    assert observer.failed_required == 0
+
+
+def test_an_owner_in_other_namespaces_for_now_is_suspended_not_retired():
+    """Same start ticks, another network namespace: it holds nothing (a
+    coverage gap, failing a TCP source) but is read again, and owns its
+    sockets once its namespaces match."""
+    from vllm.kv_profiling.endpoint_probes import sockets
+
+    real = sockets.process_identity
+
+    def moved(pid):
+        return {**real(pid), "net_namespace": "net:[1]"}
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        discovery = sockets.Discovery([_me()])
+        with mock.patch.object(sockets, "process_identity", moved):
+            first = discovery.scan()
+        second = discovery.scan()
+        inode = os.fstat(listener.fileno()).st_ino
+    assert first.complete and first.owned == {} and os.getpid() in first.mismatched
+    assert os.getpid() in discovery.identities and not discovery.retired
+    assert inode in _owned_by_inode(second)
+
+
+def test_a_generation_change_needs_one_verified_owner_across_both_reads():
+    """Two frozen worker generations under one PID. If the live one changes
+    during a scan, no identity is verified in both reads, and nothing is
+    admitted (never with an empty owner list). Between two scans, the new
+    generation is another owner: a new admission naming its engine."""
+    from vllm.kv_profiling.endpoint_probes import sockets
+
+    real = sockets.process_identity
+    mine = real(os.getpid())
+    old = {**_me("worker", engine_id="old", rank=0), "start_ticks": mine["start_ticks"]}
+    new = {
+        **_me("worker", engine_id="new", rank=0),
+        "start_ticks": mine["start_ticks"] + 1,
+    }
+    calls = []
+
+    def changing(switch_after):
+        def identity(pid):
+            calls.append(pid)
+            live = real(pid)
+            if len(calls) > switch_after:
+                live = {**live, "start_ticks": new["start_ticks"]}
+            return live
+
+        return identity
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        inode = os.fstat(listener.fileno()).st_ino
+        discovery = sockets.Discovery([old, new])
+        with mock.patch.object(sockets, "process_identity", changing(2)):
+            during = discovery.scan()  # first read: old; second read: new
+        tracker = sockets.Tracker()
+        calls.clear()
+        with mock.patch.object(sockets, "process_identity", changing(10**6)):
+            before = discovery.scan()  # old throughout
+        tracker.apply(before)
+        first_admission = tracker.active[_owned_by_inode(before)[inode]["cookie"]]
+        calls.clear()
+        with mock.patch.object(sockets, "process_identity", changing(0)):
+            after = discovery.scan()  # new throughout
+        changes = tracker.apply(after)
+    assert during.complete and inode not in _owned_by_inode(during)
+    assert os.getpid() in during.mismatched
+    assert all(record["owners"] for record in during.owned.values())
+    assert [o["engine_id"] for o in _owned_by_inode(before)[inode]["owners"]] == ["old"]
+    record = _owned_by_inode(after)[inode]
+    assert [o["engine_id"] for o in record["owners"]] == ["new"]
+    admitted = [c for c in changes if c["change"] == "admitted"
+                and c["cookie"] == record["cookie"]]  # fmt: skip
+    assert admitted and admitted[0]["supersedes"] == first_admission
+    assert [o["engine_id"] for o in admitted[0]["owners"]] == ["new"]

@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--role", default="decode")
     parser.add_argument("--cpu", type=int, required=True)
     parser.add_argument("--overlap-cpu", type=int)
+    # hold one TCP connection to this local port (a connector socket)
+    parser.add_argument("--connect", type=int)
     parser.add_argument("--close-delay", type=float, default=0)
     args = parser.parse_args()
     os.sched_setaffinity(0, {args.cpu})
@@ -76,6 +78,10 @@ def main():
             pass
         assert time.monotonic() < deadline
         time.sleep(0.01)
+    if args.connect is not None:
+        import socket
+
+        held = socket.create_connection(("127.0.0.1", args.connect))  # noqa: F841
     (directory / "ready.json").write_text(json.dumps(entries))
     closed = False
     try:

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Explicit endpoint selectors and bounded observer configuration."""
 
-import ipaddress
 import math
 from dataclasses import asdict, dataclass, field
 
@@ -29,7 +28,11 @@ def component(value):
 class ProbeConfig:
     interval_s: float = 1.0
     slow_interval_s: float = 5.0
+    # TCP_INFO of the sockets the endpoint's scheduler and worker processes
+    # own: {"owned_sockets": true}, with optional port lists that narrow it.
     tcp: dict = field(default_factory=dict)
+    # How often those sockets are discovered (for TCP sampling and eBPF).
+    discovery_interval_s: float = 0.25
     interfaces: list[str] = field(default_factory=list)
     driver_statistics: bool = False
     rdma_ports: list[dict] = field(default_factory=list)
@@ -60,24 +63,26 @@ class ProbeConfig:
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         integer(self.max_threads, 1, 1024, "max_threads")
-        if not isinstance(self.tcp, dict) or set(self.tcp) - {
-            "local_ips",
-            "peer_ips",
-            "local_ports",
-            "peer_ports",
-            "exclude_ports",
-        }:
+        if not isinstance(self.tcp, dict):
+            raise ValueError("tcp must be a mapping")
+        if {"local_ips", "peer_ips"} & set(self.tcp):
+            raise ValueError(
+                "tcp selects the sockets the endpoint's scheduler and worker "
+                "processes own, never by address: use owned_sockets: true "
+                "(local_ips and peer_ips are removed)"
+            )
+        if set(self.tcp) - {"owned_sockets", "local_ports", "peer_ports",
+                            "exclude_ports"}:  # fmt: skip
             raise ValueError("unknown TCP selector")
-        for key in ("local_ips", "peer_ips"):
-            values = self.tcp.get(key, [])
-            if not isinstance(values, list) or len(values) > 8:
-                raise ValueError("IP selectors must be lists of at most eight")
-            for value in values:
-                if not isinstance(value, str):
-                    raise ValueError("IP selector must be a string")
-                ipaddress.ip_address(value)
-            if self.tcp and not values:
-                raise ValueError("TCP requires local_ips and peer_ips allowlists")
+        if self.tcp and self.tcp.get("owned_sockets") is not True:
+            raise ValueError("TCP sampling is enabled by owned_sockets: true")
+        value = self.discovery_interval_s
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or not 0.05 <= value <= 10
+        ):
+            raise ValueError("discovery_interval_s must be in 0.05..10 seconds")
         for key in ("local_ports", "peer_ports", "exclude_ports"):
             values = self.tcp.get(key, [])
             if not isinstance(values, list) or len(values) > 64:
