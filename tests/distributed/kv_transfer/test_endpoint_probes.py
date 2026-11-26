@@ -93,6 +93,42 @@ def test_discovery_reports_an_owned_socket_with_its_cookie_and_tcp_info(
     assert owned[listener_inode]["listening"]
 
 
+def test_a_dual_stack_socket_reached_over_ipv4_is_owned_and_sampled():
+    """A dual-stack listener on ``::`` accepts an IPv4 client: the accepted
+    socket is an IPv6 one with an IPv4-mapped address. Selection is by owner,
+    not address, so it is owned with its TCP_INFO and sampled like any other."""
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery
+
+    try:
+        listener = socket.socket(socket.AF_INET6)
+        listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        listener.bind(("::", 0))
+    except OSError as error:
+        pytest.skip(f"no dual-stack IPv6 listener: {error}")
+    with listener, socket.socket(socket.AF_INET) as client:
+        listener.listen()
+        client.connect(("127.0.0.1", listener.getsockname()[1]))
+        server, peer = listener.accept()
+        with server:
+            assert server.family == socket.AF_INET6
+            assert peer[0] == "::ffff:127.0.0.1"
+            client.sendall(b"payload")
+            assert server.recv(7) == b"payload"
+            server_inode = os.fstat(server.fileno()).st_ino
+            client_inode = os.fstat(client.fileno()).st_ino
+            scan = Discovery([_me()]).scan()
+    assert scan.complete, scan.reason
+    owned = _owned_by_inode(scan)
+    record, ipv4 = owned[server_inode], owned[client_inode]
+    assert record["row"]["family"] == socket.AF_INET6
+    assert record["row"]["fields"]["bytes_received"]["value"] >= 7
+    assert ipv4["row"]["family"] == socket.AF_INET
+    sink = _Rows()
+    _sample_once(sink, scan)
+    sampled = {r["entity"] for r in sink.rows if r["scope"] == "socket"}
+    assert {str(record["cookie"]), str(ipv4["cookie"])} <= sampled
+
+
 _HOLDER = """
 import socket, sys, time
 s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
