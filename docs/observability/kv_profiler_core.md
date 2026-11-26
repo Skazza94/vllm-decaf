@@ -19,36 +19,37 @@ tensor-parallel server opens, so give containers a larger one
 at startup with an error that names the directory, its free space and the size
 each recorder needs.
 
-The profiler levels' overhead was measured with two-node serving A/Bs of one
-workload, profiler off against on, on latency and throughput: the NIXL pull
-connector at concurrency one.
+Overhead was measured with two-node serving A/Bs of one workload, profiler off
+against on: the NIXL pull connector at concurrency one, with a CPU-simulated
+model. Each check compares a 95% bound on latency or throughput with a fixed
+limit.
 
-We compared default L1 (`flush="background"`) with profiling off over UCX/TCP. The
-95% lower bound for throughput fell below its limit. The upper bounds for mean
-time to first token and for mean and p99 end-to-end latency exceeded theirs. All
-four point estimates favored L1. Variation among profiler-off runs accounted for
-most of the uncertainty in those estimates. P99 time to first token, mean time per
-output token, and mean and p99 inter-token latency passed. The gate recorded FAIL,
-and we accepted an exception for this workload.
+- **L1, default `flush="background"`, UCX/TCP:** p99 time to first token, mean
+  time per output token, and mean and p99 inter-token latency were within their
+  limits. The bounds for throughput, mean time to first token, and mean and p99
+  end-to-end latency were not, though all four point estimates favored L1;
+  variation among the profiler-off runs accounted for most of that uncertainty.
+- **`flush="end"`, UCX/TCP:** L2 was within every limit. L1 (with the request
+  timelines) and L3 were within the throughput and mean-latency limits, not the
+  p99 time to first token and p99 end-to-end ones.
+- **`flush="end"`, UCX/RDMA:** L1, L2 and L3 together were within every limit.
+- **eBPF**, L3 in both arms over UCX/TCP, with the earlier address-based event
+  selection: throughput, every mean latency and p99 inter-token latency were
+  within their limits; p99 time to first token and p99 end-to-end latency were
+  not. Host-wide tracing also exceeded the p99 end-to-end limit. The owned-socket
+  selection that replaced the address lists was not measured.
 
-The results below were measured with `flush="end"`, the eBPF one included.
+## Limitations
 
-- Over UCX/TCP, L2 passed every check. L1 (with the request timelines) and L3
-  passed throughput and every mean latency; their 95% upper bounds for p99 time to
-  first token and p99 end-to-end latency exceeded the gate's limits, and both were
-  accepted after review of those results.
-- Over UCX/RDMA, L1, L2 and L3 together passed every check.
-
-We measured how enabling eBPF changed serving performance with L3 enabled in both
-arms of a two-node NIXL pull benchmark over UCX/TCP at concurrency one. With the
-KV-link address filters, throughput, all mean latencies and p99 inter-token
-latency passed. The upper 95% bounds for p99 time to first token and p99
-end-to-end latency exceeded their limits. The gate recorded FAIL, and we accepted
-an exception for this filtered workload. Host-wide tracing also exceeded its p99
-end-to-end limit.
-
-Other workloads and connectors are not covered by these measurements. Not yet
-qualified: GPU execution and exact socket/QP attribution.
+- **Overhead** is measured only for the workload above: not for the Mooncake
+  connector, other concurrencies or GPU serving. GPU execution is untested.
+- **No per-transfer network attribution:** TCP sockets and RDMA queue pairs are
+  never matched exactly to individual transfers; joins with them are candidates.
+- **eBPF** covers TCP tracepoints only. There is no per-transfer or per-RDMA-work
+  request tracing; RDMA is observed through port counters and queue-pair
+  snapshots.
+- **No network emulation:** the profiler observes the network, never shapes it.
+- **The e2e harness** runs and profiles TCP transports only.
 
 ## Explicit library lifecycle
 
@@ -71,7 +72,8 @@ cmake --build build/kv-profiler
 cmake --install build/kv-profiler
 ```
 
-The connector-extra namespace is reserved for the later adapter.
+The connector adapters (below) read their settings from the connector-extra
+namespace, `kv_connector_extra_config["network_profiler"]`.
 `NetworkProfilerConfig.from_extra_config` parses it without modifying the
 connector configuration. The default `level="off"` starts no helper and
 imports no native recorder.
@@ -128,7 +130,7 @@ remain explicitly unbound. None of this operates a transport.
 The C ABI in `csrc/kv_profiler/recorder.h` accepts the same native event inputs
 without Python allocation. The mapping and input buffers must remain alive
 through a call; only the creating process may publish. Stop all producers
-before closing the mapping. This is not yet an observer/proxy API.
+before closing the mapping. It is not an observer or proxy API.
 
 ## Publication and loss
 
@@ -209,7 +211,8 @@ loss from a missing end record.
 
 There is no serving-process JSON writer thread and no recording-path
 formatting, I/O, resizing or descriptor traversal. Native allocation tests
-cover cached and first-seen IDs; they do not qualify a future adapter.
+cover cached and first-seen IDs; the adapters' hooks are covered by their own
+tests.
 
 ## Clocks
 
@@ -252,9 +255,10 @@ on arbitrary mid-run clock changes or network asymmetry.
   /profiles/run/process/events.jsonl --output-dir /profiles/perfetto
 ```
 
-Without calibration, clocks are exported separately. Supply
-`--calibration calibration.json` for saved clock mappings and optionally
-`--reference-clock UUID`. Aligned processes share **one origin after clock
+Without calibration, clocks are exported separately. Supply each saved clock
+mapping with `--calibration`, repeated: the `calibration-N.json` files the
+consumer's scheduler saves (its `calibration.json` is the peer list naming them),
+and optionally `--reference-clock UUID`. Aligned processes share **one origin after clock
 mapping**; individually zeroing processes would erase real delays.
 
 The exporter retains raw ns, generations, calibration samples, uncertainty,
@@ -263,7 +267,10 @@ footer counters remain in metadata even when every event was dropped. The
 exporter reconciles the final sequence with the footer's published head. Request observations and transfer
 spans are per-process/rank; a DONE span includes polling observation delay.
 It does not infer an automatic notification's send instant or an exact
-socket/QP. Qualified cross-process handoff flows await the adapter.
+socket/QP. A cross-process handoff arrow joins a consumer's read to the
+producer's notification only when both are recorded with the same producer and
+request, one to one (`cross_process_flows: exact_recorded_handoff_ids`); repeated
+or fan-in occurrences draw none.
 
 `import_modeled_steps` converts an already collected step log offline.
 Modeled device/host costs use a separate document and elapsed clock. The importer
@@ -271,14 +278,14 @@ retains the timing-provider record and refuses combined logs from restarts;
 split those generations first. This elapsed track sums device costs, not wall
 clock idle gaps or pipeline overlap.
 L1 does not enable a synchronous step logger or add per-token records to
-manufacture a missing compute track. The format follows Chrome Trace Event
-conventions used by vllm-vcr, not its inferred request-prefill durations.
+manufacture a missing compute track. The format follows the Chrome Trace Event
+conventions.
 
 ## Offline analysis summary
 
 ```console
 .venv/bin/python -m vllm.kv_profiling.summary \
-  /profiles/run --output summary.json [--calibration mapping.json ...]
+  /profiles/run --output summary.json [--calibration calibration-0.json ...]
 ```
 
 `--output` is required. Directories are searched for `events.jsonl`; identical
@@ -333,10 +340,22 @@ ordinal, its generation, and whether the step is marked or carried no tokens). A
 records one `step` row per marked step with the hook's own clock readings, taken when the
 connector received the step's metadata and when the runner called `finish_forward`
 (`begin_ns`, `end_ns`; the row's timestamp is its publication time and is never a step
-bound). Every other step only feeds a rollup row per time window (`step_window_s`, 1 s by
-default, 0 disables; driven by the step hooks, no thread or timer, flushed at close) with
-the steps, their busy and maximum time, and the zero-token polls counted apart. The row
-count scales with request transitions and prefill chunks, never with decode tokens.
+bound). Every worker step that carries the scheduler's metadata, marked or not, also
+feeds a rollup window (`step_window_s`, 1 s by default, up to 60, 0 disables), and every
+scheduler step feeds the scheduler's:
+
+- a **worker window** (`step_span` subject 2) counts its steps (`marked_steps` among
+  them), their busy (summed) and maximum time, and the zero-token polls apart
+  (`empty_steps`, whose time is not busy);
+- a **scheduler window** (subject 3) counts its steps with tokens, their
+  `scheduled_tokens`, the most requests in one step (`max_requests`), and its empty and
+  marked steps.
+
+A window opens at its first step and is published by the first step at least
+`step_window_s` after that, or at close: windows are not on a fixed grid, and none is
+written while idle (driven by the step hooks; no thread or timer). A worker step without
+that metadata feeds no window and is counted (`timeline_steps_without_marker`). The row count scales with request transitions and
+prefill chunks, never with decode tokens.
 
 A step's end is the runner's `finish_forward`: the host-side end of the forward, which on
 asynchronous device execution is the dispatch return rather than device completion, and in a
@@ -443,6 +462,12 @@ the quality of the producer or frontend capture they use.
   [--port N] [--host H]
 ```
 
+It serves on `127.0.0.1:8321` by default, with no authentication: binding
+`--host` to another address exposes the runs' captures to whoever can reach it.
+It reads UCX protocol tables from `ucx-protocols/**/*.json` under each run
+directory (the parser's output, as the e2e harness saves it); without them the
+page says UCX protocol selection was not captured.
+
 With data parallelism each scheduler of an instance calibrates its own clock
 against every peer. Schedulers of one clock domain read one clock, so any of
 them maps a peer. A mapping is considered only when its samples carry its
@@ -529,16 +554,16 @@ unavailable/absent state. The metrics follow what the records measure:
   nothing are listed separately with the reason.
 - The request timeline columns come from the summary's `timelines` (see
   "Request timeline and decode stall attribution"), never estimated:
-  - from the decode node's own timeline: KV wait (`stall.waiting_for_kv_ns`),
-    decode admission (`intervals_ns.queued_to_admitted`), the decode window
-    (first token output to the finish), and that node's TTFT (its API entry to
-    its first token output, only with an `api_arrival` basis);
-  - the prefill window (`intervals_ns.prefill_window`), measured on the
-    producer's own clock, only through the row's one confirmed handoff join
-    (`joins`) whose producer identity is not reused: the producer scheduler it
-    names (`producer_sources`, a `producer` or `both` scheduler), and the producer
-    occurrence whose record sequences contain the outgoing handoff
-    (`producer_handoff_sequence`).
+    - from the decode node's own timeline: KV wait (`stall.waiting_for_kv_ns`),
+      decode admission (`intervals_ns.queued_to_admitted`), the decode window
+      (first token output to the finish), and that node's TTFT (its API entry to
+      its first token output, only with an `api_arrival` basis);
+    - the prefill window (`intervals_ns.prefill_window`), measured on the
+      producer's own clock, only through the row's one confirmed handoff join
+      (`joins`) whose producer identity is not reused: the producer scheduler it
+      names (`producer_sources`, a `producer` or `both` scheduler), and the producer
+      occurrence whose record sequences contain the outgoing handoff
+      (`producer_handoff_sequence`).
 
   A row is a connector occurrence. Its scheduler occurrence is the timeline
   whose `sequences` contain the row's own incoming handoff (the record
@@ -575,6 +600,9 @@ other processes' output or lost when a process exits.
 .venv/bin/python -m vllm.kv_profiling.ucx_protocols server.log \
   [--profiles /profiles] [--run-id RUN] [--output ucx.json]
 ```
+
+The viewer shows a run's tables when their output is saved under the run directory's
+`ucx-protocols/` (the e2e harness writes `ucx-protocols/<role>/<node>.json`).
 
 The parser groups each table by its log prefix (time, host, PID and UCX thread,
 kept as printed, e.g. `a` for UCX's async thread), so several processes can share
@@ -725,7 +753,8 @@ grace for every profiled server with data parallelism, and fails a run unless
 each server node has exactly the frontends of its launch's API server slots, a
 scheduler per DP rank and a worker per (DP rank, TP rank) on its rank's engine,
 all of the side's KV role, each whole and closed (the observer package's
-`--check-core`: stream, terminal row and manifest).
+`--check-core <profiles directory> --run-id <UUID>`: stream, terminal row and
+manifest; it exits 2 when one is not).
 
 ## Endpoint observations at L3
 
@@ -737,11 +766,26 @@ and kernel queries run in a separate endpoint process, never in a transfer
 callback. The native L1 ring ABI and transfer metrics are unchanged.
 
 Use `network_profiler.level: l3`, the same run UUID as L1, and a `probes` object.
-`probes` accepts `interval_s` (default 1), `slow_interval_s` (default 5), `tcp`,
-`discovery_interval_s` (default 0.25), `interfaces`, `driver_statistics`,
-`rdma_ports`, `qp`, `threads`, `max_threads` (default 256), `interrupts` and
-`required`. Interface names and RDMA `{device, port}` entries are explicit
-endpoint allowlists.
+Interface names and RDMA `{device, port}` entries are explicit endpoint
+allowlists. An unknown key is refused.
+
+| Key | Default | Accepted |
+| --- | --- | --- |
+| `interval_s`, `slow_interval_s` | 1, 5 | seconds, 0.1..3600 |
+| `tcp` | `{}` (off) | `owned_sockets: true`, optional `local_ports`, `peer_ports`, `exclude_ports` (each at most 64 ports, 1..65535) |
+| `discovery_interval_s` | 0.25 | seconds, 0.05..10 |
+| `interfaces` | `[]` | at most eight names of `[A-Za-z0-9_.-]` (not `.` or `..`) |
+| `driver_statistics` | false | needs `interfaces` |
+| `rdma_ports` | `[]` | at most eight `{device, port}`, port 1..255 |
+| `rdma_required_families` | `["counters"]` | a non-empty subset of `counters`, `hw_counters` |
+| `qp` | false | needs `rdma_ports` |
+| `threads`, `interrupts` | false | booleans |
+| `max_threads` | 256 | 1..1024 |
+| `max_sockets` | 1024 | 1..1024 (it can only be lowered) |
+| `queue_rows` | 512 | 1..512 (it can only be lowered) |
+| `output_bytes` | 256 MiB | 4096 bytes..1 GiB |
+| `ebpf` | `{}` (off) | see the eBPF section; disabled, only `enabled: false` |
+| `required` | `[]` | enabled sources among `ebpf`, `tcp`, `netdev`, `driver`, `rdma`, `qp`, `threads`, `interrupts` |
 
 TCP sampling (`tcp: {"owned_sockets": true}`; `tcp: {}` is off) takes the
 `TCP_INFO` of the sockets the endpoint's connector processes own, never an
@@ -784,7 +828,7 @@ runs on a fixed schedule whose skipped periods are counted. Each sampled socket
 row is one observation, timed by its dump's own interval, and carries
 `selection`: its cookie, admission (whose record names the owners), owner roles
 and count. A socket that opens and closes between two scans is never observed. No intermediate-network observation or packet modification occurs.
-`required` names enabled sources (`tcp`, `netdev`, `driver`, `rdma`, `qp`,
+`required` names enabled sources (`ebpf`, `tcp`, `netdev`, `driver`, `rdma`, `qp`,
 `threads`, `interrupts`). The kernel reports request sockets (`SYN_RECV`,
 timer 1) and time-wait sockets (`FIN_WAIT2` or `TIME_WAIT` after close, timer 3)
 as compact records: inode 0 and no `TCP_INFO` (at most `INET_DIAG_MARK`, for a
@@ -858,27 +902,34 @@ the installation manifest. Run it by absolute file path to avoid importing
 vLLM/Torch in the observer:
 
 ```console
-.venv/bin/python /installed/vllm/kv_profiling/probe.py --config endpoint.json
+.venv/bin/python /installed/vllm/kv_profiling/probe.py --config config.json
 ```
 
-`endpoint.json` has the following runtime fields in addition to `probes`. There
-is one launch form: the launcher names how many recorders of each role the
-endpoint has, and the observer finds them and the process to follow itself. A
-config that supplies an inventory or an owner is refused.
+The config (the harness and the sidecar write it as `config.json` in the
+observer's directory, which `--check-capture` reads back) has the following
+runtime fields in addition to `probes`. There is one launch form: the launcher
+names how many recorders of each role the endpoint has, and the observer finds
+them and the process to follow itself. A config that supplies `inventory`,
+`owner_pid` or `owner_start` is refused, ending the observer with an error
+(exit 1). Once started, it exits 0 for a complete capture and 2 for an
+incomplete one.
 
 | Field | Meaning |
 |---|---|
-| `run_id`, `endpoint`, `role` | Shared UUID, endpoint ID, `prefill` or `decode` |
+| `run_id`, `endpoint`, `role` | Shared run UUID, endpoint ID, `prefill` or `decode` |
 | `expected` | Recorders per role, `{"frontend": n, "scheduler": n, "worker": n}`: one of each per DP rank and TP rank as the server runs them, at least one frontend |
-| `cpus` | Nonempty observer CPU list, disjoint from serving CPUs |
+| `cpus` | Nonempty observer CPU list: within the observer's own affinity, disjoint from the serving CPUs |
 | `irq_policy` | `operator_verified` or `virtual_not_applicable` |
-| `input_dir`, `output_dir` | Read-only L1 root and separate probe output |
+| `input_dir`, `output_dir` | Read-only L1 root and separate probe output (not inside the input) |
 | `stop_file`, `endpoint_complete_file` | Stop and child-closure paths |
+| `owner_exit_grace_s` | Optional: how long after the owner's exit the controller's completion notice is awaited, (0, 600] seconds, default 2 |
+| `package_sha256` | Optional: the SHA-256 of the observer package (`observer.pyz`) run; a mismatch refuses to start, and `--check-capture` then checks the package |
 
 Share the endpoint network and PID namespaces. Check physical IRQ affinities
 externally; the observer never retunes them. The observer discovers its
 endpoint from the L1 recorders' opening metadata in `input_dir`, without
 transfer-path I/O:
+
 - the recorders must be exactly the `expected` ones, each carrying a KV role of
   the configured side (`kv_producer` for prefill, `kv_consumer` for decode,
   `kv_both` for either);
@@ -888,7 +939,8 @@ transfer-path I/O:
 It freezes the inventory, the owner, the evidence for the owner (each frontend's
 parent as read) and the digest of the observer code that ran (`code_sha256`) in
 its capture before it is ready. `--check-capture` checks the owner against that
-evidence and the code against its own. PID start ticks, namespace identities,
+evidence and the code against its own; `--code-digest` prints the digest of the
+observer code it runs, as captures record it. PID start ticks, namespace identities,
 engine and rank are validated before optional fd ownership reads. If the kernel
 refuses a process's namespace links (it holds capabilities the observer lacks, or
 is not dumpable), the error names the path, the errno and both causes.
@@ -899,9 +951,10 @@ Start the observer before admitting workload and wait for its manifest's `ready`
 beside the server: a container of the server's pod, or any process that shares
 its namespaces. `SETTINGS` holds `probes`, `role`, `expected`, `profiles_dir`,
 `observer_root`, `irq_policy` and, optionally, `cpus` (the sidecar's own affinity
-by default), `startup_timeout_s` and `stop_grace_s`. Each start is a fresh
+by default), `startup_timeout_s` (default 900) and `stop_grace_s` (default 25). Each start is a fresh
 attempt in its own directory under `observer_root`, so markers from an earlier
 attempt never apply. The sidecar:
+
 1. **Startup, within one deadline (`startup_timeout_s`):** it finds the serving
    generation whose expected recorders are all running, without holding the
    server back. That is `profiles_dir` itself, or one directory per serving
@@ -914,14 +967,15 @@ attempt never apply. The sidecar:
    owner-exit wait (`owner_exit_grace_s`), it waits for every frozen serving
    process to exit and its L1 capture to close. The processes include the owner
    (with several API servers, their parent), and a process whose status cannot
-   be read is never taken as exited. Part of the budget is kept for stopping the
-   observer. It writes the completion file (`children_closed` only if both
+   be read is never taken as exited. A quarter of the budget, at most 5 s, is
+   kept for stopping the observer. It writes the completion file (`children_closed` only if both
    held), creates the stop file, reaps the observer by the deadline or kills it
    (`timed_out`), and publishes its exit record. Termination during startup
    cancels the attempt; it is not a timeout.
 
-The attempt directory is then checked with `--check-capture`, its `config.json`
-naming the generation. `deploy/llm-d/profiling` runs it as a Kubernetes native
+The attempt directory is then checked with `--check-capture <attempt> --core-dir
+<generation>` (its `config.json` names the generation); the check exits 0 for a
+complete capture and 2 otherwise. `deploy/llm-d/profiling` runs it as a Kubernetes native
 sidecar.
 After child/L1 completion, the controller writes the endpoint completion file:
 `{"run_id": "<UUID>", "endpoint": "<ID>", "children_closed": true}`, then
@@ -929,9 +983,9 @@ creates `stop_file`. The observer independently checks the L1 manifests, samples
 once more and flushes. Unconfirmed owner exit, signal termination, incomplete
 child captures,
 required-source failures, queue loss and missed ticks cannot yield a complete
-capture. Owner exit is not proof of worker/helper closure: the observer allows
-a bounded two-second controller notification interval, then marks a timeout
-incomplete. The controller must
+capture. Owner exit is not proof of worker/helper closure: the observer allows a
+bounded controller notification interval (`owner_exit_grace_s`, 2 s by default),
+then marks a timeout incomplete. The controller must
 also collect observer exit/timeout status; kill only its own observer after the
 shutdown deadline. Kernel driver I/O can outlast user-space deadlines. Observer
 failure never signals or stops the server.
@@ -1012,7 +1066,7 @@ than catching up, records gaps/loss and never fabricates completeness. Final
 manifests retain observer CPU/RSS accounting separately from serving and L1
 helpers. Off-vs-L3 serving overhead was measured only for the workload described
 at the top of this page, with `flush="end"`, where its p99 latency bounds exceeded
-the gate and it was accepted after review.
+their limits.
 
 ### Capture inventory and deployment snapshot
 
@@ -1062,7 +1116,9 @@ cleans up that ID even if startup fails; it never removes a name collision.
 
 The stdlib observer accepts `probes.ebpf` with `enabled: true`,
 `privileged_opt_in: true`, `mode: tcp_tracepoints`, and an absolute `artifacts`
-directory. It records the events of the sockets the endpoint's scheduler and
+directory. Without `privileged_opt_in` (or without the effective privilege) the
+source is unavailable at runtime (`missing_explicit_effective_privilege`), not a
+configuration error. It records the events of the sockets the endpoint's scheduler and
 worker processes own, the same owned sockets TCP sampling selects (discovery,
 by kernel cookie), never by address: there are no address lists. Optional
 `local_ports` and `peer_ports` lists (at most 32 unique ports each) narrow it.
@@ -1150,8 +1206,38 @@ candidates, which offer possible owners without proving ownership at the
 event. Ambiguous or absent evidence stays explicit. Aggregate bytes are never
 apportioned and unique candidates are never causal attribution.
 
-Build artifacts separately with `tools/kv-profiler-ebpf/build.sh` and mount the
-finished artifact directory read-only. One CO-RE BPF
+Build the artifacts separately, inside the eBPF tooling image
+(`tools/kv-profiler-ebpf-image`, which provides the SDK under
+`/opt/kv-profiler-tools`; `KVP_TOOLS_PREFIX` points elsewhere), from a source
+checkout into a new directory that must not exist yet:
+
+```console
+bash tools/kv-profiler-ebpf/build.sh <source root> <new artifact directory>
+python tools/kv-profiler-ebpf/check-unprivileged.py <artifact directory> <source root>
+```
+
+The directory receives the collector, the BPF object `observe.bpf.o`, its
+`limits.json` and `manifest.json` (the files' hashes, which the observer checks),
+with inspection records beside them (`build-inputs.json`,
+`object-inspection.jsonl`, `observe.skel.h`, `sections.txt`, `disassembly.txt`).
+The unprivileged check (run without BPF privileges, with the `vllm` package
+importable) verifies the package, its hooks and maps and instruction bounds, and
+that an unprivileged arm is refused before anything loads. Mount the
+finished directory read-only.
+
+The observer runs the collector as `collector --arm <plan> <observe.bpf.o>`
+(`collector --inspect <observe.bpf.o>` only lists the object's maps and
+programs). The plan file names the observer process, its network namespace and
+the port lists; the ownership commands go over the collector's stdin, one per
+line (`A <seq> <cookie> <admission>`, `D <seq> <cookie> <admission>`,
+`R <seq> <cookie>`, and `stop`). Exit 2 has two meanings, told apart by the rows:
+a run that started (a `ready` row) and ended normally, its coverage partial as
+always, with its `end` row; and a refusal to start (an invalid plan, missing
+privilege or a dead parent, an object that does not open or load), with a
+`status` row saying which. Exit 3 is an output or collector failure, a malformed
+row included. The observer itself exits 0 for a complete capture and 2 for an
+incomplete one once started; a launch config it refuses ends it with an error
+(exit 1). One CO-RE BPF
 object targets BTF kernels from 5.15 upward, consuming positional argument prefixes
 and ignoring appended arguments. This is the compatibility contract, not a claim
 that an untested kernel has passed validation. The tooling image and dependency
@@ -1174,10 +1260,13 @@ Coverage is never provably complete, so a
 required eBPF source is judged on a clean run (`clean` in the stop record): ready
 and still available, no failure, the collector's own unfailed terminal record, a
 normal exit and its final resource accounting. Known event loss (endpoint ring or
-read losses, counter wraps, the collector's output drops or malformed rows) marks
-the capture `ebpf_degraded`, with the counts in `ebpf_event_loss`: it stands, but
-its events cannot certify agreement with other sources. Namespace, protocol,
-family, port and address exclusions and global unknown exclusions are not loss.
+read losses, counter wraps, the collector's output drops) marks the capture
+`ebpf_degraded`, with the counts in `ebpf_event_loss`: it stands, but its events
+cannot certify agreement with other sources. A malformed row is no loss but a
+collector bug: the collector exits with an error (status 3), so the run is not
+clean and a required eBPF source fails; the count stays in its terminal record. Namespace,
+protocol, family and port exclusions, ownership rejections (counted apart) and global
+unknown exclusions are not loss.
 
 In the e2e harness an endpoint opts in with `probes.ebpf: {enabled: true,
 privileged_opt_in: true, mode: tcp_tracepoints, artifacts: <built directory>}`,
@@ -1194,9 +1283,12 @@ between the sending and receiving endpoints. L3 polled the current socket state,
 while eBPF recorded individual transitions.
 
 The ring has fixed 1 MiB data capacity, plus two one-entry ARRAY values: 512 bytes
-of control (the port and address lists) and 256 bytes of loss counters. That is
-1,049,344 bytes of ring/value capacity,
-not physical kernel memory charge. Kernel bookkeeping and JIT memory are additional.
+of control (the namespace and port lists) and 256 bytes of loss counters. That is
+1,049,344 bytes of ring/value capacity. The ownership map (`allowed`, a hash of at
+most 65,536 cookies, 8-byte keys and values) and the rejection counters
+(`rejected`, an LRU hash of at most 4,096 cookies, 8-byte keys, 24-byte values)
+are additional. None of this is a
+physical kernel memory charge. Kernel bookkeeping and JIT memory are additional.
 Map fdinfo is diagnostic only; missing or large reported values are not a gate.
 No per-host qualification or per-kernel audit is required. Four programs/links,
 256-byte binary events, 2 KiB native JSON records and a 4,096-row native output
@@ -1227,7 +1319,7 @@ Mooncake's producer writes KV into the consumer, so the unit is a **write batch*
 the requests one pull found ready for one consumer rank. Each batch has its own
 generation, in the frame that owns it (`send_kv_to_decode`), and the sequence is
 
-```
+```text
 transfer_bind -> prepared -> post_begin -> post_return
     -> complete_observed | failed -> batch_member / request failures -> transfer_retire
 ```
@@ -1264,7 +1356,10 @@ The summary's **`write_batches`** view (one entry per batch: one transport call)
 and checks the partition: `exact` only if the declared member count equals the distinct recorded
 identities (a missing zero-byte member is detected, not only a wrong sum), every share is known and
 the sums equal the posted totals (and the completion's); `mismatch`, `member_mismatch`,
-`shares_unavailable` and `not_posted` say otherwise, and a capture with loss is never `exact`.
+`shares_unavailable` and `not_posted` say otherwise. `observed_only` means the sums match
+but cannot certify the partition: the capture has loss (a member row may be missing) or the
+adapter's own record (`profiler.json`) reports a problem, each named in `partition.reasons`;
+such a batch is never `exact`.
 A request's entry lists its batch memberships (associations, never request occurrences) with
 posted, planned-unconfirmed and unknown shares kept apart.
 
@@ -1412,9 +1507,10 @@ scheduler handed off from (its recorded handoffs) calibrates once, `ok`, against
 worker clock (that capture's `clock_id`, served and advertised), with a mapping file of the same run and
 clock pair; a calibration of an engine it never handed off from, or a handoff whose peer
 its capture's dictionary does not resolve, fails too. The servers are stopped as under NIXL (decode first, so the clock servers are alive for the
-end calibration) before the profile directories are copied. With `collector` as well, each producer rank's
-batches can be checked against its TENT counters: the batches' bytes equal the collector's write bytes, and
-TENT's requests (it merges adjacent descriptors of a batch) are at most the batches' descriptors.
+end calibration) before the profile directories are copied. With `collector` as well, a producer rank's
+batches and its TENT counters are both recorded, so they can be compared: the batches' bytes should equal the
+collector's write bytes, and TENT's requests (it merges adjacent descriptors of a batch) be at most the batches'
+descriptors. No tool makes this comparison; the harness checks the TENT counters against the bytes it moved.
 
 ### NIXL's built-in telemetry (L2 source `nixl`)
 

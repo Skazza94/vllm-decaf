@@ -114,7 +114,7 @@ workload:  # vllm bench serve --dataset-name random
 # stopped before the servers. Its capture is copied to collector/<node>/ and
 # checked: complete, and its counters' change over the workload equal to the
 # harness's own scrape (tent.json). Independent of the L1 profiler.
-# nixl_telemetry (any NIXL backend, data_parallel_size 1) reads NIXL's own telemetry too, with a recorded process
+# nixl_telemetry (server.connector nixl, any backend and DP size) reads NIXL's own telemetry too, with a recorded process
 # inventory, a bounded baseline and a bounded, stable and checked final sample; tent: false drops the TENT scrape
 # (a backend without TENT).
 # collector:

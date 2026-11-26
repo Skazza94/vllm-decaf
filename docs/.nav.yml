@@ -32,6 +32,7 @@ nav:
         - models/hardware_supported_models/*
         - TPU: https://docs.vllm.ai/projects/tpu/en/latest/recommended_models/
     - Features: features
+    - Observability: observability
   - Developer Guide:
     - contributing/README.md
     - General:

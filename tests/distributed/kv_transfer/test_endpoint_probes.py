@@ -2823,6 +2823,18 @@ def test_ebpf_known_event_loss_marks_a_clean_run_degraded(
             channel.stop(writer)
 
 
+def test_ebpf_a_malformed_row_is_a_collector_failure_not_event_loss():
+    """Output drops are loss; malformed rows are not (the collector exits with
+    an error on one, so the run is never clean): no loss entry stands for
+    them."""
+    from vllm.kv_profiling.endpoint_probes.ebpf import event_loss
+
+    assert event_loss({}, {"output_drops": 0, "malformed": 2}) == {}
+    assert event_loss({}, {"output_drops": 3, "malformed": 2}) == {
+        "terminal.output_drops": 3
+    }
+
+
 def test_ebpf_saved_capture_loss_comes_from_the_recorded_counters(
     tmp_path, monkeypatch
 ):

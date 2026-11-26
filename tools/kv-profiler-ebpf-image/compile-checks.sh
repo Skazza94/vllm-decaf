@@ -1,5 +1,7 @@
 #!/bin/bash
-# Later checkpoint, AFTER main returns the built image identity. Never attaches.
+# A compile smoke test of the built image: compile, strip and skeleton a BPF
+# object, and link a native program against static libbpf. Never loads or
+# attaches anything. Usage: compile-checks.sh /new/output-dir (inside the image)
 set -euo pipefail
 prefix=/opt/kv-profiler-tools
 output=$1

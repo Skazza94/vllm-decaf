@@ -226,16 +226,17 @@ LOSS_SCOPES = ("endpoint_namespace", "counter_health")
 def event_loss(losses, terminal):
     """Known event loss, by counter: the cumulative counters of ``LOSS_SCOPES``
     (``losses``: (scope, counter) -> highest value) and the collector's terminal
-    output drops and malformed rows; zero counts and exclusions are not loss."""
+    output drops; zero counts and exclusions are not loss. A malformed row is
+    no loss but a collector failure (it exits 3), so a run with one is never
+    clean."""
     loss = {
         f"{scope}.{counter}": value
         for (scope, counter), value in sorted(losses.items())
         if value and scope in LOSS_SCOPES
     }
-    for name in ("output_drops", "malformed"):
-        value = (terminal or {}).get(name)
-        if isinstance(value, int) and value:
-            loss[f"terminal.{name}"] = value
+    value = (terminal or {}).get("output_drops")
+    if isinstance(value, int) and value:
+        loss["terminal.output_drops"] = value
     return loss
 
 
@@ -831,7 +832,7 @@ class Channel:
             "coverage": "partial",
             # Known event loss, apart from the lifecycle (``clean``): endpoint
             # events the ring or the reads lost, counter wraps, and the
-            # collector's own output drops and malformed rows. Ordinary
+            # collector's own output drops (a malformed row fails it). Ordinary
             # namespace, protocol, family and port exclusions, and global
             # unknown exclusions, are not loss.
             "event_loss": loss,
