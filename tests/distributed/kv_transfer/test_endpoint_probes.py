@@ -599,7 +599,7 @@ def test_synthetic_read_windows_have_only_qualified_flow_candidates(
 ):
     """Real recorder and sockets, not evidence of a native NIXL handle/FD map."""
     from tests.distributed.kv_transfer.test_profiler_core import fields
-    from vllm.kv_profiling.endpoint_probes.sockets import Discovery
+    from vllm.kv_profiling.endpoint_probes.sockets import Discovery, Tracker
 
     run_id = str(uuid4())
     core_dir = tmp_path / "core"
@@ -627,6 +627,7 @@ def test_synthetic_read_windows_have_only_qualified_flow_candidates(
     )
     core.record(*fields(EventKind.TRANSFER_BIND, handle=7, request="request"))
     core.record(*fields(EventKind.POST_RETURN, handle=7))
+    tracker = Tracker()
     for _ in range(flow_count):
         with socket.socket() as listener, socket.socket() as client:
             listener.bind(("127.0.0.1", 0))
@@ -644,12 +645,13 @@ def test_synthetic_read_windows_have_only_qualified_flow_candidates(
                     for cookie, record in scan.owned.items()
                     if record["inode"] == client_inode
                 }
-                _sample_once(writer, scan)
+                _sample_once(writer, scan, tracker)
                 row = next(iter(scan.owned.values()))["row"]
                 now = scan.dump_finished_ns
                 if rare_event:
                     native = {
                         **tcp_event_row(),
+                        "schema": 2,  # before owned-socket selection: tuples
                         **{
                             k: row[k]
                             for k in (
@@ -1009,24 +1011,10 @@ def test_candidate_uniqueness_is_qualified_when_either_stream_is_partial(
         {"enabled": True, "sets": ["provider_wr", "provider_wr"]},
         {"enabled": True, "sets": ["unknown"]},
         {"enabled": False, "artifacts": "/unused"},
-        {"enabled": True, "mode": "tcp_tracepoints", "local_ips": ["10.0.0.300"]},
-        {"enabled": True, "mode": "tcp_tracepoints", "peer_ips": "10.0.0.1"},
-        {
-            "enabled": True,
-            "mode": "tcp_tracepoints",
-            "peer_ips": [f"10.0.0.{i}" for i in range(9)],
-        },
-        {
-            "enabled": True,
-            "mode": "tcp_tracepoints",
-            "local_ips": ["10.0.0.1", "::ffff:10.0.0.1"],
-        },
-        {"enabled": True, "mode": "tcp_tracepoints", "peer_ips": ["fe80::1%eth0"]},
-        {
-            "enabled": True,
-            "mode": "tcp_tracepoints",
-            "peer_ips": ["::ffff:10.0.0.1%eth0"],
-        },
+        # the selection is the owned sockets: address lists are no option
+        {"enabled": True, "mode": "tcp_tracepoints", "local_ips": ["10.0.0.1"]},
+        {"enabled": True, "mode": "tcp_tracepoints", "peer_ips": ["10.0.0.1"]},
+        {"enabled": True, "mode": "tcp_tracepoints", "local_ports": [0]},
     ],
 )
 def test_ebpf_invalid_options_are_refused_before_start(value):
@@ -1105,7 +1093,7 @@ def tcp_event_row():
 
     return dict(
         type="tcp_event",
-        schema=2,
+        schema=3,
         event="inet_sock_set_state",
         timestamp_ns=10,
         netns=99,
@@ -1114,7 +1102,8 @@ def tcp_event_row():
         peer_ip="127.0.0.2",
         local_port=1234,
         peer_port=4321,
-        cookie=None,
+        cookie=42,
+        admission=7,
         old_state=1,
         new_state=7,
         snapshot={name: {"state": "available", "value": 0} for name in FIELDS},
@@ -1132,6 +1121,9 @@ def test_ebpf_wire_records_cannot_invent_attribution_or_byte_semantics():
         {"exact": True},
         {"transfer": 0},
         {"cookie": 0},
+        {"cookie": None},
+        {"admission": 0},
+        {"schema": 2},
         {"timestamp_ns": True},
         {"old_state": None},
         {"family": 10},
@@ -1207,7 +1199,7 @@ def test_ebpf_artifacts_match_their_own_manifest_not_build_environment(tmp_path)
     for name in names:
         (tmp_path / name).write_text(name)
     manifest = {
-        "schema": 3,
+        "schema": 4,
         "mode": "tcp_tracepoints",
         "files": {name: digest(tmp_path / name) for name in names},
         "image": "different-build",
@@ -1219,8 +1211,8 @@ def test_ebpf_artifacts_match_their_own_manifest_not_build_environment(tmp_path)
     (tmp_path / "collector").write_text("changed")
     with pytest.raises(ValueError, match="hash mismatch"):
         validate_artifacts(tmp_path)
-    # a previous generation's package (no address allow-lists) is rebuilt
-    (tmp_path / "manifest.json").write_text(json.dumps({**manifest, "schema": 2}))
+    # a previous generation's package (address allow-lists) is rebuilt
+    (tmp_path / "manifest.json").write_text(json.dumps({**manifest, "schema": 3}))
     with pytest.raises(ValueError, match="rebuild it"):
         validate_artifacts(tmp_path)
 
@@ -2461,10 +2453,12 @@ def _sampler(writer, required=()):
     return observer
 
 
-def _sample_once(writer, scan):
+def _sample_once(writer, scan, tracker=None):
     """Record ``scan`` as the observer does: its admissions (which name the
-    owners), then its TCP sample."""
+    owners), then its TCP sample; one capture's scans share one tracker."""
     observer = _sampler(writer)
+    if tracker is not None:
+        observer.tracker = tracker
     for change in observer.tracker.apply(scan):
         observer.emit("socket_ownership", str(change["cookie"]), scan.started_ns,
                       change, kind="probe_status")  # fmt: skip
@@ -2854,12 +2848,11 @@ def test_ebpf_saved_capture_loss_comes_from_the_recorded_counters(
         owner.wait(10)
 
 
-def test_ebpf_the_collector_s_plan_carries_the_address_allow_lists(
+def test_ebpf_the_collector_s_plan_carries_only_its_identity_and_ports(
     tmp_path, monkeypatch
 ):
-    """The observer hands the collector its address allow-lists as the kernel
-    matches them (IPv4-mapped IPv6 as IPv4), next to the port lists; no lists
-    means any address."""
+    """The plan names the observer, its namespace and the optional port lists;
+    no address (the selection is the owned sockets, sent as commands)."""
     from vllm.kv_profiling.endpoint_probes import ebpf
 
     monkeypatch.setattr(ebpf, "effective_privilege", lambda: True)
@@ -2876,17 +2869,7 @@ def test_ebpf_the_collector_s_plan_carries_the_address_allow_lists(
         )
 
     monkeypatch.setattr(ebpf.subprocess, "Popen", popen)
-    for name, options in [
-        (
-            "scoped",
-            {
-                "local_ips": ["::ffff:10.0.0.1"],
-                "peer_ips": ["10.0.0.2", "fd00::5"],
-                "peer_ports": [7],
-            },
-        ),
-        ("any", {}),
-    ]:
+    for name, options in [("scoped", {"peer_ports": [7]}), ("any", {})]:
         collector = ebpf.Collector(
             ebpf.Settings(enabled=True, privileged_opt_in=True,
                           mode="tcp_tracepoints", artifacts=str(tmp_path), **options),
@@ -2896,8 +2879,8 @@ def test_ebpf_the_collector_s_plan_carries_the_address_allow_lists(
         collector.child.wait(10)
         collector.child.stdin.close()
     lines = [plan.splitlines()[2:] for plan in launched]
-    assert lines[0] == ["L ", "R 7", "LA 10.0.0.1", "RA 10.0.0.2 fd00::5"]
-    assert lines[1] == ["L ", "R ", "LA ", "RA "]
+    assert lines[0] == ["L ", "R 7"]
+    assert lines[1] == ["L ", "R "]
 
 
 @pytest.mark.parametrize(
@@ -4182,10 +4165,13 @@ def test_an_owner_record_too_long_for_one_row_is_split_and_recovered():
     rows = [r for r in sink.rows if r["scope"] == "socket_ownership"]
     assert len(rows) > 1 and all(len(json.dumps(r)) <= ROW_BUDGET for r in rows)
     assert {(r["sample_begin_ns"], r["sample_end_ns"]) for r in rows} == {(5, 9)}
-    owners = _admitted_owners(rows)[tracker.active[17]]
+    owners = _admitted_owners(rows)[tracker.active[17]]["owners"]
     assert [o["pid"] for o in owners] == list(range(1000, 1128))
-    flow = {"selection": {"admission": tracker.active[17]}}
+    flow = {"selection": {"cookie": 17, "admission": tracker.active[17]}}
     assert len(_owners(flow, _admitted_owners(rows))) == 128
+    # the admission's record is of another cookie: no owners
+    assert _owners({"selection": {"cookie": 18, "admission": tracker.active[17]}},
+                   _admitted_owners(rows)) == []  # fmt: skip
     # an incomplete record resolves to nothing, never to part of its owners
     assert _admitted_owners(rows[:1]) == {}
     # a long status keeps the dump's interval in every part
@@ -4311,3 +4297,595 @@ def test_a_generation_change_needs_one_verified_owner_across_both_reads():
                 and c["cookie"] == record["cookie"]]  # fmt: skip
     assert admitted and admitted[0]["supersedes"] == first_admission
     assert [o["engine_id"] for o in admitted[0]["owners"]] == ["new"]
+
+
+_FAKE_COLLECTOR = r"""
+import json, sys, time
+# a collector speaking the real protocol; argv: the acknowledgements to lose
+# (sequence numbers, applied anyway) and the deletes to fail (sequence numbers,
+# or "all")
+lose = {int(x) for x in sys.argv[1].split(",") if x}
+fail_all = sys.argv[2] == "all"
+fail = set() if fail_all else {int(x) for x in sys.argv[2].split(",") if x}
+owned = {}
+counters = {42: 3}  # rejections so far, harvested by an admit or a delete
+def say(row):
+    print(json.dumps(row), flush=True)
+say({"type": "ready", "available": True, "exact": False, "coverage": "partial"})
+for line in sys.stdin:
+    words = line.split()
+    if words == ["stop"]:
+        say({"type": "loss", "scope": "filter_exclusion",
+             "counter": "excluded_unowned", "value": 12})
+        now = time.monotonic_ns()
+        say({"type": "rejected", "cookie": 42, "count": 5, "first_ns": now,
+             "last_ns": now, "consistent": True})
+        say({"type": "rejected", "cookie": 77, "count": 3, "first_ns": 1, "last_ns": 2,
+             "consistent": True})
+        say({"type": "end", "complete": False, "coverage": "partial", "output_drops": 0,
+             "malformed": 0, "rejected_complete": True, "failed": False})
+        sys.exit(2)
+    op, seq, cookie = words[0], int(words[1]), int(words[2])
+    before = time.monotonic_ns()
+    if op == "A":
+        owned[cookie] = int(words[3])
+        row = {"type": "ack", "op": "A", "seq": seq, "cookie": cookie,
+               "admission": int(words[3]), "ok": True, "errno": 0, "before_ns": before,
+               "applied_ns": time.monotonic_ns(), "rejected": counters.pop(cookie, 0),
+               "rejected_first_ns": 1, "rejected_errno": 0}
+    elif op == "D":
+        admission = int(words[3])
+        stale = owned.get(cookie) != admission
+        failed = fail_all or seq in fail
+        if not stale and not failed:
+            del owned[cookie]
+        row = {"type": "ack", "op": "D", "seq": seq, "cookie": cookie,
+               "admission": admission, "ok": not failed, "errno": 5 if failed else 0,
+               "stale": stale, "before_ns": before, "applied_ns": time.monotonic_ns(),
+               "rejected": 0 if stale else counters.pop(cookie, 0),
+               "rejected_first_ns": 0, "rejected_errno": 0, "harvested": not stale}
+    else:
+        row = {"type": "ack", "op": "R", "seq": seq, "cookie": cookie, "ok": True,
+               "errno": 0, "admission": owned.get(cookie),
+               "applied_ns": time.monotonic_ns()}
+    if seq not in lose:
+        say(row)
+"""
+
+
+def _fake_channel(tmp_path, lose=(), fail=()):
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel, Settings
+
+    failing = fail if isinstance(fail, str) else ",".join(map(str, fail))
+    child = subprocess.Popen(
+        [sys.executable, "-c", _FAKE_COLLECTOR, ",".join(map(str, lose)), failing],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )  # fmt: skip
+    channel = Channel(child, tmp_path, Settings(enabled=True, privileged_opt_in=True,
+                                                mode="tcp_tracepoints"))  # fmt: skip
+    _settle(channel, until=lambda: channel.status.get("available") is True)
+    channel.monotonic_offset = 0  # the fake's clock is the observer's
+    return channel
+
+
+def _settle(channel, until=None, timeout=5):
+    deadline = time.monotonic() + timeout
+    while (channel.outbox or channel.pending or (until and not until())) and (
+        time.monotonic() < deadline
+    ):
+        channel.poll(None, 0.02)
+
+
+def _event(admission, cookie=42):
+    return {"cookie": cookie, "admission": admission}
+
+
+def test_ebpf_a_delayed_event_stays_verified_and_a_replacement_ends_the_old(
+    tmp_path,
+):
+    """An event of a removed admission, delivered late but timed inside its
+    interval, is verified; one after it is not. Replacing a cookie's admission
+    ends the old one; the old admission's late removal changes nothing."""
+    channel = _fake_channel(tmp_path)
+    try:
+        channel.admit(42, 1)
+        _settle(channel)
+        inside = time.monotonic_ns()
+        channel.admit(42, 2)  # a reversioned socket: replaced
+        _settle(channel)
+        between = time.monotonic_ns()
+        channel.retire(42, 1)  # no longer the decision: nothing is sent
+        assert not channel.outbox and not channel.pending
+        assert channel.windows[2]["until"] is None
+        assert channel.windows[1]["until"] is not None
+        assert channel.verify(_event(1), inside)["verified"] is True
+        assert channel.verify(_event(1), between)["reason"] == (
+            "outside the owned interval"
+        )
+        assert channel.verify(_event(2), between)["verified"] is True
+        channel.retire(42, 2)
+        _settle(channel)
+        after = time.monotonic_ns()
+        assert channel.verify(_event(2), after)["verified"] is False
+        assert channel.verify(_event(2, cookie=43), between)["verified"] is False
+    finally:
+        assert channel.stop(None)["clean"] is True
+
+
+def test_ebpf_a_lost_acknowledgement_after_apply_is_unknown_until_read_back(
+    tmp_path, monkeypatch
+):
+    """The kernel applied an admission whose acknowledgement never came: events
+    in between are unverified (kernel state unknown); a readback establishes
+    the admission, and later events are verified."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "ACK_TIMEOUT_NS", 200_000_000)
+    channel = _fake_channel(tmp_path, lose=[1])
+    try:
+        channel.admit(42, 7)
+        _settle(channel, until=lambda: 7 in channel.windows)
+        settled = channel.unknown[42][-1][1]
+        assert settled is not None and channel.ack_failures[0]["reason"] == (
+            "no acknowledgement"
+        )
+        sent = channel.ack_failures[0]["sent_ns"]
+        assert channel.windows[7]["since"] == sent
+        assert channel.verify(_event(7), sent + 1)["reason"] == "kernel state unknown"
+        assert channel.verify(_event(7), settled + 1)["verified"] is True
+    finally:
+        assert channel.stop(None)["clean"] is True
+
+
+@pytest.mark.parametrize("lose", [(), (2,)])
+def test_ebpf_a_retired_socket_is_never_reported_owned_and_its_entry_is_removed(
+    tmp_path, monkeypatch, lose
+):
+    """The delete of a retired socket fails (its acknowledgement lost, too):
+    an event after the retirement is unverified when recorded and stays so;
+    the readback finds the stale entry and the delete is retried until the
+    kernel matches discovery; an event from before the retirement stays
+    verified, and the capture ends clean."""
+    from vllm.kv_profiling.endpoint_probes import ebpf
+
+    monkeypatch.setattr(ebpf, "ACK_TIMEOUT_NS", 100_000_000)
+    channel = _fake_channel(tmp_path, lose=lose, fail=[2])
+    try:
+        channel.admit(42, 1)
+        _settle(channel)
+        owned = time.monotonic_ns()
+        channel.retire(42, 1)
+        retired = time.monotonic_ns()
+        assert channel.verify(_event(1), retired)["verified"] is False
+        _settle(channel, until=lambda: channel.kernel.get(42) is None)
+        assert channel.kernel.get(42) is None and not channel.inflight
+        reasons = [f["reason"] for f in channel.ack_failures]
+        assert reasons == (["no acknowledgement"] if lose else ["delete failed"])
+        assert channel.verify(_event(1), retired)["verified"] is False
+        assert channel.verify(_event(1), time.monotonic_ns())["verified"] is False
+        assert channel.verify(_event(1), owned)["verified"] is True
+        assert channel.windows[1]["until"] is not None
+    finally:
+        result = channel.stop(None)
+    assert result["clean"] is True and not any(result["ownership_unresolved"].values())
+
+
+def test_ebpf_a_delete_that_never_succeeds_is_bounded_and_not_clean(tmp_path):
+    channel = _fake_channel(tmp_path, fail="all")
+    channel.admit(42, 1)
+    _settle(channel)
+    channel.retire(42, 1, time.monotonic_ns())
+    _settle(channel)
+    assert 42 in channel.unresolved
+    assert channel.ack_failures[-1]["reason"] == "unresolved after retries"
+    # bounded by event time: before the retirement it was owned
+    assert channel.verify(_event(1), channel.decided[1]["until"] - 1)["verified"]
+    sent = sum(1 for f in channel.ack_failures if f["reason"] == "delete failed")
+    assert sent == 2  # delete, readback, delete, readback, then given up
+    result = channel.stop(None)
+    assert result["clean"] is False
+    assert result["ownership_unresolved"]["given_up"] == 1
+
+
+def test_ebpf_a_timely_acknowledgement_read_late_is_not_lost(tmp_path):
+    """An acknowledgement readable before its deadline, polled only after it,
+    is read before anything expires."""
+    import select
+
+    channel = _fake_channel(tmp_path)
+    try:
+        channel.admit(42, 1)
+        assert select.select([channel.child.stdout], [], [], 1)[0]
+        time.sleep(1.06)
+        _settle(channel)
+        assert not channel.ack_failures and not channel.unknown
+        assert channel.kernel[42] == 1
+    finally:
+        assert channel.stop(None)["clean"] is True
+
+
+def test_ebpf_ownership_commands_unsent_at_shutdown_are_not_clean(tmp_path):
+    channel = _fake_channel(tmp_path)
+    send = channel.send_command
+    with mock.patch.object(
+        channel, "send_command", lambda wire: wire == b"stop\n" and send(wire)
+    ):
+        for cookie in range(1, 17):
+            channel.admit(cookie, cookie)
+        assert len(channel.outbox) == 16
+        result = channel.stop(None)
+    assert result["clean"] is False
+    assert result["ownership_unresolved"]["unsent"] == 16
+    assert result["ownership_unresolved"]["cookies"] == 16
+
+
+def test_ebpf_each_rejection_counts_once_with_the_rest_unattributed(tmp_path):
+    """The admitted cookie's counter harvested at its admit (3) is before its
+    admission; its terminal counter (5), all begun after its delete began, is
+    after its retirement; another cookie's 3 are never owned; of the kernel's
+    total (12), 1 is unattributed."""
+    channel = _fake_channel(tmp_path)
+    channel.admit(42, 7)
+    _settle(channel)
+    assert channel.harvests[42][0]["count"] == 3
+    channel.retire(42, 7)
+    _settle(channel)
+    result = channel.stop(None)
+    assert result["rejections"] == {
+        "total": 12, "untracked": 0, "attributed": 11,
+        "before_or_between_admissions": 3, "after_retirement": 5,
+        "unresolved": 0, "never_owned": 3, "admitted_cookies_rejected": 1,
+        "never_owned_cookies": 1, "unattributed": 1, "counters_complete": True,
+        "reconciled": True,
+    }  # fmt: skip
+
+
+def _harvest_channel(tmp_path, harvests, final, retired=True, offset=0):
+    """A channel given acknowledgements directly: admit at 10..11, delete at
+    20..21 (each harvesting ``harvests[op]``), the terminal counter ``final``
+    (count, first_ns)."""
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel
+
+    channel = Channel(None, tmp_path)
+    channel.monotonic_offset = offset
+    count, errno = harvests.get("A", (0, 0))
+    channel.acknowledged({"seq": 1, "op": "A", "cookie": 42, "admission": 1,
+                          "ok": True, "before_ns": 10, "applied_ns": 11,
+                          "rejected": count, "rejected_first_ns": 0,
+                          "rejected_errno": errno})  # fmt: skip
+    if retired:
+        count, errno = harvests.get("D", (0, 0))
+        channel.acknowledged({"seq": 2, "op": "D", "cookie": 42, "admission": 1,
+                              "ok": True, "stale": False, "before_ns": 20,
+                              "applied_ns": 21, "rejected": count,
+                              "rejected_first_ns": 0, "rejected_errno": errno,
+                              "harvested": True})  # fmt: skip
+    if final:
+        consistent = final[2] if len(final) > 2 else True
+        channel.rejected[42] = {"cookie": 42, "count": final[0],
+                                "first_ns": final[1], "last_ns": 99,
+                                "consistent": consistent}  # fmt: skip
+    channel.losses["filter_exclusion", "excluded_unowned"] = 10
+    return channel.rejection_summary()
+
+
+@pytest.mark.parametrize(
+    "harvests, final, retired, offset, expected",
+    [
+        # missed before the admit, counted after it: the delete's harvest
+        # holds it, before the admission (never after the retirement)
+        ({"D": (1, 0)}, None, True, 0, (1, 0, 0)),
+        # 3 before the admit; 5 begun after the delete began
+        ({"A": (3, 0)}, (5, 25), True, 0, (3, 5, 0)),
+        # a remainder with an event begun before the delete: undecidable
+        ({"A": (3, 0)}, (2, 15), True, 0, (3, 0, 2)),
+        # its earliest time unknown under contention
+        ({"A": (3, 0)}, (2, 25 | (1 << 63)), True, 0, (3, 0, 2)),
+        # a harvest that failed: what came later is unresolved
+        ({"A": (0, 5), "D": (4, 0)}, (2, 25), True, 0, (0, 0, 6)),
+        # still admitted at the end
+        ({"A": (3, 0)}, (2, 25), False, 0, (3, 0, 2)),
+        # kernel time unconvertible
+        ({"A": (3, 0)}, (2, 25), True, None, (3, 0, 2)),
+        # kernel time ahead of the observer's by the namespace offset
+        ({"A": (3, 0)}, (2, 18), True, 5, (3, 2, 0)),
+        # read while a hook was still updating it: not consistent
+        ({"A": (3, 0)}, (2, 25, False), True, 0, (3, 0, 2)),
+    ],
+)
+def test_ebpf_rejections_are_phased_only_where_harvests_prove_it(
+    tmp_path, harvests, final, retired, offset, expected
+):
+    result = _harvest_channel(tmp_path, harvests, final, retired, offset)
+    assert (
+        result["before_or_between_admissions"],
+        result["after_retirement"],
+        result["unresolved"],
+    ) == expected
+    assert result["never_owned"] == 0 and result["reconciled"]
+
+
+@pytest.mark.parametrize("began, phase", [(25, "unresolved"), (35, "after")])
+def test_ebpf_a_rejection_while_discovery_owned_the_socket_again_is_not_after(
+    tmp_path, began, phase
+):
+    """The cookie is retired (its delete pending), admitted again and retired
+    again before the delete is acknowledged; the re-admission is never
+    installed. A rejection begun while discovery owned it again (25, within
+    22..30) is unresolved; one after its final retirement (35) is after."""
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel
+
+    channel = Channel(None, tmp_path)
+    channel.child, channel.send_command = object(), lambda wire: True
+    channel.monotonic_offset = 0
+    channel.admit(42, 1, at=5)
+    channel.acknowledged({"seq": 1, "op": "A", "cookie": 42, "admission": 1,
+                          "ok": True, "before_ns": 6, "applied_ns": 7, "rejected": 0,
+                          "rejected_first_ns": 0, "rejected_errno": 0})  # fmt: skip
+    channel.retire(42, 1, at=15)
+    channel.admit(42, 2, at=22)
+    channel.retire(42, 2, at=30)
+    channel.acknowledged({"seq": 2, "op": "D", "cookie": 42, "admission": 1,
+                          "ok": True, "stale": False, "before_ns": 16,
+                          "applied_ns": 17, "rejected": 0, "rejected_first_ns": 0,
+                          "rejected_errno": 0, "harvested": True})  # fmt: skip
+    assert not channel.pending and not channel.outbox  # converged: no install
+    channel.rejected[42] = {"cookie": 42, "count": 1, "first_ns": began,
+                            "last_ns": began, "consistent": True}  # fmt: skip
+    channel.losses["filter_exclusion", "excluded_unowned"] = 1
+    result = channel.rejection_summary()
+    assert (result["after_retirement"], result["unresolved"]) == (
+        (1, 0) if phase == "after" else (0, 1)
+    )
+
+
+def test_ebpf_the_terminal_summary_scales_with_cookies_not_their_square(tmp_path):
+    """16,384 cookies admitted and retired, one at a time: the summary and
+    the per-cookie closing stay linear."""
+    from vllm.kv_profiling.endpoint_probes.ebpf import Channel
+
+    channel = Channel(None, tmp_path)
+    began = time.monotonic()
+    for cookie in range(1, 16385):
+        channel.acknowledged({"seq": 0, "op": "A", "cookie": cookie,
+                              "admission": cookie, "ok": True, "before_ns": 1,
+                              "applied_ns": 2, "rejected": 0,
+                              "rejected_first_ns": 0, "rejected_errno": 0})  # fmt: skip
+        channel.acknowledged({"seq": 0, "op": "D", "cookie": cookie,
+                              "admission": cookie, "ok": True, "stale": False,
+                              "before_ns": 3, "applied_ns": 4, "rejected": 0,
+                              "rejected_first_ns": 0, "rejected_errno": 0,
+                              "harvested": True})  # fmt: skip
+    channel.losses["filter_exclusion", "excluded_unowned"] = 0
+    assert channel.rejection_summary()["reconciled"]
+    assert time.monotonic() - began < 2
+
+
+def test_ebpf_ownership_ends_at_the_scan_s_decision_time(tmp_path):
+    """A removal (or suspension) found by a scan ends the admission at the
+    scan's published time: an event after it, processed before the channel
+    heard of the removal, is not verified; one before it is."""
+    from types import SimpleNamespace
+
+    from vllm.kv_profiling.endpoint_probes import runner, sockets
+
+    channel = _fake_channel(tmp_path)
+    try:
+        observer = runner.Observer.__new__(runner.Observer)
+        observer.ebpf, observer.endpoint = channel, "d"
+        observer.tracker = sockets.Tracker()
+        observer.config = SimpleNamespace(tcp=None, ebpf={"enabled": True},
+                                          required=["ebpf"])  # fmt: skip
+        observer.discovery_failures = observer.failed_required = 0
+        rows = []
+        observer.writer = SimpleNamespace(put=rows.append)
+        me = {**process_identity(os.getpid()), "engine_id": "d", "rank": 0,
+              "role": "worker"}  # fmt: skip
+        record = {"cookie": 42, "owners": [me], "owner_pids": [me["pid"]],
+                  "holders": [], "row": {}}  # fmt: skip
+
+        def scan(owned):
+            result = sockets.Scan(time.monotonic_ns())
+            result.complete, result.owned = True, owned
+            result.finished_ns = time.monotonic_ns()
+            return result
+
+        observer.discovery = SimpleNamespace(scan=lambda: scan({42: record}))
+        observer.discover()
+        _settle(channel)
+        admission = next(iter(channel.decided))
+        observer.discovery = SimpleNamespace(scan=lambda: scan({}))
+        observer.discover()
+        changes = [r["observation"] for r in rows if r.get("observation")]
+        ended = next(c["ended_ns"] for c in changes if c.get("change") == "removed")
+        assert channel.decided[admission]["until"] == ended
+        event = _event(admission)
+        assert channel.verify(event, ended + 1)["verified"] is False
+        assert channel.verify(event, ended - 1)["verified"] is True
+        _settle(channel)
+    finally:
+        assert channel.stop(None)["clean"] is True
+
+
+@pytest.mark.parametrize(
+    "verified, polls, damage",
+    [
+        (True, True, None),
+        (False, True, None),
+        (True, False, None),
+        # identities that do not agree make no candidate
+        (True, False, "no selection"),
+        (True, False, "selection names another admission"),
+        (True, False, "admission record of another cookie"),
+    ],
+)
+def test_a_transferred_cookie_s_ebpf_event_joins_only_its_verified_admission(
+    tmp_path, verified, polls, damage
+):
+    """One cookie, admitted for an old worker and then (another admission) for
+    a new one: a verified event under the new admission is a candidate of the
+    new worker's READ only, with or without TCP samples; an unverified event is
+    no one's."""
+    from tests.distributed.kv_transfer.test_profiler_core import fields
+
+    run = str(uuid4())
+    me = process_identity(os.getpid())
+    cores = {}
+    for engine in ("old", "new"):
+        recorder = ProcessRecorder(
+            NetworkProfilerConfig(
+                level="l3", run_id=run, output_dir=str(tmp_path / engine),
+                ring_records=64,
+                context={"role": "worker", "engine_id": engine, "rank": 0,
+                         "kv_role": "kv_consumer"},
+            )
+        )  # fmt: skip
+        assert recorder.wait_ready()
+        recorder.record(*fields(EventKind.TRANSFER_BIND, handle=7))
+        recorder.record(*fields(EventKind.POST_RETURN, handle=7))
+        cores[engine] = recorder
+    writer = Writer(tmp_path / "probe", metadata(run), ProbeConfig())
+    owners = {e: {**me, "engine_id": e, "rank": 0, "role": "worker"} for e in cores}
+    now = time.monotonic_ns()
+    for admission, engine in ((1, "old"), (2, "new")):
+        cookie = 44 if damage == "admission record of another cookie" else 17
+        admitted = {"change": "admitted", "cookie": cookie if admission == 2 else 17,
+                    "admission": admission, "owners": [owners[engine]]}  # fmt: skip
+        writer.put(event("probe_status", "socket_ownership", "17", now, now, admitted))
+    if polls:  # a sample of the socket under each admission
+        for admission, engine in ((1, "old"), (2, "new")):
+            writer.put(event("endpoint_metrics", "socket", "17", now, now,
+                             {"cookie": 17, "owners": [owners[engine]],
+                              "selection": {"by": "owned_socket", "cookie": 17,
+                                            "admission": admission}},
+                             "tcp"))  # fmt: skip
+    native = {
+        **tcp_event_row(), "cookie": 17, "admission": 2, "timestamp_ns": now,
+        "time_conversion_qualified": True,
+        "selection": {"by": "owned_socket", "cookie": 17, "admission": 2,
+                      "verified": verified},
+    }  # fmt: skip
+    if damage == "no selection":
+        del native["selection"]
+    elif damage == "selection names another admission":
+        native["selection"]["admission"] = 1
+    writer.put(event("endpoint_metrics", "ebpf", "d", now, now, native, "tcp"))
+    for recorder in cores.values():
+        recorder.record(*fields(EventKind.COMPLETE_OBSERVED, handle=7))
+        assert recorder.close().complete
+    assert writer.close(True, "test", {})
+    result = candidates(
+        [cores[e].output_dir / "events.jsonl" for e in cores],
+        [tmp_path / "probe/events.jsonl"],
+    )
+    events = {
+        r["engine_id"]: sum(len(c.get("tcp_events", [])) for c in r["candidates"])
+        for r in result
+    }
+    assert events == {"old": 0, "new": int(verified and not damage)}
+    if polls:  # the samples stay each admission's
+        assert all(r["association"] == "unique_temporal_candidate" for r in result)
+    new = next(r for r in result if r["engine_id"] == "new")
+    if verified and not damage:
+        basis = [e["ownership_basis"] for c in new["candidates"]
+                 for e in c.get("tcp_events", [])]  # fmt: skip
+        assert basis == ["verified_admission"]
+
+
+@pytest.mark.skipif(
+    not os.environ.get("KVP_EBPF_ARTIFACTS"),
+    reason="needs built eBPF artifacts (KVP_EBPF_ARTIFACTS) and CAP_BPF/CAP_PERFMON",
+)
+def test_a_live_observer_selects_its_endpoint_s_sockets_in_the_kernel(tmp_path):
+    """The real collector, under the observer: the endpoint process's socket is
+    admitted in the kernel by cookie, its events are recorded under that
+    admission and verified, the test's own end of the connection is rejected
+    and counted, and the capture with required TCP and eBPF checks complete."""
+    allowed = sorted(os.sched_getaffinity(0))
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        port = listener.getsockname()[1]
+        owner, inventory, endpoint_dir = start_recorded_endpoint(
+            tmp_path, allowed[0], connect=port
+        )
+        accepted, _ = listener.accept()
+        run_id = inventory[0]["run_id"]
+        core_dir = endpoint_dir / "profiles"
+        ebpf = {"enabled": True, "privileged_opt_in": True, "mode": "tcp_tracepoints",
+                "artifacts": os.environ["KVP_EBPF_ARTIFACTS"]}  # fmt: skip
+        settings = ProbeConfig(
+            interval_s=0.1, slow_interval_s=0.1, interfaces=["lo"],
+            tcp={"owned_sockets": True}, discovery_interval_s=0.05, ebpf=ebpf,
+            required=["netdev", "tcp", "ebpf"],
+        )  # fmt: skip
+        path = _observer_config(tmp_path, run_id, core_dir, allowed[-1],
+                                probes=asdict(settings),
+                                owner_exit_grace_s=30)  # fmt: skip
+        observer_dir = path.parent
+        entry = str(Path(probe.__file__))
+        process = subprocess.Popen(
+            [sys.executable, entry, "--config", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )  # fmt: skip
+        glob = f"captures/{run_id}/*/manifest.json"
+        try:
+
+            def ready():
+                paths = observer_dir.glob(glob)
+                return any(json.loads(p.read_text()).get("ready") for p in paths)
+
+            wait_for(ready, timeout=30)
+            time.sleep(0.3)
+            accepted.close()  # the connection closes: state changes on both ends
+            time.sleep(0.5)
+            (endpoint_dir / "close").touch()
+            wait_for(lambda: (endpoint_dir / "closed").exists(), timeout=20)
+            (endpoint_dir / "exit").touch()
+            owner.wait(timeout=20)
+            time.sleep(0.3)
+            closed = {"run_id": run_id, "endpoint": "d", "children_closed": True}
+            (observer_dir / "children.json").write_text(json.dumps(closed))
+            (observer_dir / "stop").touch()
+            _, stderr = process.communicate(timeout=30)
+            assert process.returncode == 0, stderr
+        finally:
+            if process.poll() is None:
+                process.kill()
+            if owner.poll() is None:
+                (endpoint_dir / "exit").touch()
+                owner.wait(timeout=20)
+    manifest = next(observer_dir.glob(glob))
+    rows = [json.loads(line) for line in manifest.with_name("events.jsonl").open()]
+    admitted = [r["observation"] for r in rows if r.get("scope") == "socket_ownership"
+                and r["observation"]["change"] == "admitted"]  # fmt: skip
+    assert len(admitted) == 1, admitted
+    cookie, admission = admitted[0]["cookie"], admitted[0]["admission"]
+    events = [r["transport"]["tcp"] for r in rows if r.get("scope") == "ebpf"
+              and (r.get("transport") or {}).get("tcp")
+              and r["transport"]["tcp"].get("type") == "tcp_event"]  # fmt: skip
+    assert events and all(
+        e["selection"]["cookie"] == cookie
+        and e["selection"]["admission"] == admission
+        and e["selection"]["verified"] is True
+        for e in events
+    ), events
+    lifecycle = [
+        r["observation"]
+        for r in rows
+        if r.get("scope") == "ebpf"
+        and (r.get("observation") or {}).get("type") == "lifecycle"
+    ]
+    rejections = lifecycle[-1]["rejections"]
+    assert rejections["total"] >= 1 and rejections["reconciled"], rejections
+    record = {"run_id": run_id, "endpoint": "d", "process_id": rows[0]["process_id"],
+              "exit_code": 0, "launcher": "test-process"}  # fmt: skip
+    subprocess.run([sys.executable, entry, "--record-exit", str(observer_dir)],
+                   input=json.dumps(record), text=True, check=True)  # fmt: skip
+    checked = subprocess.run(
+        [sys.executable, entry, "--check-capture", str(observer_dir),
+         "--core-dir", str(core_dir)],
+        capture_output=True, text=True, timeout=30,
+    )  # fmt: skip
+    summary = json.loads(checked.stdout)
+    assert checked.returncode == 0 and summary["complete"], summary

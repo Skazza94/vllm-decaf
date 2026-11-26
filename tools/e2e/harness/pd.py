@@ -1618,7 +1618,7 @@ def ebpf_opt_in(node: str, probes) -> bool:
 
 # The built eBPF package, as the observer's runtime check (endpoint_probes.ebpf.validate_artifacts) reads it.
 EBPF_ARTIFACT_FILES = ("collector", "observe.bpf.o", "limits.json")
-EBPF_PACKAGE_SCHEMA = 3  # endpoint_probes.ebpf.PACKAGE_SCHEMA
+EBPF_PACKAGE_SCHEMA = 4  # endpoint_probes.ebpf.PACKAGE_SCHEMA
 
 
 def _ebpf_artifacts_problem(artifacts) -> str | None:

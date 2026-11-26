@@ -20,7 +20,7 @@ from pathlib import Path
 import hashlib,json,sys
 root,src=map(Path,sys.argv[1:])
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
-data=dict(schema=3,mode='tcp_tracepoints',
+data=dict(schema=4,mode='tcp_tracepoints',
  files={name:sha(root/name) for name in ['collector','observe.bpf.o','limits.json']})
 (root/'manifest.json').write_text(json.dumps(data,indent=2)+'\n')
 # Build input provenance is never a runtime host eligibility rule.

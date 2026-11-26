@@ -25,6 +25,18 @@
       "max_entries": 1,
       "key_bytes": 4,
       "value_bytes": 256
+    },
+    "allowed": {
+      "type": "HASH",
+      "max_entries": 65536,
+      "key_bytes": 8,
+      "value_bytes": 8
+    },
+    "rejected": {
+      "type": "LRU_HASH",
+      "max_entries": 4096,
+      "key_bytes": 8,
+      "value_bytes": 24
     }
   },
   "ring_and_array_value_capacity_bytes": 1049344,
@@ -32,8 +44,6 @@
   "memory_audit_gate": false,
   "local_ports_max": 32,
   "peer_ports_max": 32,
-  "local_addresses_max": 8,
-  "peer_addresses_max": 8,
   "event_binary_bytes_max": 256,
   "output_json_bytes_max": 2048,
   "output_queue_max_records": 4096,
@@ -45,5 +55,7 @@
   "helper_fd_limit": 64,
   "loss_sample_ms": 1000,
   "runtime_environment_pins": false,
-  "artifact_self_hashes": true
+  "artifact_self_hashes": true,
+  "allowed_sockets_max": 65536,
+  "rejected_counters_max": 4096
 }

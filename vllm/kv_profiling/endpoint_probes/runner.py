@@ -256,6 +256,12 @@ class Observer:
             )
             self.ebpf.start()
             self.wait_ebpf_answer()
+        if self.discovery is not None:
+            # the owned sockets before readiness: their admissions are in the
+            # kernel (acknowledged, or bounded) before the workload starts
+            self.discover()
+            if self.ebpf is not None:
+                self.wait_ebpf_acknowledgements()
         # ready for the workload only now: every source started, an eBPF
         # collector attached (or reported unavailable)
         self.writer.publish_ready()
@@ -389,6 +395,21 @@ class Observer:
                 change,
                 kind="probe_status",
             )
+            # the kernel filter follows, as of the scan's decision time: an
+            # admission replaces the cookie's entry (a reversioned one
+            # included); a removal or suspension deletes it if still under
+            # that admission
+            if self.ebpf is not None and self.ebpf.child is not None:
+                if change["change"] == "admitted":
+                    self.ebpf.admit(
+                        change["cookie"],
+                        change["admission"],
+                        change["socket"]["admitted_ns"],
+                    )
+                elif change["change"] in ("removed", "suspended"):
+                    self.ebpf.retire(
+                        change["cookie"], change["admission"], change["ended_ns"]
+                    )
         status = {
             "complete": scan.complete,
             "reason": scan.reason,
@@ -408,13 +429,14 @@ class Observer:
         # namespaces for now) is a coverage gap; a confirmed exit is not
         if not scan.complete or scan.unreadable or scan.mismatched:
             self.discovery_failures += 1
+            why = scan.reason or (
+                "owners unreadable" if scan.unreadable else "owner identity mismatch"
+            )
+            # both selections depend on discovery: a gap is each enabled one's
             if self.config.tcp:
-                why = scan.reason or (
-                    "owners unreadable"
-                    if scan.unreadable
-                    else "owner identity mismatch"
-                )
                 self.failure("tcp", f"socket discovery: {why}", begin)
+            if self.config.ebpf.get("enabled"):
+                self.failure("ebpf", f"socket discovery: {why}", begin)
         self.last_scan = scan
 
     @staticmethod
@@ -522,14 +544,28 @@ class Observer:
         if row.get("type") == "tcp_event":
             data["clock_source"] = "kernel_monotonic"
             data["time_conversion_qualified"] = False
+            event_ns = None
             if self.ebpf is not None and self.ebpf.monotonic_offset is not None:
                 from .ebpf import convert_time
 
-                begin = end = convert_time(
+                begin = end = event_ns = convert_time(
                     row["timestamp_ns"], self.ebpf.monotonic_offset
                 )
                 data["endpoint_time_ns"] = begin
                 data["time_conversion_qualified"] = True
+            # the socket it was matched as in the kernel: its admission (whose
+            # record names the owners), and whether that admission was in force
+            # then, as acknowledged
+            data["selection"] = {
+                "by": "owned_socket",
+                "cookie": row["cookie"],
+                "admission": row["admission"],
+                **(
+                    self.ebpf.verify(row, event_ns)
+                    if self.ebpf is not None
+                    else {"verified": False, "reason": "no channel"}
+                ),
+            }
         return self.writer.put(
             event(
                 "endpoint_metrics",
@@ -563,6 +599,36 @@ class Observer:
                 self.ebpf_row(row)
         if self.ebpf.status.get("state") == "starting":
             self.failure("ebpf", "not_ready_within_deadline", time.monotonic_ns())
+
+    def wait_ebpf_acknowledgements(self, timeout_s=1.0):
+        """Wait, bounded, for the kernel filter to reach the first discovery's
+        decisions; any cookie still unresolved at readiness fails the source."""
+        deadline = time.monotonic() + timeout_s
+        while (
+            (self.ebpf.outbox or self.ebpf.pending)
+            and self.ebpf.running()
+            and time.monotonic() < deadline
+        ):
+            for row in self.ebpf.poll(self.writer, 0.02):
+                self.ebpf_row(row)
+        unresolved = self.ebpf.unresolved_ownership()
+        if self.ebpf.status.get("available") and any(unresolved.values()):
+            self.failure(
+                "ebpf",
+                f"ownership unresolved at readiness: {unresolved}",
+                time.monotonic_ns(),
+            )
+
+    def service_ebpf(self):
+        """The collector's replies, read as they come, apart from sampling:
+        acknowledgements are timed against their commands, not the interval."""
+        if self.ebpf is None or self.ebpf.child is None:
+            return
+        try:
+            for row in self.ebpf.poll(self.writer):
+                self.ebpf_row(row)
+        except (OSError, ValueError, KeyError) as error:
+            self.failure("ebpf", error, time.monotonic_ns())
 
     def sample_ebpf(self):
         if self.ebpf is None:
@@ -707,6 +773,7 @@ class Observer:
                         )
                     if time.monotonic() - owner_exited_at >= self.owner_exit_grace_s:
                         break
+                self.service_ebpf()
                 wake = next_tick if cadence is None else min(next_tick, cadence.next)
                 self.stop_event.wait(min(0.1, max(0, wake - time.monotonic())))
             if self.discovery is not None:

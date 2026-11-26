@@ -80,6 +80,7 @@ static int event_row(void *ctx, void *data, size_t size) {
   const struct kvp_event *e = data;
   if (size != sizeof(*e) || e->schema != KVP_SCHEMA || e->size != size ||
       e->kind >= KVP_EVENTS || (e->family != AF_INET && e->family != AF_INET6) ||
+      !e->cookie || !e->admission ||
       (e->available | e->read_errors) > 255 || (e->available & e->read_errors)) {
     malformed++;
   } else {
@@ -107,22 +108,21 @@ static int event_row(void *ctx, void *data, size_t size) {
         }
         used += n;
       }
-      char old[16] = "null", next[16] = "null", cookie[32] = "null";
+      char old[16] = "null", next[16] = "null";
       if (e->kind == KVP_STATE) {
         snprintf(old, sizeof(old), "%u", e->old_state);
         snprintf(next, sizeof(next), "%u", e->new_state);
       }
-      if (e->cookie_available)
-        snprintf(cookie, sizeof(cookie), "%llu", (unsigned long long)e->cookie);
       output(1,
-             "{\"type\":\"tcp_event\",\"schema\":2,\"timestamp_ns\":%llu,"
+             "{\"type\":\"tcp_event\",\"schema\":3,\"timestamp_ns\":%llu,"
              "\"netns\":%llu,\"event\":\"%s\",\"family\":%u,\"local_ip\":\"%s\","
              "\"peer_ip\":\"%s\",\"local_port\":%u,\"peer_port\":%u,"
-             "\"cookie\":%s,\"old_state\":%s,\"new_state\":%s,"
+             "\"cookie\":%llu,\"admission\":%llu,\"old_state\":%s,\"new_state\":%s,"
              "\"snapshot\":{%s},\"srtt_encoding\":\"usec_shift_3\",\"exact\":false}",
              (unsigned long long)e->timestamp_ns, (unsigned long long)e->netns,
              kinds[e->kind], e->family, local, peer, e->local_port, e->peer_port,
-             cookie, old, next, snapshot);
+             (unsigned long long)e->cookie, (unsigned long long)e->admission, old,
+             next, snapshot);
     }
   }
   return 0;
@@ -197,45 +197,6 @@ static int parse_plan(const char *path, struct plan *p) {
     else
       p->control.local_count = n;
   }
-  /* LA/RA: the local and peer address allow-lists; IPv4-mapped IPv6 is IPv4. */
-  for (u32 side = 0; ok && side < 2; side++) {
-    ok = fgets(line, sizeof(line), f) && line[0] == (side ? 'R' : 'L') &&
-         line[1] == 'A' && line[2] == ' ';
-    if (!ok) break;
-    u32 *v4 = side ? p->control.peer_v4 : p->control.local_v4;
-    u32(*v6)[4] = side ? p->control.peer_v6 : p->control.local_v6;
-    u32 n4 = 0, n6 = 0;
-    char *save, *token = strtok_r(line + 3, " \n", &save);
-    while (token) {
-      struct in_addr a4;
-      struct in6_addr a6;
-      if (n4 + n6 >= KVP_ADDRESSES) {
-        ok = 0;
-        break;
-      }
-      if (inet_pton(AF_INET, token, &a4) == 1) {
-        v4[n4++] = a4.s_addr;
-      } else if (inet_pton(AF_INET6, token, &a6) == 1) {
-        u32 words[4];
-        memcpy(words, &a6, sizeof(words));
-        if (!words[0] && !words[1] && words[2] == htonl(0x0000ffff))
-          v4[n4++] = words[3];
-        else
-          memcpy(v6[n6++], words, sizeof(words));
-      } else {
-        ok = 0;
-        break;
-      }
-      token = strtok_r(NULL, " \n", &save);
-    }
-    if (side) {
-      p->control.peer_v4_count = n4;
-      p->control.peer_v6_count = n6;
-    } else {
-      p->control.local_v4_count = n4;
-      p->control.local_v6_count = n6;
-    }
-  }
   if (fgets(line, sizeof(line), f)) ok = 0;
   fclose(f);
   return ok ? 0 : -EINVAL;
@@ -248,16 +209,22 @@ static int contract(struct bpf_object *obj, int inspect) {
     unsigned int bit = !strcmp(name, "events")        ? 1
                        : !strcmp(name, "control")     ? 2
                        : !strcmp(name, "loss_counts") ? 4
+                       : !strcmp(name, "allowed")     ? 8
+                       : !strcmp(name, "rejected")    ? 16
                                                       : 0;
     unsigned int n = bpf_map__max_entries(map), k = bpf_map__key_size(map),
-                 v = bpf_map__value_size(map);
+                 v = bpf_map__value_size(map), type = bpf_map__type(map);
     if (!bit || (mask & bit)) return -EINVAL;
-    if (bit == 1 ? (bpf_map__type(map) != BPF_MAP_TYPE_RINGBUF || n != KVP_RING_BYTES ||
-                    k || v)
-                 : (bpf_map__type(map) != BPF_MAP_TYPE_ARRAY || n != 1 || k != 4 ||
-                    v != (bit == 2 ? sizeof(struct kvp_control)
-                                   : sizeof(struct kvp_loss_counts))))
-      return -EINVAL;
+    int bad = bit == 1   ? (type != BPF_MAP_TYPE_RINGBUF || n != KVP_RING_BYTES || k || v)
+              : bit == 8 ? (type != BPF_MAP_TYPE_HASH || n != KVP_ALLOWED || k != 8 ||
+                            v != sizeof(struct kvp_admission))
+              : bit == 16
+                  ? (type != BPF_MAP_TYPE_LRU_HASH || n != KVP_REJECTED || k != 8 ||
+                     v != sizeof(struct kvp_rejected))
+                  : (type != BPF_MAP_TYPE_ARRAY || n != 1 || k != 4 ||
+                     v != (bit == 2 ? sizeof(struct kvp_control)
+                                    : sizeof(struct kvp_loss_counts)));
+    if (bad) return -EINVAL;
     mask |= bit;
     maps++;
     if (inspect)
@@ -286,7 +253,7 @@ static int contract(struct bpf_object *obj, int inspect) {
              "\"instructions\":%zu,\"autoattach\":false}",
              bpf_program__name(prog), bpf_program__section_name(prog), n);
   }
-  return maps == 3 && mask == 7 && programs == 4 && seen == 15 && total <= 65536
+  return maps == 5 && mask == 31 && programs == 4 && seen == 15 && total <= 65536
              ? 0
              : -EINVAL;
 }
@@ -319,8 +286,8 @@ static int losses(struct bpf_object *obj) {
   const char *names[] = {
       "global_null",           "global_scope_read", "global_nonfull",
       "excluded_namespace",    "excluded_protocol", "excluded_port",
-      "excluded_family",       "excluded_address",  "scoped_ring_drop",
-      "scoped_tuple_read",     "counter_wrap"};
+      "excluded_family",       "excluded_unowned",  "rejected_untracked",
+      "scoped_ring_drop",      "scoped_tuple_read", "counter_wrap"};
   _Static_assert(sizeof(names) / sizeof(*names) == STAT_COUNT, "loss names");
   struct kvp_loss_counts value;
   u32 zero = 0;
@@ -328,12 +295,172 @@ static int losses(struct bpf_object *obj) {
   for (u32 i = 0; i < STAT_COUNT; i++)
     if (output(0,
                "{\"type\":\"loss\",\"scope\":\"%s\",\"counter\":\"%s\",\"value\":%llu}",
-               i <= GLOBAL_NONFULL    ? "global_unknown"
-               : i <= EXCLUDED_ADDRESS ? "filter_exclusion"
-               : i == STAT_WRAP       ? "counter_health"
-                                      : "endpoint_namespace",
+               i <= GLOBAL_NONFULL       ? "global_unknown"
+               : i <= EXCLUDED_UNOWNED   ? "filter_exclusion"
+               : i == REJECTED_UNTRACKED ? "filter_accounting"
+               : i == STAT_WRAP          ? "counter_health"
+                                         : "endpoint_namespace",
                names[i], (unsigned long long)value.count[i]))
       return -ENOSPC;
+  return 0;
+}
+/* Userspace's ownership commands, one per line on stdin, each acknowledged on
+   stdout with its sequence number and when it was applied (CLOCK_MONOTONIC,
+   before and after the map operation):
+     A <seq> <cookie> <admission>  admit (replacing any entry of the cookie)
+     D <seq> <cookie> <admission>  delete, only if the cookie is still under that
+                                   admission (a stale delete changes nothing)
+     R <seq> <cookie>              read back the cookie's entry
+     stop                          detach and end
+   An admit, and a delete that removes the entry, harvest the cookie's
+   rejection counter (read and deleted at once, so each rejection is in exactly
+   one harvest or the terminal dump): an admit's after its update (once no
+   rejection can start), a delete's before it (while none can).
+   A malformed command fails the collector. */
+/* 0, or the errno of a harvest that failed (the counter, if any, kept) */
+static int harvest(struct bpf_object *obj, u64 cookie, struct kvp_rejected *seen) {
+  u64 key = cookie;
+  memset(seen, 0, sizeof(*seen));
+  if (!bpf_map_lookup_and_delete_elem(map_fd(obj, "rejected"), &key, seen)) return 0;
+  int error = errno == ENOENT ? 0 : errno;
+  memset(seen, 0, sizeof(*seen));
+  return error;
+}
+static char line_buffer[256];
+static size_t line_used;
+static int command(struct bpf_object *obj, char *line) {
+  unsigned long long seq, cookie, admission;
+  char extra;
+  int allowed = map_fd(obj, "allowed");
+  u64 before = monotonic_ns();
+  if (sscanf(line, "A %llu %llu %llu %c", &seq, &cookie, &admission, &extra) == 3 &&
+      cookie && admission) {
+    u64 key = cookie;
+    struct kvp_admission value = {.admission = admission};
+    int error = bpf_map_update_elem(allowed, &key, &value, BPF_ANY) ? errno : 0;
+    u64 applied = monotonic_ns();
+    struct kvp_rejected seen = {0};
+    int harvested = error ? 0 : harvest(obj, cookie, &seen);
+    return output(0,
+                  "{\"type\":\"ack\",\"op\":\"A\",\"seq\":%llu,\"cookie\":%llu,"
+                  "\"admission\":%llu,\"ok\":%s,\"errno\":%d,\"before_ns\":%llu,"
+                  "\"applied_ns\":%llu,\"rejected\":%llu,"
+                  "\"rejected_first_ns\":%llu,\"rejected_errno\":%d}",
+                  seq, cookie, admission, error ? "false" : "true", error,
+                  (unsigned long long)before, (unsigned long long)applied,
+                  (unsigned long long)seen.count, (unsigned long long)seen.first_ns,
+                  harvested);
+  }
+  if (sscanf(line, "D %llu %llu %llu %c", &seq, &cookie, &admission, &extra) == 3 &&
+      cookie && admission) {
+    u64 key = cookie;
+    struct kvp_admission current;
+    struct kvp_rejected seen = {0};
+    int error = 0, stale = 0, harvested = 0, matched = 0;
+    if (bpf_map_lookup_elem(allowed, &key, &current)) {
+      if (errno == ENOENT)
+        stale = 1; /* absent: nothing to delete */
+      else
+        error = errno; /* the entry could not be read: nothing is known */
+    } else if (current.admission != admission)
+      stale = 1; /* a newer admission of the cookie: kept */
+    else {
+      matched = 1;
+      harvested = harvest(obj, cookie, &seen);
+      if (bpf_map_delete_elem(allowed, &key)) error = errno;
+    }
+    return output(0,
+                  "{\"type\":\"ack\",\"op\":\"D\",\"seq\":%llu,\"cookie\":%llu,"
+                  "\"admission\":%llu,\"ok\":%s,\"errno\":%d,\"stale\":%s,"
+                  "\"before_ns\":%llu,\"applied_ns\":%llu,\"rejected\":%llu,"
+                  "\"rejected_first_ns\":%llu,\"rejected_errno\":%d,"
+                  "\"harvested\":%s}",
+                  seq, cookie, admission, error ? "false" : "true", error,
+                  stale ? "true" : "false", (unsigned long long)before,
+                  (unsigned long long)monotonic_ns(), (unsigned long long)seen.count,
+                  (unsigned long long)seen.first_ns, harvested, matched ? "true" : "false");
+  }
+  if (sscanf(line, "R %llu %llu %c", &seq, &cookie, &extra) == 2 && cookie) {
+    u64 key = cookie;
+    struct kvp_admission current;
+    int error = bpf_map_lookup_elem(allowed, &key, &current) ? errno : 0;
+    char value[24] = "null";
+    if (!error) snprintf(value, sizeof(value), "%llu", (unsigned long long)current.admission);
+    return output(0,
+                  "{\"type\":\"ack\",\"op\":\"R\",\"seq\":%llu,\"cookie\":%llu,"
+                  "\"ok\":%s,\"errno\":%d,\"admission\":%s,\"applied_ns\":%llu}",
+                  seq, cookie, error && error != ENOENT ? "false" : "true",
+                  error == ENOENT ? 0 : error, value, (unsigned long long)monotonic_ns());
+  }
+  return -EINVAL;
+}
+/* Read what stdin holds: 1 on stop, -1 on a malformed command or EOF. */
+static int commands(struct bpf_object *obj) {
+  ssize_t size = read(0, line_buffer + line_used, sizeof(line_buffer) - 1 - line_used);
+  if (size < 0 && (errno == EAGAIN || errno == EINTR)) return 0;
+  if (size <= 0) return -1;
+  line_used += size;
+  line_buffer[line_used] = 0;
+  char *start = line_buffer, *end;
+  while ((end = memchr(start, '\n', line_used - (start - line_buffer)))) {
+    *end = 0;
+    if (!strcmp(start, "stop")) return 1;
+    if (command(obj, start)) return -1;
+    start = end + 1;
+  }
+  line_used -= start - line_buffer;
+  memmove(line_buffer, start, line_used);
+  return line_used >= sizeof(line_buffer) - 1 ? -1 : 0;
+}
+/* Every per-cookie rejection counter, at the end (bounded by the map), with the
+   records the output queue admits; the exact total is the loss counter. */
+static int rejected_complete;
+static int rejected_dump(struct bpf_object *obj, u64 deadline) {
+  int fd = map_fd(obj, "rejected");
+  u64 key, next, rows = 0;
+  int first = 1, unreadable = 0;
+  rejected_complete = 0;
+  /* twice the map: a key evicted meanwhile restarts the walk */
+  while (rows < 2 * KVP_REJECTED && monotonic_ns() < deadline) {
+    if (bpf_map_get_next_key(fd, first ? NULL : &key, &next)) {
+      rejected_complete = errno == ENOENT && !unreadable;
+      break;
+    }
+    first = 0;
+    key = next;
+    /* hooks may still be updating it: read until two reads agree (each hook
+       sets its earliest time before its count, so equal reads are
+       consistent), else the row says it is not */
+    struct kvp_rejected value, again;
+    int consistent = 0, gone = 0;
+    if (bpf_map_lookup_elem(fd, &key, &value)) {
+      if (errno != ENOENT) unreadable = 1; /* evicted meanwhile is not */
+      continue;
+    }
+    for (int i = 0; i < 8 && !consistent && !gone; i++) {
+      if (bpf_map_lookup_elem(fd, &key, &again)) {
+        if (errno != ENOENT) unreadable = 1;
+        gone = 1;
+      } else if (!memcmp(&value, &again, sizeof(value)))
+        consistent = 1;
+      else
+        value = again;
+    }
+    if (gone) continue;
+    while (count >= KVP_QUEUE - 1 && monotonic_ns() < deadline) {
+      if (flush()) return -EIO;
+      struct pollfd out = {1, POLLOUT, 0};
+      poll(&out, 1, 5);
+    }
+    if (output(0,
+               "{\"type\":\"rejected\",\"cookie\":%llu,\"count\":%llu,"
+               "\"first_ns\":%llu,\"last_ns\":%llu,\"consistent\":%s}",
+               (unsigned long long)key, (unsigned long long)value.count,
+               (unsigned long long)value.first_ns, (unsigned long long)value.last_ns,
+               consistent ? "true" : "false"))
+      return -ENOSPC;
+    rows++;
+  }
   return 0;
 }
 static int run(struct bpf_object *obj, struct plan *p) {
@@ -384,11 +511,12 @@ static int run(struct bpf_object *obj, struct plan *p) {
       break;
     }
     if (fds[0].revents) {
-      char command[16];
-      ssize_t size = read(0, command, sizeof(command));
-      if (size == 5 && !memcmp(command, "stop\n", 5)) break;
-      failed = 1;
-      break;
+      int result = commands(obj);
+      if (result > 0) break;
+      if (result < 0) {
+        failed = 1;
+        break;
+      }
     }
     if (ring_buffer__consume_n(ring, 256) < 0 || flush()) {
       failed = 1;
@@ -431,12 +559,14 @@ cleanup:
     poll(&out, 1, 5);
   }
   if (losses(obj)) failed = 1;
+  if (rejected_dump(obj, deadline)) failed = 1;
   if (output(0,
              "{\"type\":\"end\",\"complete\":false,\"reason\":\"producer_quiescence_"
              "and_miss_visibility_unverified\","
              "\"coverage\":\"partial\",\"output_drops\":%llu,\"malformed\":%llu,"
-             "\"failed\":%s}",
+             "\"rejected_complete\":%s,\"failed\":%s}",
              (unsigned long long)output_drops, (unsigned long long)malformed,
+             rejected_complete ? "true" : "false",
              failed || output_broken ? "true" : "false"))
     failed = 1;
   while (count && monotonic_ns() < deadline && !flush()) {

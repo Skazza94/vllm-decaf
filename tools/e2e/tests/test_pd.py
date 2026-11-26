@@ -5487,7 +5487,7 @@ def ebpf_package(root, omit=(), corrupt=(), manifest=None, collector_mode=0o755)
         (root / name).write_bytes(name.encode())
         files[name] = hashlib.sha256(name.encode()).hexdigest()
     (root / "collector").chmod(collector_mode)
-    whole = {"schema": 3, "mode": "tcp_tracepoints", "files": files}
+    whole = {"schema": 4, "mode": "tcp_tracepoints", "files": files}
     (root / "manifest.json").write_text(json.dumps(whole if manifest is None else manifest(whole)))
     for name in omit:
         (root / name).unlink()
@@ -5554,13 +5554,13 @@ class EndpointObserverCapabilities(unittest.TestCase):
                 package("null-manifest", manifest=lambda whole: None),
                 package("list-manifest", manifest=lambda whole: [whole]),
                 package("integer-files", manifest=lambda whole: {**whole, "files": 3}),
-                package("previous-schema", manifest=lambda whole: {**whole, "schema": 2}),
+                package("previous-schema", manifest=lambda whole: {**whole, "schema": 3}),
             ]
             for artifacts in (None, "relative/dir", "/nonexistent/kvp-ebpf", empty, *broken):
                 with self.subTest(artifacts=artifacts), self.assertRaisesRegex(ValueError, "probes.ebpf.artifacts"):
                     parts({"ebpf": {"enabled": True, "privileged_opt_in": True, "artifacts": artifacts}})
             # a previous generation's package is named as such, to rebuild
-            with self.assertRaisesRegex(ValueError, "package schema 2, not 3: rebuild it"):
+            with self.assertRaisesRegex(ValueError, "package schema 3, not 4: rebuild it"):
                 parts({"ebpf": {"enabled": True, "privileged_opt_in": True, "artifacts": broken[-1]}})
         # a string is never consent: quoted booleans are refused, not read as true
         for bad in ({"enabled": "false", "privileged_opt_in": True}, {"enabled": True, "privileged_opt_in": "true"}):

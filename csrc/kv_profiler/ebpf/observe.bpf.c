@@ -28,6 +28,22 @@ struct {
   __type(key, u32);
   __type(value, struct kvp_loss_counts);
 } loss_counts SEC(".maps");
+/* The owned sockets in force, by cookie; userspace adds and deletes single
+   elements, each update atomic per element. */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, KVP_ALLOWED);
+  __type(key, u64);
+  __type(value, struct kvp_admission);
+} allowed SEC(".maps");
+/* Rejected events per cookie, best effort (an LRU evicts); never deleted from
+   by userspace, read at the end. */
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, KVP_REJECTED);
+  __type(key, u64);
+  __type(value, struct kvp_rejected);
+} rejected SEC(".maps");
 static __always_inline void count_stat(u32 kind) {
   u32 zero = 0;
   struct kvp_loss_counts *counts = bpf_map_lookup_elem(&loss_counts, &zero);
@@ -42,23 +58,36 @@ static __always_inline int port_allowed(u16 port, u16 *ports, u32 count) {
     if (i < count && ports[i] == port) return 1;
   return 0;
 }
-static __always_inline int address_allowed(u32 family, const u32 *address,
-                                           const u32 *v4, u32 v4_count,
-                                           const u32 (*v6)[4], u32 v6_count) {
-  if (!v4_count && !v6_count) return 1;
-  int mapped = family == 10 && !address[0] && !address[1] &&
-               address[2] == bpf_htonl(0x0000ffff);
-  if (family == 2 || mapped) {
-    u32 ipv4 = family == 2 ? address[0] : address[3];
-    for (u32 i = 0; i < KVP_ADDRESSES; i++)
-      if (i < v4_count && v4[i] == ipv4) return 1;
-    return 0;
+/* The entry's earliest event time, kept by compare-and-swap; contention past
+   the bound marks it unknown rather than leave a later time. */
+static __always_inline void earliest(struct kvp_rejected *seen, u64 timestamp) {
+  for (int i = 0; i < 4; i++) {
+    u64 current = seen->first_ns;
+    if (current & KVP_FIRST_UNKNOWN || current <= timestamp) return;
+    if (__sync_val_compare_and_swap(&seen->first_ns, current, timestamp) == current) return;
   }
-  for (u32 i = 0; i < KVP_ADDRESSES; i++)
-    if (i < v6_count && v6[i][0] == address[0] && v6[i][1] == address[1] &&
-        v6[i][2] == address[2] && v6[i][3] == address[3])
-      return 1;
-  return 0;
+  __sync_fetch_and_or(&seen->first_ns, KVP_FIRST_UNKNOWN);
+}
+static __always_inline void count_rejected(u64 cookie, u64 timestamp) {
+  struct kvp_rejected *seen = bpf_map_lookup_elem(&rejected, &cookie);
+  if (seen) {
+    earliest(seen, timestamp); /* before the count: a read that sees the
+                                  count sees this event's time (twice-read) */
+    __sync_fetch_and_add(&seen->count, 1);
+    seen->last_ns = timestamp;
+    return;
+  }
+  struct kvp_rejected first = {.count = 1, .first_ns = timestamp, .last_ns = timestamp};
+  if (!bpf_map_update_elem(&rejected, &cookie, &first, BPF_NOEXIST)) return;
+  seen = bpf_map_lookup_elem(&rejected, &cookie); /* inserted concurrently */
+  if (seen) {
+    earliest(seen, timestamp); /* before the count: a read that sees the
+                                  count sees this event's time (twice-read) */
+    __sync_fetch_and_add(&seen->count, 1);
+    seen->last_ns = timestamp;
+  } else {
+    count_stat(REJECTED_UNTRACKED);
+  }
 }
 static __noinline int socket_event(struct sock *sk, u32 kind, u32 old, u32 next) {
   u64 timestamp = bpf_ktime_get_ns();
@@ -115,6 +144,17 @@ static __noinline int socket_event(struct sock *sk, u32 kind, u32 old, u32 next)
     count_stat(EXCLUDED_PORT);
     return 0;
   }
+  /* The socket's identity: its kernel cookie (assigned on first use, unique
+     per boot, the one sock_diag reports). Only an owned one is recorded, with
+     the admission it matched in the same lookup. */
+  u64 cookie = bpf_get_socket_cookie(sk);
+  struct kvp_admission *owned = bpf_map_lookup_elem(&allowed, &cookie);
+  if (!owned) {
+    count_stat(EXCLUDED_UNOWNED);
+    count_rejected(cookie, timestamp);
+    return 0;
+  }
+  u64 admission = owned->admission;
   u32 local_address[4] = {0, 0, 0, 0}, peer_address[4] = {0, 0, 0, 0};
   int error;
   if (family == 2) {
@@ -128,13 +168,6 @@ static __noinline int socket_event(struct sock *sk, u32 kind, u32 old, u32 next)
   }
   if (error) {
     count_stat(SCOPED_TUPLE_READ);
-    return 0;
-  }
-  if (!address_allowed(family, local_address, cfg->local_v4, cfg->local_v4_count,
-                       cfg->local_v6, cfg->local_v6_count) ||
-      !address_allowed(family, peer_address, cfg->peer_v4, cfg->peer_v4_count,
-                       cfg->peer_v6, cfg->peer_v6_count)) {
-    count_stat(EXCLUDED_ADDRESS);
     return 0;
   }
   struct kvp_event *row = bpf_ringbuf_reserve(&events, sizeof(*row), 0);
@@ -155,9 +188,8 @@ static __noinline int socket_event(struct sock *sk, u32 kind, u32 old, u32 next)
   row->new_state = next;
   __builtin_memcpy(row->local_address, local_address, 16);
   __builtin_memcpy(row->peer_address, peer_address, 16);
-  if (bpf_core_field_exists(sk->__sk_common.skc_cookie.counter) &&
-      !BPF_CORE_READ_INTO(&row->cookie, sk, __sk_common.skc_cookie.counter))
-    row->cookie_available = row->cookie != 0;
+  row->cookie = cookie;
+  row->admission = admission;
   struct tcp_sock *tp = (void *)sk;
 #define SNAP(index, field)                                                         \
   do {                                                                             \

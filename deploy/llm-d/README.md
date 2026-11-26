@@ -216,8 +216,9 @@ nodes whose kernel has BTF (Linux 5.15 or newer):
    "ebpf": {"enabled": true, "privileged_opt_in": true,
             "mode": "tcp_tracepoints", "artifacts": "/opt/kv-profiler-ebpf"}
    ```
-   In a pod the collector sees only the pod's own network namespace. For a
-   shared one, `local_ips` and `peer_ips` keep it to the KV link.
+   It records the events of the sockets vLLM's scheduler and workers own (found
+   at runtime, by socket cookie), never by address, so nothing about the pod's
+   addresses is configured, with a shared network namespace too.
 
 ## Without llm-d's gateway
 

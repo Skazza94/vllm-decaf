@@ -13,10 +13,13 @@ typedef __u32 u32;
 typedef __u16 u16;
 typedef __u8 u8;
 #endif
-#define KVP_SCHEMA 2
+#define KVP_SCHEMA 3
 #define KVP_RING_BYTES 1048576
 #define KVP_PORTS 32
-#define KVP_ADDRESSES 8
+/* Owned sockets in force (cookie -> admission), and the per-cookie rejection
+   counters (best effort: an LRU; the exact total is a loss counter). */
+#define KVP_ALLOWED 65536
+#define KVP_REJECTED 4096
 #define KVP_RECORD_BYTES 2048
 #define KVP_QUEUE 4096
 #define KVP_EVENTS 4
@@ -32,7 +35,12 @@ enum kvp_stat {
   EXCLUDED_PROTOCOL,
   EXCLUDED_PORT,
   EXCLUDED_FAMILY,
-  EXCLUDED_ADDRESS,
+  /* eligible events (namespace, protocol, family and ports passed) whose socket
+     is not an owned one: every rejection, counted once */
+  EXCLUDED_UNOWNED,
+  /* rejections the per-cookie counters could not record (an LRU insertion lost
+     to a concurrent one): part of the total, never of a cookie's count */
+  REJECTED_UNTRACKED,
   SCOPED_RING_DROP,
   SCOPED_TUPLE_READ,
   STAT_WRAP,
@@ -42,27 +50,36 @@ struct kvp_control {
   u64 enabled, netns;
   u32 local_count, peer_count;
   u16 local_ports[KVP_PORTS], peer_ports[KVP_PORTS];
-  /* Address allow-lists, network order; IPv4-mapped IPv6 is matched as IPv4.
-     Both of a side's counts zero: any address. */
-  u32 local_v4_count, peer_v4_count, local_v6_count, peer_v6_count;
-  u32 local_v4[KVP_ADDRESSES], peer_v4[KVP_ADDRESSES];
-  u32 local_v6[KVP_ADDRESSES][4], peer_v6[KVP_ADDRESSES][4];
-  u8 reserved[24];
+  u8 reserved[360];
 };
+/* An owned socket's entry in force: the admission it was matched under. */
+struct kvp_admission {
+  u64 admission;
+};
+/* A rejected cookie's counter: its events rejected, the first and last. */
+/* A cookie's rejections since its counter was last harvested: their count,
+   the earliest event time (KVP_FIRST_UNKNOWN set when contention left it
+   unknown) and the latest written. */
+struct kvp_rejected {
+  u64 count, first_ns, last_ns;
+};
+#define KVP_FIRST_UNKNOWN (1ULL << 63)
 struct kvp_loss_counts {
   u64 count[32];
 };
 struct kvp_event {
-  u64 timestamp_ns, netns, cookie;
+  u64 timestamp_ns, netns, cookie, admission;
   u32 schema, size, kind, family;
   u16 local_port, peer_port;
   u8 local_address[16], peer_address[16];
   u32 old_state, new_state;
   u32 fields[KVP_FIELDS];
-  u32 available, read_errors, cookie_available;
-  u8 reserved[128];
+  u32 available, read_errors;
+  u8 reserved[124];
 };
 _Static_assert(sizeof(struct kvp_control) == 512, "control capacity");
 _Static_assert(sizeof(struct kvp_loss_counts) == 256, "statistics capacity");
 _Static_assert(sizeof(struct kvp_event) == 256, "binary event capacity");
+_Static_assert(sizeof(struct kvp_admission) == 8, "admission value");
+_Static_assert(sizeof(struct kvp_rejected) == 24, "rejection value");
 #endif

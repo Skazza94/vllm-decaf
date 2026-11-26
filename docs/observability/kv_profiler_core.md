@@ -1062,14 +1062,57 @@ cleans up that ID even if startup fails; it never removes a name collision.
 
 The stdlib observer accepts `probes.ebpf` with `enabled: true`,
 `privileged_opt_in: true`, `mode: tcp_tracepoints`, and an absolute `artifacts`
-directory. Optional `local_ports` and `peer_ports` lists contain at most 32
-unique ports each; optional `local_ips` and `peer_ips` lists, as `probes.tcp`'s,
-at most eight unique addresses each, without a zone (`%eth0`), an IPv4 address
-also matching its IPv4-mapped IPv6 form. Matching is OR within each list and AND between configured
-lists; absent lists are unrestricted. The program applies them in the kernel,
-after the network namespace, before an event reaches the ring: with host
-networking the namespace is the host's, and the address lists keep the capture to
-the KV link's connections. Off is the default: there is no native
+directory. It records the events of the sockets the endpoint's scheduler and
+worker processes own, the same owned sockets TCP sampling selects (discovery,
+by kernel cookie), never by address: there are no address lists. Optional
+`local_ports` and `peer_ports` lists (at most 32 unique ports each) narrow it.
+In the kernel, after the network namespace, protocol, family and ports, each
+event's socket cookie (`bpf_get_socket_cookie`, assigned on first use, the
+value `sock_diag` reports) is looked up in an `allowed` map of the admissions in
+force; only an owned socket's event reaches the ring, carrying the admission it
+matched. The observer reconciles that map to discovery's latest decision for
+each cookie over the collector's stdin, one command per cookie in flight:
+sequenced commands (`A`dmit a cookie under an admission, replacing any entry;
+`D`elete it only if still under that admission, so a stale delete never
+removes a newer one; `R`ead it back), each acknowledged with when it was
+applied. Replies are read as they come, apart from sampling, and a command is
+unacknowledged only once every readable reply has been read and its second
+has passed. An unacknowledged command, a failed update or delete, or an entry
+that could not be read makes the cookie's kernel state unknown from the
+command until a readback establishes it; the readback is followed by the
+command that still moves the entry to the decision (a retired cookie's stale
+entry is deleted again), within a bound of four attempts. Discovery's
+decisions take effect at the time of the scan that made them (an admission's
+`admitted_ns`, a removal's or suspension's `ended_ns`). Each update is
+atomic per element, and each event is judged on its own cookie. An event is
+`verified` when, at its time, discovery had decided its admission, the kernel
+held it as acknowledged, no change of the cookie was still unresolved, and its
+kernel state was not unknown; a late event of a removed admission, timed
+within its interval, stays verified, and an event after a cookie's retirement
+never is. A cookie whose entry does not match the decision at readiness fails
+the eBPF source; one at the end (a command unsent, unacknowledged or given up)
+makes the collector's run unclean (`ownership_unresolved`); a cookie given
+up is judged by event time, through its unknown intervals, so its events from
+before its retirement stay verified. Every eligible event the ownership filter
+rejects is counted once in an exact total (`excluded_unowned`), and best
+effort per cookie in an LRU map whose entry keeps the count and the earliest
+event time (an atomic minimum, marked unknown under contention, set before the
+count). Each admit, after its update, and each delete that removes the entry,
+before it, harvests the cookie's entry (read and deleted at once); the dump at
+the end reads each entry until two reads agree (`consistent`, since hooks may
+still be running) and is `counters_complete` when the whole map was read. The
+per-cookie counts are lower bounds: a hook can finish updating an entry after
+it was harvested or evicted, an increment the total keeps and no cookie
+shows (unattributed). A harvest holds rejections that began while the cookie
+was out of the map: `before_or_between_admissions` (the discovery gap, an
+event in flight across an admit included). What remains at the end is
+`after_retirement` only if the cookie's last harvest was a confirmed delete,
+the dump's read of it was consistent, and its earliest event began after both
+that delete began and discovery's latest retirement of the cookie (an
+admission decided meanwhile, installed or not, was ownership); anything the
+evidence cannot place (kernel state unknown, a failed harvest, an
+inconsistent read, an earliest time unknown or too early) is `unresolved`. Cookies never admitted are `never_owned`, and the
+rest (evictions, `rejected_untracked`) unattributed. A rejected event's content is not recoverable. Off is the default: there is no native
 child, capability check, BPF syscall or automatic privileged launch. Off identities
 and old stdlib captures remain unchanged. Uprobe `sets` and `kernel_audit` options
 are removed; old enabled configurations need an explicit migration.
@@ -1081,7 +1124,7 @@ The events complement the sampled TCP_INFO gauges instead of repeating byte or
 segment counters. RDMA remains out-of-process hardware/port observation.
 
 Each record has kernel CLOCK_MONOTONIC time (`bpf_ktime_get_ns`), network namespace,
-family, local/peer address and port, cookie when known, and CO-RE snapshots of
+family, local/peer address and port, its cookie and admission, and CO-RE snapshots of
 `srtt_us`, `snd_cwnd`, `snd_ssthresh`, `packets_out`, `retrans_out`, `lost_out`,
 `total_retrans`, and `mss_cache`. Missing fields are unavailable, never zero;
 failed reads are distinct. `srtt_us` retains the kernel's raw usec-shift-3 encoding.
@@ -1096,11 +1139,15 @@ records. Hooks still execute the early filter on unrelated events globally.
 Null, TIME_WAIT and request sockets are excluded before full-socket reads and
 reported as global unknown exclusions, not endpoint losses. Ordinary namespace,
 protocol, family and port rejections are filter exclusions. Reservation/read/output
-losses have separate counters and scope. A zero cookie stays unknown rather than
-becoming a pointer identity. Tuples and time provide candidate-only joins to L1;
-TCP inventory may offer possible owners, not prove ownership at the event.
-An event between TCP_INFO samples can use a matching tuple/cookie inventory
-candidate; ambiguous or absent evidence stays explicit. Aggregate bytes are never
+losses have separate counters and scope. In the offline join to L1 a
+verified event is its admission's: the capture's admission record names the
+owners, so it is a candidate of those owners' READs only (with the usual clock
+and READ-window checks), with or without TCP samples, when the event, its
+selection and the admission's record name one cookie and one admission; an
+unverified or inconsistent event is no one's. Only events of the schema
+before owned-socket selection (2) fall back to tuple/cookie inventory
+candidates, which offer possible owners without proving ownership at the
+event. Ambiguous or absent evidence stays explicit. Aggregate bytes are never
 apportioned and unique candidates are never causal attribution.
 
 Build artifacts separately with `tools/kv-profiler-ebpf/build.sh` and mount the
@@ -1120,8 +1167,9 @@ status that it is unavailable) and marks its capture `ready` in its manifest, th
 signal a controller waits for, after that answer or when the bound expires. A
 collector still starting at the bound is `not_ready`: a failure when eBPF is
 required, even if it answers later. The endpoint capture can close cleanly with
-partial eBPF coverage. Without address lists, qualifying events across the whole
-network namespace (with host networking, the host's) are eligible for capture.
+partial eBPF coverage. Only owned sockets' events are captured; an observer
+whose inventory has no scheduler or worker owns none, and a discovery gap is a
+failure of a required eBPF source as of a TCP one.
 Coverage is never provably complete, so a
 required eBPF source is judged on a clean run (`clean` in the stop record): ready
 and still available, no failure, the collector's own unfailed terminal record, a

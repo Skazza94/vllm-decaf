@@ -9,10 +9,10 @@ from .perfetto import _clock_aliases, _domain, _load
 
 
 def _admitted_owners(samples) -> dict:
-    """Each admission's owners, from the capture's ``socket_ownership``
-    admitted records, a record split over several rows reassembled from its
-    slices; an admission whose slices are incomplete is left out (its owners
-    unavailable)."""
+    """Each admission's cookie and owners, from the capture's
+    ``socket_ownership`` admitted records, a record split over several rows
+    reassembled from its slices; an admission whose slices are incomplete, or
+    disagree on the cookie, is left out (its owners unavailable)."""
     parts = {}
     for row in samples:
         observation = row.get("observation") or {}
@@ -24,24 +24,48 @@ def _admitted_owners(samples) -> dict:
         start, _, total = (observation.get("slices") or {}).get(
             "owners", (0, len(owners), len(owners))
         )
-        entry = parts.setdefault(observation.get("admission"), [total, {}])
+        entry = parts.setdefault(
+            observation.get("admission"), [total, {}, {observation.get("cookie")}]
+        )
+        entry[2].add(observation.get("cookie"))
         for offset, owner in enumerate(owners):
             entry[1][start + offset] = owner
     return {
-        admission: [items[index] for index in range(total)]
-        for admission, (total, items) in parts.items()
-        if len(items) == total and all(index in items for index in range(total))
+        admission: {
+            "cookie": next(iter(cookies)),
+            "owners": [items[index] for index in range(total)],
+        }  # fmt: skip
+        for admission, (total, items, cookies) in parts.items()
+        if len(cookies) == 1
+        and None not in cookies
+        and len(items) == total
+        and all(index in items for index in range(total))
     }
 
 
 def _owners(flow, admitted) -> list:
-    """A sampled flow's owners: its admission's, or those it carries."""
-    admission = (flow.get("selection") or {}).get("admission")
-    return admitted.get(admission) or flow.get("owners") or []
+    """A sampled flow's owners: those of the admission its selection names,
+    when that admission's record is of the same cookie; a flow without a
+    selection (an older capture), those it carries."""
+    selection = flow.get("selection")
+    if not selection or selection.get("admission") is None:
+        return flow.get("owners") or []
+    record = admitted.get(selection["admission"])
+    if record is None or record["cookie"] != selection.get("cookie"):
+        return []
+    return record["owners"]
 
 
-def _with_tcp_events(samples):
-    """Offer tuple/cookie inventory candidates, never event-time ownership proof."""
+# the eBPF event schema before owned-socket selection: tuple candidates only
+LEGACY_EVENT_SCHEMAS = (2,)
+
+
+def _with_tcp_events(samples, admitted):
+    """Offer eBPF events as socket candidates. An event selected in the kernel as an
+    owned socket is its admission's (whose record, in this capture, names the
+    owners) only when verified in force at the event; an unverified one is no
+    candidate. Captures without a selection fall back to tuple/cookie inventory
+    candidates, never event-time ownership proof."""
     result = list(samples)
     sockets = [s for s in samples if s.get("scope") == "socket"]
     keys = ("family", "local_ip", "local_port", "peer_ip", "peer_port")
@@ -53,6 +77,36 @@ def _with_tcp_events(samples):
             or tcp.get("type") != "tcp_event"
             or not tcp.get("time_conversion_qualified")
         ):
+            continue
+        if tcp.get("schema") not in LEGACY_EVENT_SCHEMAS:
+            # selected in the kernel: the event, its selection and the
+            # admission's record must name one cookie and one admission
+            selection = tcp.get("selection") or {}
+            admission = tcp.get("admission")
+            record = admitted.get(admission)
+            if (
+                selection.get("by") == "owned_socket"
+                and selection.get("verified") is True
+                and selection.get("cookie") == tcp.get("cookie")
+                and selection.get("admission") == admission
+                and record is not None
+                and record["cookie"] == tcp.get("cookie")
+            ):
+                result.append(
+                    {
+                        **sample,
+                        "scope": "socket",
+                        "entity": str(tcp["cookie"]),
+                        "transport": {
+                            **sample["transport"],
+                            "tcp": {
+                                **tcp,
+                                "owners": record["owners"],
+                                "candidate_owner_basis": "verified_admission",
+                            },
+                        },
+                    }
+                )
             continue
         for flow in sockets:
             data = flow["transport"]["tcp"]
@@ -149,7 +203,7 @@ def candidates(core_paths, probe_paths, group=None):
                 )
                 same = _domain(meta) == _domain(observed) and all(_domain(meta))
                 admitted = _admitted_owners(samples)
-                for sample in _with_tcp_events(samples):
+                for sample in _with_tcp_events(samples, admitted):
                     if sample.get("scope") != "socket":
                         continue
                     flow = sample["transport"]["tcp"]
@@ -224,6 +278,7 @@ def candidates(core_paths, probe_paths, group=None):
                                     "cookie",
                                 )
                             },
+                            "admission": (flow.get("selection") or {}).get("admission"),
                             "ownership_basis": flow["candidate_owner_basis"],
                             "exact": False,
                         }

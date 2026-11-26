@@ -54,6 +54,12 @@ static int test_read(void *dst, const void *from, size_t size, const char *field
 #define BPF_CORE_READ_INTO(dst, p, field) \
   test_read(dst, &(p)->field, sizeof(*(dst)), #field)
 static void *bpf_map_lookup_elem(void *map, const void *key);
+static long bpf_map_update_elem(void *map, const void *key, const void *value,
+                                unsigned long long flags);
+/* The socket's cookie, as the tracing helper returns it (the fixture's value). */
+static u64 bpf_get_socket_cookie(void *sk) {
+  return (u64)((struct sock *)sk)->__sk_common.skc_cookie.counter;
+}
 static void *bpf_ringbuf_reserve(void *map, unsigned int bytes, unsigned long flags) {
   (void)map;
   (void)flags;

@@ -23,6 +23,8 @@ assert {r["name"] for r in rows if r["type"] == "map"} == {
     "events",
     "control",
     "loss_counts",
+    "allowed",
+    "rejected",
 }
 for row in rows:
     if row["type"] == "map":
@@ -36,7 +38,7 @@ assert all("tcp_probe" not in r["section"] for r in programs)
 pid = os.getpid()
 start = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
 plan = root / "unprivileged.plan"
-plan.write_text(f"P {pid} {start}\nN {os.stat('/proc/self/ns/net').st_ino}\nL \nR \nLA \nRA \n")
+plan.write_text(f"P {pid} {start}\nN {os.stat('/proc/self/ns/net').st_ino}\nL \nR \n")
 plan.chmod(0o600)
 run = subprocess.run(
     [str(root / "collector"), "--arm", str(plan), str(root / "observe.bpf.o")],
@@ -50,7 +52,7 @@ row = json.loads(run.stdout)
 assert run.returncode == 2 and row["reason"] == "privilege_or_parent"
 assert row["available"] is False and row["errno"] == 1
 print(
-    "PASS: artifact self-integrity; four passive hooks/three maps; "
+    "PASS: artifact self-integrity; four passive hooks/five maps; "
     "unprivileged arm refused before object load"
 )
 

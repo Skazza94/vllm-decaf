@@ -10,6 +10,9 @@ static int fixture_destroy(struct bpf_link *);
 static int fixture_map_fd(const struct bpf_map *);
 static int fixture_update(int, const void *, const void *, __u64);
 static int fixture_lookup(int, const void *, void *);
+static int fixture_delete(int, const void *);
+static int fixture_next_key(int, const void *, void *);
+static int fixture_lookup_and_delete(int, const void *, void *);
 static struct ring_buffer *fixture_ring_new(int, ring_buffer_sample_fn, void *,
                                             const struct ring_buffer_opts *);
 static int fixture_consume(struct ring_buffer *);
@@ -23,6 +26,9 @@ static FILE *fixture_fopen(const char *, const char *);
 #define bpf_map__fd fixture_map_fd
 #define bpf_map_update_elem fixture_update
 #define bpf_map_lookup_elem fixture_lookup
+#define bpf_map_delete_elem fixture_delete
+#define bpf_map_get_next_key fixture_next_key
+#define bpf_map_lookup_and_delete_elem fixture_lookup_and_delete
 #define ring_buffer__new fixture_ring_new
 #define ring_buffer__consume fixture_consume
 #define ring_buffer__consume_n fixture_consume_n
@@ -37,6 +43,9 @@ static FILE *fixture_fopen(const char *, const char *);
 #undef bpf_map__fd
 #undef bpf_map_update_elem
 #undef bpf_map_lookup_elem
+#undef bpf_map_delete_elem
+#undef bpf_map_get_next_key
+#undef bpf_map_lookup_and_delete_elem
 #undef ring_buffer__new
 #undef ring_buffer__consume
 #undef ring_buffer__consume_n
@@ -79,21 +88,95 @@ static int fixture_destroy(struct bpf_link *link) {
   destroyed++;
   return destroy_error;
 }
+/* One descriptor per map; the two hash maps are small emulated tables. */
+enum { FD_EVENTS = 771, FD_CONTROL, FD_LOSS, FD_ALLOWED, FD_REJECTED };
+static uint64_t owned_keys[8], owned_values[8], rejected_keys[KVP_REJECTED];
+static struct kvp_rejected rejected_values[KVP_REJECTED];
+static uint64_t rejected_unreadable, rejected_unstable;
+static unsigned int owned_count, rejected_count;
+static int delete_error, update_error, lookup_error;
 static int fixture_map_fd(const struct bpf_map *map) {
-  (void)map;
-  return 777;
+  const char *name = bpf_map__name(map);
+  return !strcmp(name, "events")     ? FD_EVENTS
+         : !strcmp(name, "control")  ? FD_CONTROL
+         : !strcmp(name, "allowed")  ? FD_ALLOWED
+         : !strcmp(name, "rejected") ? FD_REJECTED
+                                     : FD_LOSS;
+}
+static int owned_index(uint64_t key) {
+  for (unsigned int i = 0; i < owned_count; i++)
+    if (owned_keys[i] == key) return i;
+  return -1;
 }
 static int fixture_update(int fd, const void *k, const void *v, __u64 flags) {
-  (void)fd;
-  (void)k;
-  last_enabled = ((const struct kvp_control *)v)->enabled;
   (void)flags;
+  if (fd == FD_ALLOWED) {
+    if (update_error) return errno = update_error, -1;
+    uint64_t key = *(const uint64_t *)k;
+    int i = owned_index(key);
+    if (i < 0) {
+      i = owned_count++;
+      owned_keys[i] = key;
+    }
+    owned_values[i] = ((const struct kvp_admission *)v)->admission;
+    return 0;
+  }
+  last_enabled = ((const struct kvp_control *)v)->enabled;
   return 0;
 }
 static int fixture_lookup(int fd, const void *k, void *v) {
-  (void)fd;
+  if (fd == FD_ALLOWED) {
+    if (lookup_error) return errno = lookup_error, -1;
+    int i = owned_index(*(const uint64_t *)k);
+    if (i < 0) return errno = ENOENT, -1;
+    ((struct kvp_admission *)v)->admission = owned_values[i];
+    return 0;
+  }
+  if (fd == FD_REJECTED) {
+    if (rejected_unreadable && *(const uint64_t *)k == rejected_unreadable)
+      return errno = EIO, -1;
+    for (unsigned int i = 0; i < rejected_count; i++)
+      if (rejected_keys[i] == *(const uint64_t *)k) {
+        /* a hook still counting: every read differs */
+        if (rejected_keys[i] == rejected_unstable) rejected_values[i].count++;
+        *(struct kvp_rejected *)v = rejected_values[i];
+        return 0;
+      }
+    return errno = ENOENT, -1;
+  }
   (void)k;
   memset(v, 0, sizeof(struct kvp_loss_counts));
+  return 0;
+}
+static int fixture_delete(int fd, const void *k) {
+  assert(fd == FD_ALLOWED);
+  if (delete_error) return errno = delete_error, -1;
+  int i = owned_index(*(const uint64_t *)k);
+  if (i < 0) return errno = ENOENT, -1;
+  owned_keys[i] = owned_keys[--owned_count];
+  owned_values[i] = owned_values[owned_count];
+  return 0;
+}
+static int fixture_lookup_and_delete(int fd, const void *k, void *v) {
+  assert(fd == FD_REJECTED);
+  for (unsigned int i = 0; i < rejected_count; i++)
+    if (rejected_keys[i] == *(const uint64_t *)k) {
+      *(struct kvp_rejected *)v = rejected_values[i];
+      rejected_keys[i] = rejected_keys[--rejected_count];
+      rejected_values[i] = rejected_values[rejected_count];
+      return 0;
+    }
+  return errno = ENOENT, -1;
+}
+static int fixture_next_key(int fd, const void *k, void *next) {
+  assert(fd == FD_REJECTED);
+  unsigned int i = 0;
+  if (k) {
+    while (i < rejected_count && rejected_keys[i] != *(const uint64_t *)k) i++;
+    i++;
+  }
+  if (i >= rejected_count) return errno = ENOENT, -1;
+  *(uint64_t *)next = rejected_keys[i];
   return 0;
 }
 static struct ring_buffer *fixture_ring_new(int fd, ring_buffer_sample_fn cb, void *ctx,
@@ -120,8 +203,10 @@ static struct ring_buffer *fixture_ring_new(int fd, ring_buffer_sample_fn cb, vo
   ring->mask = KVP_RING_BYTES - 1;
   ring->sample_cb = cb;
   ring->ctx = ctx;
-  struct kvp_event event = {.schema = 2,
+  struct kvp_event event = {.schema = 3,
                             .size = 256,
+                            .cookie = 42,
+                            .admission = 7,
                             .kind = KVP_STATE,
                             .family = AF_INET,
                             .timestamp_ns = 123,
@@ -187,6 +272,123 @@ static void reset(void) {
   attempt = attached = destroyed = rings = frees = 0;
   load_error = failure_at = destroy_error = 0;
   seeded_records = active_batches = stop_checks = largest_batch = 0;
+  owned_count = rejected_count = 0;
+  rejected_unreadable = rejected_unstable = 0;
+  delete_error = update_error = lookup_error = 0;
+  line_used = 0;
+}
+/* Run with ``input`` on stdin and the output captured: the output's text. */
+static char *run_with_input(struct bpf_object *obj, struct plan *p, const char *input,
+                            int *rc) {
+  int pipe_fds[2];
+  assert(!pipe(pipe_fds));
+  assert(write(pipe_fds[1], input, strlen(input)) == (ssize_t)strlen(input));
+  close(pipe_fds[1]);
+  assert(dup2(pipe_fds[0], 0) == 0);
+  close(pipe_fds[0]);
+  int saved = dup(1);
+  FILE *captured = tmpfile();
+  assert(saved >= 0 && captured && dup2(fileno(captured), 1) == 1);
+  *rc = run(obj, p);
+  flush();
+  assert(dup2(saved, 1) == 1);
+  close(saved);
+  long size = ftell(captured);
+  if (size <= 0) size = lseek(fileno(captured), 0, SEEK_END);
+  char *text = calloc(1, size + 1);
+  assert(text && pread(fileno(captured), text, size, 0) == size);
+  fclose(captured);
+  return text;
+}
+static void test_ownership_commands(struct bpf_object *obj, struct plan *p) {
+  /* Admit (with the cookie's rejections so far), a stale delete across a
+     replacement, a real delete, readbacks, a failed delete, the terminal
+     per-cookie rejection dump; acknowledgements carry their sequence. */
+  reset();
+  rejected_keys[0] = 42;
+  rejected_values[0] = (struct kvp_rejected){.count = 3, .first_ns = 1, .last_ns = 2};
+  rejected_keys[1] = 900;
+  rejected_values[1] = (struct kvp_rejected){.count = 5, .first_ns = 3, .last_ns = 4};
+  rejected_count = 2;
+  int rc;
+  char *out = run_with_input(obj, p,
+                             "A 1 42 7\nA 2 43 8\nA 3 42 9\nD 4 42 7\nD 5 43 8\n"
+                             "R 6 42\nR 7 43\nstop\n",
+                             &rc);
+  assert(rc == 2);
+  assert(strstr(out, "\"op\":\"A\",\"seq\":1,\"cookie\":42,\"admission\":7,\"ok\":true"));
+  /* the admit harvests (reads and deletes) the cookie's counter; its second
+     admit finds none; a matched delete harvests too, a stale one does not */
+  assert(strstr(out, "\"seq\":1,\"cookie\":42,\"admission\":7,\"ok\":true") &&
+         strstr(out, "\"rejected\":3,\"rejected_first_ns\":1,\"rejected_errno\":0}"));
+  assert(strstr(out, "\"stale\":true,") && strstr(out, "\"harvested\":false}") &&
+         strstr(out, "\"harvested\":true}"));
+  assert(!strstr(out, "{\"type\":\"rejected\",\"cookie\":42,"));
+  /* 42 is under admission 9 now: deleting admission 7 is stale, keeps it */
+  assert(strstr(out, "\"op\":\"D\",\"seq\":4,\"cookie\":42,\"admission\":7,\"ok\":true,"
+                     "\"errno\":0,\"stale\":true"));
+  assert(strstr(out, "\"op\":\"D\",\"seq\":5,\"cookie\":43,\"admission\":8,\"ok\":true,"
+                     "\"errno\":0,\"stale\":false"));
+  assert(strstr(out, "\"op\":\"R\",\"seq\":6,\"cookie\":42,\"ok\":true,\"errno\":0,"
+                     "\"admission\":9"));
+  assert(strstr(out, "\"op\":\"R\",\"seq\":7,\"cookie\":43,\"ok\":true,\"errno\":0,"
+                     "\"admission\":null"));
+  assert(strstr(out, "{\"type\":\"rejected\",\"cookie\":900,\"count\":5,\"first_ns\":3,"
+                     "\"last_ns\":4,\"consistent\":true}"));
+  assert(strstr(out, "\"rejected_complete\":true,\"failed\":false"));
+  free(out);
+  /* a delete that really fails is acknowledged as failed, with its errno */
+  reset();
+  out = run_with_input(obj, p, "A 1 42 7\nstop\n", &rc);
+  free(out);
+  delete_error = EIO;
+  line_used = 0;
+  out = run_with_input(obj, p, "D 2 42 7\nstop\n", &rc);
+  assert(strstr(out, "\"op\":\"D\",\"seq\":2,\"cookie\":42,\"admission\":7,\"ok\":false,"
+                     "\"errno\":5"));
+  free(out);
+  /* an entry that cannot be read is no stale delete: failed, with its errno */
+  delete_error = 0;
+  lookup_error = EPERM;
+  line_used = 0;
+  out = run_with_input(obj, p, "D 3 42 7\nstop\n", &rc);
+  assert(strstr(out, "\"op\":\"D\",\"seq\":3,\"cookie\":42,\"admission\":7,\"ok\":false,"
+                     "\"errno\":1,\"stale\":false"));
+  free(out);
+  /* a malformed command fails the collector */
+  reset();
+  out = run_with_input(obj, p, "A one 42 7\n", &rc);
+  assert(rc == 3 && strstr(out, "\"failed\":true"));
+  free(out);
+  /* the dump is complete at the map's end, a full map's too, and not when an
+     entry could not be read */
+  for (int unreadable = 0; unreadable < 2; unreadable++) {
+    reset();
+    rejected_count = KVP_REJECTED;
+    for (unsigned int i = 0; i < KVP_REJECTED; i++) {
+      rejected_keys[i] = 1000 + i;
+      rejected_values[i] = (struct kvp_rejected){.count = 1, .first_ns = 1, .last_ns = 1};
+    }
+    rejected_unreadable = unreadable ? 1002 : 0;
+    out = run_with_input(obj, p, "stop\n", &rc);
+    unsigned int rows = 0;
+    for (char *at = out; (at = strstr(at, "{\"type\":\"rejected\"")); at++) rows++;
+    assert(rows == KVP_REJECTED - unreadable);
+    assert(strstr(out, unreadable ? "\"rejected_complete\":false" : "\"rejected_complete\":true"));
+    free(out);
+  }
+  /* an entry still changing under the dump's reads is reported inconsistent */
+  reset();
+  rejected_keys[0] = 77;
+  rejected_values[0] = (struct kvp_rejected){.count = 1, .first_ns = 1, .last_ns = 1};
+  rejected_count = 1;
+  rejected_unstable = 77;
+  out = run_with_input(obj, p, "stop\n", &rc);
+  assert(strstr(out, "\"cookie\":77,") && strstr(out, "\"consistent\":false}"));
+  free(out);
+  puts("PASS: sequenced admit/delete/readback acknowledgements, stale and failed "
+       "deletes, an unreadable entry's delete failed, harvests at admit and delete, full and "
+       "unreadable dumps, inconsistent entries, terminal per-cookie rejection counters, malformed command");
 }
 int main(int argc, char **argv) {
   assert(argc == 2);
@@ -198,28 +400,17 @@ int main(int argc, char **argv) {
   p.control.netns = ns.st_ino;
   FILE *plan_file = tmpfile();
   assert(plan_file);
-  fprintf(plan_file,
-          "P %d %llu\nN %llu\nL \nR 1234\nLA 10.0.0.1 ::ffff:10.0.0.2\nRA fd00::5\n",
-          p.parent, (unsigned long long)p.start, (unsigned long long)p.control.netns);
+  fprintf(plan_file, "P %d %llu\nN %llu\nL \nR 1234\n", p.parent,
+          (unsigned long long)p.start, (unsigned long long)p.control.netns);
   fflush(plan_file);
   char plan_path[64];
   snprintf(plan_path, sizeof(plan_path), "/proc/self/fd/%d", fileno(plan_file));
   struct plan parsed = {0};
   assert(!parse_plan(plan_path, &parsed));
   assert(parsed.control.local_count == 0 && parsed.control.peer_ports[0] == 1234);
-  /* IPv4-mapped IPv6 is kept as IPv4; IPv6 in network order */
-  assert(parsed.control.local_v4_count == 2 && !parsed.control.local_v6_count);
-  assert(parsed.control.local_v4[0] == htonl(0x0a000001) &&
-         parsed.control.local_v4[1] == htonl(0x0a000002));
-  assert(!parsed.control.peer_v4_count && parsed.control.peer_v6_count == 1 &&
-         parsed.control.peer_v6[0][0] == htonl(0xfd000000) &&
-         parsed.control.peer_v6[0][3] == htonl(5));
   fclose(plan_file);
-  /* a malformed address, nine addresses, or a plan without its address lines */
-  const char *bad[] = {"LA 10.0.0.300\nRA \n",
-                       "LA 1.1.1.1 1.1.1.2 1.1.1.3 1.1.1.4 1.1.1.5 1.1.1.6 1.1.1.7 1.1.1.8 "
-                       "1.1.1.9\nRA \n",
-                       ""};
+  /* address lines are no part of the plan any more, nor anything after it */
+  const char *bad[] = {"LA 10.0.0.1\nRA \n", "extra\n"};
   for (unsigned int i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
     plan_file = tmpfile();
     assert(plan_file);
@@ -240,7 +431,7 @@ int main(int argc, char **argv) {
     reset();
     failure_at = fail;
     assert(run(obj, &p) == 2 && attached == fail - 1 && destroyed == attached);
-    assert(rings == frees && strstr(queue[3], "kernel_attach"));
+    assert(rings == frees && strstr(queue[5], "kernel_attach"));
     failure_at = fail + 1;
   }
   for (int broken = 0; broken < 2; broken++) {
@@ -288,9 +479,12 @@ int main(int argc, char **argv) {
   puts(
       "PASS: exact pinned libbpf consumed 1024 events in <=256-record batches; "
       "256 events flushed and stop checked before shutdown drained the other 768");
+  test_ownership_commands(obj, &p);
   reset();
-  struct kvp_event e = {.schema = 2,
+  struct kvp_event e = {.schema = 3,
                         .size = 256,
+                        .cookie = 42,
+                        .admission = 7,
                         .kind = KVP_STATE,
                         .family = 2,
                         .timestamp_ns = 123,
@@ -304,7 +498,7 @@ int main(int argc, char **argv) {
   e.peer_address[3] = 2;
   for (unsigned int i = 0; i < 8; i++) e.fields[i] = i + 10;
   event_row(NULL, &e, sizeof(e));
-  assert(strstr(queue[0], "\"old_state\":1,\"new_state\":7") &&
+  assert(strstr(queue[0], "\"cookie\":42,\"admission\":7,\"old_state\":1,\"new_state\":7") &&
          strstr(queue[0], "\"value\":10"));
   assert(strstr(queue[0], "usec_shift_3") && lengths[0] < KVP_RECORD_BYTES);
   for (unsigned int i = 0; i < KVP_QUEUE + 10; i++) event_row(NULL, &e, sizeof(e));
@@ -313,11 +507,11 @@ int main(int argc, char **argv) {
   assert(count == KVP_QUEUE);
   reset();
   map_diagnostics(obj);
-  assert(count == 3 && strstr(queue[0], "\"reported\":false"));
+  assert(count == 5 && strstr(queue[0], "\"reported\":false"));
   reset();
   fdinfo = "memlock: 99999999999\n";
   map_diagnostics(obj);
-  assert(count == 3 && strstr(queue[0], "99999999999") && !strstr(queue[0], "FAIL"));
+  assert(count == 5 && strstr(queue[0], "99999999999") && !strstr(queue[0], "FAIL"));
   bpf_object__close(obj);
   puts(
       "PASS: real object; emulated kernel load/attach errors; partial-link cleanup; "
