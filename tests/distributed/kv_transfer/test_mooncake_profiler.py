@@ -1055,6 +1055,38 @@ def test_a_receive_completes_once_and_a_failed_peer_keeps_it_failed(tmp_path, ou
         ]
 
 
+def test_a_consumer_receive_completion_is_its_request_s_not_an_orphan(tmp_path):
+    """The producer owns a Mooncake write's generation; the consumer worker's
+    completion names the request and its transfer ID only. The summary keeps
+    it as that request's receive completion, never an orphan transfer event."""
+    from vllm.kv_profiling.summary import summarize
+
+    with worker_of("kv_consumer", profiler_extra(tmp_path)) as worker:
+        meta = PullReqMeta(
+            d_req_id="d-req",
+            transfer_id="tx",
+            local_block_ids=[[1, 2]],
+            remote_engine_id="engine-p",
+            remote_bootstrap_addr="127.0.0.1:1",
+            pull_tasks_count=1,
+        )
+        response = MooncakeXferResponse(
+            status=MooncakeXferResponseStatus.FINISH, ok_reqs=["d-req"]
+        )
+        worker.process_pulling_result(response, {"d-req": meta})
+        profiler = worker._kvp
+        (done,) = [e for e in events_of(profiler) if e["kind"] == "complete_observed"]
+    assert done["transfer"] == 0 and done["subject"] == Subject.WORKER
+    summary = summarize([profiler.output_dir])
+    assert not [p for p in summary["problems"] if "transfer" in p["kind"]]
+    (request,) = [r for r in summary["requests"] if r["request"] == "d-req"]
+    assert request["receive_completed_time_ns"] is not None
+    assert request["receive_transfer_id"] == "tx"
+    assert [r["transfer_id"] for r in request["receive_completions"]] == ["tx"]
+    assert request["state"] == "completed"
+    assert request["recv_finished_time_ns"] is None  # the scheduler's, not here
+
+
 @pytest.mark.asyncio
 async def test_bootstrap_queries_lease_expiry_and_the_producer_identity_are_recorded(
     tmp_path,

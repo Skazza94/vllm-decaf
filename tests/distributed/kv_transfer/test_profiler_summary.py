@@ -1637,6 +1637,96 @@ def mooncake_summary(recorders, build, **overrides):
     return summarize([recorder.output_dir])
 
 
+MOONCAKE_CONSUMER = {
+    **MOONCAKE,
+    "kv_role": "kv_consumer",
+    "engine_id": "engine-decode",
+    "capabilities": {"receive_completion": True},
+}
+
+
+def receipts_summary(
+    recorders, transfer_ids, declared="both", failed_first=False, handle=None
+):
+    """A Mooncake consumer worker's receive completions of one request ID, one
+    per transfer ID, the capability declared in the metadata, the context,
+    both or neither; optionally after a failed receive of the request, or
+    each giving ``handle`` (one the recorder never bound)."""
+    recorder = recorders(context=MOONCAKE_CONSUMER)
+    assert recorder.wait_ready()
+    if failed_first:
+        recorder.record(*fields(EventKind.FAILED, "d-req", handoff="tx-0",
+                                status=int(Failure.RECEIVE_FAILED)))  # fmt: skip
+    for transfer_id in transfer_ids:
+        recorder.record(*fields(EventKind.COMPLETE_OBSERVED, "d-req",
+                                handoff=transfer_id, handle=handle,
+                                subject=1))  # fmt: skip
+    # an unbound handle is the recorder's loss (an unknown handle)
+    assert recorder.close().complete is (handle is None)
+    adapter_summary(recorder)
+    path = recorder.output_dir / "events.jsonl"
+    lines = path.read_text().splitlines()
+    meta = json.loads(lines[0])
+    if declared in ("context", "neither"):
+        meta.pop("capabilities")
+    if declared in ("metadata", "neither"):
+        meta["context"].pop("capabilities")
+    path.write_text("\n".join([json.dumps(meta), *lines[1:]]) + "\n")
+    summary = summarize([recorder.output_dir])
+    requests = [r for r in summary["requests"] if r["request"] == "d-req"]
+    return summary, requests
+
+
+def test_a_reused_request_id_keeps_every_receive_completion(recorders):
+    """Two receives of one request ID (two transfer IDs): both are kept, in
+    order; the single values stay empty rather than pick one."""
+    summary, (request,) = receipts_summary(recorders, ["tx-1", "tx-2"])
+    assert "orphan_transfer_event" not in kinds_of(summary)
+    first, second = request["receive_completions"]
+    assert (first["transfer_id"], second["transfer_id"]) == ("tx-1", "tx-2")
+    assert first["time_ns"] <= second["time_ns"]
+    assert request["receive_completed_time_ns"] is None
+    assert request["receive_transfer_id"] is None
+    assert request["state"] == "completed"
+
+
+def test_a_worker_completion_with_an_unbound_handle_stays_an_orphan(recorders):
+    """A completion that gave a handle the recorder never bound (the recorder
+    marks it unbound, generation 0) is no receive completion: it stays an
+    orphan, with no receipt and no inferred completion."""
+    summary, requests = receipts_summary(recorders, ["tx-1"], handle=42)
+    assert "orphan_transfer_event" in kinds_of(summary)
+    assert not any(r.get("receive_completions") for r in requests)
+    assert all(r["state"] != "completed" for r in requests)
+
+
+def test_a_receive_completion_proves_movement_but_not_over_an_earlier_failure(
+    recorders,
+):
+    """A consumer rank moves no transfer of its own: its receive completion is
+    the request's proof of movement (completed); a receive failure before it
+    keeps the request failed."""
+    _, (request,) = receipts_summary(recorders, ["tx-1"])
+    assert request["state"] == "completed"
+    _, (request,) = receipts_summary(recorders, ["tx-1"], failed_first=True)
+    assert request["state"] == "failed"
+
+
+@pytest.mark.parametrize("declared", ["both", "metadata", "context", "neither"])
+def test_a_receive_completion_is_recognized_only_where_declared(recorders, declared):
+    """The capability is read from the capture's metadata, else its context;
+    undeclared, a worker completion without a generation stays an orphan."""
+    summary, requests = receipts_summary(recorders, ["tx-1"], declared)
+    if declared == "neither":
+        assert "orphan_transfer_event" in kinds_of(summary)
+        assert not any(r.get("receive_completions") for r in requests)
+    else:
+        assert "orphan_transfer_event" not in kinds_of(summary)
+        (request,) = requests
+        assert request["receive_transfer_id"] == "tx-1"
+        assert request["receive_completed_time_ns"] is not None
+
+
 def test_write_batch_members_partition_the_batch_exactly(recorders):
     def build(record):
         write_batch(

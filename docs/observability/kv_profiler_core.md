@@ -1281,7 +1281,17 @@ reports finished, status 1 when its failure was reported by request) and the rel
 permission. The consumer's worker records the bootstrap query (`handshake_begin`/
 `handshake_end`), each request's rank-local receive completion only when every peer
 answered and none failed (the failure flag is sticky: a later peer's success does not
-heal an earlier peer's failure), and `failed(receive_failed)`. A recovered
+heal an earlier peer's failure), and `failed(receive_failed)`. That completion names
+the request and its transfer ID, never a generation (the write's generation is the
+producer's): the summary keeps it in the request's row, not as a transfer event,
+with every such receipt in `receive_completions` (transfer ID and time; a reused
+request ID keeps each) and `receive_completed_time_ns`/`receive_transfer_id` when
+there is exactly one. The rank moves no transfer of its own, so its receive
+completion is the request row's proof of movement (`completed`), under the same
+failure rules: a required failure before it keeps the request failed. It is
+recognized only where the capture declares `receive_completion` (in its metadata, or
+else its context); elsewhere a worker completion without a generation is still an
+orphan. A recovered
 `LAYOUT_MISS` retry is not observed; only a terminal failure is.
 
 The adapter keeps a bounded registry of open generations (`inflight_cap`). If the

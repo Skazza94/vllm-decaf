@@ -278,6 +278,27 @@ class _Source:
             }
         )
 
+    def _is_receive_completion(self, row) -> bool:
+        """A Mooncake consumer worker's receive completion: the producer owns
+        the write's generation, so the consumer's per-request completion names
+        the request and its transfer ID and gives no handle. A request event of
+        that rank, not a transfer event. A completion that gave a handle the
+        recorder never bound (``unbound_handle``) is an orphan, never this."""
+        return (
+            self.mooncake
+            and row["kind"] in _COMPLETE
+            and row["subject"] == Subject.WORKER
+            and not row["transfer"]
+            and not row["unbound_handle"]  # a handle given, never bound: orphan
+            and bool(row["request_ref"])
+            and self._capabilities().get("receive_completion") is True
+        )
+
+    def _capabilities(self) -> dict:
+        """The capture's declared capabilities: the metadata's, else the
+        context's."""
+        return self.meta.get("capabilities") or self.context.get("capabilities") or {}
+
     def _transfer_rows(self):
         prepared_transfers = {
             row["transfer"] for row in self.events if row["kind"] in _PREPARED
@@ -288,6 +309,8 @@ class _Source:
             if row["kind"] in _PREPARED and transfer:
                 buckets.setdefault(transfer, []).append(row)
                 self.classified.add(id(row))
+                continue
+            if self._is_receive_completion(row):
                 continue
             is_transfer_event = (
                 row["kind"] in _POST_BEGIN
@@ -575,6 +598,7 @@ class _Source:
                     and row["subject"] == Subject.REQUEST)
                 or (row["kind"] in _COMPLETE
                     and row["subject"] == Subject.SCHEDULER)
+                or self._is_receive_completion(row)
                 or (row["kind"] == _END
                     and row["request_ref"])
             )
@@ -816,7 +840,7 @@ class _Source:
         ]
         if not reads:
             return
-        caps = self.meta.get("capabilities") or self.context.get("capabilities") or {}
+        caps = self._capabilities()
         if not caps.get("post_pass") or all(
             item["post_pass"] is None for item in reads
         ):
@@ -1049,6 +1073,11 @@ class _Source:
             if row["kind"] == "complete_observed"
             and row["subject"] == Subject.SCHEDULER
         ]
+        receipts = [
+            {"transfer_id": self._name(row["handoff_ref"]), "time_ns": row["time_ns"]}
+            for row in ordered
+            if self._is_receive_completion(row)
+        ]
         handoffs = []
         for row in ordered:
             if row["kind"] != "handoff":
@@ -1139,6 +1168,12 @@ class _Source:
                 ),
                 default=None,
             )
+        elif not transfers and receipts:
+            # A Mooncake consumer rank moves no transfer of its own: its
+            # receive completion (every peer answered, none failed) is the
+            # movement's proof, under the same failure rules.
+            all_completed = True
+            boundary = max(item["time_ns"] for item in receipts)
         failure_items = []
         for row in failures:
             try:
@@ -1211,6 +1246,14 @@ class _Source:
             "senders_done_time_ns": done[-1]["time_ns"] if done else None,
             "recv_finished_time_ns":
                 completed[-1]["time_ns"] if completed else None,
+            # Mooncake consumer worker: each receive of this rank that
+            # completed (every producer peer answered, none failed), with its
+            # transfer ID; the single values only when there is one.
+            "receive_completions": receipts,
+            "receive_completed_time_ns":
+                receipts[0]["time_ns"] if len(receipts) == 1 else None,
+            "receive_transfer_id":
+                receipts[0]["transfer_id"] if len(receipts) == 1 else None,
             "failures": failure_items,
             # Post-completion cleanup/notification issues only exist once the
             # relevant data movement has completed.
