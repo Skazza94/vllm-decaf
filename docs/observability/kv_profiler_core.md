@@ -1285,11 +1285,15 @@ clean and a required eBPF source fails; the count stays in its terminal record.
 A row the observer cannot frame or decode is the same: the rows read before it
 are still handled, and the error stands to the end of the run, which is not
 clean. The
-capture writer's own rate is the ceiling for a sustained event rate: above it,
-the backlog fills the reader's queue, then the collector's and the ring, and the
-excess is counted as eBPF loss (the source degraded) rather than dropped by the
-writer, whose drops (`drop_probe_rows`) would leave the whole capture
-incomplete. Namespace,
+sustained event rate the observer keeps up with depends on its own work per row
+on its main thread (decoding the collector's row, annotating it and encoding it
+for the capture), on the rest of its work, and on the capture's filesystem:
+above it, the backlog fills the reader's queue, then the collector's and the
+ring, and the excess is counted as eBPF loss (the source degraded) rather than
+dropped by the writer, whose drops (`drop_probe_rows`) would leave the whole
+capture incomplete. A
+writer that has failed holds nothing back: its rows are dropped and counted, its
+capture already incomplete. Namespace,
 protocol, family and port exclusions, ownership rejections (counted apart) and global
 unknown exclusions are not loss.
 

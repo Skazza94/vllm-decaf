@@ -5488,3 +5488,69 @@ def test_ebpf_valid_rows_before_malformed_output_are_kept_and_the_error_stands(
     assert sum(r["type"] == "resource" for r in delivered) == 1  # once
     assert len(raised) == 1 and diagnostic in raised[0]
     assert result["clean"] is False and diagnostic in result["error"]
+
+
+def test_ebpf_a_failed_capture_writer_holds_no_rows_back(tmp_path):
+    """The writer fails with its queue full (held after its first dequeue while
+    the queue fills, then past its output limit): flow control does not wait
+    on it, the channel handles every row of a burst in order, and the writer
+    drops and counts them, its capture incomplete."""
+    import threading
+
+    release = threading.Event()
+
+    class Held(bytes):  # the first row dequeued: held, then past the limit
+        def __len__(self):
+            release.wait(10)
+            return 1 << 40
+
+    go, done = tmp_path / "go", tmp_path / "done"
+    channel = _scripted(tmp_path, go=str(go), done=str(done), burst=50)
+    writer = Writer(tmp_path / "writer", metadata(), ProbeConfig(queue_rows=8))
+    try:
+        writer.queue.put((1, Held(b"x")))
+        wait_for(lambda: writer.queue.qsize() == 0)  # dequeued: the writer holds
+        now = time.monotonic_ns()
+        for _ in range(8):
+            writer.put(event("endpoint_metrics", "ebpf", "d", now, now,
+                             {"type": "loss"}))  # fmt: skip
+        assert writer.queue.qsize() == 8  # full
+        release.set()
+        writer.thread.join(5)
+        assert writer.error and writer.queue.qsize() == 8  # dead, still full
+        _settle(channel, until=lambda: channel.status.get("available") is True)
+        go.touch()
+        handled, dropped = [], writer.dropped
+        deadline = time.monotonic() + 10
+        while len(handled) < 50 and time.monotonic() < deadline:
+            for row in channel.poll(writer, 0.05):
+                if row.get("type") == "loss":
+                    handled.append(row["value"])
+                writer.put(event("endpoint_metrics", "ebpf", "d", now, now, row))
+        assert handled == list(range(50)) and not channel.writer_blocked
+        assert writer.dropped - dropped >= 50
+        assert writer.room() == writer.queue.maxsize
+    finally:
+        release.set()
+        channel.stop(writer)
+        assert writer.close(True, "test", {}) is False
+
+
+def test_a_writer_dead_of_an_error_without_a_message_reports_its_failure(tmp_path):
+    """The writer's thread dies of an exception with an empty message: it is
+    still a failure that the next put, room() and close() see."""
+
+    class Silent(bytes):
+        def __len__(self):
+            raise MemoryError()
+
+    writer = Writer(tmp_path / "writer", metadata(), ProbeConfig(queue_rows=8))
+    writer.queue.put((1, Silent(b"x")))
+    writer.thread.join(5)
+    assert not writer.thread.is_alive() and writer.error == "MemoryError"
+    assert writer.room() == writer.queue.maxsize
+    now = time.monotonic_ns()
+    assert writer.put(event("endpoint_metrics", "ebpf", "d", now, now,
+                            {"type": "loss"})) is None  # fmt: skip
+    assert writer.dropped == 1
+    assert writer.close(True, "test", {}) is False

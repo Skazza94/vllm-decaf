@@ -132,7 +132,11 @@ class Writer:
         atomic_json(self.directory / "manifest.json", self.manifest)
 
     def room(self) -> int:
-        """Rows the queue can take now (approximately: its thread drains it)."""
+        """Rows the queue can take now (approximately: its thread drains it).
+        A failed writer takes no more rows, so it holds nothing back: all of
+        its queue, its rows dropped and counted (its capture incomplete)."""
+        if self.error or not self.thread.is_alive():
+            return self.queue.maxsize
         return max(0, self.queue.maxsize - self.queue.qsize())
 
     def put(self, row):
@@ -215,6 +219,7 @@ class Writer:
                 },
             )
         except Exception as error:
-            self.error = str(error)
+            # never empty: put(), room(), close() and the observer test it
+            self.error = str(error) or type(error).__name__
         finally:
             self.ready.set()
