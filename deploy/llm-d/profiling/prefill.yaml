@@ -62,7 +62,7 @@ spec:
       - name: vllm-prefill
         env:
         - name: KV_TRANSFER_CONFIG
-          value: '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu", "kv_connector_extra_config": {"backends": ["Mooncake"], "network_profiler": {"level": "l3", "run_id": "@RUN_ID@", "output_dir": "@GENERATION@", "transport": "tcp"}}}'
+          value: '{"kv_connector": "NixlConnector", "kv_role": "kv_producer", "kv_buffer_device": "cpu", "kv_connector_extra_config": {"backends": ["Mooncake"], "network_profiler": {"level": "l3", "run_id": "@RUN_ID@", "output_dir": "@GENERATION@"}}}'
         # Integer CPUs and requests equal to limits (Guaranteed QoS): exclusive
         # CPUs under a static CPU manager policy.
         resources:

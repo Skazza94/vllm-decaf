@@ -49,7 +49,6 @@ def run_pair(tmp_path, prefill, decode, *, profile=True, wait=0.0, tolerate=Fals
                 "level": "l1",
                 "run_id": run_id,
                 "output_dir": str(tmp_path / "profiles"),
-                "transport": "tcp",
                 "clock_port_offset": 100,
                 "shutdown_timeout_s": 5,
                 "context": {"case": role},

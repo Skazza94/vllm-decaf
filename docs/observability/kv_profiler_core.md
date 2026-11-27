@@ -294,7 +294,8 @@ rejected. The summary reports, per process
 and per transfer, the handshake, prepared-to-posted and posted-to-completed
 durations (with transfer throughput and NIXL's own integer microseconds),
 per-request handoffs, releases and failures, and per-backend/per-transport
-percentiles; TCP and RDMA are always separate keys. A request completes only
+percentiles, keyed by each process's declared transport (see "Transport
+derivation"); TCP and RDMA are always separate keys. A request completes only
 when every one of its transfers completed and no required failure was
 recorded: receive-finished and senders-done are terminal notifications,
 recorded with their times but never establishing success, and only an
@@ -644,6 +645,72 @@ or overhead: the connector and harness tests cover attachment and transfers, and
 overhead is covered only by the serving A/B above, for its tested workload. No
 connector behavior or pairing is changed here.
 
+## Transport derivation
+
+A backend's configuration constrains its transport but does not say which one it
+selects, so the recorder never labels its events with a transport (their
+`transport` field stays `unknown`). Each scheduler and worker recorder derives,
+when it opens (after the connector has bound its transport), one entry per
+backend in its context's `transport` and in `profiler.json`: the `candidates`
+its configuration allows (`tcp`, `rdma`; `null` when unconstrained, empty when
+neither), the `source` setting and value it was read from, and the `reason` it is
+no more than that. Values and reasons are redacted and bounded as the
+configuration snapshot's are, so a long setting never keeps a recorder from
+opening.
+
+| Backend | Source | Candidates |
+| --- | --- | --- |
+| UCX | `UCX_TLS` | The network transports it lists: `tcp`, or `rdma` for `rc*`, `dc*`, `ud*` and `ib`; local ones (`self`, shared memory, devices) are ignored. Unset, `all`, an exclusion (`^…`) or an unclassified name is unconstrained. UCX selects at runtime, so even `tcp,self` stays a candidate. |
+| LIBFABRIC | `FI_PROVIDER` | A filter: `tcp` and `sockets` give `tcp`, `verbs` gives `rdma`, `udp` gives neither. Any other provider (`psm3`, `efa`, …: a fabric provider alone need not be hardware RDMA) leaves it unconstrained, the providers kept by name. Unset or an exclusion is unconstrained. The provider libfabric selected is not recorded. |
+| Mooncake over TENT (`MC_USE_TENT` or `MC_USE_TEV1` present, any value) | `MC_TENT_CONF`'s `transports` | Each network transport enabled by the configuration or by TENT's defaults, read as TENT reads it: `tcp` and `rdma` on unless their boolean `enable` (nested, else the exact flat leaf, a mistyped nested value falling back to the flat one, then to the default) is `false` (`rdma` also needs an RDMA NIC); `hp_tcp` off unless its object (nested, or under the exact flat key `transports/hp_tcp`) enables it, an absent `enable` being off and a present non-boolean one (`null` included) invalid. `tcp` and `hp_tcp` are `tcp`. An invalid `hp_tcp` (its type recorded), or an unset or unreadable configuration, is unconstrained. |
+| Mooncake, classic engine (either connector) | `MC_FORCE_TCP`, `mooncake_protocol` | `tcp` when `MC_FORCE_TCP` is present; otherwise unconstrained: the engine discovers its transport whatever its protocol (TCP even under the default `rdma`). It records no per-transport counters. |
+| Any other | none | Unconstrained. |
+
+The summary keys transfers and handshakes by the declared entries, never by
+counters: a worker's counters show what it moved over each transport, not which
+path a given transfer took, so derived processes are keyed `<backend>/unknown`.
+What a TENT worker moved is reported apart, from its own byte counters as the L2
+collector recorded them (give the collector's captures to the summary with the
+recorders'):
+
+- **Attribution.** A collector target is attributed to one worker when it names
+  the worker's process (`process_id`) or engine (`engine_id`), both agreeing when
+  both are named, or else serves the worker's TENT metrics endpoint: resolved
+  from the worker's recorded configuration, which must be present, readable,
+  untrimmed where it sets the metrics host or port (a snapshot that dropped
+  TENT's `metrics` object, its flat `metrics/http_host` or `metrics/http_port`,
+  `MC_TENT_CONF` or a `TENT_METRICS_HTTP_*` variable identifies nothing; other
+  drops do not matter), and resolved with TENT's precedence (the file's host and
+  port, else the environment's, else the defaults) and name the port (TENT's default port identifies
+  nothing), on the same boot and, for a loopback endpoint, in the same network
+  namespace (the collector records both). A rank
+  the target names must be the worker's. An ambiguous, unmatched or wrong-rank
+  target attributes nothing (a wrong rank is reported as
+  `transport_evidence_rank_mismatch`); `transport_evidence` lists every target's
+  attribution or reason.
+- **Evidence.** Of an attributed target's series, only a positive read or write
+  byte delta counts, between consecutive samples of the target (a missed scrape
+  breaks the series), both complete, the later with an established baseline, in
+  one reset generation and without a discontinuity. A missing, zero or reset
+  counter shows nothing.
+- **Report.** `transport_observed` lists one stream per worker, collector, target
+  and transport label: its read and write bytes (`null` for a direction never
+  measured, a measured zero kept) and every interval. Two collectors of one
+  worker scrape the same cumulative counters, so their streams are never summed. The worker's entry gets `observed` (the network
+  kinds seen, `null` without attributed evidence) and an `observation` reason
+  when there are none; a kind outside its candidates (an empty list included)
+  is reported as `transport_outside_configuration`. UCX, LIBFABRIC and the
+  classic engine have no such evidence here.
+- **Inputs.** Identical copies of one collector capture fold into one;
+  conflicting copies of one run and process are refused.
+
+Each summary source lists its entries under `transport`. A capture from before
+the derivation carries a manual label: it is kept and keyed as configured (for
+example `UCX/tcp (configured)`); a recorder with neither (a frontend) has no
+entry. Trace export adds each process's entries (candidates, reason, source) to
+every event's recorded transport, marked `derived`, or the old label, marked
+`configured`.
+
 ## NIXL adapter (L1)
 
 Enable it on both the prefill and the decode instance with the same run ID:
@@ -651,13 +718,13 @@ Enable it on both the prefill and the decode instance with the same run ID:
 ```json
 {"kv_connector_extra_config": {"network_profiler": {
   "level": "l1", "run_id": "<UUID shared by P and D>", "output_dir": "/profiles",
-  "transport": "tcp", "clock_port_offset": 1000}}}
+  "clock_port_offset": 1000}}}
 ```
 
-`transport` is the configured transport (`tcp`, `rdma` or `unknown`) and the
-backend list comes from the connector's `backends`; both are recorded as
-configured, never as observed. Invalid options, and the push connector, are
-refused when the connector is built. The key is not part of the NIXL compatibility
+The backend list comes from the connector's `backends`. The transport is not
+configured: each recorder derives it per backend (see "Transport derivation").
+Invalid options (an unknown key among them), and the push connector, are refused
+when the connector is built. The key is not part of the NIXL compatibility
 hash, so a profiled instance pairs with an unprofiled one.
 
 Each scheduler, worker and frontend process owns one recorder and writes its own

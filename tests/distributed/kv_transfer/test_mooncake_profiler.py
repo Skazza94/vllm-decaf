@@ -2396,3 +2396,28 @@ def test_a_deadline_exit_keeps_the_last_status_received():
     finally:
         busy.shutdown()
         late.shutdown()
+
+
+def test_a_tent_worker_derives_its_candidates_from_its_tent_configuration(
+    tmp_path, monkeypatch
+):
+    """With TENT selected, the worker's context and profiler.json name every
+    network transport its MC_TENT_CONF leaves enabled, as a candidate only;
+    its events carry no transport."""
+    monkeypatch.setenv("MC_USE_TENT", "1")
+    monkeypatch.setenv("MC_TENT_CONF", json.dumps({"transports": {
+        "rdma": {"enable": False}, "tcp": {"enable": False},
+        "hp_tcp": {"enable": True}}}))  # fmt: skip
+    profiler = _clock_profiler(tmp_path, "worker", "kv_consumer", str(uuid4()),
+                               "engine-d")  # fmt: skip
+    profiler.close()
+    path = profiler.output_dir / "events.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    (entry,) = rows[0]["context"]["transport"]
+    assert (entry["backend"], entry["engine"], entry["candidates"]) == (
+        "Mooncake", "tent", ["tcp"])  # fmt: skip
+    assert entry["source"]["name"] == "MC_TENT_CONF"
+    assert all(r["transport"]["kind"] == "unknown" for r in rows
+               if r.get("type") == "event")  # fmt: skip
+    profile = json.loads((profiler.output_dir / "profiler.json").read_text())
+    assert profile["transport"] == rows[0]["context"]["transport"]

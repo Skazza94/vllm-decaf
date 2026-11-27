@@ -345,7 +345,6 @@ class Profiler:
     worker serves its clock and advertises it to the instance's bootstrap
     server, where decode finds it: nothing is pinned or configured here."""
 
-    transport: str = "tcp"
     clock_port_offset: int = 1000
     flush: str = "background"
     level: str = "l1"
@@ -490,8 +489,8 @@ def parse(raw: dict, path: Path, *, fetch: bool = False) -> Run:
                 ebpf_opt_in(node, probes)
         elif profiler.probes or profiler.observer_cpus:
             raise ValueError("endpoint probe settings require L3")
-        if profiler.transport not in ("tcp", "unknown") or profiler.flush not in ("end", "background"):
-            raise ValueError("profiler.transport is tcp or unknown, profiler.flush end or background")
+        if profiler.flush not in ("end", "background"):
+            raise ValueError("profiler.flush is end or background")
         if (not isinstance(profiler.clock_port_offset, int) or isinstance(profiler.clock_port_offset, bool)
                 or not 1 <= profiler.clock_port_offset <= 65535):
             raise ValueError("profiler.clock_port_offset is a port offset in 1..65535")
@@ -1096,7 +1095,7 @@ def server_command(run: Run, role: str, kv_addresses: list[str], port: int = SER
             raise ValueError("a profiled run needs one profile ID for both servers")
         kv_transfer["kv_connector_extra_config"]["network_profiler"] = {
             "level": run.profiler.level, "run_id": profile_id, "output_dir": PROFILES,
-            "transport": run.profiler.transport, "clock_port_offset": run.profiler.clock_port_offset,
+            "clock_port_offset": run.profiler.clock_port_offset,
             "flush": run.profiler.flush, "shutdown_timeout_s": 10}
         if not nixl:  # Mooncake clocks are advertised (no side-channel offset)
             del kv_transfer["kv_connector_extra_config"]["network_profiler"]["clock_port_offset"]

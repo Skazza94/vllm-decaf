@@ -254,7 +254,7 @@ def test_known_sequence_is_summarized_exactly(recorders):
     assert request["duration_sum_samples"] == 2
     assert request["release_requested_time_ns"] == time("release_requested")
     assert request["failures"] == []
-    key = summary["aggregates"]["transfers"]["Test/tcp"]
+    key = summary["aggregates"]["transfers"]["Test/tcp (configured)"]
     assert key["count"] == 2 and key["completed"] == 1 and key["failed"] == 1
     assert key["incomplete"] == 0
     assert key["bytes"] == {"sum": 1000, "samples": 1}
@@ -262,7 +262,7 @@ def test_known_sequence_is_summarized_exactly(recorders):
     assert key["posted_to_completed_ns"]["p50"] == done[
         "posted_to_completed_ns"
     ]
-    handshake = summary["aggregates"]["handshakes"]["Test/tcp"]
+    handshake = summary["aggregates"]["handshakes"]["Test/tcp (configured)"]
     assert handshake["count"] == 1
     assert handshake["duration_ns"]["p50"] == done["handshake_duration_ns"]
     scopes = [item["scope"] for item in summary["not_available"]]
@@ -416,7 +416,7 @@ def test_multi_rank_handshake_and_request_edges(recorders):
     summary = summarize(
         [producer_a.output_dir, producer_b.output_dir, consumer.output_dir]
     )
-    handshakes = summary["aggregates"]["handshakes"]["Test/tcp"]
+    handshakes = summary["aggregates"]["handshakes"]["Test/tcp (configured)"]
     assert handshakes["count"] == 1
     (consumer_handshake,) = [
         item
@@ -432,7 +432,7 @@ def test_multi_rank_handshake_and_request_edges(recorders):
     assert by_rank[0]["handshake_duration_ns"] is not None
     assert by_rank[1]["state"] == "completed"
     assert by_rank[1]["handshake_duration_ns"] is not None
-    aggregate = summary["aggregates"]["transfers"]["Test/tcp"]
+    aggregate = summary["aggregates"]["transfers"]["Test/tcp (configured)"]
     assert aggregate["count"] == 5 and aggregate["completed"] == 4
     assert aggregate["incomplete"] == 1
     request = next(
@@ -523,7 +523,7 @@ def test_handshake_attempts_by_role(recorders):
     assert ("p", "no_local_begin") not in states
     assert len(completed) == 2
     assert {item["peer"] for item in completed} == {"p"}
-    aggregate = summary["aggregates"]["handshakes"]["Test/tcp"]
+    aggregate = summary["aggregates"]["handshakes"]["Test/tcp (configured)"]
     # The two attempts are two handshakes; each its own begin/end interval.
     assert aggregate["count"] == 2
     assert aggregate["duration_ns"]["samples"] == 2
@@ -1263,7 +1263,7 @@ def test_saved_capture_with_one_completed_read():
     assert handshake["duration_ns"] == transfer["handshake_duration_ns"]
     (join,) = summary["joins"]
     assert join["joined"] and not join["ambiguous"]
-    entries = summary["aggregates"]["transfers"]["Mooncake/tcp"]
+    entries = summary["aggregates"]["transfers"]["Mooncake/tcp (configured)"]
     assert entries["count"] == 1 and entries["completed"] == 1
     assert entries["bytes"] == {"sum": 37748736, "samples": 1}
 
@@ -1960,3 +1960,329 @@ def test_batch_membership_is_an_association_not_a_request_occurrence(recorders):
         ("written", "posted"), ("failed", "planned"), ("incomplete", "unknown")]  # fmt: skip
     (b,) = [r for r in summary["requests"] if r["request"] == "d-b"]
     assert (b["request_occurrences"], b["write_bytes_posted"]) == (1, 256)
+
+
+_TENT_ENTRY = {
+    "backend": "Mooncake", "candidates": ["tcp"], "engine": "tent",
+    "reason": "TENT enables transports from MC_TENT_CONF",
+    "source": {"name": "MC_TENT_CONF", "value": {}},
+}  # fmt: skip
+
+
+def reading(label, written, *, number, generation=0, baseline=None, read=None,
+            **target):  # fmt: skip
+    """One TENT transport_metrics row of target prefill-tp0 (scrape ``number``),
+    its baseline established after the first scrape unless given."""
+    return {
+        "schema": 1, "type": "event", "kind": "transport_metrics",
+        "sample_id": f"c0ffee00-prefill-tp0-{number}", "time_ns": 1000 * number,
+        "target": {"id": "prefill-tp0", "rank": {"dp": 0, "tp": 0},
+                   "endpoint": "127.0.0.1:9100", "engine_id": None,
+                   "process_id": None, **target},
+        "scrape": {"begin_ns": 1000 * number - 500, "end_ns": 1000 * number},
+        "reset_generation": generation, "labels": {"transport": label},
+        "fields": {"write_bytes": written,
+                   **({} if read is None else {"read_bytes": read})},
+        "partial": False,
+        "discontinuity": False,
+        "baseline": baseline or ("first" if number == 1 else "established"),
+    }  # fmt: skip
+
+
+def series(label, values, start=1):
+    return [reading(label, v, number=start + i) for i, v in enumerate(values)]
+
+
+def tent_evidence(recorders, tmp_path, readings, *, namespace=None,
+                  entry=_TENT_ENTRY, environment=None, transfer=False,
+                  copies=None, recorded=True, dropped=None,
+                  target=None, tent=None):  # fmt: skip
+    """A Mooncake TENT worker (a derived entry, its metrics on 127.0.0.1:9100,
+    DP 0 TP 0; optionally one completed write batch) and an L2 collector
+    capture of ``readings``; ``namespace`` is the collector's network namespace,
+    ``environment`` the worker's recorded one (none at all unless
+    ``recorded``), ``copies`` extra collector files (each a function of the
+    rows) passed after the first."""
+    context = {**MOONCAKE, "transport": [entry], "tp_rank": 0, "dp_rank": 0}
+    recorder = recorders(context=context)
+    assert recorder.wait_ready()
+    if transfer:
+        write_batch(recorder.record, 0x10, {"m-req": (4096, 1)})
+    recorder.close()
+    adapter_summary(recorder)
+    path = recorder.output_dir / "events.jsonl"
+    lines = path.read_text().splitlines()
+    meta = json.loads(lines[0])
+    meta.pop("config", None)
+    if recorded:
+        meta["config"] = {"environment": {"TENT_METRICS_HTTP_PORT": "9100"}
+                          if environment is None else environment}  # fmt: skip
+        if dropped:
+            meta["config"]["dropped"] = dropped
+        if tent is not None:
+            meta["config"]["tent_config"] = tent
+    meta.setdefault("net_namespace", "net:[1]")
+    meta.setdefault("boot_id", "boot-1")
+    path.write_text("\n".join([json.dumps(meta), *lines[1:]]) + "\n")
+    if target is not None:  # target fields from the worker's own metadata
+        readings = [{**row, "target": {**row["target"], **target(meta)}}
+                    for row in readings]  # fmt: skip
+    rows = [{
+        "type": "metadata", "schema": 1, "run_id": meta["run_id"],
+        "process_id": str(uuid4()), "clock_id": str(uuid4()),
+        "boot_id": meta["boot_id"],
+        "net_namespace": namespace or meta["net_namespace"],
+        "context": {"role": "collector", "connector": "mooncake"},
+    }, *readings]  # fmt: skip
+    collectors = []
+    for index, variant in enumerate([lambda r: r, *(copies or [])]):
+        collector = tmp_path / f"collector{index}" / "events.jsonl"
+        collector.parent.mkdir(parents=True)
+        collector.write_text(
+            "\n".join(json.dumps(row) for row in variant(rows)) + "\n")
+        collectors.append(collector)
+    summary = summarize([recorder.output_dir, *collectors])
+    (source,) = summary["sources"]
+    (resolved,) = source["transport"]
+    return summary, resolved
+
+
+def test_a_tent_workers_byte_counters_are_observed_by_worker_and_interval(
+    recorders, tmp_path
+):
+    """Positive write-byte deltas on hp_tcp, at the worker's own metrics
+    endpoint in its network namespace, are reported for that worker, by
+    transport and interval."""
+    summary, entry = tent_evidence(recorders, tmp_path,
+                                   series("hp_tcp", [0, 4096, 8192]))  # fmt: skip
+    assert entry["observed"] == ["tcp"] and entry["kind"] == "unknown"
+    (row,) = summary["transport_observed"]
+    assert (row["source"], row["transport"], row["kind"]) == (0, "hp_tcp", "tcp")
+    assert (row["target"], row["collector"]) == (
+        "prefill-tp0", summary["transport_evidence"][0]["collector"])  # fmt: skip
+    assert row["write_bytes"] == 8192
+    assert row["read_bytes"] is None  # never measured, not zero
+    assert [i["write_bytes"] for i in row["intervals"]] == [4096, 4096]
+    (attribution,) = summary["transport_evidence"]
+    assert attribution["source"] == 0
+    assert attribution["basis"] == "metrics endpoint"
+
+
+def test_a_workers_counters_never_label_its_transfers(recorders, tmp_path):
+    """Counters show the worker moved bytes over TCP, not which path a given
+    transfer took: its transfers stay keyed unknown."""
+    readings = series("hp_tcp", [0, 4096])
+    summary, entry = tent_evidence(recorders, tmp_path, readings, transfer=True)
+    assert entry["observed"] == ["tcp"]
+    assert list(summary["aggregates"]["transfers"]) == ["Mooncake/unknown"]
+
+
+def test_bytes_over_two_transports_are_both_kept(recorders, tmp_path):
+    entry = {**_TENT_ENTRY, "candidates": ["rdma", "tcp"]}
+    summary, resolved = tent_evidence(
+        recorders, tmp_path,
+        series("hp_tcp", [0, 10]) + series("rdma", [0, 20]), entry=entry)  # fmt: skip
+    assert resolved["observed"] == ["rdma", "tcp"]
+    assert {r["transport"] for r in summary["transport_observed"]} == {
+        "hp_tcp", "rdma"}  # fmt: skip
+    assert "transport_outside_configuration" not in kinds_of(summary)
+
+
+@pytest.mark.parametrize("candidates", [["tcp"], []])
+def test_bytes_outside_the_candidates_are_reported(recorders, tmp_path, candidates):
+    """An observed kind its candidates exclude, an explicitly empty list
+    included, is reported."""
+    summary, resolved = tent_evidence(
+        recorders, tmp_path, series("rdma", [0, 20]),
+        entry={**_TENT_ENTRY, "candidates": candidates})  # fmt: skip
+    assert resolved["observed"] == ["rdma"]
+    assert "transport_outside_configuration" in kinds_of(summary)
+
+
+def test_a_reset_or_zero_counter_confirms_nothing(recorders, tmp_path):
+    """A decrease starts a new reset generation: no delta spans it; a steady
+    counter is a zero delta."""
+    readings = [reading("hp_tcp", 500, number=1),
+                reading("hp_tcp", 100, number=2, generation=1),
+                reading("hp_tcp", 100, number=3, generation=1)]  # fmt: skip
+    summary, entry = tent_evidence(recorders, tmp_path, readings)
+    assert entry["observed"] == [] and summary["transport_observed"] == []
+    assert "no positive byte delta" in entry["observation"]
+
+
+@pytest.mark.parametrize(
+    "readings",
+    [
+        # scrape 2 missed: 1 -> 3 spans a gap
+        [reading("hp_tcp", 0, number=1), reading("hp_tcp", 4096, number=3)],
+        # the later reading's baseline is unavailable (history evicted)
+        [reading("hp_tcp", 0, number=1),
+         reading("hp_tcp", 4096, number=2, baseline="unavailable")],
+    ],
+)  # fmt: skip
+def test_a_missed_scrape_or_unavailable_baseline_breaks_the_series(
+    recorders, tmp_path, readings
+):
+    summary, entry = tent_evidence(recorders, tmp_path, readings)
+    assert entry["observed"] == [] and summary["transport_observed"] == []
+
+
+def test_another_ranks_counters_are_not_attributed(recorders, tmp_path):
+    """A target naming TP 1 at the TP 0 worker's endpoint is a wrong rank:
+    nothing is attributed, and it is reported."""
+    readings = [reading("hp_tcp", v, number=i + 1, rank={"dp": 0, "tp": 1})
+                for i, v in enumerate([0, 4096])]  # fmt: skip
+    summary, entry = tent_evidence(recorders, tmp_path, readings)
+    assert entry["observed"] is None
+    (attribution,) = summary["transport_evidence"]
+    assert attribution["source"] is None and "rank" in attribution["reason"]
+    assert "transport_evidence_rank_mismatch" in kinds_of(summary)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["namespace", "no recorded configuration", "default port", "unreadable"],
+)
+def test_without_sufficient_endpoint_identity_nothing_is_attributed(
+    recorders, tmp_path, case
+):
+    """Another network namespace, a worker configuration that was not recorded,
+    that leaves TENT's default port, or that is set but unreadable, identify no
+    worker by its loopback endpoint."""
+    options = {
+        "namespace": {"namespace": "net:[2]"},
+        "no recorded configuration": {"recorded": False},
+        "default port": {"environment": {}},
+        "unreadable": {"environment": {"MC_TENT_CONF": "see tent_config"}},
+    }[case]
+    summary, entry = tent_evidence(recorders, tmp_path,
+                                   series("hp_tcp", [0, 4096]), **options)  # fmt: skip
+    assert entry["observed"] is None
+    assert summary["transport_evidence"][0]["source"] is None
+
+
+def test_conflicting_collector_copies_are_refused(recorders, tmp_path):
+    """Two copies of one collector process that differ are refused, whatever
+    their order; identical copies fold into one."""
+
+    def altered(rows):
+        return [*rows[:-1], {**rows[-1], "fields": {"write_bytes": 1}}]
+
+    with pytest.raises(ValueError, match="conflicting duplicate collector"):
+        tent_evidence(recorders, tmp_path / "a", series("hp_tcp", [0, 4096]),
+                      copies=[altered])  # fmt: skip
+    summary, entry = tent_evidence(recorders, tmp_path / "b",
+                                   series("hp_tcp", [0, 4096]),
+                                   copies=[lambda rows: rows])  # fmt: skip
+    assert entry["observed"] == ["tcp"] and len(summary["transport_evidence"]) == 1
+
+
+def test_a_capture_before_the_derivation_keeps_its_label_as_configured(recorders):
+    """An old capture's manual label is kept, never taken as observed."""
+    recorder = recorders()
+    assert recorder.wait_ready()
+    recorder.close()
+    summary = summarize([recorder.output_dir])
+    (entry,) = summary["sources"][0]["transport"]
+    assert entry == {"backend": "Test", "kind": "tcp", "provenance": "configured"}
+    assert summary["transport_evidence"] == []
+
+
+def test_a_recorder_without_a_transport_has_no_entry(recorders):
+    """A recorder with no derivation and no label (a frontend) declares no
+    transport, configured or otherwise."""
+    recorder = recorders(context={"role": "frontend", "kv_role": "kv_consumer"})
+    assert recorder.wait_ready()
+    recorder.close()
+    (source,) = summarize([recorder.output_dir])["sources"]
+    assert source["transport"] == []
+
+
+def test_a_measured_zero_direction_stays_zero(recorders, tmp_path):
+    readings = [reading("hp_tcp", w, number=i + 1, read=0)
+                for i, w in enumerate([0, 4096])]  # fmt: skip
+    summary, _ = tent_evidence(recorders, tmp_path, readings)
+    (row,) = summary["transport_observed"]
+    assert (row["read_bytes"], row["write_bytes"]) == (0, 4096)
+    assert row["intervals"][0]["read_bytes"] == 0
+
+
+def test_two_collectors_of_one_worker_are_separate_streams(recorders, tmp_path):
+    """Two collectors scraping the same cumulative counters are two streams of
+    one worker, each with its own total: never summed into one."""
+
+    def second(rows):
+        return [{**rows[0], "process_id": str(uuid4())}, *rows[1:]]
+
+    readings = series("hp_tcp", [0, 4096])
+    summary, entry = tent_evidence(recorders, tmp_path, readings, copies=[second])
+    rows = summary["transport_observed"]
+    assert len(rows) == 2 and len({row["collector"] for row in rows}) == 2
+    assert [row["write_bytes"] for row in rows] == [4096, 4096]
+
+
+@pytest.mark.parametrize(
+    "dropped",
+    [{"tent_config": ["metrics"]}, {"tent_config": ["metrics/http_port"]},
+     {"environment": ["TENT_METRICS_HTTP_PORT"]}],
+)  # fmt: skip
+def test_a_snapshot_trimmed_of_the_metrics_endpoint_identifies_none(
+    recorders, tmp_path, dropped
+):
+    """A snapshot that dropped what sets the metrics host or port: the
+    environment's port is not taken in its place."""
+    readings = series("hp_tcp", [0, 4096])
+    summary, entry = tent_evidence(recorders, tmp_path, readings, dropped=dropped)
+    assert entry["observed"] is None
+    assert summary["transport_evidence"][0]["source"] is None
+
+
+@pytest.mark.parametrize("endpoint, attributed", [
+    ("127.0.0.1:9200", True), ("127.0.0.2:9200", False)])  # fmt: skip
+def test_the_workers_file_host_identifies_its_endpoint(
+    recorders, tmp_path, endpoint, attributed
+):
+    """The recorded MC_TENT_CONF host wins over the environment's, as TENT
+    takes it: only the file's endpoint is the worker's."""
+    environment = {"MC_TENT_CONF": "see tent_config",
+                   "TENT_METRICS_HTTP_HOST": "127.0.0.2"}  # fmt: skip
+    readings = [{**row, "target": {**row["target"], "endpoint": endpoint}}
+                for row in series("hp_tcp", [0, 4096])]  # fmt: skip
+    summary, entry = tent_evidence(
+        recorders, tmp_path, readings, environment=environment,
+        tent={"settings": {"metrics": {"http_host": "127.0.0.1",
+                                       "http_port": 9200}}})  # fmt: skip
+    assert (summary["transport_evidence"][0]["source"] == 0) is attributed
+    assert entry["observed"] == (["tcp"] if attributed else None)
+
+
+def test_a_snapshot_trimmed_of_unrelated_settings_still_identifies(
+    recorders, tmp_path
+):
+    """Dropping settings that cannot move the metrics endpoint (TENT's
+    transports, another variable) keeps the worker identifiable."""
+    summary, entry = tent_evidence(
+        recorders, tmp_path, series("hp_tcp", [0, 4096]),
+        dropped={"tent_config": ["transports", "metrics/report_interval_seconds"],
+                 "environment": ["UCX_TLS"]})  # fmt: skip
+    assert entry["observed"] == ["tcp"]
+    assert summary["transport_evidence"][0]["source"] == 0
+
+
+def test_a_process_and_engine_that_disagree_attribute_nothing(recorders, tmp_path):
+    """A target naming this worker's process but another engine names no
+    single worker: nothing is credited to either."""
+    summary, entry = tent_evidence(
+        recorders, tmp_path, series("hp_tcp", [0, 4096]),
+        target=lambda meta: {"process_id": meta["process_id"],
+                             "engine_id": "engine-decode"})  # fmt: skip
+    (attribution,) = summary["transport_evidence"]
+    assert attribution["source"] is None and entry["observed"] is None
+    assert attribution["reason"] == (
+        "the process_id and engine_id name no single worker")
+    agreeing, entry = tent_evidence(
+        recorders, tmp_path / "agree", series("hp_tcp", [0, 4096]),
+        target=lambda meta: {"process_id": meta["process_id"],
+                             "engine_id": "engine-prefill"})  # fmt: skip
+    assert agreeing["transport_evidence"][0]["basis"] == "process_id and engine_id"
+    assert entry["observed"] == ["tcp"]

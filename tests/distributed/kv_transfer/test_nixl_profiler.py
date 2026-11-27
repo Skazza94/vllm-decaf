@@ -35,6 +35,9 @@ from vllm.kv_profiling.nixl import (
 from vllm.kv_profiling.peers import PeerClocks
 from vllm.kv_profiling.perfetto import _load, export_traces
 from vllm.kv_profiling.schema import Failure, IdSource, Subject
+from vllm.kv_profiling.transport import derive
+
+UCX_TCP = {"UCX_TLS": "tcp,self"}
 
 nixl = pytest.importorskip("nixl")
 
@@ -47,7 +50,7 @@ ROOT = Path(vllm.__file__).resolve().parent.parent
 def config(tmp_path, **kw):
     context = {"role": "worker", "backend": ["UCX"], **kw.pop("context", {})}
     context.setdefault("capabilities", capabilities(context["role"]))
-    kw.setdefault("transport", "tcp")
+    context.setdefault("transport", derive(context["backend"], "nixl", UCX_TCP))
     return NetworkProfilerConfig(
         level="l1",
         run_id=kw.pop("run_id", str(uuid4())),
@@ -118,9 +121,8 @@ def read(profiler):
 # ------------------------------------------------------------------ config
 def test_new_config_fields_validate_and_unknown_keys_name_themselves(tmp_path):
     cfg = config(tmp_path, clock_max_peers=8, clock_port_offset=2000)
-    assert (cfg.transport, cfg.clock, cfg.clock_samples) == ("tcp", True, 7)
+    assert (cfg.clock, cfg.clock_samples) == (True, 7)
     for bad in (
-        {"transport": "ib"},
         {"clock": 1},
         {"clock_port_offset": 0},
         {"clock_port_offset": 70000},
@@ -224,7 +226,7 @@ def test_the_worker_hooks_write_the_expected_records(tmp_path):
         "d-req", "p-req", "engine-P")  # fmt: skip
     assert (bind["subject"], bind["selected_descriptors"]) == (1, 12)
     assert (bind["aux0"], bind["aux1"]) == (0, 1)
-    assert bind["transport"]["kind"] == "tcp"
+    assert bind["transport"]["kind"] == "unknown"  # derived per backend, not here
     (done,) = by_kind["complete_observed"]
     assert done["bytes"] == res.totalBytes > 0
     assert done["merged_descriptors"] == res.descCount > 0
@@ -1385,8 +1387,11 @@ def test_the_exporter_aligns_one_domain_draws_the_handoff_and_tags_the_backend(
     assert document["metadata"]["cross_process_flows"] == "exact_recorded_handoff_ids"
     bind = next(e for e in events if e["name"] == "transfer_bind")["args"]
     assert bind["selected_descriptors"] == 6 and bind["leg"] == "single"
-    assert bind["transport"] == {**bind["transport"], "backend": "UCX",
-                                 "provenance": "configured", "kind": "tcp"}  # fmt: skip
+    (backend,) = bind["transport"]["backends"]
+    assert bind["transport"]["provenance"] == "derived"
+    assert bind["transport"]["kind"] == "unknown"  # the recorded event, as is
+    assert (backend["backend"], backend["candidates"]) == ("UCX", ["tcp"])
+    assert backend["source"] == {"name": "UCX_TLS", "value": "tcp,self"}
     handoff = next(e for e in events if e["name"] == "handoff" and "args" in e)["args"]
     assert handoff["handoff_blocks"] == 2
     aliases = {
@@ -1525,7 +1530,7 @@ out = Path(sys.argv[1])
 N = 200
 cfg = NetworkProfilerConfig(
     level="l1", run_id=str(uuid4()), output_dir=str(out), shared_dir="/dev/shm",
-    transport="tcp", ring_records=1 << 16, id_slots=1 << 14, id_bytes=1 << 22,
+    ring_records=1 << 16, id_slots=1 << 14, id_bytes=1 << 22,
     handle_slots=1024, clock_max_peers=256, context={"role": "worker"})
 p = NixlProfiler(cfg, open_recorder(cfg), rank=0, engine_id="engine-A")
 p.peers = PeerClocks(cfg, cfg.run_id, p.recorder.metadata["clock_id"])
@@ -2173,3 +2178,28 @@ def test_a_frontend_in_an_api_server_child_records_its_shutdown_risk(monkeypatch
     assert risky["close_at_shutdown"].startswith("not guaranteed")
     safe = _api_server_context(SimpleNamespace(shutdown_timeout=30))
     assert safe["close_at_shutdown"] == "within --shutdown-timeout"
+
+
+def test_a_worker_derives_its_transport_from_its_backends_environment(
+    tmp_path, monkeypatch
+):
+    """The recorder's context and profiler.json carry each backend's derived
+    candidates; its events carry no transport."""
+    from vllm.kv_profiling.nixl import _build
+
+    monkeypatch.setenv("UCX_TLS", "rc,self")
+    monkeypatch.delenv("MC_TENT_CONF", raising=False)
+    cfg = config(tmp_path, context={"role": "worker", "backends": ["UCX"]})
+    cfg = dataclasses.replace(cfg, context={
+        k: v for k, v in cfg.context.items() if k != "transport"})  # fmt: skip
+    p = _build(cfg, "worker", "engine-A", 0, None, "kv_consumer")
+    p.request_bound("r1")
+    p.close()
+    rows = [json.loads(line) for line in
+            (p.output_dir / "events.jsonl").read_text().splitlines()]  # fmt: skip
+    (entry,) = rows[0]["context"]["transport"]
+    assert entry["backend"] == "UCX" and entry["candidates"] == ["rdma"]
+    assert all(r["transport"]["kind"] == "unknown" for r in rows[1:]
+               if r.get("type") == "event")  # fmt: skip
+    profile = json.loads((p.output_dir / "profiler.json").read_text())
+    assert profile["transport"] == rows[0]["context"]["transport"]

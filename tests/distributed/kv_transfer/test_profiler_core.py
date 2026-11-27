@@ -1826,3 +1826,179 @@ def test_an_unloadable_native_recorder_keeps_its_loader_error(tmp_path, monkeypa
     assert not isinstance(raised.value, ModuleNotFoundError)
     assert "not installed" not in str(raised.value)
     assert "_kv_profiler.abi3.so" in str(raised.value)
+
+
+def test_the_transport_is_not_a_setting():
+    """The transport is derived per recorder; the old manual label is refused
+    like any unknown key."""
+    from vllm.kv_profiling.config import profiler_config
+
+    with pytest.raises(ValueError, match="unknown network_profiler keys"):
+        profiler_config({"network_profiler": {"level": "l1", "transport": "tcp"}}, {})
+
+
+_TENT_TCP = {"settings": {"transports": {
+    "rdma": {"enable": False}, "tcp": {"enable": False}, "hp_tcp": {"enable": True}}}}
+_TENT_RDMA = {"settings": {"transports": {
+    "rdma": {"enable": True}, "tcp": {"enable": False}, "hp_tcp": {"enable": False}}}}
+
+
+@pytest.mark.parametrize(
+    "backends, connector, environment, tent, extra, candidates",
+    [
+        # UCX: allowed network transports only; UCX still selects at runtime
+        (["UCX"], "nixl", {"UCX_TLS": "tcp,self"}, None, None, ["tcp"]),
+        (["UCX"], "nixl", {"UCX_TLS": "rc,self"}, None, None, ["rdma"]),
+        (["UCX"], "nixl", {"UCX_TLS": "tcp,rc_x,sm,cuda_copy"}, None, None,
+         ["rdma", "tcp"]),
+        (["UCX"], "nixl", {}, None, None, None),
+        (["UCX"], "nixl", {"UCX_TLS": "all"}, None, None, None),
+        (["UCX"], "nixl", {"UCX_TLS": "^tcp"}, None, None, None),
+        (["UCX"], "nixl", {"UCX_TLS": "tcp,unheard"}, None, None, None),
+        # LIBFABRIC: a provider filter
+        (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "tcp"}, None, None, ["tcp"]),
+        (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "tcp;ofi_rxm"}, None, None,
+         ["tcp"]),
+        (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "verbs,tcp"}, None, None,
+         ["rdma", "tcp"]),
+        (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "udp"}, None, None, []),
+        (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "psm3"}, None, None, None),
+        (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "tcp,psm3"}, None, None, None),
+        (["LIBFABRIC"], "nixl", {}, None, None, None),
+        # Mooncake over TENT (either variable present, any value): its network
+        # transports enabled, by TENT's defaults (tcp, rdma on; hp_tcp off)
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"}, _TENT_TCP, None,
+         ["tcp"]),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"}, _TENT_RDMA, None,
+         ["rdma"]),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "0"}, _TENT_RDMA, None,
+         ["rdma"]),
+        (["Mooncake"], "mooncake", {"MC_USE_TEV1": ""}, _TENT_RDMA, None,
+         ["rdma"]),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports": {"rdma": {"enable": False}}}}, None,
+         ["tcp"]),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports": {"rdma": {"enable": False},
+                                      "tcp": {"enable": False}}}}, None, []),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports/rdma/enable": False}}, None, ["tcp"]),
+        # tcp and rdma read through Config::get: a mistyped enable is the default
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports": {"tcp": {"enable": "no"},
+                                      "rdma": {"enable": False}}}}, None,
+         ["tcp"]),
+        # hp_tcp reads only its object, nested or under the exact flat key
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports/tcp/enable": False,
+                       "transports/rdma/enable": False,
+                       "transports/hp_tcp": {"enable": True}}}, None, ["tcp"]),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports/tcp/enable": False,
+                       "transports/rdma/enable": False,
+                       "transports/hp_tcp/enable": True}}, None, []),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports": {"hp_tcp": {"enable": "yes"}}}}, None,
+         None),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports": {"hp_tcp": True}}}, None, None),
+        # a mistyped nested enable falls back to the exact flat key first
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports": {"tcp": {"enable": "auto"},
+                                      "rdma": {"enable": "auto"}},
+                       "transports/tcp/enable": False,
+                       "transports/rdma/enable": False}}, None, []),
+        (["Mooncake"], "nixl", {"MC_USE_TENT": "1"},
+         {"settings": {"transports": {"tcp": {"enable": "auto"}},
+                       "transports/tcp/enable": False,
+                       "transports/rdma/enable": False}}, None, []),
+        # an hp_tcp enable that is present must be a boolean: null is invalid
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports": {"hp_tcp": {"enable": None}}}}, None,
+         None),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": {"transports": {"tcp": {"enable": False},
+                                      "rdma": {"enable": False},
+                                      "hp_tcp": {"port": 1}}}}, None, []),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"}, None, None, None),
+        (["Mooncake"], "mooncake", {"MC_USE_TENT": "1"},
+         {"settings": "unreadable"}, None, None),
+        (["Mooncake"], "nixl", {"MC_USE_TENT": "1"}, _TENT_TCP, None, ["tcp"]),
+        # the classic engine discovers its transport (whatever the protocol)
+        # unless MC_FORCE_TCP forces TCP: both connector paths
+        (["Mooncake"], "mooncake", {}, None, {"mooncake_protocol": "tcp"},
+         None),
+        (["Mooncake"], "mooncake", {}, None, {}, None),
+        (["Mooncake"], "mooncake", {"MC_FORCE_TCP": "1"}, None, {}, ["tcp"]),
+        (["Mooncake"], "nixl", {}, _TENT_TCP, None, None),
+        (["Mooncake"], "nixl", {"MC_FORCE_TCP": ""}, None, None, ["tcp"]),
+        (["POSIX"], "nixl", {"UCX_TLS": "tcp"}, None, None, None),
+    ],
+)  # fmt: skip
+def test_the_transport_is_derived_per_backend_as_candidates(
+    backends, connector, environment, tent, extra, candidates
+):
+    """Each backend's configuration gives only candidates, with the setting it
+    came from and why it is no more."""
+    from vllm.kv_profiling.transport import derive
+
+    (entry,) = derive(backends, connector, environment, tent, extra)
+    assert entry["backend"] == backends[0]
+    assert entry["candidates"] == candidates
+    assert entry["reason"] and "source" in entry and "kind" not in entry
+
+
+def test_several_backends_each_get_their_own_entry():
+    from vllm.kv_profiling.transport import combined, derive
+
+    entries = derive(["UCX", "LIBFABRIC"], "nixl",
+                     {"UCX_TLS": "tcp", "FI_PROVIDER": "verbs"})  # fmt: skip
+    assert [(e["backend"], e["candidates"]) for e in entries] == [
+        ("UCX", ["tcp"]), ("LIBFABRIC", ["rdma"])]  # fmt: skip
+    assert combined([{"kind": "tcp"}, {"kind": "tcp"}]) == "tcp"
+    assert combined([{"kind": "tcp"}, {"kind": "unknown"}]) == "unknown"
+    assert combined([{"kind": "tcp"}, {"kind": "rdma"}]) == "mixed"
+    assert combined([]) == "unknown"
+
+
+def test_a_long_or_secret_source_is_bounded_and_redacted():
+    """A derived value is recorded as the configuration snapshot records one:
+    bounded and redacted, so the recorder's metadata stays openable."""
+    from vllm.kv_profiling.transport import MAX_TEXT, derive
+
+    many = ",".join(f"unheard{i}" for i in range(2000))
+    (entry,) = derive(["UCX"], "nixl", {"UCX_TLS": many})
+    assert entry["candidates"] is None
+    assert len(entry["source"]["value"]) < MAX_TEXT + 40
+    assert len(entry["reason"]) < MAX_TEXT + 40
+    (entry,) = derive(["LIBFABRIC"], "nixl",
+                      {"FI_PROVIDER": "https://user:pw@host/x"})  # fmt: skip
+    assert "pw" not in json.dumps(entry)
+
+
+def test_a_recorder_with_a_long_transport_setting_still_opens(tmp_path, monkeypatch):
+    from vllm.kv_profiling.nixl import _build
+
+    monkeypatch.setenv("UCX_TLS", ",".join(f"unheard{i}" for i in range(5000)))
+    config = NetworkProfilerConfig(
+        level="l1", run_id=str(uuid4()), output_dir=str(tmp_path),
+        context={"role": "worker", "backends": ["UCX"]},
+    )  # fmt: skip
+    profiler = _build(config, "worker", "engine-A", 0, None, "kv_consumer")
+    profiler.close()
+    meta = json.loads((profiler.output_dir / "events.jsonl").read_text()
+                      .splitlines()[0])  # fmt: skip
+    assert meta["context"]["transport"][0]["candidates"] is None
+
+
+def test_an_invalid_enable_records_its_type_within_bounds():
+    """An invalid hp_tcp enable is recorded by its type, never its value: a
+    huge one stays within the recorder's bounds."""
+    from vllm.kv_profiling.transport import derive
+
+    tent = {"settings": {"transports": {"hp_tcp": {"enable": [0] * 100000},
+                                        "tcp": {"enable": [1] * 100000}}}}
+    (entry,) = derive(["Mooncake"], "mooncake", {"MC_USE_TENT": "1"}, tent)
+    assert entry["candidates"] is None
+    assert entry["source"]["value"]["hp_tcp.enable"] == "invalid: list"
+    assert len(json.dumps(entry)) < 2048

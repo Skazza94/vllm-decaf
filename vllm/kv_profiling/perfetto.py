@@ -95,10 +95,24 @@ def _clock_aliases(metas, group):
 
 
 def _tagged_transport(transport, meta):
-    """Backend and transport as configured for the process, never as observed."""
+    """The event's recorded transport, with the process's per-backend
+    derivation (candidates, reason, source), or, for a capture from before
+    the derivation, its manual label as configured; never as observed."""
     if "probe_schema" in meta:
         return transport
-    backend = (meta.get("context") or {}).get("backend")
+    context = meta.get("context") or {}
+    derived = context.get("transport")
+    if isinstance(derived, list):
+        return {
+            **transport,
+            "backends": [
+                {key: entry.get(key) for key in (
+                    "backend", "candidates", "reason", "source")}
+                for entry in derived
+            ],
+            "provenance": "derived",
+        }  # fmt: skip
+    backend = context.get("backend")
     if not backend:
         return transport
     return {

@@ -39,7 +39,6 @@ class NetworkProfilerConfig:
     id_bytes: int = 8 << 20
     handle_slots: int = 4096
     flush: str = "background"
-    transport: str = "unknown"
     clock: bool = True
     clock_port_offset: int = 1000
     clock_samples: int = 7
@@ -71,8 +70,6 @@ class NetworkProfilerConfig:
             raise ValueError("probe settings require level l3")
         if self.flush not in ("end", "background"):
             raise ValueError("flush must be end or background")
-        if self.transport not in ("tcp", "rdma", "unknown"):
-            raise ValueError("transport must be tcp, rdma or unknown")
         if type(self.clock) is not bool:
             raise ValueError("clock must be a boolean")
         for name, low, high in (

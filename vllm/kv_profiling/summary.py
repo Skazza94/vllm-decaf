@@ -22,6 +22,7 @@ from . import timeline
 from .clock import ClockGroup, ClockMapping
 from .perfetto import _clock_aliases, _load
 from .schema import Failure, Subject
+from .transport import combined
 
 # The loader yields kind names as lower-case strings (the JSONL rows); these
 # sets are checked against schema.EventKind in the tests.
@@ -93,12 +94,315 @@ def _backend(meta):
     return backends[0] if backends else "unknown"
 
 
-def _transport(rows):
+def _recorded_kind(rows):
     for row in rows:
         kind = row["transport"]["kind"]
         if kind != "unknown":
             return kind
     return "unknown"
+
+
+_TENT_KINDS = {"rdma": "rdma", "tcp": "tcp", "hp_tcp": "tcp"}
+_RANK_KEYS = {"dp": "dp_rank", "tp": "tp_rank", "pp": "pp_rank", "pcp": "pcp_rank"}
+
+
+def _declared_transport(context, events):
+    """The recorder's per-backend transport entries, unresolved. A capture
+    from before the derivation carries one manual label for the process
+    (the context's string, stamped on its events): kept, as configured."""
+    declared = context.get("transport")
+    backends = context.get("backend") or context.get("backends") or ["unknown"]
+    if isinstance(declared, list):
+        return [
+            {**entry, "kind": "unknown", "provenance": "derived"}
+            for entry in declared
+        ]
+    label = declared if isinstance(declared, str) else _recorded_kind(events)
+    if declared is None and label == "unknown":
+        return []  # no backend's transport recorded (e.g. a frontend)
+    return [
+        {"backend": backend, "kind": label, "provenance": "configured"}
+        for backend in backends
+    ]
+
+
+def _transport_key(entries):
+    kind = combined(entries)
+    if entries and all(e.get("provenance") == "configured" for e in entries):
+        return f"{kind} (configured)"
+    return kind
+
+
+def load_collector(path: Path):
+    """One L2 collector capture: its metadata and its transport_metrics rows."""
+    rows = []
+    with open(path) as file:
+        for line in file:
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+    meta = rows[0] if rows and rows[0].get("type") == "metadata" else None
+    if meta is None:
+        raise ValueError(f"{path}: no metadata")
+    return {
+        "path": path,
+        "meta": meta,
+        "rows": [
+            row for row in rows
+            if row.get("type") == "event" and row.get("kind") == "transport_metrics"
+        ],
+    }
+
+
+def _is_collector(path: Path) -> bool:
+    with open(path) as file:
+        first = file.readline()
+    try:
+        meta = json.loads(first)
+    except ValueError:
+        return False
+    return (meta.get("context") or {}).get("role") == "collector"
+
+
+def _metrics_endpoint(meta):
+    """The TENT metrics endpoint a worker serves, from its recorded
+    configuration, resolved as the collector resolves a target's; None unless
+    that configuration was recorded, is readable and names the port (TENT's
+    default port is no identity: it is what any unreadable configuration would
+    give)."""
+    from .collector import Target, resolve_endpoint
+
+    settings = meta.get("config")
+    if not isinstance(settings, dict) or not isinstance(
+        settings.get("environment"), dict
+    ):
+        return None
+    dropped = settings.get("dropped") or {}
+    if any(
+        key in ("metrics", "metrics/http_host", "metrics/http_port")
+        for key in dropped.get("tent_config") or []
+    ) or any(
+        key in ("MC_TENT_CONF", "TENT_METRICS_HTTP_HOST", "TENT_METRICS_HTTP_PORT")
+        for key in dropped.get("environment") or []
+    ):
+        return None  # the metrics host or port was trimmed from the snapshot
+    environment = dict(settings["environment"])
+    recorded = settings.get("tent_config")
+    if "MC_TENT_CONF" in environment and not (
+        isinstance(recorded, dict) and isinstance(recorded.get("settings"), dict)
+    ):
+        return None  # set, but not recorded readably
+    environment.pop("MC_TENT_CONF", None)
+    tent = (recorded or {}).get("settings")
+    target = Target(
+        id="worker", env=environment,
+        mc_tent_conf=json.dumps(tent) if isinstance(tent, dict) else None,
+    )  # fmt: skip
+    host, port, source = resolve_endpoint(target)
+    if host is None or source == "default":
+        return None
+    return host, port
+
+
+def _loopback(host):
+    return host in ("localhost", "::1") or str(host).startswith("127.")
+
+
+def _attribute(collector, target, workers):
+    """The worker source a collector target's counters belong to, or (None,
+    reason). The target must name the worker's process, or its engine, or
+    serve its metrics endpoint on the same host (and, for a loopback endpoint,
+    in the same network namespace); a rank it names must be the worker's."""
+    meta = collector["meta"]
+    if target.get("process_id") or target.get("engine_id"):
+        found = [
+            w for w in workers
+            if target.get("process_id") in (None, w.meta.get("process_id"))
+            and target.get("engine_id") in (None, w.engine_id)
+        ]  # fmt: skip
+        basis = " and ".join(
+            key for key in ("process_id", "engine_id") if target.get(key))
+        if not found and target.get("process_id") and target.get("engine_id"):
+            return None, "the process_id and engine_id name no single worker"
+    else:
+        basis = "metrics endpoint"
+        try:
+            from .collector import _endpoint
+
+            endpoint = _endpoint(target.get("endpoint") or "")
+        except ValueError:
+            return None, "the target records no endpoint"
+        if _loopback(endpoint[0]) and not meta.get("net_namespace"):
+            return None, "the collector records no network namespace"
+        if not meta.get("boot_id"):
+            return None, "the collector records no boot ID"
+        found = [
+            w for w in workers
+            if _metrics_endpoint(w.meta) == endpoint
+            and w.meta.get("boot_id") == meta.get("boot_id")
+            and (not _loopback(endpoint[0])
+                 or w.meta.get("net_namespace") == meta.get("net_namespace"))
+        ]  # fmt: skip
+    rank = target.get("rank") or {}
+    matched = [
+        w for w in found
+        if all(
+            w.context.get(_RANK_KEYS[key]) == value
+            for key, value in rank.items() if key in _RANK_KEYS
+        )
+    ]  # fmt: skip
+    if len(matched) == 1:
+        return matched[0], basis
+    if found and not matched:
+        return None, f"rank {rank} is not the {basis}'s worker's"
+    if len(matched) > 1:
+        return None, f"ambiguous: {len(matched)} workers match the {basis}"
+    return None, f"no worker matches the {basis}"
+
+
+def _sample_number(row):
+    try:
+        return int(str(row.get("sample_id")).rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _byte_intervals(rows, collector=None, target=None):
+    """Positive read/write byte deltas between consecutive readings of one
+    transport's series: the target's consecutive samples (no scrape missed),
+    both complete, the later with an established baseline, in one reset
+    generation and without a discontinuity."""
+    series = {}
+    for row in rows:
+        label = (row.get("labels") or {}).get("transport")
+        if label is not None:
+            series.setdefault(label, []).append(row)
+    intervals = []
+    for label, items in sorted(series.items()):
+        items.sort(key=lambda r: (r.get("scrape") or {}).get("end_ns") or 0)
+        for prior, item in zip(items, items[1:]):
+            before_number, number = _sample_number(prior), _sample_number(item)
+            if (
+                before_number is None or number != before_number + 1
+                or item.get("baseline") != "established"
+                or prior.get("reset_generation") != item.get("reset_generation")
+                or prior.get("partial") or item.get("partial")
+                or item.get("discontinuity")
+            ):
+                continue
+            deltas = {}
+            for name in ("read_bytes", "write_bytes"):
+                before = (prior.get("fields") or {}).get(name)
+                after = (item.get("fields") or {}).get(name)
+                measured = isinstance(before, (int, float)) and isinstance(
+                    after, (int, float))  # fmt: skip
+                deltas[name] = after - before if measured else None
+            if any(value is not None and value > 0 for value in deltas.values()):
+                intervals.append({
+                    "collector": collector,
+                    "target": target,
+                    "transport": label,
+                    "begin_ns": (prior.get("scrape") or {}).get("end_ns"),
+                    "end_ns": (item.get("scrape") or {}).get("end_ns"),
+                    "reset_generation": item.get("reset_generation"),
+                    **deltas,
+                })  # fmt: skip
+    return intervals
+
+
+def _measured_sum(intervals, name):
+    """The direction's measured total, None when no interval measured it."""
+    values = [i[name] for i in intervals if i[name] is not None]
+    return sum(values) if values else None
+
+
+def _resolve_transports(sources, collectors, problems):
+    """Resolve each worker's TENT entries from its attributed byte counters;
+    every other entry stays as declared (UCX, LIBFABRIC and the classic
+    Mooncake engine record no evidence here)."""
+    workers = [s for s in sources if s.role == "worker"]
+    evidence = {}
+    attributions = []
+    for collector in collectors:
+        by_target = {}
+        for row in collector["rows"]:
+            target = row.get("target") or {}
+            by_target.setdefault(target.get("id"), (target, []))[1].append(row)
+        for target_id, (target, rows) in sorted(
+            by_target.items(), key=lambda item: str(item[0])
+        ):
+            worker, basis = _attribute(collector, target, workers)
+            attributions.append({
+                "collector": collector["meta"].get("process_id"),
+                "target": target_id,
+                "source": worker.index if worker else None,
+                "basis": basis if worker else None,
+                "reason": None if worker else basis,
+            })  # fmt: skip
+            if worker is None:
+                if basis.startswith("rank "):
+                    problems.append({
+                        "source": None,
+                        "process_id": collector["meta"].get("process_id"),
+                        "kind": "transport_evidence_rank_mismatch",
+                        "detail": f"target {target_id}: {basis}",
+                    })  # fmt: skip
+                continue
+            evidence.setdefault(worker.index, []).extend(_byte_intervals(
+                rows, collector["meta"].get("process_id"), target_id))
+    observed_rows = []
+    for source in sources:
+        for entry in source.transport_entries:
+            if entry.get("provenance") != "derived" or entry.get("engine") != "tent":
+                continue
+            entry["observed"] = None
+            if source.role != "worker":
+                entry["observation"] = "not a worker: TENT's counters are the workers'"
+                continue
+            if source.index not in evidence:
+                entry["observation"] = "no collector target attributed to this worker"
+                continue
+            # one stream per collector, target and label: two collectors of
+            # one worker scrape the same cumulative counters, never summed
+            streams = {}
+            for interval in evidence[source.index]:
+                key = (str(interval["collector"]), str(interval["target"]),
+                       interval["transport"])  # fmt: skip
+                streams.setdefault(key, []).append(interval)
+            for (_, _, label), intervals in sorted(streams.items()):
+                observed_rows.append({
+                    "source": source.index,
+                    "process_id": source.meta["process_id"],
+                    "backend": entry["backend"],
+                    "collector": intervals[0]["collector"],
+                    "target": intervals[0]["target"],
+                    "transport": label,
+                    "kind": _TENT_KINDS.get(label),
+                    **{name: _measured_sum(intervals, name)
+                       for name in ("read_bytes", "write_bytes")},
+                    "intervals": intervals,
+                })  # fmt: skip
+            observed = sorted({
+                _TENT_KINDS[label] for _, _, label in streams
+                if label in _TENT_KINDS
+            })  # fmt: skip
+            entry["observed"] = observed
+            if not observed:
+                entry["observation"] = "no positive byte delta on a network transport"
+            candidates = entry.get("candidates")
+            outside = sorted(set(observed) - set(candidates or [])) if (
+                candidates is not None) else []  # fmt: skip
+            if outside:
+                problems.append({
+                    "source": source.index,
+                    "process_id": source.meta["process_id"],
+                    "kind": "transport_outside_configuration",
+                    "detail": f"{entry['backend']} moved bytes over {outside}, "
+                    f"not among its candidates {candidates}",
+                })  # fmt: skip
+    return attributions, observed_rows
 
 
 def load_capture(path: Path):
@@ -163,7 +467,8 @@ class _Source:
         self.context = self.meta.get("context") or {}
         self.role = self.context.get("role")
         self.engine_id = self.context.get("engine_id")
-        self.transport = _transport(self.events)
+        self.transport_entries = _declared_transport(self.context, self.events)
+        self.transport = _transport_key(self.transport_entries)
         self.unclassified = 0
         self.classified = set()
         self.transfers = []
@@ -1571,15 +1876,7 @@ def _aggregates(sources, transfers):
     buckets = {}
     for item in transfers:
         source = sources[item["source"]]
-        prepared = [
-            row for row in source.events
-            if row.get("transfer") == item["transfer"]
-            and row["kind"] in _PREPARED
-        ]
-        key = (
-            f"{_backend(source.meta)}/"
-            f"{_transport(prepared) if prepared else 'unknown'}"
-        )
+        key = f"{_backend(source.meta)}/{source.transport}"
         bucket = buckets.setdefault(
             key,
             {
@@ -1705,6 +2002,26 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
                 files.append(candidate)
     if not files:
         raise ValueError("no events.jsonl inputs")
+    collectors = []
+    seen_collectors = {}
+    for path in [f for f in files if _is_collector(f)]:
+        files.remove(path)
+        collector = load_collector(path)
+        meta = collector["meta"]
+        identity = (meta.get("run_id"), meta.get("process_id"))
+        content = Path(path).read_bytes()
+        if identity in seen_collectors:
+            if seen_collectors[identity][0] != content:
+                raise ValueError(
+                    "conflicting duplicate collector captures for process "
+                    f"{identity[1]} of run {identity[0]}: {path} vs "
+                    f"{seen_collectors[identity][1]}"
+                )
+            continue
+        seen_collectors[identity] = (content, path)
+        collectors.append(collector)
+    if not files:
+        raise ValueError("no recorder captures: collector captures alone")
     # One logical contribution per recorded process generation: identical
     # copies (a repeated path, overlapping directory and file inputs) fold
     # into one source, conflicting copies are rejected, never both counted.
@@ -1731,7 +2048,9 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
         captures.append(capture)
     for capture in captures:
         capture["duplicates"] = duplicates
-    run_ids = {capture["meta"]["run_id"] for capture in captures}
+    run_ids = {capture["meta"]["run_id"] for capture in captures} | {
+        collector["meta"].get("run_id") for collector in collectors
+    }
     if len(run_ids) > 1:
         raise ValueError(f"cannot summarize different runs: {sorted(run_ids)}")
     problems = []
@@ -1801,6 +2120,7 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
                 f"calibration belongs to run {group.run_id}, not the "
                 f"captured run {next(iter(run_ids))}"
             )
+    attributions, observed = _resolve_transports(sources, collectors, problems)
     alias = _clock_aliases(
         [source.meta for source in sources], group
     )
@@ -1837,7 +2157,7 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
                 "engine_id": source.engine_id,
                 "backends": source.context.get("backend")
                 or source.context.get("backends"),
-                "configured_transport": source.context.get("transport"),
+                "transport": source.transport_entries,
                 "clock_id": source.meta["clock_id"],
                 "events": len(source.events),
                 "loss": source.capture["loss"],
@@ -1846,6 +2166,8 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
             }
             for source in sources
         ],
+        "transport_evidence": attributions,
+        "transport_observed": observed,
         "transfers": transferred,
         "write_batches": [item for source in sources for item in source.write_batches],
         "post_groups": [item for source in sources for item in source.post_groups],

@@ -67,7 +67,7 @@ class ProfilerConfig(unittest.TestCase):
 
     def test_both_servers_share_one_profile_id_and_the_options(self):
         run = self.run_with(profiler=pd.Profiler(clock_port_offset=2000, flush="background"))
-        expected = {"level": "l1", "run_id": "id-1", "output_dir": pd.PROFILES, "transport": "tcp",
+        expected = {"level": "l1", "run_id": "id-1", "output_dir": pd.PROFILES,
                     "clock_port_offset": 2000, "flush": "background", "shutdown_timeout_s": 10}
         for role in ("prefill", "decode"):
             self.assertEqual(self.extra(run, role)["network_profiler"], expected)
@@ -305,7 +305,8 @@ class ProfilerConfig(unittest.TestCase):
             run = pd.parse({**raw, "profiler": {"clock_port_offset": 1500}}, Path("/r.yaml"))
             self.assertEqual(run.profiler, pd.Profiler(clock_port_offset=1500))
             self.assertIsNone(pd.parse(raw, Path("/r.yaml")).profiler)
-            for bad, message in (({"profiler": {"transport": "rdma"}}, "profiler.transport"),
+            for bad, message in (({"profiler": {"flush": "never"}}, "profiler.flush"),
+                                 ({"profiler": {"transport": "tcp"}}, "unexpected keyword"),
                                  ({"profiler": {"clock_port_offset": 0}}, "clock_port_offset"),
                                  ({"profiler": {"nope": 1}}, "unexpected keyword")):
                 with self.assertRaisesRegex(ValueError, message):

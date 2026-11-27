@@ -785,17 +785,26 @@ def attach_mooncake(
     from .snapshot import snapshot
 
     settings = snapshot(vllm_config, config)
-    return _build(config, role, engine_id, rank, kv.kv_role, settings)
+    return _build(
+        config, role, engine_id, rank, kv.kv_role, settings,
+        extra=kv.kv_connector_extra_config,
+    )  # fmt: skip
 
 
 def _build(
-    config: NetworkProfilerConfig, role, engine_id, rank, kv_role, settings=None
-):
+    config: NetworkProfilerConfig, role, engine_id, rank, kv_role, settings=None,
+    extra=None,
+):  # fmt: skip
     import dataclasses
+
+    from .snapshot import tent_settings
+    from .transport import derive
 
     context = {
         **config.context,
-        "transport": config.transport,
+        "transport": derive(
+            ["Mooncake"], "mooncake", tent_settings=tent_settings(), extra=extra
+        ),
         "backend": ["Mooncake"],
         "capabilities": capabilities(role, kv_role, config),
     }

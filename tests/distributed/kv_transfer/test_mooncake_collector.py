@@ -1147,6 +1147,21 @@ def test_endpoint_precedence_manifest_then_the_targets_conf_then_its_env_then_de
     )
 
 
+def test_a_file_host_wins_over_the_environment_even_at_the_default():
+    """TENT takes the host as the port: the file, else the environment, else
+    the default; a wildcard is scraped on loopback only after that choice."""
+    resolve = collector.resolve_endpoint
+    conf = json.dumps({"metrics": {"http_host": "127.0.0.1", "http_port": 9200}})
+    env = {"TENT_METRICS_HTTP_HOST": "127.0.0.2"}
+    assert resolve(Target(id="a", mc_tent_conf=conf, env=env))[:2] == (
+        "127.0.0.1", 9200)  # fmt: skip
+    wildcard = json.dumps({"metrics": {"http_host": "0.0.0.0"}})
+    assert resolve(Target(id="a", mc_tent_conf=wildcard, env=env))[0] == "127.0.0.1"
+    assert resolve(Target(id="a", env=env))[0] == "127.0.0.2"
+    assert resolve(Target(id="a", env={"TENT_METRICS_HTTP_HOST": "0.0.0.0"}))[0] == (
+        "127.0.0.1")  # fmt: skip
+
+
 def test_unreadable_or_invalid_ownership_is_unavailable_never_a_guess(tmp_path):
     resolve = collector.resolve_endpoint
     for target_ in (

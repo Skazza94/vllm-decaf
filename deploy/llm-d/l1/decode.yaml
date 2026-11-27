@@ -52,7 +52,7 @@ spec:
         - name: POD_UID
           valueFrom: {fieldRef: {fieldPath: metadata.uid}}
         - name: KV_TRANSFER_CONFIG
-          value: '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu", "kv_connector_extra_config": {"backends": ["Mooncake"], "network_profiler": {"level": "l1", "run_id": "@RUN_ID@", "output_dir": "@GENERATION@", "transport": "tcp"}}}'
+          value: '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer", "kv_buffer_device": "cpu", "kv_connector_extra_config": {"backends": ["Mooncake"], "network_profiler": {"level": "l1", "run_id": "@RUN_ID@", "output_dir": "@GENERATION@"}}}'
         # At vLLM's default --shutdown-timeout 0 the engine-core process, where
         # the scheduler and worker recorders live, is force-killed on SIGTERM
         # before they close; this is its cleanup grace, above the recorders'

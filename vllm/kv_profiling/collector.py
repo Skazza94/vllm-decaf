@@ -292,7 +292,10 @@ def resolve_endpoint(target: Target):
         return host, port, "manifest"
     if target.source == "nixl":
         return None, None, "a nixl target needs an explicit endpoint"
-    host, port, source = "127.0.0.1", None, None
+    # TENT's precedence, for the host as for the port: the configuration file,
+    # else the environment, else its default; a wildcard host is scraped on
+    # the loopback address only after that choice.
+    host, port, source = None, None, None
     conf_text = target.mc_tent_conf or target.env.get("MC_TENT_CONF")
     if conf_text:
         try:
@@ -307,11 +310,7 @@ def resolve_endpoint(target: Target):
         found = _lookup(conf, "metrics/http_port", _port_value)
         if found is not None:
             port, source = int(found), "target MC_TENT_CONF"
-        configured_host = _lookup(
-            conf, "metrics/http_host", lambda v: isinstance(v, str) and v
-        )
-        if configured_host and configured_host != "0.0.0.0":
-            host = configured_host
+        host = _lookup(conf, "metrics/http_host", lambda v: isinstance(v, str) and v)
     if port is None and target.env.get("TENT_METRICS_HTTP_PORT"):
         value = str(target.env["TENT_METRICS_HTTP_PORT"])
         if not value.isdigit() or not 1 <= int(value) <= 65535:
@@ -319,10 +318,10 @@ def resolve_endpoint(target: Target):
         port, source = int(value), "target environment"
     if port is None:
         port, source = DEFAULT_METRICS_PORT, "default"
-    if target.env.get("TENT_METRICS_HTTP_HOST") and host == "127.0.0.1":
-        configured = str(target.env["TENT_METRICS_HTTP_HOST"])
-        if configured != "0.0.0.0":
-            host = configured
+    if host is None and target.env.get("TENT_METRICS_HTTP_HOST"):
+        host = str(target.env["TENT_METRICS_HTTP_HOST"])
+    if host is None or host == "0.0.0.0":
+        host = "127.0.0.1"
     port += target.port_offset
     if not 1 <= port <= 65535:
         return None, None, "the target's metrics port is out of range"
@@ -567,15 +566,18 @@ def parse(text, limits: Limits, source="tent"):
 
 # --------------------------------------------------------------------- the capture
 def _identity():
-    """Boot ID and time namespace; each is None when unreadable (a kernel without time
-    namespaces shares the host's monotonic clock)."""
-    identity = {"boot_id": None, "time_namespace": None}
+    """Boot ID, time and network namespaces; each is None when unreadable (a kernel
+    without time namespaces shares the host's monotonic clock). The network
+    namespace attributes a loopback endpoint's counters to the worker serving it."""
+    identity = {"boot_id": None, "time_namespace": None, "net_namespace": None}
     with contextlib.suppress(OSError):
         identity["boot_id"] = (
             Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         )
     with contextlib.suppress(OSError):
         identity["time_namespace"] = os.readlink("/proc/self/ns/time")
+    with contextlib.suppress(OSError):
+        identity["net_namespace"] = os.readlink("/proc/self/ns/net")
     return identity
 
 

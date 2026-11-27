@@ -67,12 +67,6 @@ _UNKNOWN_FAILURE = int(Failure.UNKNOWN)
 _LEASE_EXPIRED = int(Failure.LEASE_EXPIRED)
 _LATE_NOTIFICATION = int(Failure.LATE_NOTIFICATION)
 
-_TRANSPORTS = {
-    "unknown": int(Transport.UNKNOWN),
-    "tcp": int(Transport.TCP),
-    "rdma": int(Transport.RDMA),
-}
-
 _live: "weakref.WeakSet[_Profiler]" = weakref.WeakSet()
 
 
@@ -97,7 +91,8 @@ class _Profiler:
         self.recorder = recorder
         self.output_dir = recorder.output_dir
         self._record = recorder.record
-        self._transport = _TRANSPORTS[config.transport]
+        # derived per backend in the context, never resolved at record time
+        self._transport = int(Transport.UNKNOWN)
         self.hook_errors = 0
         self.first_error: str | None = None
         self.shutdown_failures: list[str] = []
@@ -171,7 +166,7 @@ class _Profiler:
                     "first_error": self.first_error,
                     "shutdown_failures": self.shutdown_failures,
                     "capabilities": self.config.context.get("capabilities"),
-                    "transport": self.config.transport,
+                    "transport": self.config.context.get("transport"),
                     "backend": self.config.context.get("backend"),
                     "saved": None if self.result is None else self.result.saved,
                     "complete": None if self.result is None else self.result.complete,
@@ -650,10 +645,13 @@ def _build(
 ) -> NixlProfiler:
     import dataclasses
 
+    from .snapshot import tent_settings
+    from .transport import derive
+
     backends = config.context.get("backends")
     context = {
         **config.context,
-        "transport": config.transport,
+        "transport": derive(backends, "nixl", tent_settings=tent_settings()),
         "capabilities": capabilities(role),
         "backend": backends,
     }
@@ -726,7 +724,6 @@ def attach_frontend(vllm_config) -> FrontendProfiler | None:
         caps = capabilities("frontend")
     context = {
         **config.context,
-        "transport": config.transport,
         "capabilities": caps,
         **_api_server_context(vllm_config),
     }
