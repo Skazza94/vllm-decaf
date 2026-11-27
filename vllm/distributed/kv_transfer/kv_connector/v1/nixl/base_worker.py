@@ -1218,6 +1218,8 @@ class NixlBaseConnectorWorker:
             self._TRANSFER_MODE,
             context={
                 "backends": list(self.nixl_backends),
+                # names the agent's UCP context in UCX's protocol tables
+                "nixl_agent": getattr(self.nixl_wrapper, "name", None),
                 "tp_rank": self.tp_rank,
                 "dp_rank": vllm_config.parallel_config.data_parallel_index,
             },

@@ -162,6 +162,9 @@ def test_a_profiled_pair_moves_the_same_bytes_and_traces_every_request(tmp_path)
                            else ["Mooncake"])  # fmt: skip
     (d_worker,) = by_role(found, "worker", "decode")
     (p_worker,) = by_role(found, "worker", "prefill")
+    # each worker names its NIXL agent, after which UCX names its UCP context
+    agents = {w["meta"]["context"].get("nixl_agent") for w in (d_worker, p_worker)}
+    assert None not in agents and len(agents) == 2
     (d_sched,) = by_role(found, "scheduler", "decode")
     (p_sched,) = by_role(found, "scheduler", "prefill")
     (d_front,) = by_role(found, "frontend", "decode")

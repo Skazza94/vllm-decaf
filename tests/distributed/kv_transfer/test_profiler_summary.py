@@ -2286,3 +2286,259 @@ def test_a_process_and_engine_that_disagree_attribute_nothing(recorders, tmp_pat
                              "engine_id": "engine-prefill"})  # fmt: skip
     assert agreeing["transport_evidence"][0]["basis"] == "process_id and engine_id"
     assert entry["observed"] == ["tcp"]
+
+
+_UCX_ENTRY = {
+    "backend": "UCX", "candidates": ["tcp"], "reason": "UCX selects at runtime",
+    "source": {"name": "UCX_TLS", "value": "tcp,self"},
+}  # fmt: skip
+
+
+AGENT = "e56dbb66-7907-4c3a-b674-7a967eaba96f"
+
+
+def ucx_range(*lanes, start=0, end=None, selections=None):
+    share = 100 // len(lanes)
+    return {"start": start, "end": end, "selections": selections,
+            "description": "software emulation", "estimated": False,
+            "config": ", ".join(f"{share}% on {lane}/data0" for lane in lanes),
+            "lanes": [{"transport": lane, "device": "data0", "path": None,
+                       "share_percent": share} for lane in lanes]}  # fmt: skip
+
+
+def ucx_operation(*ranges, api="ucp_get*", counts=False):
+    return {"time_s": 1.0, "ucs_thread": "nixl", "locality": None,
+            "operation": f"remote memory read by {api}(multi) into host memory",
+            "api": api, "selection_counts": counts, "ranges": list(ranges)}  # fmt: skip
+
+
+def ucx_evidence(recorders, tmp_path, operations, *, locality="inter-node",
+                 kv_role="kv_consumer", entry=_UCX_ENTRY, run_id=True,
+                 joined=True, documents=1, transfer=False,
+                 context_name=AGENT[:31], extra=(), coverage=None):  # fmt: skip
+    """A UCX worker (a derived entry, NIXL agent ``AGENT``) and a
+    ucx_protocols document whose one endpoint configuration of its process,
+    in UCP context ``context_name``, holds ``operations``; ``extra`` are more
+    documents (written as given)."""
+    context = {"role": "worker", "kv_role": kv_role, "engine_id": "engine-d",
+               "backend": ["UCX"], "transport": [entry], "rank": 0,
+               "tp_rank": 0, "dp_rank": 0, "nixl_agent": AGENT}  # fmt: skip
+    recorder = recorders(context=context)
+    assert recorder.wait_ready()
+    if transfer:
+        write_batch(recorder.record, 0x10, {"u-req": (4096, 1)})
+    recorder.close()
+    adapter_summary(recorder)
+    meta = json.loads((recorder.output_dir / "events.jsonl").read_text()
+                      .splitlines()[0])  # fmt: skip
+    document = {
+        "schema": 1, "source": "UCX_PROTO_INFO",
+        "run_id": meta["run_id"] if run_id else None,
+        "endpoint_configurations": [{
+            "host": "decode0", "pid": meta["pid"],
+            "recorder": {"run_id": meta["run_id"],
+                         "process_id": meta["process_id"], "role": "worker",
+                         "rank": 0, "engine_id": "engine-d"} if joined else None,
+            "recorder_candidates": 1 if joined else 2,
+            "context": context_name, "ep_config": 1, "locality": locality,
+            "worker_collision_detected": True,
+            "operations": operations,
+        }],
+        **(coverage or {}),
+    }  # fmt: skip
+    paths = []
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    for index, written in enumerate([document] * documents + list(extra)):
+        path = tmp_path / f"ucx{index}.json"
+        path.write_text(json.dumps(written))
+        paths.append(str(path))
+    summary = summarize([recorder.output_dir], ucx_protocols=paths)
+    (source,) = summary["sources"]
+    (resolved,) = source["transport"]
+    return summary, resolved
+
+
+def test_a_ucx_workers_kv_reads_are_observed_from_its_own_tables(
+    recorders, tmp_path
+):
+    """Its inter-node ucp_get* table selects TCP for every size: the worker
+    observes tcp, at process scope; its transfers stay unknown."""
+    operations = [ucx_operation(ucx_range("tcp"))]
+    summary, entry = ucx_evidence(recorders, tmp_path, operations, transfer=True)
+    assert entry["observed"] == ["tcp"] and entry["kind"] == "unknown"
+    (row,) = summary["transport_observed"]
+    assert (row["basis"], row["locality"], row["kinds"]) == (
+        "ucx_protocol_tables", "inter-node", ["tcp"])  # fmt: skip
+    (attribution,) = summary["transport_evidence"]
+    assert attribution["basis"] == "pid and NIXL agent"
+    assert list(summary["aggregates"]["transfers"]) == ["UCX/unknown"]
+
+
+def test_only_a_ucx_kv_read_on_another_process_counts(recorders, tmp_path):
+    """A table of another operation (a put, active messages), or of the
+    process's own endpoint (self), is no KV read."""
+    put = ucx_operation(ucx_range("tcp"), api="ucp_put*")
+    summary, entry = ucx_evidence(recorders, tmp_path, [put])
+    assert entry["observed"] is None and summary["transport_observed"] == []
+    summary, entry = ucx_evidence(recorders, tmp_path / "self",
+                                  [ucx_operation(ucx_range("tcp"))],
+                                  locality="self")  # fmt: skip
+    assert entry["observed"] is None
+    summary, entry = ucx_evidence(recorders, tmp_path / "intra",
+                                  [ucx_operation(ucx_range("sysv"))],
+                                  locality="intra-node")  # fmt: skip
+    assert entry["observed"] == []
+    assert "no network lane" in entry["observation"]
+
+
+def test_size_ranges_that_select_different_transports_stay_unresolved(
+    recorders, tmp_path
+):
+    """Without selection counts the read sizes are unknown, so ranges that
+    select different transports resolve nothing; counts name the ones used."""
+    ranges = (ucx_range("rc_mlx5", end=8191), ucx_range("tcp", start=8192))
+    both = {**_UCX_ENTRY, "candidates": ["rdma", "tcp"]}
+    _, entry = ucx_evidence(recorders, tmp_path, [ucx_operation(*ranges)], entry=both)
+    assert entry["observed"] == []
+    assert "message sizes are not recorded" in entry["observation"]
+    counted = (ucx_range("rc_mlx5", end=8191, selections=0),
+               ucx_range("tcp", start=8192, selections=12))  # fmt: skip
+    _, entry = ucx_evidence(recorders, tmp_path / "counts",
+                            [ucx_operation(*counted, counts=True)])  # fmt: skip
+    assert entry["observed"] == ["tcp"]
+    unused = (ucx_range("tcp", selections=0),)
+    _, entry = ucx_evidence(recorders, tmp_path / "unused",
+                            [ucx_operation(*unused, counts=True)])  # fmt: skip
+    assert entry["observed"] == [] and "selected" in entry["observation"]
+
+
+@pytest.mark.parametrize("case", ["other run", "ambiguous pid"])
+def test_a_table_not_tied_to_one_recorder_of_this_run_is_not_attributed(
+    recorders, tmp_path, case
+):
+    options = {"other run": {"run_id": False}, "ambiguous pid": {"joined": False}}
+    summary, entry = ucx_evidence(recorders, tmp_path,
+                                  [ucx_operation(ucx_range("tcp"))],
+                                  **options[case])  # fmt: skip
+    (attribution,) = summary["transport_evidence"]
+    assert attribution["source"] is None and attribution["reason"]
+    assert entry["observed"] is None
+
+
+def test_a_ucx_lane_outside_the_candidates_is_reported(recorders, tmp_path):
+    summary, entry = ucx_evidence(recorders, tmp_path,
+                                  [ucx_operation(ucx_range("rc_verbs"))])  # fmt: skip
+    assert entry["observed"] == ["rdma"]
+    assert "transport_outside_configuration" in kinds_of(summary)
+
+
+def test_a_producer_without_kv_reads_and_repeated_documents(recorders, tmp_path):
+    """A producer issues no ucp_get*: nothing is observed, and it says why.
+    The same document given twice folds into one."""
+    summary, entry = ucx_evidence(recorders, tmp_path, [],
+                                  kv_role="kv_producer")  # fmt: skip
+    assert entry["observed"] is None and "issues none" in entry["observation"]
+    operations = [ucx_operation(ucx_range("tcp"))]
+    summary, _ = ucx_evidence(recorders, tmp_path / "twice", operations, documents=2)
+    assert len(summary["transport_observed"]) == 1
+
+
+def test_a_table_of_another_agent_reusing_the_pid_is_only_a_diagnostic(
+    recorders, tmp_path
+):
+    """Another process instance (another run's log, another UCP context) with
+    this worker's PID names another NIXL agent: nothing is attributed, and
+    its table stays as a diagnostic."""
+    other = "0b26985e-dd05-4256-9576-74644c96f1aa"[:31]
+    summary, entry = ucx_evidence(recorders, tmp_path,
+                                  [ucx_operation(ucx_range("tcp"))],
+                                  context_name=other)  # fmt: skip
+    (attribution,) = summary["transport_evidence"]
+    assert attribution["source"] is None
+    assert attribution["reason"] == "its UCP context is not this worker's NIXL agent"
+    assert attribution["tables"][0]["kinds"] == ["tcp"]
+    assert entry["observed"] is None and summary["transport_observed"] == []
+    assert entry["observation"] == "no ucp_get* table attributed to this worker"
+
+
+def test_a_producer_only_workers_get_table_raises_nothing(recorders, tmp_path):
+    """A ucp_get* table on a producer-only worker is not NIXL's pull read: no
+    observation and no outside-configuration alert."""
+    summary, entry = ucx_evidence(recorders, tmp_path,
+                                  [ucx_operation(ucx_range("rc_verbs"))],
+                                  kv_role="kv_producer")  # fmt: skip
+    assert summary["transport_evidence"][0]["reason"] == (
+        "its recorder is not a consumer-capable worker")
+    assert "transport_outside_configuration" not in kinds_of(summary)
+
+
+def test_partial_lanes_keep_the_known_selection_and_name_the_rest(
+    recorders, tmp_path
+):
+    """A range half on TCP and half on an unclassified lane keeps TCP and
+    names the other lane; selected shared-memory and TCP ranges keep TCP and
+    name the local lane."""
+    half = [ucx_operation(ucx_range("tcp", "mystery"))]
+    summary, entry = ucx_evidence(recorders, tmp_path, half)
+    assert entry["observed"] == ["tcp"]
+    assert entry["unclassified_lanes"] == ["mystery/data0"]
+    counted = (ucx_range("sysv", end=8191, selections=5),
+               ucx_range("tcp", start=8192, selections=8))  # fmt: skip
+    summary, entry = ucx_evidence(recorders, tmp_path / "counted",
+                                  [ucx_operation(*counted, counts=True)])  # fmt: skip
+    assert entry["observed"] == ["tcp"]
+    (row,) = summary["transport_observed"]
+    assert row["local"] == ["sysv/data0"] and row["unresolved"] is None
+
+
+def test_a_node_without_tables_is_a_coverage_gap_not_an_error(recorders, tmp_path):
+    """The harness's ``unavailable`` record for one node is reported; the
+    other node's observations stay."""
+    unavailable = {"unavailable": "no UCX_PROTO_INFO table in the server log",
+                   "log": {"path": "logs/prefill.log", "after_stop": True}}  # fmt: skip
+    summary, entry = ucx_evidence(recorders, tmp_path,
+                                  [ucx_operation(ucx_range("tcp"))],
+                                  extra=[unavailable])  # fmt: skip
+    assert entry["observed"] == ["tcp"]
+    gaps = [a for a in summary["transport_evidence"]
+            if (a["reason"] or "").startswith("node not covered")]  # fmt: skip
+    assert len(gaps) == 1
+
+
+def test_only_the_applicable_ranges_feed_every_lane_class(recorders, tmp_path):
+    """With counts, unselected local and unknown ranges stay in the raw detail
+    only; without, TCP stays known when every range includes it, an unknown
+    lane beside it named; an unknown-only selection says so."""
+    counted = (ucx_range("tcp", selections=8), ucx_range("sysv", selections=0),
+               ucx_range("mystery", selections=0))  # fmt: skip
+    summary, entry = ucx_evidence(recorders, tmp_path,
+                                  [ucx_operation(*counted, counts=True)])  # fmt: skip
+    (row,) = summary["transport_observed"]
+    assert entry["observed"] == ["tcp"] and "unclassified_lanes" not in entry
+    assert (row["local"], row["unclassified"], len(row["ranges"])) == ([], [], 3)
+    both = (ucx_range("tcp", end=8191), ucx_range("tcp", "mystery", start=8192))
+    _, entry = ucx_evidence(recorders, tmp_path / "every",
+                            [ucx_operation(*both)])  # fmt: skip
+    assert entry["observed"] == ["tcp"]
+    assert entry["unclassified_lanes"] == ["mystery/data0"]
+    _, entry = ucx_evidence(recorders, tmp_path / "unknown",
+                            [ucx_operation(ucx_range("mystery"))])  # fmt: skip
+    assert entry["observed"] == []
+    assert entry["observation"] == "its selected transport is unclassified"
+
+
+def test_a_partly_parsed_log_is_reported_beside_the_observations(
+    recorders, tmp_path
+):
+    """Tables the parser could not read, or recorders it skipped, are reported
+    for the node: a lost table is never read as a worker that issued no GET."""
+    coverage = {"unparsed": 1, "unparsed_examples": [
+        {"time_s": 1.0, "pid": 81, "reason": "unrecognized header"}],
+        "recorders_skipped": 0}  # fmt: skip
+    summary, entry = ucx_evidence(recorders, tmp_path,
+                                  [ucx_operation(ucx_range("tcp"))],
+                                  coverage=coverage)  # fmt: skip
+    assert entry["observed"] == ["tcp"]
+    (partial,) = [a for a in summary["transport_evidence"]
+                  if (a["reason"] or "").startswith("node partly covered")]  # fmt: skip
+    assert partial["unparsed_pids"] == [81]

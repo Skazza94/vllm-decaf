@@ -22,7 +22,7 @@ from . import timeline
 from .clock import ClockGroup, ClockMapping
 from .perfetto import _clock_aliases, _load
 from .schema import Failure, Subject
-from .transport import combined
+from .transport import combined, ucx_lane_class
 
 # The loader yields kind names as lower-case strings (the JSONL rows); these
 # sets are checked against schema.EventKind in the tests.
@@ -312,6 +312,220 @@ def _byte_intervals(rows, collector=None, target=None):
     return intervals
 
 
+# NIXL's UCX backend reads KV with ucp_get (the pull connector, the only one
+# profiled); a process's own endpoint (``self``) moves no KV between engines.
+_UCX_KV_API = "ucp_get*"
+
+
+def load_ucx_protocols(path):
+    """One ``ucx_protocols`` document (a node's parsed UCX_PROTO_INFO tables,
+    joined by PID to its recorders), or that node's ``unavailable`` record."""
+    document = json.loads(Path(path).read_text())
+    if not isinstance(document, dict) or (
+        document.get("source") != "UCX_PROTO_INFO" and "unavailable" not in document
+    ):
+        raise ValueError(f"{path}: not a UCX protocol-table document")
+    return {"path": str(path), "document": document}
+
+
+def _ucx_range(item):
+    """A range's lanes by class: the network kinds, and the local and
+    unclassified lanes kept apart (never dropped, never taken as network)."""
+    classes = {"network": set(), "local": [], "unclassified": []}
+    for lane in item.get("lanes") or []:
+        name = lane.get("transport") or ""
+        kind = ucx_lane_class(name)
+        if kind in ("tcp", "rdma"):
+            classes["network"].add(kind)
+        else:
+            classes[kind].append(f"{name}/{lane.get('device')}")
+    return {
+        "start": item.get("start"), "end": item.get("end"),
+        "selections": item.get("selections"), "description": item.get("description"),
+        "lanes": item.get("lanes"), "network": sorted(classes["network"]),
+        "local": classes["local"], "unclassified": classes["unclassified"],
+    }  # fmt: skip
+
+
+def _ucx_selection(operation):
+    """The lanes an operation's table shows selected, from its applicable
+    ranges: with UCX_PROTO_INFO=used counts, those selected at least once;
+    without, every range (the read sizes are not recorded per read), so only
+    the network kinds every range includes are known. Returns every range
+    (raw), the known network kinds, the applicable local and unclassified
+    lanes, and why nothing is known when nothing is."""
+    ranges = [_ucx_range(item) for item in operation.get("ranges") or []]
+    counted = bool(operation.get("selection_counts"))
+    applicable = (
+        [r for r in ranges if (r["selections"] or 0) > 0] if counted else ranges
+    )
+    local = sorted({lane for r in applicable for lane in r["local"]})
+    unclassified = sorted({lane for r in applicable for lane in r["unclassified"]})
+    if not applicable:
+        reason = ("no range of this operation was selected" if counted
+                  else "the table has no range")  # fmt: skip
+        return ranges, [], local, unclassified, reason
+    if counted:
+        kinds = sorted({k for r in applicable for k in r["network"]})
+    else:
+        kinds = sorted(set.intersection(*(set(r["network"]) for r in applicable)))
+    if kinds:
+        return ranges, kinds, local, unclassified, None
+    if not counted and any(r["network"] for r in applicable):
+        reason = ("ranges select different lanes and message sizes are not "
+                  "recorded per read")  # fmt: skip
+    elif unclassified:
+        reason = "its selected transport is unclassified"
+    else:
+        reason = "its selected ranges use no network lane"
+    return ranges, kinds, local, unclassified, reason
+
+
+def _ucx_names_agent(context, agent):
+    """UCX names a UCP context after NIXL's agent, truncated to 31 characters."""
+    return bool(context and agent) and context == agent[: len(context)] and (
+        len(context) >= min(len(agent), 31))  # fmt: skip
+
+
+def _ucx_observations(sources, documents, run_id, problems):
+    """Each UCX worker's KV reads as its own UCX_PROTO_INFO tables show them:
+    a ``ucp_get*`` table of a process whose PID was joined to one recorder of
+    this run, on a consumer-capable worker, in the UCP context named after
+    that worker's NIXL agent (so another process or run reusing the PID, or
+    another UCP context, never counts). Process scope only: UCX numbers
+    endpoint configurations per UCP worker without naming it, and a table
+    names no peer or transfer. Unmatched tables stay as diagnostics."""
+    by_process = {s.meta["process_id"]: s for s in sources}
+    attributions, rows = [], []
+    seen = set()
+    for item in documents:
+        document = item["document"]
+        content = json.dumps(document, sort_keys=True)
+        if content in seen:
+            continue
+        seen.add(content)
+        if "unavailable" in document:
+            attributions.append({
+                "evidence": "ucx_protocol_tables", "document": item["path"],
+                "source": None, "basis": None,
+                "reason": f"node not covered: {document['unavailable']}",
+            })  # fmt: skip
+            continue
+        unparsed = document.get("unparsed") or 0
+        skipped = document.get("recorders_skipped") or 0
+        if unparsed or skipped:
+            # a lost table and a worker that issued no GET look alike: say so
+            attributions.append({
+                "evidence": "ucx_protocol_tables", "document": item["path"],
+                "source": None, "basis": None,
+                "reason": f"node partly covered: {unparsed} table(s) unparsed, "
+                f"{skipped} recorder(s) skipped",
+                "unparsed_pids": sorted({
+                    e.get("pid") for e in document.get("unparsed_examples") or []
+                    if e.get("pid") is not None}),
+                "unparsed_examples": document.get("unparsed_examples") or [],
+                "recorders_skipped_examples":
+                    document.get("recorders_skipped_examples") or [],
+            })  # fmt: skip
+        for endpoint in document.get("endpoint_configurations") or []:
+            locality = endpoint.get("locality")
+            kv = [o for o in endpoint.get("operations") or []
+                  if o.get("api") == _UCX_KV_API]  # fmt: skip
+            if locality == "self" or not kv:
+                continue
+            recorder = endpoint.get("recorder")
+            source = by_process.get((recorder or {}).get("process_id"))
+            reason = None
+            if document.get("run_id") != run_id:
+                reason = "the document is not restricted to this run"
+            elif recorder is None:
+                reason = (f"its PID matches {endpoint.get('recorder_candidates')} "
+                          "recorders")  # fmt: skip
+            elif source is None or recorder.get("run_id") != run_id:
+                reason = "its recorder is not among this run's inputs"
+            elif source.role != "worker" or source.context.get("kv_role") not in (
+                "kv_consumer", "kv_both"
+            ):
+                reason = "its recorder is not a consumer-capable worker"
+            elif not any(e.get("backend") == "UCX" for e in source.transport_entries):
+                reason = "its worker declares no UCX backend"
+            elif not _ucx_names_agent(endpoint.get("context"),
+                                      source.context.get("nixl_agent")):  # fmt: skip
+                reason = "its UCP context is not this worker's NIXL agent"
+            tables = []
+            for operation in kv:
+                ranges, kinds, local, unclassified, unresolved = _ucx_selection(
+                    operation)
+                tables.append({
+                    "operation": operation.get("operation"),
+                    "selection_counts": operation.get("selection_counts"),
+                    "ranges": ranges, "kinds": kinds, "unresolved": unresolved,
+                    "local": local, "unclassified": unclassified,
+                })  # fmt: skip
+            attributions.append({
+                "evidence": "ucx_protocol_tables",
+                "document": item["path"],
+                "pid": endpoint.get("pid"),
+                "context": endpoint.get("context"),
+                "ep_config": endpoint.get("ep_config"),
+                "locality": locality,
+                "source": None if reason else source.index,
+                "basis": None if reason else "pid and NIXL agent",
+                "reason": reason,
+                # an unmatched table stays a diagnostic of its process
+                **({"tables": tables} if reason else {}),
+            })  # fmt: skip
+            if reason:
+                continue
+            for table in tables:
+                rows.append({
+                    "basis": "ucx_protocol_tables",
+                    "source": source.index,
+                    "process_id": source.meta["process_id"],
+                    "backend": "UCX",
+                    "document": item["path"],
+                    "pid": endpoint.get("pid"),
+                    "locality": locality,
+                    "ep_config": endpoint.get("ep_config"),
+                    "worker_collision_detected": endpoint.get(
+                        "worker_collision_detected"),
+                    **table,
+                })  # fmt: skip
+    if not documents:
+        return attributions, rows
+    for source in sources:
+        for entry in source.transport_entries:
+            if entry.get("backend") != "UCX" or source.role != "worker":
+                continue
+            mine = [r for r in rows if r["source"] == source.index]
+            observed = sorted({k for r in mine for k in r["kinds"]})
+            entry["observed"] = observed if mine else None
+            if not mine:
+                producer = source.context.get("kv_role") == "kv_producer"
+                entry["observation"] = "no ucp_get* table attributed to this worker" + (
+                    " (a producer issues none under the pull connector)"
+                    if producer else "")  # fmt: skip
+            elif not observed:
+                entry["observation"] = next(
+                    r["unresolved"] for r in mine if r["unresolved"])
+            unclassified = sorted({lane for r in mine for lane in r["unclassified"]})
+            if unclassified:
+                entry["unclassified_lanes"] = unclassified
+            candidates = entry.get("candidates")
+            outside = sorted(set(observed) - set(candidates or [])) if (
+                entry.get("provenance") == "derived" and candidates is not None
+            ) else []  # fmt: skip
+            if outside:
+                problems.append({
+                    "source": source.index,
+                    "process_id": source.meta["process_id"],
+                    "kind": "transport_outside_configuration",
+                    "detail": f"UCX selected {outside} for its KV reads, not "
+                    f"among its candidates {candidates}",
+                })  # fmt: skip
+    return attributions, rows
+
+
 def _measured_sum(intervals, name):
     """The direction's measured total, None when no interval measured it."""
     values = [i[name] for i in intervals if i[name] is not None]
@@ -335,6 +549,7 @@ def _resolve_transports(sources, collectors, problems):
         ):
             worker, basis = _attribute(collector, target, workers)
             attributions.append({
+                "evidence": "tent_metrics",
                 "collector": collector["meta"].get("process_id"),
                 "target": target_id,
                 "source": worker.index if worker else None,
@@ -373,6 +588,7 @@ def _resolve_transports(sources, collectors, problems):
                 streams.setdefault(key, []).append(interval)
             for (_, _, label), intervals in sorted(streams.items()):
                 observed_rows.append({
+                    "basis": "tent_byte_deltas",
                     "source": source.index,
                     "process_id": source.meta["process_id"],
                     "backend": entry["backend"],
@@ -1965,7 +2181,9 @@ _NOT_AVAILABLE = [
 ]
 
 
-def summarize(paths, calibration=None, reference_clock=None) -> dict:
+def summarize(
+    paths, calibration=None, reference_clock=None, ucx_protocols=None
+) -> dict:
     """Summarize profiler JSONL files or directories of them.
 
     Args:
@@ -1974,6 +2192,9 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
             for cross-process spans.
         reference_clock: The reference clock generation; defaults to the
             first calibration's local generation.
+        ucx_protocols: Paths of ``ucx_protocols`` documents of this run
+            (``--profiles`` and ``--run-id``); each UCX worker's KV read
+            lanes are reported from its own tables.
 
     Returns:
         The summary document: sources with loss flags, transfers, requests,
@@ -2121,6 +2342,11 @@ def summarize(paths, calibration=None, reference_clock=None) -> dict:
                 f"captured run {next(iter(run_ids))}"
             )
     attributions, observed = _resolve_transports(sources, collectors, problems)
+    documents = [load_ucx_protocols(path) for path in ucx_protocols or []]
+    ucx_attributions, ucx_rows = _ucx_observations(
+        sources, documents, next(iter(run_ids), None), problems)
+    attributions += ucx_attributions
+    observed += ucx_rows
     alias = _clock_aliases(
         [source.meta for source in sources], group
     )
@@ -2239,8 +2465,14 @@ def main(argv=None):
         help="saved ClockMapping JSON; enables cross-process spans",
     )
     parser.add_argument("--reference-clock")
+    parser.add_argument(
+        "--ucx-protocols", action="append", default=[],
+        help="a ucx_protocols document (run with --profiles and --run-id); "
+        "reports the UCX workers' KV read lanes",
+    )
     args = parser.parse_args(argv)
-    summary = summarize(args.inputs, args.calibration, args.reference_clock)
+    summary = summarize(args.inputs, args.calibration, args.reference_clock,
+                        args.ucx_protocols)  # fmt: skip
     output = Path(args.output)
     if output.parent != Path(""):
         output.parent.mkdir(parents=True, exist_ok=True)

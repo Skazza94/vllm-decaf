@@ -76,6 +76,19 @@ def _entry(backend, candidates, reason, name, value, **extra) -> dict[str, Any]:
     }
 
 
+def ucx_lane_class(transport: str) -> str:
+    """A UCX lane's transport (``tcp``, ``rc_mlx5``, ``sysv``, …) as ``tcp``,
+    ``rdma``, ``local`` (shared memory, self, devices) or ``unclassified``."""
+    name = transport.split(":")[0]
+    if name in _UCX_NETWORK:
+        return _UCX_NETWORK[name]
+    if name.startswith(("rc_", "dc_", "ud_")):
+        return "rdma"
+    if name in _UCX_LOCAL or name.startswith(_UCX_LOCAL_PREFIXES):
+        return "local"
+    return "unclassified"
+
+
 def ucx(environment) -> dict[str, Any]:
     """UCX selects among the transports UCX_TLS allows, at runtime."""
     value = environment.get("UCX_TLS")

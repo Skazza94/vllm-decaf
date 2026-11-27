@@ -660,7 +660,7 @@ opening.
 
 | Backend | Source | Candidates |
 | --- | --- | --- |
-| UCX | `UCX_TLS` | The network transports it lists: `tcp`, or `rdma` for `rc*`, `dc*`, `ud*` and `ib`; local ones (`self`, shared memory, devices) are ignored. Unset, `all`, an exclusion (`^…`) or an unclassified name is unconstrained. UCX selects at runtime, so even `tcp,self` stays a candidate. |
+| UCX | `UCX_TLS` | The network transports it lists: `tcp`, or `rdma` for `rc*`, `dc*`, `ud*` and `ib`; local ones (`self`, shared memory, devices) are ignored. Unset, `all`, an exclusion (`^…`) or an unclassified name is unconstrained. UCX selects at runtime, so even `tcp,self` stays a candidate (its protocol tables show what it selected, below). |
 | LIBFABRIC | `FI_PROVIDER` | A filter: `tcp` and `sockets` give `tcp`, `verbs` gives `rdma`, `udp` gives neither. Any other provider (`psm3`, `efa`, …: a fabric provider alone need not be hardware RDMA) leaves it unconstrained, the providers kept by name. Unset or an exclusion is unconstrained. The provider libfabric selected is not recorded. |
 | Mooncake over TENT (`MC_USE_TENT` or `MC_USE_TEV1` present, any value) | `MC_TENT_CONF`'s `transports` | Each network transport enabled by the configuration or by TENT's defaults, read as TENT reads it: `tcp` and `rdma` on unless their boolean `enable` (nested, else the exact flat leaf, a mistyped nested value falling back to the flat one, then to the default) is `false` (`rdma` also needs an RDMA NIC); `hp_tcp` off unless its object (nested, or under the exact flat key `transports/hp_tcp`) enables it, an absent `enable` being off and a present non-boolean one (`null` included) invalid. `tcp` and `hp_tcp` are `tcp`. An invalid `hp_tcp` (its type recorded), or an unset or unreadable configuration, is unconstrained. |
 | Mooncake, classic engine (either connector) | `MC_FORCE_TCP`, `mooncake_protocol` | `tcp` when `MC_FORCE_TCP` is present; otherwise unconstrained: the engine discovers its transport whatever its protocol (TCP even under the default `rdma`). It records no per-transport counters. |
@@ -696,13 +696,51 @@ recorders'):
 - **Report.** `transport_observed` lists one stream per worker, collector, target
   and transport label: its read and write bytes (`null` for a direction never
   measured, a measured zero kept) and every interval. Two collectors of one
-  worker scrape the same cumulative counters, so their streams are never summed. The worker's entry gets `observed` (the network
-  kinds seen, `null` without attributed evidence) and an `observation` reason
-  when there are none; a kind outside its candidates (an empty list included)
-  is reported as `transport_outside_configuration`. UCX, LIBFABRIC and the
-  classic engine have no such evidence here.
+  worker scrape the same cumulative counters, so their streams are never
+  summed. The worker's entry gets `observed` (the network kinds seen, `null`
+  without attributed evidence) and an `observation` reason when there are none;
+  a kind outside its candidates (an empty list included) is reported as
+  `transport_outside_configuration`. LIBFABRIC and the classic engine have no
+  such evidence here.
 - **Inputs.** Identical copies of one collector capture fold into one;
   conflicting copies of one run and process are refused.
+
+A UCX worker's KV reads are reported from its own UCX protocol selection
+tables, when the server logged them (`UCX_PROTO_INFO=y`, or `used` for
+per-range selection counts) and each node's log was parsed with
+`python vllm/kv_profiling/ucx_protocols.py <log> --profiles <node's profiles>
+--run-id <run>`; give those documents to the summary with `--ucx-protocols`:
+
+- **Attribution.** A table counts only when its PID was joined on its node to
+  exactly one recorder of this run, a consumer-capable worker that declares a
+  UCX backend, and its UCP context is named after that worker's NIXL agent
+  (UCX names the context after the agent, truncated to 31 characters; each
+  worker records its agent as `nixl_agent`). So another process or run reusing
+  the PID, or another UCP context of the process, never counts: its tables stay
+  in `transport_evidence` as diagnostics, with the reason.
+- **Evidence.** Only the `ucp_get*` tables (NIXL's KV read under the pull
+  connector) of endpoints to other processes (`intra-node` or `inter-node`, not
+  `self`, each labelled with its locality). A lane is `tcp` (`tcp`), `rdma`
+  (`rc*`, `dc*`, `ud*`), `local` (shared memory, self, devices) or
+  `unclassified`; local and unclassified lanes are kept by name apart from the
+  network kinds, never dropped. Only the applicable ranges count, for every lane
+  class (every range stays in the raw detail): with selection counts, those
+  selected at least once (a selected local range erases no selected network
+  one); without, every range, since the read sizes are not recorded per read,
+  so a network kind is known only when every range includes it. An
+  unclassified-only selection says its transport is unclassified.
+- **Scope.** The worker process: UCX numbers endpoint configurations per UCP
+  worker without naming it, and a table names no peer or transfer, so
+  transfers stay keyed as declared. `transport_observed` lists each table with
+  its locality, endpoint configuration, ranges, lanes and kinds (or why it is
+  unresolved); the entry gets `observed` and `observation` as above (and
+  `unclassified_lanes` when any), a producer (which issues no read) none.
+- **Inputs.** Identical documents fold into one. A node's `unavailable` record
+  (no tables in its log, or its parse failed) is reported in
+  `transport_evidence` as a coverage gap, and a document with unparsed tables
+  or skipped recorders as partly covered (with the PIDs the parser names), so a
+  lost table is never read as a worker that issued no read; the observations
+  that were parsed stay.
 
 Each summary source lists its entries under `transport`. A capture from before
 the derivation carries a manual label: it is kept and keyed as configured (for
