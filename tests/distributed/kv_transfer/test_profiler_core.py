@@ -1862,6 +1862,7 @@ _TENT_RDMA = {"settings": {"transports": {
         (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "verbs,tcp"}, None, None,
          ["rdma", "tcp"]),
         (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "udp"}, None, None, []),
+        (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "TCP"}, None, None, ["tcp"]),
         (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "psm3"}, None, None, None),
         (["LIBFABRIC"], "nixl", {"FI_PROVIDER": "tcp,psm3"}, None, None, None),
         (["LIBFABRIC"], "nixl", {}, None, None, None),

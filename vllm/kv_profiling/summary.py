@@ -526,6 +526,204 @@ def _ucx_observations(sources, documents, run_id, problems):
     return attributions, rows
 
 
+# libfabric core providers by wire transport (certain cases only); a utility
+# provider (ofi_rxm, a hook, lnx) layers over a core and alone names no wire.
+_FI_WIRE = {"tcp": "tcp", "sockets": "tcp", "verbs": "rdma"}
+
+
+def _fi_utility(provider: str) -> bool:
+    return provider.startswith(("ofi_", "hook")) or provider in ("lnx", "rxm", "rxd")
+
+
+def load_libfabric_providers(path):
+    """One ``libfabric_providers`` document (the agents' rail records of a
+    node's logs), or that node's ``unavailable`` record."""
+    document = json.loads(Path(path).read_text())
+    if not isinstance(document, dict) or (
+        document.get("source") != "NIXL_LIBFABRIC_LOG" and "unavailable" not in document
+    ):
+        raise ValueError(f"{path}: not a LIBFABRIC provider document")
+    return {"path": str(path), "document": document}
+
+
+def _filter_excludes(value, provider):
+    """Whether libfabric's effective FI_PROVIDER ``value`` (as libfabric read
+    it) provably excludes the opened core ``provider``, by libfabric's own
+    rules: names compared case-insensitively, a ``^`` list excludes the names
+    it lists, any other list keeps only them. A list with a layered or utility
+    name is not decided here (a utility opens its core under it)."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    negated = value.startswith("^")
+    names = [name.strip().lower() for name in value.lstrip("^").split(",")
+             if name.strip()]  # fmt: skip
+    if not names or any(";" in name or _fi_utility(name) for name in names):
+        return False
+    listed = provider.lower() in names
+    return listed if negated else not listed
+
+
+def _libfabric_resolution(record):
+    """The kinds a rail record proves, or why it proves none: libfabric's
+    opened core provider on every rail, each the rail manager's choice and
+    classified."""
+    opened = [o.get("provider") or "" for o in record.get("opened") or []]
+    cores = [name for name in opened if not _fi_utility(name)]
+    if not opened:
+        return [], ("no libfabric open record for its rails (FI_LOG_LEVEL=info "
+                    "off for the process)")  # fmt: skip
+    manager = (record.get("manager_provider") or "").split(";")[0].lower()
+    # every known core first: a utility rail never hides another's disagreement
+    differing = sorted({name for name in cores if name.lower() != manager})
+    if differing:
+        return [], (f"the rail manager chose {manager} but libfabric opened "
+                    f"{differing} on a rail")  # fmt: skip
+    if len(cores) != len(opened):
+        return [], "a utility provider alone on a rail: its wire type is unknown"
+    unclassified = sorted({name for name in cores if name.lower() not in _FI_WIRE})
+    if unclassified:
+        return [], f"the opened provider {unclassified} is unclassified"
+    return sorted({_FI_WIRE[name.lower()] for name in cores}), None
+
+
+def _record_key(record):
+    return json.dumps({k: v for k, v in record.items() if k not in ("log", "lines")},
+                      sort_keys=True)  # fmt: skip
+
+
+def _libfabric_observations(sources, documents, problems):
+    """Each LIBFABRIC worker's opened provider, from the rail record naming
+    its NIXL agent on the worker's main thread (an agent UUID is one process
+    instance). Records are grouped by agent across every input first:
+    identical copies fold, differing ones all stay diagnostics. Process
+    scope; records matching no worker stay as diagnostics."""
+    from .transport import libfabric as derive_libfabric
+
+    workers = {}
+    for source in sources:
+        agent = source.context.get("nixl_agent")
+        if source.role == "worker" and agent and any(
+            e.get("backend") == "LIBFABRIC" for e in source.transport_entries
+        ):
+            workers.setdefault(agent, []).append(source)
+    attributions, rows, by_worker, seen = [], [], {}, set()
+    by_agent: dict[str, dict[str, tuple]] = {}
+    for item in documents:
+        document = item["document"]
+        content = json.dumps(document, sort_keys=True)
+        if content in seen:
+            continue
+        seen.add(content)
+        if "unavailable" in document:
+            attributions.append({
+                "evidence": "libfabric_open_log", "document": item["path"],
+                "source": None, "basis": None,
+                "reason": f"node not covered: {document['unavailable']}",
+            })  # fmt: skip
+            continue
+        if document.get("unparsed"):
+            attributions.append({
+                "evidence": "libfabric_open_log", "document": item["path"],
+                "source": None, "basis": None,
+                "reason": f"node partly covered: {document['unparsed']} rail "
+                "sequence(s) not paired or failed",
+                "unparsed_examples": document.get("unparsed_examples") or [],
+            })  # fmt: skip
+        for record in document.get("records") or []:
+            by_agent.setdefault(record.get("agent"), {}).setdefault(
+                _record_key(record), (item["path"], record))
+    for agent, distinct in sorted(by_agent.items(), key=lambda kv: str(kv[0])):
+        matched = workers.get(agent, [])
+        for path, record in distinct.values():
+            reason = None
+            if len(distinct) > 1:
+                reason = "differing rail records name the agent across the inputs"
+            elif len(matched) != 1:
+                reason = ("its NIXL agent is no LIBFABRIC worker of this run"
+                          if not matched else "its NIXL agent names several "
+                          "recorders")  # fmt: skip
+            elif record.get("tid") != matched[0].meta.get("pid"):
+                pid = matched[0].meta.get("pid")
+                reason = (f"its thread {record.get('tid')} is not the worker's "
+                          f"main thread (PID {pid})")  # fmt: skip
+            attributions.append({
+                "evidence": "libfabric_open_log", "document": path,
+                "agent": agent, "tid": record.get("tid"),
+                "source": None if reason else matched[0].index,
+                "basis": None if reason else "NIXL agent, worker's main thread",
+                "reason": reason,
+                **({"record": record} if reason else {}),
+            })  # fmt: skip
+            if reason:
+                continue
+            kinds, unresolved = _libfabric_resolution(record)
+            source = matched[0]
+            row = {
+                "basis": "libfabric_open_log", "source": source.index,
+                "process_id": source.meta["process_id"], "backend": "LIBFABRIC",
+                "document": path, "agent": agent,
+                **{key: record.get(key) for key in (
+                    "log", "tid", "manager_provider", "rails", "rail_fabrics",
+                    "opened", "effective_filter")},
+                "kinds": kinds, "unresolved": unresolved,
+            }  # fmt: skip
+            rows.append(row)
+            by_worker.setdefault(source.index, []).append(row)
+    if not documents:
+        return attributions, rows
+    for source in sources:
+        for entry in source.transport_entries:
+            if entry.get("backend") != "LIBFABRIC" or source.role != "worker":
+                continue
+            mine = by_worker.get(source.index, [])
+            if not mine:
+                entry["observed"] = None
+                entry["observation"] = "no rail record names this worker's NIXL agent"
+                continue
+            (row,) = mine
+            entry["observed"] = row["kinds"]
+            entry["provider"] = row["manager_provider"]
+            entry["opened_providers"] = [o.get("provider") for o in row["opened"]]
+            entry["effective_filter"] = row["effective_filter"]
+            if row["unresolved"]:
+                entry["observation"] = row["unresolved"]
+                if row["unresolved"].startswith("the rail manager"):
+                    problems.append({
+                        "source": source.index,
+                        "process_id": source.meta["process_id"],
+                        "kind": "libfabric_provider_disagreement",
+                        "detail": row["unresolved"],
+                    })  # fmt: skip
+            effective = row["effective_filter"]
+            if entry.get("provenance") != "derived" or effective == "unknown":
+                # the environment is not the effective filter: no contradiction
+                # is claimed against it (its candidates stay as derived)
+                continue
+            candidates = derive_libfabric(
+                {"FI_PROVIDER": effective} if effective else {})["candidates"]
+            outside = sorted(set(row["kinds"]) - set(candidates or [])) if (
+                candidates is not None) else []  # fmt: skip
+            if outside:
+                problems.append({
+                    "source": source.index, "process_id": source.meta["process_id"],
+                    "kind": "transport_outside_configuration",
+                    "detail": f"LIBFABRIC opened {outside}, not among the "
+                    f"candidates {candidates} of its effective filter {effective!r}",
+                })  # fmt: skip
+            against = sorted({
+                o for o in entry["opened_providers"]
+                if o and not _fi_utility(o) and _filter_excludes(effective, o)
+            })  # fmt: skip
+            if against:
+                problems.append({
+                    "source": source.index, "process_id": source.meta["process_id"],
+                    "kind": "provider_outside_filter",
+                    "detail": f"libfabric opened {against} although its effective "
+                    f"FI_PROVIDER is {effective!r}",
+                })  # fmt: skip
+    return attributions, rows
+
+
 def _measured_sum(intervals, name):
     """The direction's measured total, None when no interval measured it."""
     values = [i[name] for i in intervals if i[name] is not None]
@@ -2182,8 +2380,9 @@ _NOT_AVAILABLE = [
 
 
 def summarize(
-    paths, calibration=None, reference_clock=None, ucx_protocols=None
-) -> dict:
+    paths, calibration=None, reference_clock=None, ucx_protocols=None,
+    libfabric_providers=None,
+) -> dict:  # fmt: skip
     """Summarize profiler JSONL files or directories of them.
 
     Args:
@@ -2195,6 +2394,9 @@ def summarize(
         ucx_protocols: Paths of ``ucx_protocols`` documents of this run
             (``--profiles`` and ``--run-id``); each UCX worker's KV read
             lanes are reported from its own tables.
+        libfabric_providers: Paths of ``libfabric_providers`` documents;
+            each LIBFABRIC worker's opened provider is reported from the rail
+            record naming its NIXL agent.
 
     Returns:
         The summary document: sources with loss flags, transfers, requests,
@@ -2347,6 +2549,11 @@ def summarize(
         sources, documents, next(iter(run_ids), None), problems)
     attributions += ucx_attributions
     observed += ucx_rows
+    fi_documents = [load_libfabric_providers(p) for p in libfabric_providers or []]
+    fi_attributions, fi_rows = _libfabric_observations(
+        sources, fi_documents, problems)
+    attributions += fi_attributions
+    observed += fi_rows
     alias = _clock_aliases(
         [source.meta for source in sources], group
     )
@@ -2470,9 +2677,14 @@ def main(argv=None):
         help="a ucx_protocols document (run with --profiles and --run-id); "
         "reports the UCX workers' KV read lanes",
     )
+    parser.add_argument(
+        "--libfabric-providers", action="append", default=[],
+        help="a libfabric_providers document; reports the LIBFABRIC workers' "
+        "opened providers",
+    )
     args = parser.parse_args(argv)
     summary = summarize(args.inputs, args.calibration, args.reference_clock,
-                        args.ucx_protocols)  # fmt: skip
+                        args.ucx_protocols, args.libfabric_providers)  # fmt: skip
     output = Path(args.output)
     if output.parent != Path(""):
         output.parent.mkdir(parents=True, exist_ok=True)

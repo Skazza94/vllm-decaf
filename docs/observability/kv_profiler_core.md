@@ -661,7 +661,7 @@ opening.
 | Backend | Source | Candidates |
 | --- | --- | --- |
 | UCX | `UCX_TLS` | The network transports it lists: `tcp`, or `rdma` for `rc*`, `dc*`, `ud*` and `ib`; local ones (`self`, shared memory, devices) are ignored. Unset, `all`, an exclusion (`^…`) or an unclassified name is unconstrained. UCX selects at runtime, so even `tcp,self` stays a candidate (its protocol tables show what it selected, below). |
-| LIBFABRIC | `FI_PROVIDER` | A filter: `tcp` and `sockets` give `tcp`, `verbs` gives `rdma`, `udp` gives neither. Any other provider (`psm3`, `efa`, …: a fabric provider alone need not be hardware RDMA) leaves it unconstrained, the providers kept by name. Unset or an exclusion is unconstrained. The provider libfabric selected is not recorded. |
+| LIBFABRIC | `FI_PROVIDER` | A filter: `tcp` and `sockets` give `tcp`, `verbs` gives `rdma`, `udp` gives neither. Any other provider (`psm3`, `efa`, …: a fabric provider alone need not be hardware RDMA) leaves it unconstrained, the providers kept by name. Unset or an exclusion is unconstrained. The provider libfabric opened is shown by its log, below. |
 | Mooncake over TENT (`MC_USE_TENT` or `MC_USE_TEV1` present, any value) | `MC_TENT_CONF`'s `transports` | Each network transport enabled by the configuration or by TENT's defaults, read as TENT reads it: `tcp` and `rdma` on unless their boolean `enable` (nested, else the exact flat leaf, a mistyped nested value falling back to the flat one, then to the default) is `false` (`rdma` also needs an RDMA NIC); `hp_tcp` off unless its object (nested, or under the exact flat key `transports/hp_tcp`) enables it, an absent `enable` being off and a present non-boolean one (`null` included) invalid. `tcp` and `hp_tcp` are `tcp`. An invalid `hp_tcp` (its type recorded), or an unset or unreadable configuration, is unconstrained. |
 | Mooncake, classic engine (either connector) | `MC_FORCE_TCP`, `mooncake_protocol` | `tcp` when `MC_FORCE_TCP` is present; otherwise unconstrained: the engine discovers its transport whatever its protocol (TCP even under the default `rdma`). It records no per-transport counters. |
 | Any other | none | Unconstrained. |
@@ -741,6 +741,57 @@ per-range selection counts) and each node's log was parsed with
   or skipped recorders as partly covered (with the PIDs the parser names), so a
   lost table is never read as a worker that issued no read; the observations
   that were parsed stay.
+
+A LIBFABRIC worker's provider is reported from the servers' own logs, when the
+deployment enables them before NIXL loads: `NIXL_LOG_LEVEL=INFO` (NIXL's rail
+manager logs its rails, the provider its topology chose and the agent's
+self-connection) and `FI_LOG_LEVEL=info` with `FI_LOG_PROV=core
+FI_LOG_SUBSYS=core` (libfabric logs each fabric it opened and the provider that
+opened it, about 45 lines at startup). Parse each node's log on its own with
+`python vllm/kv_profiling/libfabric_providers.py <log> --output <file>` and give
+the documents to the summary with `--libfabric-providers`:
+
+- **Records.** One per agent, on the thread that created it (abseil's thread
+  ID, libfabric's process ID: the same for the main thread), within one process
+  lifetime (from NIXL's version line), in this order: per rail libfabric's open
+  and its provider (the core's own `core:core` INFO records only), taken by
+  NIXL's rail of that fabric before the next open begins (no open when the
+  core's logging is off for the process), then the manager's rail count and
+  provider, then the self-connection naming the agent. A sequence out of that order (an open after
+  the manager, an open no rail took), with disagreeing counts or fabric names,
+  or with no process start on record is a diagnostic with its reason; a thread
+  ID with more than one lifetime in one input (a restart, two containers' logs
+  merged) keeps none of its records; nothing is paired across inputs. A rail
+  failure of LIBFABRIC's startup (not another backend's error, nor a
+  transfer's error after startup) is reported even at NIXL's default level.
+  Each record keeps the filter libfabric's core itself read (`effective_filter`: its value, `null` when
+  unset, `unknown` when libfabric did not log it).
+- **Attribution.** Records are grouped by agent across every input: identical
+  copies fold, differing ones all stay diagnostics. A record counts for the one
+  worker whose recorded `nixl_agent` it names, on that worker's main thread (its
+  thread is the worker's recorded PID); any other record stays a diagnostic.
+- **Evidence.** The manager's choice is kept, but only libfabric's opened core
+  providers confirm a transport, every rail's the manager's: `tcp` and
+  `sockets` are `tcp`, `verbs` is `rdma`; any other provider is unclassified, a
+  utility provider (`ofi_rxm`, a hook) names no wire, and no open on record
+  (libfabric's logging off) confirms nothing. A rail that opened another core
+  provider than the manager chose, classified or not, is unresolved, both kept,
+  and reported as `libfabric_provider_disagreement`, whatever another rail's
+  utility provider.
+- **Report.** The entry gets `provider` (the manager's), `opened_providers`,
+  `effective_filter`, `observed` and an `observation` when nothing is
+  confirmed; `transport_observed` lists each record. Contradictions need the
+  effective filter: a kind outside its candidates (names compared
+  case-insensitively) is `transport_outside_configuration`; without it, the
+  derived candidates stay and no contradiction is claimed.
+  `provider_outside_filter` needs libfabric's effective filter and libfabric's
+  own matching (case-insensitive names; a `^` list excludes what it names,
+  another list keeps only what it names); a list with a layered or utility name
+  is not decided. Producers and consumers both create rails, so both report;
+  transfers stay keyed as declared.
+- **Inputs.** Identical documents fold into one; unpaired or failed sequences
+  are reported as partial coverage and an `unavailable` record as a coverage
+  gap.
 
 Each summary source lists its entries under `transport`. A capture from before
 the derivation carries a manual label: it is kept and keyed as configured (for

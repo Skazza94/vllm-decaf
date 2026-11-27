@@ -2542,3 +2542,226 @@ def test_a_partly_parsed_log_is_reported_beside_the_observations(
     (partial,) = [a for a in summary["transport_evidence"]
                   if (a["reason"] or "").startswith("node partly covered")]  # fmt: skip
     assert partial["unparsed_pids"] == [81]
+
+
+def fi_entry(value="tcp", candidates=("tcp",)):
+    return {"backend": "LIBFABRIC", "candidates": list(candidates),
+            "reason": "FI_PROVIDER filters the providers",
+            "source": {"name": "FI_PROVIDER", "value": value},
+            "providers": value}  # fmt: skip
+
+
+def fi_record(agent, manager="tcp", opened=("tcp",), rails=None, tid=None,
+              effective="tcp"):  # fmt: skip
+    """A rail record; ``tid`` None is the worker's own PID (its main thread)."""
+    rails = len(opened) if rails is None else rails
+    return {"log": "decode.log", "tid": tid, "agent": agent, "time": "21:26:39",
+            "lines": [1, 9], "manager_provider": manager, "rails": rails,
+            "rail_fabrics": [f"n{i}" for i in range(rails)],
+            "opened": [{"fabric": f"n{i}", "provider": p, "version": "2.7"}
+                       for i, p in enumerate(opened)],
+            "libfabric_logging": bool(opened),
+            "effective_filter": effective if opened else "unknown"}  # fmt: skip
+
+
+def fi_document(records):
+    return {"schema": 1, "source": "NIXL_LIBFABRIC_LOG", "records": records,
+            "conflicts": [], "unparsed": 0, "unparsed_examples": []}  # fmt: skip
+
+
+def fi_evidence(recorders, tmp_path, records, *, kv_roles=("kv_consumer",),
+                entry=None, documents=None, transfer=False):  # fmt: skip
+    """LIBFABRIC workers, one per role (agents agent-0, agent-1, …) with a
+    derived entry, and libfabric_providers documents (one of ``records``
+    unless ``documents``); a record's ``tid`` None becomes this process's PID,
+    which every recorder here has."""
+    run_id = str(uuid4())
+    outputs = []
+    for index, kv_role in enumerate(kv_roles):
+        context = {"role": "worker", "kv_role": kv_role, "engine_id": f"e-{index}",
+                   "backend": ["LIBFABRIC"], "transport": [entry or fi_entry()],
+                   "rank": 0, "tp_rank": 0, "dp_rank": 0,
+                   "nixl_agent": f"agent-{index}"}  # fmt: skip
+        recorder = recorders(run_id=run_id, context=context)
+        assert recorder.wait_ready()
+        if transfer:
+            write_batch(recorder.record, 0x10, {f"r{index}": (4096, 1)})
+        recorder.close()
+        adapter_summary(recorder)
+        outputs.append(recorder.output_dir)
+    paths = []
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    for index, written in enumerate(documents or [fi_document(records)]):
+        for record in written.get("records") or []:
+            if record["tid"] is None:
+                record["tid"] = os.getpid()
+        path = tmp_path / f"fi{index}.json"
+        path.write_text(json.dumps(written))
+        paths.append(str(path))
+    summary = summarize(outputs, libfabric_providers=paths)
+    entries = [s["transport"][0] for s in summary["sources"]]
+    return summary, entries
+
+
+def test_a_libfabric_workers_opened_provider_confirms_its_transport(
+    recorders, tmp_path
+):
+    """Producer and consumer alike: libfabric opened tcp on every rail of the
+    worker's main thread, the manager chose tcp; transfers stay as declared."""
+    summary, entries = fi_evidence(
+        recorders, tmp_path, [fi_record("agent-0"), fi_record("agent-1")],
+        kv_roles=("kv_producer", "kv_consumer"), transfer=True)  # fmt: skip
+    assert [e["observed"] for e in entries] == [["tcp"], ["tcp"]]
+    assert all(e["provider"] == "tcp" and e["opened_providers"] == ["tcp"]
+               and e["effective_filter"] == "tcp" for e in entries)  # fmt: skip
+    assert {r["basis"] for r in summary["transport_observed"]} == {"libfabric_open_log"}
+    assert list(summary["aggregates"]["transfers"]) == ["LIBFABRIC/unknown"]
+    assert not [p for p in kinds_of(summary) if "provider" in p or "outside" in p]
+
+
+def test_a_record_off_the_workers_main_thread_is_not_attributed(
+    recorders, tmp_path
+):
+    """Its agent's UUID, but opened on thread 181 while the worker is another
+    PID: not the worker's main-thread open."""
+    elsewhere = [fi_record("agent-0", tid=os.getpid() + 100)]
+    summary, (entry,) = fi_evidence(recorders, tmp_path, elsewhere)
+    assert entry["observed"] is None
+    assert "main thread" in summary["transport_evidence"][0]["reason"]
+
+
+@pytest.mark.parametrize(
+    "record, observation",
+    [
+        (fi_record("agent-0", opened=()), "no libfabric open record"),
+        (fi_record("agent-0", opened=("ofi_rxm",)), "utility provider alone"),
+        (fi_record("agent-0", manager="psm3", opened=("psm3",)), "unclassified"),
+    ],
+)  # fmt: skip
+def test_an_open_that_names_no_wire_confirms_nothing(
+    recorders, tmp_path, record, observation
+):
+    _, (entry,) = fi_evidence(recorders, tmp_path, [dict(record)],
+                              entry=fi_entry(value=None, candidates=()))  # fmt: skip
+    assert entry["observed"] == [] and observation in entry["observation"]
+
+
+@pytest.mark.parametrize(
+    "manager, opened",
+    [("tcp", ("verbs",)), ("tcp", ("tcp", "verbs")), ("tcp", ("efa",)),
+     ("tcp", ("ofi_rxm", "verbs"))],  # a utility rail never hides the other
+)  # fmt: skip
+def test_every_rail_must_open_the_managers_provider(
+    recorders, tmp_path, manager, opened
+):
+    """One rail on another core provider, even an unclassified one, is a
+    disagreement: unresolved, both kept, reported."""
+    record = fi_record("agent-0", manager=manager, opened=opened)
+    summary, (entry,) = fi_evidence(recorders, tmp_path, [record])
+    assert entry["observed"] == [] and entry["provider"] == manager
+    assert entry["opened_providers"] == list(opened)
+    assert "libfabric_provider_disagreement" in kinds_of(summary)
+    (row,) = summary["transport_observed"]
+    assert [o["provider"] for o in row["opened"]] == list(opened)
+
+
+def test_records_of_no_worker_or_none_at_all(recorders, tmp_path):
+    """Another agent's record stays a diagnostic; a worker without a record
+    keeps its candidate."""
+    summary, (entry,) = fi_evidence(recorders, tmp_path, [fi_record("stranger")])
+    assert entry["observed"] is None
+    (attribution,) = summary["transport_evidence"]
+    assert attribution["source"] is None
+    assert attribution["record"]["agent"] == "stranger"
+
+
+@pytest.mark.parametrize(
+    "effective, opened, alert",
+    [
+        ("tcp", "verbs", True),
+        ("TCP", "tcp", False),  # libfabric compares names case-insensitively
+        ("^verbs", "verbs", True),
+        ("^VERBS", "verbs", True),
+        ("^tcp;ofi_rxm", "tcp", False),  # a layered exclusion keeps the core
+        ("tcp;ofi_rxm", "tcp", False),  # layered: not decided here
+        ("ofi_rxm", "verbs", False),  # a utility filter names no core
+        (None, "verbs", False),  # no filter
+        ("unknown", "verbs", False),  # only the environment's value is known
+    ],
+)  # fmt: skip
+def test_a_filter_alert_needs_libfabrics_effective_filter_to_exclude(
+    recorders, tmp_path, effective, opened, alert
+):
+    record = fi_record("agent-0", manager=opened, opened=(opened,))
+    record["effective_filter"] = effective
+    either = fi_entry(value="tcp", candidates=("rdma", "tcp"))
+    summary, _ = fi_evidence(recorders, tmp_path, [record], entry=either)
+    assert ("provider_outside_filter" in kinds_of(summary)) is alert
+
+
+def test_the_effective_filter_overrides_the_environment(recorders, tmp_path):
+    """FI_PROVIDER=verbs in the environment, but libfabric read tcp (a system
+    configuration preferred) and opened tcp: no configuration alert."""
+    summary, (entry,) = fi_evidence(
+        recorders, tmp_path, [fi_record("agent-0", effective="tcp")],
+        entry=fi_entry(value="verbs", candidates=("rdma",)))  # fmt: skip
+    assert entry["observed"] == ["tcp"]
+    assert not [p for p in kinds_of(summary) if "outside" in p]
+
+
+@pytest.mark.parametrize("effective", ["tcp", "TCP"])
+def test_a_kind_outside_the_effective_filter_is_reported(
+    recorders, tmp_path, effective
+):
+    """The effective filter's candidates, its names compared as libfabric
+    compares them (case-insensitively)."""
+    record = fi_record("agent-0", manager="verbs", opened=("verbs",),
+                       effective=effective)  # fmt: skip
+    summary, (entry,) = fi_evidence(recorders, tmp_path, [record])
+    assert entry["observed"] == ["rdma"]
+    assert "transport_outside_configuration" in kinds_of(summary)
+
+
+def test_without_the_effective_filter_no_contradiction_is_claimed(
+    recorders, tmp_path
+):
+    """The environment says verbs, libfabric logged no filter, it opened tcp:
+    the observation and the derived candidates stay, no alert is raised."""
+    record = fi_record("agent-0", effective="unknown")
+    env_verbs = fi_entry(value="verbs", candidates=("rdma",))
+    summary, (entry,) = fi_evidence(recorders, tmp_path, [record], entry=env_verbs)
+    assert entry["observed"] == ["tcp"] and entry["candidates"] == ["rdma"]
+    assert not [p for p in kinds_of(summary) if "outside" in p]
+
+
+def test_differing_records_of_one_agent_stay_diagnostics_across_inputs(
+    recorders, tmp_path
+):
+    """Whatever the grouping into documents, an agent named by differing
+    records confirms nothing; an identical copy folds and changes nothing."""
+    tcp, verbs = fi_record("agent-0"), fi_record("agent-0", "verbs", ("verbs",))
+    for index, documents in enumerate([
+        [fi_document([tcp, verbs])],
+        [fi_document([tcp]), fi_document([verbs])],
+        [fi_document([tcp, verbs]), fi_document([dict(tcp, log="copy.log")])],
+    ]):
+        summary, (entry,) = fi_evidence(recorders, tmp_path / str(index), [],
+                                        documents=documents)  # fmt: skip
+        assert entry["observed"] is None and summary["transport_observed"] == []
+    summary, (entry,) = fi_evidence(
+        recorders, tmp_path / "copies", [],
+        documents=[fi_document([tcp]),
+                   fi_document([dict(tcp, log="copy.log")])])  # fmt: skip
+    assert entry["observed"] == ["tcp"]
+
+
+def test_unavailable_and_partial_documents(recorders, tmp_path):
+    partial = {**fi_document([fi_record("agent-0")]), "unparsed": 1,
+               "unparsed_examples": [{"tid": 1, "reason": "rail counts disagree"}]}
+    unavailable = {"unavailable": "no LIBFABRIC rail record in the server log"}
+    summary, (entry,) = fi_evidence(recorders, tmp_path, [],
+                                    documents=[partial, unavailable])  # fmt: skip
+    assert entry["observed"] == ["tcp"]
+    reasons = [a["reason"] or "" for a in summary["transport_evidence"]]
+    assert any(r.startswith("node partly covered") for r in reasons)
+    assert any(r.startswith("node not covered") for r in reasons)

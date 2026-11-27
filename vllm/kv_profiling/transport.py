@@ -123,11 +123,13 @@ def libfabric(environment) -> dict[str, Any]:
         return _entry("LIBFABRIC", None, "FI_PROVIDER excludes providers: "
                       "libfabric selects among the rest", "FI_PROVIDER",
                       value)  # fmt: skip
-    providers = [p.strip().split(";")[0] for p in value.split(",") if p.strip()]
+    # libfabric compares provider names case-insensitively
+    providers = [p.strip().split(";")[0].lower() for p in value.split(",")
+                 if p.strip()]  # fmt: skip
     unclassified = {p for p in providers if p not in _FI_PROVIDERS}
     reason = (
-        "FI_PROVIDER filters the providers; the provider libfabric selected is "
-        "not recorded"
+        "FI_PROVIDER filters the providers; the one libfabric opened is shown "
+        "only by its own log"
     )
     kinds = {_FI_PROVIDERS[p] for p in providers if p in _FI_PROVIDERS} - {None}
     if unclassified:
